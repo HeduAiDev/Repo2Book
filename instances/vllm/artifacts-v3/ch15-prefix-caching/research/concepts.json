@@ -1,0 +1,225 @@
+{
+  "chapter_id": "ch15",
+  "chapter_title": "前缀缓存",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "generated": "2026-08-28",
+  "scope_note": "本章 4 个 introduces（链式哈希/非 radix、块内 CoW 部分命中、LRU 双不变量、Marconi 钉住）的外部背景全覆盖，共 10 条：①merkle-hash-chain（链式哈希的密码学血统，Wikipedia 一手）；②prefix-cache-structure-routes（radix 树 vs 链式哈希两条路线 competing_set，SGLang 论文重抓 + SGLang 概念页/HiCache 文档 + vLLM PR #37898 一手）；③copy-on-write（OS fork 血统 + vLLM 论文原文 CoW 段一手，ar5iv）；④lru-eviction（LRU 策略与代价谱，Wikipedia 两篇 + Redis 官方文档一手）；⑤marconi-paper（MLSys'25 论文 + vLLM PR #37898 落地链一手核实）；⑥sparse-prefix-checkpoint-placement（arXiv:2605.05219 同期学术形式化，与 vLLM 血缘未核实、明确不主张）；⑦-⑩自 v2 映射章携带复用：fixed-point（v2 ch16 原为本算法所写，v3 该机制移入本章）、hash-algo/birthday（v2 ch15，按 v0.27.1 改锚：新 _cbor 变体 + config 文档自带安全警告，RFC 8949 一手核实）、hybrid-kv-cache-doc（2026-08-28 重抓：文档仍写两次扫描取交集、Mamba 前缀缓存标 WIP——与 pin 代码的不动点/Marconi 钉住已脱节，写进 writer_note）。有意不研（归邻章，据 ch13 scope 分工图）：PagedAttention/OS 分页/引用计数/侵入式链表 → ch13 已讲透（本章回指）；SWA/Mamba/混合注意力模型谱系 → ch14；KVConnector/Mooncake/分布式 KV → ch16（Mooncake 只在 SGLang HiCache 的 L3 语境出现一句，不单独立条）。L0 缩放 kv_column 是本书账本内部记法、非外部概念，不在研究范围。全部新研条目 2026-08-28 由本 session 一手抓取；携带条目 sources 标注原抓取日期。",
+  "concepts": [
+    {
+      "id": "merkle-hash-chain",
+      "term": "Merkle 树与哈希链（链式块哈希的密码学血统）",
+      "kind": "external_concept",
+      "one_line": "「父哈希拌进子哈希」的构造：第 i 块的哈希不只代表本块 token，而是从头到第 i 块整条前缀的指纹——git 提交号、比特币区块、vLLM 的 block hash 用的是同一招。",
+      "what_it_is": "维基定义句：Merkle 树（哈希树）是 \"a tree in which every 'leaf' node is labelled with the cryptographic hash of a data block\"，非叶节点则是 \"labelled with the cryptographic hash of the labels of its child nodes\"——每层哈希都把下一层的内容「卷」进来，于是根哈希成为整棵树内容的指纹，\"allows efficient and secure verification of the contents of a large data structure\"。它由 Ralph Merkle 在 1979 年的专利中提出（US 4,309,569，1982 年公布）。本文更关心的退化形态是**哈希链**：维基原话，哈希树 \"is a generalization of a hash list and a hash chain\"——把树压成一条线，每个节点的哈希 = H(上一节点的哈希, 本节点内容)，链上第 i 个哈希就覆盖了前 i+1 段的全部内容。vLLM 的 hash_block_tokens（vllm/v1/core/kv_cache_utils.py:L596-L623，pin）正是这个形态：BlockHash(hash_function((parent_block_hash, curr_block_token_ids_tuple, extra_keys)))，首块的 parent 用随机种子 NONE_HASH。它买到的性质正是本章 m4 的正确性根基：hash_i 递归依赖 hash_{i-1}，所以**两个请求的前缀一致 ⇔ 沿链哈希逐一相等**；而一旦 hash_i 在表里 miss，对任何 j>i 也必 miss（hash_j 把 hash_i 卷在里面）——「断一处即停、无需回溯」不是启发式，是链式指纹的数学推论（dossier theory 第 2 条同款论证）。git 的类比最直观：每个提交的哈希包含其父提交的哈希，所以一个 commit ID 命名的是整条历史而不只是一个快照（维基把 Git/Mercurial 归为这一族的 DAG 形态）。野生应用：Bitcoin/Ethereum 的 SPV 验证、Cassandra/Dynamo/Riak 副本间的 anti-entropy 对账、Certificate Transparency、ZFS/IPFS。",
+      "background": "Merkle 1979 年的原始动机是数字签名：签名一个大结构太贵，只签根哈希、验证者拿 O(log n) 个兄弟哈希就能验证任一片叶。vLLM 需要的不是「证明」也不是「对账」，而是**前缀身份**：给「到第 i 块为止的全部内容」发一张身份证，让一个平面 dict 查一下就完成前缀匹配。所以它不需要树的分叉——一个 token 序列只有一条历史，路径唯一，树退化成链恰好；也不需要 O(log n) 证明路径——直接拿链上每个哈希当 dict 的键。这是「同一个密码学构造、按需取用其性质」的教科书案例：Merkle 树用「父进子」换可验证性，vLLM 用「父进子」换「任意长度前缀的身份 = 链上最后一个哈希」。",
+      "example": "说明性最小例（函数形态对位 pin 的 hash_block_tokens）：设 hash_block_size=2，请求 A 的 token 为 [A,B,C,D]。h0 = H(NONE_HASH, (A,B))；h1 = H(h0, (C,D))——注意 h1 的输入里没有 A,B 的原文，但有 h0，而 h0 又由 A,B 决定，所以 h1 是「A,B,C,D 四个 token」的指纹。请求 B 的 token 为 [A,B,X,Y]：它算出的 h0 与 A 完全相同（输入相同）→ 查表命中，共享前两 token 的 KV；算出的 h1 = H(h0,(X,Y)) ≠ A 的 h1 → miss，到此为止。再改一个字：若有人把 A 的第一个 token 改掉，则 h0 变、h1 跟着变（h1 卷着旧 h0）——「前缀任何一处改动，其后所有哈希全部失效」不是代价，恰是指纹性质本身。",
+      "links": [
+        "https://en.wikipedia.org/wiki/Merkle_tree"
+      ],
+      "sources": [
+        {"url": "https://en.wikipedia.org/wiki/Merkle_tree", "note": "本 session 一手逐字核实：叶/非叶节点定义句、Ralph Merkle 1979 专利（US 4,309,569）、'allows efficient and secure verification'、'a generalization of a hash list and a hash chain'（哈希链族谱）、Git/Mercurial 为 DAG 形态、Bitcoin/Cassandra/Dynamo/Riak/Certificate Transparency/ZFS/IPFS 应用清单。WebFetch 于 2026-08-28"}
+      ],
+      "confidence": "high",
+      "writer_note": "m1/m4 处给一小段（4-6 句）：先立「父进子=前缀指纹」+ git 提交类比一句（最直观），再点「miss 即停的正确性来自链式指纹而非工程技巧」——这是本章最容易讲浅的点，务必用 example 的 A,B,C,D vs A,B,X,Y 走一遍（标说明性）；Merkle 树的分支/对账/SPV 证明细节留链接，别展开（vLLM 用的是退化成链的形态，这个「为什么不需要树」本身值得一句）。"
+    },
+    {
+      "id": "prefix-cache-structure-routes",
+      "term": "前缀缓存的两条数据结构路线：radix 树（SGLang RadixAttention） vs 链式哈希+平面 dict（vLLM APC）",
+      "kind": "competing_set",
+      "one_line": "同一个问题——「新请求和谁共享前缀」——两种索引哲学：SGLang 把所有请求的前缀长成一棵基数树、在树上走就是匹配；vLLM 给每块算链式指纹、平面字典查指纹——v0 与 v1 从来都是后者，radix 是隔壁的路。",
+      "what_it_is": "先立 radix 树（基数树/压缩前缀树）：trie 的压缩形态，**边**上标的是一段 token 序列（不是单个 token），所以树上从根到任一节点的路径就对应一段前缀；SGLang 的 RadixCache 让每个节点挂「这段前缀的 KV 在哪个物理页」的位置信息。命中：请求到来时 match_prefix 沿树往下走，找 \"the longest cached prefix of key in the radix tree\"（SGLang 文档原话）；写回：请求结束后 insert 把它的 token 插进树、在与已有序列分叉处**分裂**节点——于是「多请求共享 system prompt」在树里就是一个被共享的节点，共享是结构的自然结果。驱逐：每个节点带 lock_ref 计数，加锁沿 \"path to root\" 逐节点 +1，\"Nodes with lock_ref > 0 are protected from eviction\"；要腾显存时从「可驱逐叶子」里按策略驱逐（--radix-eviction-policy 可选 lru/lfu/fifo/mru/filo，论文时代默认 LRU）。vLLM 路线（本章主角）：不建任何树——请求侧增量算链式块哈希（见 merkle-hash-chain 条），满块写进一个平面 dict（BlockHashToBlockMap），查找=沿哈希链逐块 get_cached_block、第一个 miss 即停；「树」隐含在链式哈希的递归结构里，没有显式的树节点对象。一个当前粒度差异（据 2026-08-28 抓取的 SGLang 概念页）：SGLang 按页对齐匹配、\"Partial pages at the end of sequences are not cached\"——而 vLLM v0.27.1 的 partial prefix cache（m13）恰好把 prompt 尾的块内边界注册成细粒度条目，在此点上比 SGLang 文档口径更细。",
+      "background": "RadixAttention 出自 SGLang 论文《SGLang: Efficient Execution of Structured Language Model Programs》（arXiv:2312.07104，Lianmin Zheng 等 12 人，v1 2023-12-12、v2 2024-06-06），动机是「结构化程序」负载——一次任务里反复调 LLM、大量请求共享 system prompt/历史上下文（多轮对话、并行采样、agent）；论文战报：比当时最先进系统最高 6.4× 吞吐。vLLM 这边的家谱（dossier WC1，据本仓源码史实）：v0 的 APC（2024-03 #2762）就是 hash + Evictor，**不是 radix**；V1 alpha 的 TODO 注释写的正是 hash-based（2024-10 commit 6c5af09b3）；「take 2」（#9972，2024-11-07）落地链式哈希——所以「vLLM 换掉了 radix 树」是流传最广的迷思：vLLM 从没用过 radix 树，v1 day one 就是链式哈希（全仓 v1 core grep radix 零命中，dossier m2）。SGLang 那边后来把树长成了分层的：HiCache（官方设计文档）在 RadixAttention 之上提出 HiRadixTree，L1=GPU、L2=主机内存、L3=分布式存储（Mooncake/3FS/NIXL/AIBrix 等），L1/L2 每实例私有、L3 全集群共享——树仍是底座，缓存容量往层级里扩。两条路线的工程取舍（教学归纳、非官方横评）：radix 树共享结构显式、命中天然任意长度、驱逐策略可插拔，代价是 Python 侧节点对象分配/分裂/合并的 GC 与指针压力；链式哈希+平面 dict 零节点对象（KVCacheBlock slots 数组+侵入式链表，→ ch13）、查找退化为逐块 dict 命中、与块表 append-only/块对齐语义严丝合缝，代价是命中粒度绑在 hash_block_size 上、同前缀允许显存冗余（故意不去重）。",
+      "alternatives": [
+        {
+          "name": "SGLang RadixAttention（radix 树路线）",
+          "distinguishing_feature": "所有请求的前缀显式长成一棵基数树，match_prefix 走树即匹配；lock_ref>0 的节点免驱逐、可驱逐叶子按 lru/lfu/fifo/mru/filo 策略出堆；已演进出 HiCache 分层（GPU→主机内存→分布式存储 Mooncake/3FS 等）。",
+          "when_to_choose": "要「共享结构显式可见、驱逐策略可换、缓存往主机内存/集群分层扩」的部署——多副本共享大前缀的集群场景，树的分层扩展路线现成。"
+        },
+        {
+          "name": "vLLM APC（链式哈希+平面 dict 路线，v0/v1 一脉）",
+          "distinguishing_feature": "无树节点：请求侧增量算链式块哈希（父哈希拌进子哈希，前缀身份=链上哈希），满块进平面 dict；查找沿链走到第一个 miss 即停（正确性由链式指纹保证）；自由队列位置即 LRU（→ lru-eviction 条）；v0.27.1 又加了块内细粒度部分条目（m13）。",
+          "when_to_choose": "高并发单机、调度循环 CPU 时间是主战场的场景——零节点分配零 GC 压力、逐块 dict 命中的查找成本，都是为毫秒级调度拍的。"
+        }
+      ],
+      "example": "说明性对照例：两个请求 prompt = 「同一个 system prompt S（1000 token） + 各自的问题 Q1/Q2」。radix 路线：第一个请求完成后 insert，S 段成为树上一条边路径；第二个请求 match_prefix 沿 S 走到 Q2 分叉处，命中长度=1000——分叉点就是树自然分裂出的节点，lock_ref 保护正在用的路径。哈希路线：S 的每个满块（hash_block_size=16 → 62 个满块+尾块）在两个请求里算出**完全相同**的哈希链（输入相同、parent 链相同），第二个请求沿链逐块查 dict 全命中，touch 把这些块的 ref_cnt+1、从自由队列摘出——共享不是树结构给的，是「同前缀⇒同哈希」给的。同一个事实，两种索引哲学。",
+      "links": [
+        "https://arxiv.org/abs/2312.07104",
+        "https://lmsys.org/blog/2024-01-17-sglang/",
+        "https://docs.sglang.io/advanced_features/hicache_design.html"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2312.07104", "note": "本 session 一手重抓：标题/12 位作者/v1 2023-12-12、v2 2024-06-06/摘要（RadixAttention for KV cache reuse、最高 6.4×）。WebFetch 于 2026-08-28"},
+        {"url": "https://sgl-project-sglang-93.mintlify.app/concepts/radix-attention", "note": "SGLang 官方新文档预览版概念页（docs.sglang.io/concepts/radix-attention 于 2026-08-28 抓取时 404，mintlify 预览为新文档实际载体）一手核实：match_prefix 'the longest cached prefix'、lock_ref 沿 path to root、'Nodes with lock_ref > 0 are protected from eviction'、--radix-eviction-policy lru/lfu/fifo/mru/filo、--page-size 页对齐、'Partial pages at the end of sequences are not cached'。WebFetch 于 2026-08-28"},
+        {"url": "https://docs.sglang.io/advanced_features/hicache_design.html", "note": "SGLang HiCache 官方设计文档一手核实：L1 GPU/L2 主机/L3 分布式（Mooncake/3FS/NIXL/AIBrix）、'builds upon the RadixTree structure introduced in RadixAttention and proposes HiRadixTree'、L1/L2 私有 L3 共享、write_through/selective/write_back 策略。WebFetch 于 2026-08-28"},
+        {"url": "https://lmsys.org/blog/2024-01-17-sglang/", "note": "LMSYS 官方博客（携带自 v2 ch15 研究，2026-07-24 抓取）：RadixAttention 用基数树管理 token 序列到 KV 张量映射、边可标变长序列、与 paged attention 互补不冲突——本章沿用其「兼容/互补」口径。"}
+      ],
+      "confidence": "high",
+      "writer_note": "radix 迷思澄清（deepread 点名必做、hook 第一问）就靠这条：开篇先一句话立「radix 树是什么」（SGLang 的路：所有前缀长成一棵树、走树即匹配），再澄清 vLLM v0=hash+Evictor、v1=链式哈希、从不是 radix（v0/v1 源码史实引 dossier WC1）。对比点到「树 vs 平面 dict 的对象分配/对齐取舍」即可，别写「谁更优」的断言——两家官方都没做过正面横评（v2 已核），example 的双视角对照（树分叉 vs 同哈希链）是最好的一图流素材（标说明性）。SGLang 的 HiCache 分层一句带过（往 ch16 的分布式缓存世界指路）。"
+    },
+    {
+      "id": "copy-on-write",
+      "term": "写时复制（Copy-on-Write, CoW）——从 fork() 到块内部分命中",
+      "kind": "external_concept",
+      "one_line": "「先共享、谁要写谁拷贝」：多个持有者共享同一份物理资源，全部只读时一分钱不花；谁先要写，谁触发一次拷贝拿私有副本——操作系统 fork() 的省钱术，vLLM 论文 2023 年就在块粒度实现了它。",
+      "what_it_is": "维基定义句：写时复制是 \"a resource-management technique used in programming to manage shared data efficiently\"，核心是 \"Instead of copying data right away when multiple programs use it, the same data is shared between multiple programs until one tries to modify it\"——拷贝这个昂贵动作被**推迟到第一次写**，多数从不写共享部分的持有者就永远不付这笔钱。OS 的 fork() 是最著名的落地：fork 后父子进程的页表指向同一批物理页、标成只读并带引用计数；子进程真要写某页时触发缺页异常，\"the kernel intercepts the write attempt and allocates a new physical page, initialized with the copy-on-write data\"，再把这个私有页映射回写者（维基原文；若引用计数只剩 1 则连拷贝都可省掉）。其他野生应用：ZFS/Btrfs/APFS 快照（修改块 \"written to new locations, and metadata is updated to point to them\"）、Docker 镜像层共享、C++ std::string（C++98 允许 CoW、C++11 禁掉）、Qt 的隐式共享。**vLLM 论文（SOSP'23）自己就在块粒度做了 CoW**（ar5iv 全文一手核实）：\"vLLM implements a copy-on-write mechanism at the block granularity for the physical blocks that need modification by multiple sequences\"——触发条件正是块上引用计数 \"is greater than 1\" 时写入：分配新物理块、拷旧块内容、旧块计数递减；共享前缀的映射方式论文原话 \"can simply map its logical blocks to the cached physical blocks (with the last block marked copy-on-write)\"（像共享库一样把逻辑块映射到缓存物理块、**尾块标记 CoW**）。v0.27.1 的部分命中 CoW（m13：_partial_hit_reqs → 取 1 块私有 cow 块 → _apply_cow 原地换块表 + 登记 (source,cow) 对 → worker copy_kv_cache_blocks_inplace 在 GPU 上真拷）是同一思想的直系后代：部分命中意味着尾块被共享**且**即将被写——恰好是 CoW 的触发条件。论文给的共享收益数字：beam search 场景省 37.6%-55.2%（Alpaca）/44.3%-66.3%（ShareGPT）KV 显存，并行采样 6.1%-9.8%/16.2%-30.5%。",
+      "background": "CoW 之前，fork 的朴素实现是把父进程整个地址空间拷一份——维基原话 \"It would waste processor time and memory to copy all of the old process's memory during the fork only to immediately discard the copy\"（子进程往往立刻 exec 换掉地址空间，拷了白拷）；CoW 让 fork 变成「拷页表、共享页帧」的廉价操作，整个 Unix 的 fork+exec 工作流才立得住。KV 块世界的账一模一样：共享不写时白省显存；要写时，**拷一块**（显存带宽级，16 个 token 的 KV）远便宜于**重算一块**（矩阵乘级）——v0.27.1 把这条账从「beam search/并行采样的整块共享」细化到「前缀以块内边界结束时的半块共享」， CoW 的触发语义（ref_cnt>1 且要写）分毫未变。",
+      "example": "两段对位（说明性）。OS 侧：fork() 后页 P 的引用计数=2、父子页表都指向 P 且只读；子进程写 P → 缺页异常 → 内核分配新帧 P'、把 P 拷进 P'、子进程页表改指 P'（可写）、P 的计数减 1——此后各写各的。vLLM 侧（对位 pin 的 m13 链路）：请求 B 部分命中请求 A 的尾块（块内边界，如 1024-token 块内命中前 1000）→ B 的块表尾块=A 的尾块（ref_cnt=2，共享只读）→ B 要写第 1001 个 token：allocate_new_blocks 从池里多取 1 块私有 cow 块，_apply_cow 把 **B 的块表原地**换成 cow 块、登记 (source, cow) 拷贝对、cow 额外 +1 引用 → SchedulerOutput 带到 worker，copy_kv_cache_blocks_inplace 在 GPU 上执行块拷贝 → 此后 A 写 A 的、B 写 B 的，缓存条目由 move_block_hashes 重指到 cow 块。触发条件、记账方式（引用计数）、拷贝时机（写之前）与 fork 的 COW 缺页处理一一对应。",
+      "links": [
+        "https://en.wikipedia.org/wiki/Copy-on-write",
+        "https://arxiv.org/abs/2309.06180"
+      ],
+      "sources": [
+        {"url": "https://en.wikipedia.org/wiki/Copy-on-write", "note": "本 session 一手逐字核实：定义两句、fork 的只读页+缺页拦截+新物理页机制句、'waste processor time and memory ... only to immediately discard the copy'、ZFS/Btrfs 快照句、C++98/11、Qt 隐式共享。WebFetch 于 2026-08-28"},
+        {"url": "https://ar5iv.labs.arxiv.org/html/2309.06180", "note": "本 session 一手逐字核实 vLLM 论文（ar5iv 渲染）CoW/共享段：'implements a copy-on-write mechanism at the block granularity'、ref_cnt>1 触发句、'with the last block marked copy-on-write'、共享库映射类比、beam search 37.6-55.2%/44.3-66.3% 与并行采样 6.1-9.8%/16.2-30.5% 省显存数字、1.67×/3.58×（one-shot/few-shot 共享前缀吞吐 vs Orca）。WebFetch 于 2026-08-28"}
+      ],
+      "confidence": "high",
+      "writer_note": "m13 前给 3-5 句 OS 家教：fork 同构（共享只读+引用计数+写触发拷贝）是初学者最快的入口；然后立刻接 vLLM 论文原文那句 'with the last block marked copy-on-write'——2023 年的论文已经在块粒度做了 CoW，v0.27.1 的部分命中 CoW 是同一思想延伸到块内边界（一句闭环，最有历史纵深感）；example 的 fork/块两段对位可直接改写成正文小对照表（标说明性）。ZFS 快照/Qt 一句带过防好奇分叉，深究留链接。"
+    },
+    {
+      "id": "lru-eviction",
+      "term": "LRU（Least Recently Used）——驱逐策略的经典款与它的代价谱",
+      "kind": "external_concept",
+      "one_line": "「最久没人用的先扔」——操作系统页面替换到 Redis 缓存驱逐的通行策略；vLLM 的自由队列是一台精确 LRU：最近使用顺序直接就是队列位置，零时间戳、零额外内存。",
+      "what_it_is": "维基定义句：LRU \"Discards least recently used items first\"，代价是 \"requires keeping track of what was used and when, which is cumbersome\"（要维护 age bits 之类的使用时序）。它背后的假设是局部性：最近被用过的，近期再被用的概率更高——所以驱逐「最久没用」的最不容易伤未来命中。但「精确记录每个条目的使用时序」本身有成本，于是现实系统在**精确性与代价**之间各取一刀，构成一条代价谱（本条的核心教学点）：①操作系统页面替换付不起时间账——维基原话 \"The LRU algorithm cannot be implemented in the critical path of computer systems, such as operating systems, due to its high overhead; Clock, an approximation of LRU, is commonly used instead\"；②CPU 高相联缓存付不起面积账——\"the implementation cost of LRU becomes prohibitive\"，改用 PLRU（每项 1 bit）；③Redis 付不起内存账——官方文档原话 \"The reason Redis does not use a true LRU implementation is because it costs more memory\"，改为采样近似（随机抽约 maxmemory-samples=5 个键、驱逐其中最久未访问者），并自省 \"LRU is just a model to predict how likely a given key will be accessed in the future\"（Redis 文档）。vLLM 站在这条谱的哪一端？**精确 LRU，零额外成本**——因为块本来就活在池里、自由队列本来就是侵入式双向链表（→ ch13 intrusive-linked-list 条），「最近使用顺序」不需要任何时间戳或哈希表去维护，它**就是**块在队列里的位置：touch 把命中块从队中 O(1) 摘出（=「刚被用过」）、free 把释放块挂到队尾（=「排到最老」）、get_new_blocks 从队头拿（=「扔最老的」）。精确 LRU 在这里是白捡的，这也是双不变量（m7/m8）敢于在 plain LRU 之上继续精化的前提。",
+      "background": "LRU 是从 1960 年代 OS 页面替换研究传下来的启发式（FIFO→LRU→各种近似），后来成为软件缓存世界的默认款（Redis 的 maxmemory-policy allkeys-lru、各类 ORM/CDN）。维基还记着它的软肋：cache pollution——\"streaming data can fill the cache, pushing out information which will soon be used again\"（一次性扫描流把热数据挤出去）。vLLM v0 的 APC 用的是独立的 Evictor 抽象（dossier WC1）；v1 把驱逐**折叠进自由队列本身**——队列即 LRU 表，Evictor 消失。在此之上，本章的双不变量是对 plain LRU 的两次前缀感知精化（机制本体归 m7/m8，此处只给背景）：不变量一改「同时释放的块」的入队次序（链尾先驱逐）；不变量二把「永不可能是命中」的无哈希块踢出 LRU 端、直接排到驱逐最前列——那正是对 cache pollution 的定向免疫：不可能是未来命中的数据，不配占用 LRU 的宝贵名额。",
+      "example": "说明性最小例（不变量一的 LRU 视角，数字自拟）：某请求持有块链 [B0,B1,B2]（B2=链尾=最长前缀的末块），完成释放。朴素按序 free：队头起驱逐顺序 B0,B1,B2——下一个要块的 get_new_blocks 拿走 B0，链的**头**没了：任何未来请求哪怕只共享最前面一小段前缀，也必须从 B0 命中起，前缀缓存整个报废。逆序 free（pin 的做法）：驱逐顺序 B2,B1,B0——先牺牲的 B2 只有「需要完整前缀才会复用」的请求在用（潜在复用者最少），B0/B1（链头）活得最久，短前缀请求仍能命中。「驱逐顺序」三个字就是 LRU 的策略本体——这正是类文档那句『此次序规则在本类之外维持』的教学分量。Redis 对照可放脚注：同样为了命中率，Redis 花的是采样近似的命中率折扣，vLLM 花的是「所有 free 路径必须遵守约定」的工程纪律（无断言保护）。",
+      "links": [
+        "https://en.wikipedia.org/wiki/Cache_replacement_policies",
+        "https://redis.io/docs/latest/develop/reference/eviction/"
+      ],
+      "sources": [
+        {"url": "https://en.wikipedia.org/wiki/Cache_replacement_policies", "note": "本 session 一手逐字核实：LRU 定义句与 age bits、'cannot be implemented in the critical path ... Clock, an approximation of LRU, is commonly used instead'、PLRU 'implementation cost becomes prohibitive'/1 bit per item、cache pollution 句、MRU/SIEVE/LIRS 对比。WebFetch 于 2026-08-28"},
+        {"url": "https://redis.io/docs/latest/develop/reference/eviction/", "note": "Redis 官方文档一手逐字核实：'The reason Redis does not use a true LRU implementation is because it costs more memory'、采样近似与 maxmemory-samples、候选池、'LRU is just a model to predict how likely a given key will be accessed in the future'、allkeys-lru 等策略清单。WebFetch 于 2026-08-28"}
+      ],
+      "confidence": "high",
+      "writer_note": "LRU 一词首现处给 2-4 句：定义一句 + 「代价谱」三角（OS 付不起时间账用 CLOCK / Redis 付不起内存账用采样 / vLLM 因侵入式链表白拿精确 LRU——回指 ch13）——这个三角是本条全部教学价值，比讲 LRU 本身有意思；双不变量（逆序/劈分）是 m7/m8 的机制戏，本条只递背景不剧透；example 的 B0/B1/B2 驱逐顺序对照可给 writer 做图（标说明性）。"
+    },
+    {
+      "id": "marconi-paper",
+      "term": "Marconi：混合 LLM 时代的前缀缓存（MLSys 2025）——「Marconi 式钉住」的出处",
+      "kind": "external_project",
+      "one_line": "第一个支持混合模型（注意力+循环层）高效前缀缓存的系统：循环层状态不可回滚导致「只能精确命中、条目爆炸」，Marconi 用准入+驱逐两个新策略救回命中率——vLLM 的 shared_prefix_boundary 钉住借的正是它「共享前缀值得特意缓存」这半条思想。",
+      "what_it_is": "论文《Marconi: Prefix Caching for the Era of Hybrid LLMs》（arXiv:2411.19379，Rui Pan/Zhuang Wang/Zhen Jia/Can Karakus/Lu Zancato/Tri Dao/Yida Wang/Ravi Netravali，2024-11-28 提交、v3 2025-04-10 为 MLSys 2025 camera-ready）。它对混合模型的诊断（正文一手核实）：注意力层配循环层（SSM/Mamba/线性注意力），论文原话比例 \"commonly 1 Attention layer for every 6-10 SSM layers\"，点名 Jamba/Jamba 1.5、Zamba/Zamba2、RecurrentGemma、Griffin、RWKV、Nemotron-H、Hunyuan-TurboS、B'MOJO；循环层状态是**原地更新**的，\"a sequence's states cannot be rolled back to represent its prefixes\"——不能像 KV 那样「留一段就用一段」，只能精确命中；且状态是常数大小、\"10-100x larger than a single token's KVs\"。后果：按块粒度细存状态会制造海量稀命中的大条目——论文实测（7B hybrid、块 32）25.0% 的 KV 块被复用 vs 只有 0.4% 的 SSM 状态被复用；10K token 序列的状态缓存吃 17.4 GB（同尺寸 Transformer 的 3.3×）。Marconi 的答案是两个策略：**准入**——把复用场景分类成 \"purely input\"（system prompt/指令）与 \"input and output\"（对话历史），用 radix 树上的投机插入识别、从第三次出现起才准入（第二次出现时识别），对 input+output 类只珍视 \"SSM states that represent the last decoded token\"；**驱逐**——FLOP 感知的效用函数 S(n)=recency(n)+α·flop_efficiency(n)（省下的计算量÷状态显存占用，α 异步网格搜索调参），比 LRU 提升命中率 19.0%-219.7%。与本章直接相关的一句：**共享前缀保护**——树上 \"nodes with multiple children represent the common prefixes shared by multiple requests and should not be evicted\"（多子节点=多请求共享的前缀，不许驱逐；只有 ≤1 子的节点才是驱逐候选）。战报：token 命中率最高 34.4×（对 vLLM+/SGLang+，LMSys/ShareGPT/SWE-Bench 平均 4.5-34.4×），P95 TTFT 最多降 71.1%（617.0 ms）。",
+      "background": "vLLM 落地链（GitHub PR 一手核实）：PR #37898《[Hybrid] Marconi-style admission policy for hybrid cache》（s3woz/Stanislaw Wozniak，IBM Zurich；2026-03-23 开、2026-06-10 合入，即 dossier 的 commit dc66e01a7），PR 明确引用论文并复述其两案例：Last state caching（对话负载要「最后状态」）与 Shared prefix caching——\"observe prompts, if a shared prefix is detected, then cache it\"（第二次命中后缓存；system prompt/指令/few-shot/自一致性/长文档 QA/RL 负载受益）。合入前 vLLM 混合缓存只缓存 \"the last block-aligned block\"（概念上就是 Last state）；该 PR 补上共享前缀案例，但**实现不走 Marconi 的 radix 树**，而是 \"a non-cached shared prefix exists if standard attention KVCache has hits, but SSM attention doesn't\"——全注意力组命中更长而 SSM 组没缓存的那段差值（正是 pin 里的 num_uncached_common_prefix_tokens = longest − reconciled），在最后一个块对齐位置钉住以免改 kernel；基准（Qwen3.5 混合模型）延迟改善最高 40%（0.8B）/66%（35B-A3B），缓存 token ~289k/280k（对照组 0）。命名诚实度提醒：vLLM 的 \"Marconi-style\" 借的是**准入思想**（检测共享前缀并特意缓存/保护），没借 radix 树、也没借 FLOP 感知驱逐——vLLM 的驱逐仍是自由队列 LRU（+双不变量）。",
+      "example": "junction 一生（说明性，数字自拟、对位 pin 的 m16 链路）：full+SSM 混合，两个请求共享 2000-token system prompt。full 组逐块命中 2000；SSM 组只在 replay 边界（比如 1200 处）有状态 → 不动点调和后 reconciled=1200，longest=2000，差值 800=「各组都认但 SSM 还没缓的共享前缀」→ shared_prefix_boundary=2000 写回 Request → reachable mask 把 junction 边界状态特赦进表 + _mamba_block_aligned_split 把 prefill chunk 停在 2000 让该状态真被算出来 → 下一个同 prompt 请求的 SSM 组也能从 2000 处命中。论文视角的复述：这就是 \"if a shared prefix is detected, then cache it\" 在平面哈希表世界的实现——不建树，用「组间命中差」检测共享前缀，用「边界特赦+停 chunk」把它钉住。",
+      "links": [
+        "https://arxiv.org/abs/2411.19379",
+        "https://github.com/vllm-project/vllm/pull/37898",
+        "https://github.com/ruipeterpan/marconi"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2411.19379", "note": "本 session 一手核实：八位作者、2024-11-28 v1/2025-04-10 v3、MLSys 2025 camera-ready、'the first system that supports efficient prefix caching with Hybrid LLMs'、34.4×/71.1%/617ms。WebFetch 于 2026-08-28"},
+        {"url": "https://arxiv.org/html/2411.19379v3", "note": "本 session 一手核实全文：1:6-10 比例句、模型清单（Jamba/Zamba/RecurrentGemma/Griffin/RWKV/Nemotron-H/Hunyuan-TurboS/B'MOJO）、'cannot be rolled back'句、'10-100x larger'、25.0% vs 0.4%、17.4GB/3.3×、准入两分类+第三次起准入+投机插入、'SSM states that represent the last decoded token'、S(n)=recency+α·flop_efficiency 与 19.0-219.7%、'nodes with multiple children ... should not be evicted'、GreedyDual-Size 仅作相关工作（非其准入基础）。WebFetch 于 2026-08-28"},
+        {"url": "https://github.com/vllm-project/vllm/pull/37898", "note": "本 session 一手核实 PR：标题/作者 s3woz（Stanislaw Wozniak, IBM Zurich）/2026-03-23 开 2026-06-10 合入/引用 arXiv 2411.19379/两案例与 'a non-cached shared prefix exists if standard attention KVCache has hits, but SSM attention doesn't' 原话/Qwen3.5 基准 40%/66% 与 ~289k cached tokens。WebFetch 于 2026-08-28"}
+      ],
+      "confidence": "high",
+      "writer_note": "m16 首现处 4-6 句讲透：论文的问题陈述（状态不可回滚→只能精确命中→条目海，配 0.4% vs 25% 与 17.4GB 两个数字，标「外部论文证据（MLSys'25 评测）」）→ 两个策略一句 → **借了哪半条没借哪半条**（借共享前缀准入/钉住；没借 radix 树与 FLOP 驱逐）——这句必须写，防读者以为整体移植；PR #37898 的 'full 命中而 SSM 未缓' 检测原话与 num_uncached_common_prefix_tokens 的对位是最硬的落地锚。example 的 junction 一生可直接改写为正文图（标说明性）。"
+    },
+    {
+      "id": "sparse-prefix-checkpoint-placement",
+      "term": "稀疏前缀缓存的学术形式化：检查点放置（checkpoint placement）",
+      "kind": "external_concept",
+      "one_line": "把「循环层状态该稀疏地留在哪些位置」当正式优化问题研究的后续论文：在预算内选一组检查点存状态、命中时从最深的检查点恢复、只重算其后缀——vLLM 的 retention_interval 是同一问题的一种旋钮化解法。",
+      "what_it_is": "《Sparse Prefix Caching for Hybrid and Recurrent LLM Serving》（arXiv:2605.05219，Mikhail Shirokolkov/Sergey Nikolenko，2026-04-17）：注意到循环层与 KV 不同，可以 \"resume from a single stored state rather than requiring the entire token history\"，于是把稀疏前缀缓存形式化为 \"checkpoint placement under a distribution over overlap depths\"，给出精确的 O(NM) 动态规划解；命中时 \"resume from the deepest stored checkpoint and recompute the remaining suffix exactly\"（输出精确不变、无需新 kernel）；在 QuALITY/System Prompts 真实负载上验证，低检查点预算时收益最大，可与 KV 压缩组合。它与 vLLM 的 VLLM_PREFIX_CACHE_RETENTION_INTERVAL（m17 三态：None 稠密/0 只留 replay 边界/正数每段一条）处理的是同一个问题——「哪些循环层状态值得留」，但解法不同：论文在已知重叠深度分布下**算最优放置**，vLLM 给**固定间隔 + junction/replay 边界特赦**的工程旋钮。⚠️ 两者间的派生关系**未核实**（vLLM 的 #45845/#47782 提交与该论文的联系没有一手证据）——勿写成「vLLM 实现了这篇论文」。",
+      "background": "Marconi（2024-11）用准入+驱逐的策略手段对付状态缓存；这篇（2026-04）把「留哪些」上升到有精确最优解的放置问题——同一问题空间的学术演进，可当作读者深入时的第二条线索。",
+      "example": "直觉例（说明性）：序列长 10K、状态检查点预算 5 个。论文解法：按负载的重叠深度分布跑 DP，选出期望命中收益最大的 5 个位置（比如聚类出的共享前缀边界附近加密、尾部稀疏）；vLLM 旋钮解法：retention_interval=2048 → 每 2K token 留一个状态 + replay 边界与 junction 额外特赦——不追最优、胜在可解释可调。",
+      "links": [
+        "https://arxiv.org/abs/2605.05219"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2605.05219", "note": "本 session 一手核实：标题/作者 Shirokikh & Nikolenko/2026-04-17、'checkpoint placement under a distribution over overlap depths, yielding an exact O(NM) dynamic program'、'resume from the deepest stored checkpoint and recompute the remaining suffix exactly'、QuALITY/System Prompts 数据、与 Marconi 无对比（页面内容未提及）。WebFetch 于 2026-08-28"}
+      ],
+      "confidence": "high",
+      "writer_note": "m17 处一句话+链接即可：「同期还有把『留哪些状态』形式化成动态规划、给精确最优解的学术工作」；红线：不得表述为 vLLM retention_interval 的出处（血缘未核实）；论文内部（DP 细节/评测）全留链接。"
+    },
+    {
+      "id": "fixed-point-iteration-pattern",
+      "term": "不动点迭代（Fixed-Point Iteration）作为通用算法范式",
+      "kind": "external_concept",
+      "one_line": "『反复对一个值做变换，直到变换前后不再变化』的通用套路——本章 Hybrid 协调器的收敛证明用的正是这个模式，编译器的数据流分析也是同一个模式。",
+      "what_it_is": "不动点迭代不是 vLLM 发明的概念，是一类通用算法设计范式：给定一个值和一个（或几个）会把它变小/变紧的规则，反复应用规则，直到某一轮『规则应用完值不再变化』——这个不再变化的值就叫不动点。它能收敛的充分条件很直白：值的变化方向单调（比如只减不增）、且有下界（比如不能小于 0），那么『单调 + 有下界』保证它必然在有限步内停下来（不会震荡也不会跑到负无穷）。本章 `HybridKVCacheCoordinator.find_longest_cache_hit`（kv_cache_coordinator.py:L685-L817，pin）的收敛论证正是这个骨架：候选命中长度 L 只减不增、下界为 0、取值离散（必须是 lcm_block_size 的倍数），所以至多 `L/lcm` 轮必收敛；docstring 原话 'This converges because length monotonically decreases and is bounded below by 0'。（本条自 v2 ch16 研究整体携带——v2 时代该机制在 v2 ch16，v3 移入本章，文字按 v3 锚点改写。）",
+      "background": "这个范式在计算机科学里最经典的落地场景是编译器的数据流分析（data-flow analysis）：Kildall 在 1973 年提出的『格上不动点』框架里，每个程序点的分析信息会随着沿控制流图反复应用『传递函数』而不断收紧，函数满足单调性时，这个迭代过程必然收敛到一个不动点，这就是活跃变量分析、常量传播等经典编译优化背后的统一理论（后来 Kam & Ullman 把它推广成『单调数据流框架』）。本章的算法和它是同一套骨架：不同注意力类型对『候选命中长度』的判定就类似传递函数——只会维持或收紧当前值，不会把它变大；『重启全类型校验』对应迭代到不动点为止。认出这个模式，能省掉一次『这是不是 vLLM 独家发明的怪算法』的困惑。",
+      "links": [
+        "https://www.cs.cmu.edu/afs/cs/academic/class/15745-s13/public/lectures/L5-Foundations-of-Dataflow-1up.pdf",
+        "https://link.springer.com/article/10.1007/BF00290339"
+      ],
+      "sources": [
+        {"url": "https://www.cs.cmu.edu/afs/cs/academic/class/15745-s13/public/lectures/L5-Foundations-of-Dataflow-1up.pdf", "note": "CMU 编译器课程讲义：数据流分析用迭代 worklist 算法求不动点、单调框架保证收敛（v2 ch16 researcher 于 2026-07-24 抓取，本条整体携带，本 session 未重抓）。"},
+        {"url": "https://link.springer.com/article/10.1007/BF00290339", "note": "Kam & Ullman《Monotone data flow analysis frameworks》摘要页：『单调框架必存在最大不动点解』经典结论出处（v2 ch16 researcher 于 2026-07-24 抓取，未能取得全文、摘要+讲义交叉印证——故 confidence 保持 medium）。"}
+      ],
+      "confidence": "medium",
+      "writer_note": "m15 正文自己已把收敛性讲完整（docstring 原话+单调有下界），这条只适合一句『点睛』旁注——告诉读者『编译器数据流分析同款套路』，帮读者把这个技巧归档到已知模式里；一句带过+链接，别展开编译器理论。"
+    },
+    {
+      "id": "hash-algo-sha256-vs-xxhash",
+      "term": "块哈希算法选择：SHA-256 vs xxHash（及 v0.27.1 新增的 _cbor 可复现变体）",
+      "kind": "competing_set",
+      "one_line": "块哈希默认走密码学哈希 SHA-256（慢但碰撞在工程上不可能、多租户安全），可切非密码学的 xxHash 128bit（快一个数量级但安全余量小）——v0.27.1 又给两者各添了跨进程可复现的 _cbor 变体。",
+      "what_it_is": "本章 hash_block_tokens 用的哈希函数可配置（`prefix_caching_hash_algo`），v0.27.1（config/cache.py:L39+L95-L110，pin 本 session grep 核实）共四档：`sha256`（默认）、`sha256_cbor`、`xxhash`、`xxhash_cbor`。**密码学 vs 非密码学**的分野：SHA-256 是密码学哈希，除抗碰撞外还有抗原像性等安全属性，config 文档串自述默认它的理由 'SHA256 is the most secure choice to avoid potential hash collisions'；xxHash 是非密码学哈希（官网自陈 'non-cryptographic'），只求快（XXH3 带宽 30+ GB/s、比 SHA 系快一个数量级，vLLM 用 128bit 版）。**为什么这不是纯性能选择**——config 文档串自带安全警告（pin 原话）：用非密码学哈希 'theoretically increases the risk of hash collisions, which can cause undefined behavior or even leak private information in multi-tenant environments'（多租户下理论上可能**泄漏他人前缀内容**：碰撞=把别人的缓存当成自己的命中）。碰撞概率的量化工具是生日悖论（见 birthday-paradox-hash-collision 条）。**_cbor 变体管的是另一件事——可复现性**：默认变体用 Python Pickle 序列化（实现细节随 CPython 版本漂移、跨语言不通），_cbor 变体改用 CBOR（RFC 8949，STD 94，2020-12）的确定性编码做序列化——RFC §4.2 定义 'core deterministic encoding requirements'（最短形式整数、禁不定长、map 键按字节序排序），同一对象在任何进程/实现里序列化出的字节完全一致 → 哈希可复现。这呼应 pin 里 NONE_HASH 种子的告警（kv_cache_utils.py:L99-L114）：未设 PYTHONHASHSEED 时源码会 warning「不可复现」并建议改用 sha256_cbor/xxhash_cbor 或设置种子——动机（推断，注释支持）：种子不同的两个进程对同一前缀算出不同哈希，跨进程/多 worker 场景缓存互相命不中。",
+      "background": "（携带自 v2 ch15 研究，按 v0.27.1 改锚：v2 时代只有 sha256/xxhash 两档，_cbor 两档是其后新增。）非密码学哈希换速度的取舍在数据系统里很常见（xxHash 自我定位就是给哈希表/校验和用的），但在「缓存命中=内容等价判定」的场景里，碰撞的后果从「查错一行」升格为「用错别人的 KV」——所以默认值给最安全的一档、把切换权留给能评估风险的人。",
+      "example": "配置面（pin 可核）：vllm serve … --prefix-caching-hash-algo xxhash_cbor —— 快（xxHash 128bit）且跨进程可复现（CBOR 确定性编码），单租户+多 worker 共享缓存的折中选择；什么都不配 → sha256 + Pickle，最安全、但哈希字节依赖 CPython 序列化行为（不跨语言、跨版本不保证一致）。生日悖论量化（同 birthday 条 example）：128bit 哈希、缓存 10^9 块 → 碰撞概率 ~1.5×10^-21，极小但比 256bit 大 2^128 倍量级——这就是「工程上可忽略」与「理论上更小」的距离。",
+      "alternatives": [
+        {
+          "name": "SHA-256 / sha256（默认）",
+          "distinguishing_feature": "密码学哈希、256bit 输出，抗碰撞有安全保证；Pickle 序列化（CPython 绑定）。",
+          "when_to_choose": "多租户/不可信输入的默认选择——config 文档串的安全警告就是为这个场景写的；单机不在乎哈希速度时也无须动它。"
+        },
+        {
+          "name": "xxHash / xxhash",
+          "distinguishing_feature": "非密码学、128bit、快一个数量级（XXH3 30+ GB/s）；Pickle 序列化。",
+          "when_to_choose": "单租户/可信输入且哈希计算在热路径上可测时，用安全余量换吞吐。"
+        },
+        {
+          "name": "sha256_cbor / xxhash_cbor（可复现变体）",
+          "distinguishing_feature": "CBOR（RFC 8949）确定性编码替代 Pickle——同一前缀在任何进程算出同一哈希。",
+          "when_to_choose": "跨进程/多 worker/异构环境要共享或比对前缀哈希时（源码在未设 PYTHONHASHSEED 时会建议改用它）。"
+        }
+      ],
+      "links": [
+        "https://xxhash.com/",
+        "https://www.rfc-editor.org/rfc/rfc8949.html",
+        "https://csrc.nist.gov/projects/hash-functions"
+      ],
+      "sources": [
+        {"url": "vllm/config/cache.py（本仓 pin v0.27.1，无外链）", "note": "本 session grep 一手核实：L39 Literal[\"sha256\",\"sha256_cbor\",\"xxhash\",\"xxhash_cbor\"]、L95 默认 sha256、L96-L110 文档串（SHA256 most secure / cbor reproducible cross-language / xxhash 128bit + 多租户泄漏警告）；另核 vllm/v1/core/kv_cache_utils.py:L99-L114 未设 PYTHONHASHSEED 的 warning 与 sha256_cbor/xxhash_cbor 建议。2026-08-28"},
+        {"url": "https://xxhash.com/", "note": "xxHash 官网（携带自 v2 ch15 研究，2026-07-24 抓取）：自称 non-cryptographic、XXH3 64bit ~31.5 GB/s vs SHA1 ~0.8 GB/s、四个变体。"},
+        {"url": "https://www.rfc-editor.org/rfc/rfc8949.html", "note": "本 session 一手核实：RFC 8949 'Concise Binary Object Representation (CBOR)'、STD 94、2020-12、§4.2 'core deterministic encoding requirements'（最短形式/禁不定长/map 键排序）、避免用 Canonical 一词的说明。WebFetch 于 2026-08-28"}
+      ],
+      "confidence": "high",
+      "writer_note": "m18/m1 处点到即可：默认 sha256、可选 xxhash（快但多租户有泄漏警告——引 config 文档串原话最稳）、_cbor 变体管跨进程可复现（与 NONE_HASH 种子告警呼应一句）；生日悖论量化交给 birthday 条；四个变体表格可给可不给，别展开哈希算法内景。"
+    },
+    {
+      "id": "birthday-paradox-hash-collision",
+      "term": "生日悖论（哈希碰撞概率估算）",
+      "kind": "notation",
+      "one_line": "往 b bit 的哈希空间里放 n 个随机值，出现两个值相同（碰撞）的概率约为 `n²/2^(b+1)`——比较的是所有「对」而非个体，所以概率涨得比直觉快得多；这是评估「前缀缓存敢不敢信哈希」的标准工具。",
+      "what_it_is": "『生日悖论』得名于经典问题：一个房间要多少人，『至少两人生日相同』的概率才过半？直觉要接近 365 人，实际只需 23 人——因为比较的是所有『人对』（约 n²/2 对）而非人数。把『生日』换成『哈希值』、『365 天』换成『2^b 个输出』，得碰撞概率估算：n 个哈希值中出碰撞的概率约 `n²/2^(b+1)`。这也是密码学评估哈希抗碰撞强度的标准口径：b bit 哈希的抗碰撞强度按 b/2 bit 计——攻击者不必打中特定目标，撞上任意一对即可。（本条自 v2 ch15 研究携带，内容为纯数学不变项。）",
+      "example": "本章场景（说明性，与 hash-algo 条互证）：SHA-256（b=256）、同时缓存 n=10^9 块 → 概率约 `10^18/2^257 ≈ 4×10^-60`——可当零；xxHash 128bit（b=128）、同 n → 约 `10^18/2^129 ≈ 1.5×10^-21`——依然极小，但比前者大 2^128 倍量级。这就是「工程上可忽略」与「安全余量更小」之间的差距在多租户场景成为考量的算法依据。",
+      "links": [
+        "https://en.wikipedia.org/wiki/Birthday_problem",
+        "https://en.wikipedia.org/wiki/Birthday_attack"
+      ],
+      "sources": [
+        {"url": "https://en.wikipedia.org/wiki/Birthday_attack", "note": "（携带自 v2 ch15 研究，2026-07-24 抓取）生日攻击/碰撞概率近似公式 n²/2^(b+1) 与『抗碰撞强度按 b/2 bit 计』的标准用法。"}
+      ],
+      "confidence": "high",
+      "writer_note": "若正文讨论碰撞安全性（m1/m18 语境），用本条公式+一句结论即可（v2 版正文有同款句式可参考）；23 人版本类比可选（帮直觉就给、嫌枝蔓就不给）；链接留给要推导的读者。"
+    },
+    {
+      "id": "hybrid-kv-cache-doc",
+      "term": "vLLM 官方设计文档《Hybrid KV Cache Manager》——与 pin 代码的口径差",
+      "kind": "external_project",
+      "one_line": "vLLM 文档站上专讲混合注意力 KV 缓存的设计文档：它把命中查找描述成『全注意力左到右扫、滑窗在其范围内右到左扫、取交集』——是本章不动点算法在 simple hybrid 场景下的静态等价图景，但文档没提不动点，且 Mamba 前缀缓存标着 WIP。",
+      "what_it_is": "vLLM 项目公开设计文档（docs.vllm.ai design 分区），主题即本章 m15/m16 的 HybridKVCacheCoordinator 一族。文档对命中查找的描述（本 session 2026-08-28 重抓原文）：全注意力 \"from left (the first block) to the last block\" 枚举、miss 即停；然后 \"Get the longest cache hit for sliding window attention that is within that length\"（滑窗在上述长度内右到左找）；交集成立——\"It can be ensured that the resulting cache hit of sliding window attention layers is also a cache hit of full attention layers\"；并自评右到左扫描在无命中时会扫全表。**与 pin 代码的口径差**（writer 必读）：v0.27.1 的实现是迭代不动点（kv_cache_coordinator.py:L685+，docstring 原话 'iterative fixed-point algorithm'）；文档写的是『两次扫描取交集』的静态图景——两者在 simple hybrid（1 full+1 other，本轮收敛）时恰好等价（文档也自限 \"exactly two attention types full attention + X\"，与 pin 假设 6 一致），但文档没有不动点表述。文档还标着 \"The prefix caching support of the mamba model is work in progress\"——而 pin 里 Marconi 式钉住（PR #37898，2026-06-10 合入）与 Mamba reachable_block_mask（docstring 明写 Marconi-style APC）已经落地：文档滞后于代码。文档自带免责声明：\"This document was written based on commit 458e74\" + \"This feature is still in its early stage and things may change\"（抓取时页面日期 2026-08-19）。",
+      "background": "（自 v2 ch16 研究携带并 2026-08-28 重抓刷新：v2 抓取时文档即此口径，commit 同为 458e74eb——一个月内未随代码更新。）这份文档的价值是给读者另一副直觉眼镜：『不动点=每类型接受或缩短直到不动』与『各自算上界再取交集』是同一结果的两副面孔——对最常见的 full+SWA/full+Mamba 两类混合，一轮收敛，两副面孔完全重合。",
+      "links": [
+        "https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/", "note": "本 session 一手重抓（2026-08-28）：页面日期 2026-08-19；'written based on commit 458e74' + early stage 免责；两次扫描取交集三句原文；'exactly two attention types full attention + X' 范围自限；'The prefix caching support of the mamba model is work in progress'；右到左无命中扫全表的自评。（v2 ch16 researcher 亦于 2026-07-24 抓取过同页，口径一致。）"}
+      ],
+      "confidence": "high",
+      "writer_note": "章末『想深入』链接位给这条；引用纪律两条：①别把文档当不动点算法的权威出处（它没写，权威是 pin 源码 docstring）；②别引文档说『Mamba 前缀缓存还没做』——pin 已做（Marconi 钉住），文档滞后。正面用法：把文档的『交集』图景当作 simple hybrid 一轮收敛时的等价直觉讲一句，两副面孔互相印证。"
+    }
+  ]
+}

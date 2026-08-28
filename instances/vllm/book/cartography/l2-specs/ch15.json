@@ -1,0 +1,424 @@
+{
+  "schema": "l2-spec/1",
+  "chapter": 15,
+  "part": "IV",
+  "title": "前缀缓存",
+  "hook": "同一个 system prompt 一天被 prefill 一万遍，凭什么第二遍起能整段跳过？vLLM 没有 radix 树——每满 16 token 拌上前缀哈希塞进一个平面 dict：命中凭什么断一处即停？驱逐顺序凭什么保住最长前缀？ch11 被抢占打回原形的请求撞上这张表，重算怎么就变便宜了？共享半截块谁接着写？",
+  "l0_zoom": "KV 账本列缓存区",
+  "l0_region": {
+    "anchors": [
+      "kv_column"
+    ]
+  },
+  "depends_on": [
+    13
+  ],
+  "reading": "读图：上排 = 请求侧与存储面（哈希在请求上增量算 · 平面哈希表 · 粒度分离）；中排 ①-⑦ = 命中主循环（查 → 链上走 → [多组不动点] → touch 挂块 → CoW 换尾 → 写回 → 拷贝过线）；下排 = 留与逐（抢占哈希保留 = F2 回收 · 逆序+劈分 · 惰性驱逐）+ why 注；站号 = 前缀的一生（算→查→挂→写→留→逐），正文按讲解需要编排；框内方法与 file:line 均为 v0.27.1 已核锚点。",
+  "frame": {
+    "title": "调度器进程 · KV 账本的前缀缓存面（纯 CPU 元数据；CoW 拷贝对过线后 worker 只认 block_id）",
+    "file": "vllm/v1/core/kv_cache_*.py + block_pool.py + single_type_kv_cache_manager.py"
+  },
+  "center": {
+    "name": "prefix_cache_core",
+    "title": "命中主循环：get_computed_blocks → find_longest_cache_hit → touch/CoW → cache_full_blocks → 拷贝过线",
+    "where": "kv_cache_manager.py:L229-L295"
+  },
+  "components": [
+    {
+      "name": "请求侧增量哈希 · request_block_hasher",
+      "role": "kv",
+      "zone": "north",
+      "file": "vllm/v1/request.py + vllm/v1/core/kv_cache_utils.py",
+      "stations": [1],
+      "methods": [
+        "· update_block_hashes：构造尾 + 每次 append token 后增量补算（request.py:L262-L265）",
+        "· 只算新满 hash_block_size 块、逐块链式（kv_cache_utils.py:L705-L748）",
+        "· hash_i = H(parent_hash, 本块 tokens, extra_keys)（L596-L623）",
+        "· NONE_HASH 随机种子 / PYTHONHASHSEED 可共享（L99-L114）",
+        "——哈希归 Request 持有，账本只读不写"
+      ]
+    },
+    {
+      "name": "装配开关 · enable_prefix_caching",
+      "role": "plain",
+      "zone": "north",
+      "file": "vllm/config/cache.py + vllm/v1/engine/core.py",
+      "stations": [2],
+      "methods": [
+        "· 默认 True（config/cache.py:L93）；关=不装 hasher、命中恒 0",
+        "· 或装了 KVConnector 才建 hasher + init_none_hash 播种",
+        "（engine/core.py:L220-L229 → connector 归 ch16）",
+        "· 请求级 skip_reading_prefix_cache：prompt logprobs / pooling 跳读",
+        "（request.py:L291-L302）"
+      ]
+    },
+    {
+      "name": "平面哈希表 BlockHashToBlockMap",
+      "role": "kv",
+      "zone": "north",
+      "file": "vllm/v1/core/block_pool.py",
+      "stations": [4],
+      "methods": [
+        "· {hash+group_id（bytes 键）→ block | {block_id: block}}（L33-L54）",
+        "· NOTE #1 故意不去重——保 block_id 不变、块表 append-only",
+        "· NOTE #2 union 类型省内层 dict 的 GC",
+        "· get_cached_block：逐 group 查，任一 miss 整体 miss（L198-L223）",
+        "· 反向索引 cached_block_hashes_by_block（L185）：部分条目别名"
+      ]
+    },
+    {
+      "name": "哈希粒度 · hash_block_size",
+      "role": "plain",
+      "zone": "north",
+      "file": "vllm/config/cache.py + vllm/v1/core/kv_cache_utils.py",
+      "methods": [
+        "· prefix_match_unit = 命中可落的最细 token 边界（cache.py:L56-L67）",
+        "（32 vs 1024-token 混合块；= 贯穿代码的 hash_block_size）",
+        "· 惰性重串：链尾即前缀指纹——16 粒度第 2 个哈希直接当 32 粒度用",
+        "（BlockHashListWithBlockSize L2245-L2314）",
+        "· 细粒度查找保留原始粒度列表（resolve_block_hashes L2321-L2351）",
+        "· 粒度选择（GCD 或 override）ch14 已定，本章消费"
+      ]
+    },
+    {
+      "name": "① 查命中 get_computed_blocks",
+      "role": "beat",
+      "zone": "center",
+      "stations": [3],
+      "methods": [
+        "get_computed_blocks()",
+        "kv_cache_manager.py:L229",
+        "skip 谓词：关缓存/logprobs/pooling 跳读（L250）",
+        "max_cache_hit_length = num_tokens − 1（L253-L259）",
+        "全命中也须重算最后一 token 拿 logits",
+        "三元组：块 · 命中长 · junction（L260-L295）"
+      ]
+    },
+    {
+      "name": "② 链上走块 find_longest_cache_hit",
+      "role": "beat",
+      "zone": "center",
+      "stations": [4],
+      "methods": [
+        "FullAttentionManager.find_longest_cache_hit",
+        "single_type:L682-L777",
+        "phase 1 满块链逐块查、第一个 miss 即断（L731-L739）",
+        "——链式保证 miss 后必 miss，无需回溯",
+        "phase 2 块内自高向低探边界（L741-L762，细粒度才走）",
+        "对齐取整裁块（L770-L777）"
+      ]
+    },
+    {
+      "name": "③ 混合不动点（多组）",
+      "role": "beat",
+      "zone": "center",
+      "stations": [5],
+      "methods": [
+        "Hybrid.find_longest_cache_hit",
+        "kv_cache_coordinator.py:L685-L817",
+        "每类型「接受或缩短」·缩短即重启·单调递减必收敛",
+        "full 排首且向下封闭：查一次后只 min 裁剪（L738-L745）",
+        "simple hybrid（1 full + 1 other）一轮即停（L716-L720）",
+        "longest − reconciled = junction 原料（L810-L813）"
+      ]
+    },
+    {
+      "name": "④ 挂块 + touch 救回",
+      "role": "beat",
+      "zone": "center",
+      "stations": [6],
+      "methods": [
+        "add_local_computed_blocks",
+        "single_type:L232-L289",
+        "touch：ref_cnt+1；ref_cnt==0 则 O(1) remove 出队救回",
+        "（block_pool.py:L702-L717）——共享前缀的物理基础",
+        "null 填 skip 段 → 命中块挂进 req_to_blocks",
+        "部分命中记 _partial_hit_reqs（L283-L289）"
+      ]
+    },
+    {
+      "name": "⑤ CoW 换尾块",
+      "role": "beat",
+      "zone": "center",
+      "stations": [7],
+      "methods": [
+        "allocate_new_blocks 首查 _partial_hit_reqs",
+        "single_type:L347-L357",
+        "_apply_cow（L405-L425）：共享尾块原地换私有 cow 块",
+        "· 登记 (source, cow) 拷贝对 · cow 额外 +1 引用",
+        "预算里多记的那 1 块在这用掉（L226-L230）",
+        "满块链 append-only：不换请求的块，换哈希指向（→⑦）"
+      ]
+    },
+    {
+      "name": "⑥ 写回 cache_full_blocks",
+      "role": "beat",
+      "zone": "center",
+      "stations": [8],
+      "methods": [
+        "cache_blocks（L427-L477）→ cache_full_blocks",
+        "（block_pool.py:L259-L299）",
+        "reachable_boundaries = [replay 边界, junction]（L451-L456）",
+        "→ mask：永不能服务命中的块不入表",
+        "partial→full 晋升：摘旧条目插新（L284-L292）",
+        "prompt 尾部分条目 _cache_partial_tail_block（L791-L819）",
+        "chunk 停在 junction（scheduler.py:L424-L437）状态才可缓存"
+      ]
+    },
+    {
+      "name": "⑦ CoW 拷贝过线",
+      "role": "beat",
+      "zone": "center",
+      "stations": [9],
+      "methods": [
+        "take_kv_cache_block_copies（L831-L846）",
+        "→ SchedulerOutput.kv_cache_block_copies",
+        "（scheduler.py:L1181-L1190）",
+        "worker：copy_kv_cache_blocks_inplace 在 GPU 上真拷",
+        "（gpu_model_runner.py:L1223-L1228）",
+        "两端引用步序栅栏：拷完才放（L2356-L2365）"
+      ]
+    },
+    {
+      "name": "抢占打回 · 哈希保留",
+      "role": "kv",
+      "zone": "south",
+      "file": "vllm/v1/core/sched/scheduler.py + kv_cache_manager.py",
+      "stations": [10],
+      "methods": [
+        "· _preempt_request（L1274-L1315）：free 全部块【不清哈希】",
+        "（free_blocks 只动 ref_cnt 与队列位置，block_pool.py:L719-L742）",
+        "· num_computed_tokens=0 · num_preemptions+1 · 回 waiting 队头",
+        "· 抢占机制本体（抢谁/水位/stale 协议）→ ch11；F2 从这起回收"
+      ]
+    },
+    {
+      "name": "逆序 free + LRU 劈分",
+      "role": "kv",
+      "zone": "south",
+      "file": "vllm/v1/core/single_type_kv_cache_manager.py + block_pool.py",
+      "stations": [11],
+      "methods": [
+        "· manager.free 逆序传入（L519-L527）：尾块=更长前缀更难复用，",
+        "先挂回、排更靠驱逐端（类文档 L184-L204 明言规则在类外维持）",
+        "· free_blocks 劈分（block_pool.py:L719-L742，#42656）：",
+        "无哈希块（never match）prepend 队头先驱逐 ·",
+        "有哈希块 append 到 LRU 尾——带哈希者排最可复用端",
+        "· 缓存关闭跳过劈分保 GPU 局部性（#48017）"
+      ]
+    },
+    {
+      "name": "惰性驱逐 · 复用才摘哈希",
+      "role": "kv",
+      "zone": "south",
+      "file": "vllm/v1/core/block_pool.py",
+      "stations": [12],
+      "methods": [
+        "· 池紧时 get_new_blocks 从队头批量取块（L647-L677）",
+        "· _maybe_evict_cached_block（L679-L700）：复用那刻才摘哈希",
+        "· _remove_cached_block_hashes（L571-L590）：主哈希+反向索引",
+        "别名一次摘干净，不留悬空键",
+        "· move_block_hashes（L629-L645）：CoW 后条目重指私有拷贝",
+        "· F2 生存窗口 = 块在 LRU 尾未被取走；被取走 = 全量重 prefill"
+      ]
+    },
+    {
+      "name": "why · 非 radix（链式哈希 vs 树）",
+      "role": "plain",
+      "zone": "south",
+      "kind": "note",
+      "methods": [
+        "· v0 APC = hash + Evictor（#2762）· SGLang = radix 树（arXiv:2312.07104）",
+        "· v1 从 day one 就是链式哈希 + 平面 dict（PR #9972 标题自带 take 2）",
+        "· 全仓 v1 core grep「radix」零命中——带着 radix 印象来读 v1 会读错",
+        "· 账：dict O(1) 查 + 零节点分配 vs 树指针密集的 GC 与对齐维护"
+      ]
+    },
+    {
+      "name": "why · 两个隐藏不变量",
+      "role": "plain",
+      "zone": "south",
+      "kind": "note",
+      "methods": [
+        "· 朴素 free 双坑：LRU 头=前缀的头 → 最长可复用前缀被拦腰斩断；",
+        "无哈希块滞留白占容量（命中率静默劣化，不炸不错只是慢）",
+        "· 修法=逆序（尾块先驱逐）+ 劈分（无哈希块插队头）",
+        "· 顺序即策略：两条都靠约定维持、无断言保护"
+      ]
+    },
+    {
+      "name": "why · 驱逐是惰性的",
+      "role": "plain",
+      "zone": "south",
+      "kind": "note",
+      "methods": [
+        "· free 只挂回队列、不动哈希——「缓存」与「空闲」是同一队列的两端",
+        "· 真摘除发生在块被 get_new_blocks 取走复用那刻",
+        "· 这正是 F2 的机制内核：被打回的请求前缀留着等人（含自己）重命中"
+      ]
+    },
+    {
+      "name": "邻章分界 · 本章只开前缀面",
+      "role": "plain",
+      "zone": "south",
+      "kind": "note",
+      "methods": [
+        "· 池/块表/引用计数骨架 → ch13 · 账本/准入门/混合组化 → ch14",
+        "· KVConnector · 外部命中 · partial-tail offload → ch16",
+        "· SWA 窗外回收与 null 换位 → ch14（本章只消费 [NULL,…] 形态与 mask）",
+        "· eagle 丢尾块 / DCP 乘子 = 可省略分支"
+      ]
+    }
+  ],
+  "flows": [
+    {
+      "from": "装配开关 · enable_prefix_caching",
+      "to": "请求侧增量哈希 · request_block_hasher",
+      "label": "默认 True 才装 hasher（否则请求侧从不算哈希）"
+    },
+    {
+      "from": "请求侧增量哈希 · request_block_hasher",
+      "to": "① 查命中 get_computed_blocks",
+      "label": "block_hashes 随请求带来（waiting 循环 scheduler.py:L744-L766）"
+    },
+    {
+      "from": "哈希粒度 · hash_block_size",
+      "to": "② 链上走块 find_longest_cache_hit",
+      "label": "定满块链步长与块内探测边界",
+      "dash": true
+    },
+    {
+      "from": "① 查命中 get_computed_blocks",
+      "to": "② 链上走块 find_longest_cache_hit",
+      "label": "max_cache_hit_length = num_tokens − 1"
+    },
+    {
+      "from": "② 链上走块 find_longest_cache_hit",
+      "to": "平面哈希表 BlockHashToBlockMap",
+      "label": "get_cached_block 逐块查链（miss 即断）",
+      "dash": true,
+      "color_role": "kv"
+    },
+    {
+      "from": "② 链上走块 find_longest_cache_hit",
+      "to": "③ 混合不动点（多组）",
+      "label": "多组才调和（单组直通 ④）"
+    },
+    {
+      "from": "③ 混合不动点（多组）",
+      "to": "④ 挂块 + touch 救回",
+      "label": "调和后的命中块 + hit_length + junction"
+    },
+    {
+      "from": "④ 挂块 + touch 救回",
+      "to": "⑤ CoW 换尾块",
+      "label": "命中长不对齐块界（部分命中）才走"
+    },
+    {
+      "from": "⑤ CoW 换尾块",
+      "to": "⑥ 写回 cache_full_blocks",
+      "label": "新满块 / 部分条目入表"
+    },
+    {
+      "from": "⑥ 写回 cache_full_blocks",
+      "to": "平面哈希表 BlockHashToBlockMap",
+      "label": "insert：满块条目 + 块内边界条目",
+      "dash": true,
+      "color_role": "kv"
+    },
+    {
+      "from": "⑥ 写回 cache_full_blocks",
+      "to": "⑦ CoW 拷贝过线",
+      "label": "(source, cow) 拷贝对随 SchedulerOutput 过线"
+    },
+    {
+      "from": "⑦ CoW 拷贝过线",
+      "to": "抢占打回 · 哈希保留",
+      "label": "解码长大让池变紧 → allocate_slots None → 抢占（ch11）"
+    },
+    {
+      "from": "抢占打回 · 哈希保留",
+      "to": "逆序 free + LRU 劈分",
+      "label": "kv_cache_manager.free → 逆序 + 劈分挂回（哈希保留）"
+    },
+    {
+      "from": "逆序 free + LRU 劈分",
+      "to": "惰性驱逐 · 复用才摘哈希",
+      "label": "池紧：get_new_blocks 从队头取块"
+    },
+    {
+      "from": "惰性驱逐 · 复用才摘哈希",
+      "to": "① 查命中 get_computed_blocks",
+      "label": "被抢占者重排回 waiting：重走 ①②④ 命中自己的前缀、touch 救回——F2 回收：重算 = 重载元数据 + 补算",
+      "up": true,
+      "dash": true,
+      "color_role": "kv"
+    }
+  ],
+  "loop": {
+    "label": "下一个请求带着同款前缀进场：① 查 → ② 命中 → ④ touch 共享复用（PrefixCacheStats 的命中率口径）；被抢占者重排回 waiting 同路——F2（ch11 埋）在此收口"
+  },
+  "rail_header": "站号 = 前缀的一生（1-2 算哈希 · 3-5 查 · 6-9 挂/写/拷 · 10-12 留与逐）",
+  "stations": [
+    {
+      "n": 1,
+      "where": "request.py:L249-L265",
+      "what": "请求侧增量哈希：构造尾与每次 append token 后 update_block_hashes → request_block_hasher（kv_cache_utils.py:L705-L748）对每个新满 hash_block_size 块算 hash_block_tokens（parent 链式 + extra_keys）追加 block_hashes——哈希归 Request 持有，账本只读不写"
+    },
+    {
+      "n": 2,
+      "where": "engine/core.py:L220-L229",
+      "what": "装配开关：enable_prefix_caching（默认 True，config/cache.py:L93）或装了 connector 才建 request_block_hasher 并 init_none_hash 播种（随机 32 字节或 PYTHONHASHSEED 派生，kv_cache_utils.py:L99-L114）；关缓存则 _block_hasher=None、请求侧从不算哈希"
+    },
+    {
+      "n": 3,
+      "where": "scheduler.py:L744-L766",
+      "what": "准入查询：waiting 循环里 num_computed_tokens==0 的请求查本地命中 get_computed_blocks（kv_cache_manager.py:L229-L295）——skip 谓词挡掉关缓存/prompt logprobs/pooling；max_cache_hit_length=num_tokens−1（全命中也须重算最后一个 token 拿 logits，注释原话；块对齐还可能回退整块）"
+    },
+    {
+      "n": 4,
+      "where": "single_type_kv_cache_manager.py:L682-L777",
+      "what": "链上找最长命中：phase 1 沿满块哈希链逐块 get_cached_block 查平面 dict，第一个 miss 即断——链式哈希保证 miss 之后必 miss、无需回溯；phase 2（fine_grained：hash_block_size<block_size）在第一个不满块内自高向低探块内哈希边界，探到即命中到细粒度边界"
+    },
+    {
+      "n": 5,
+      "where": "kv_cache_coordinator.py:L685-L817",
+      "what": "混合不动点（多组才走）：每注意力类型对候选命中长度『接受或缩短』、任一缩短重启全类型校验、长度单调递减有下界必收敛；full 组排最前且向下封闭（查一次后只 min 裁剪）；simple hybrid（1 full+1 other）一轮即停；num_uncached_common_prefix_tokens = longest − reconciled = 各组都认但稀疏组还没缓的共享前缀（Marconi junction 原料）"
+    },
+    {
+      "n": 6,
+      "where": "single_type_kv_cache_manager.py:L232-L289",
+      "what": "挂命中块：add_local_computed_blocks 调 block_pool.touch（L702-L717：ref_cnt+1；ref_cnt==0 时 O(1) remove 出 free queue——把驱逐候选救回）→ null 填 skipped 段 → 命中块 extend 进 req_to_blocks；部分命中记 _partial_hit_reqs 并把 num_cached_block 压回整块数"
+    },
+    {
+      "n": 7,
+      "where": "single_type_kv_cache_manager.py:L347-L357",
+      "what": "部分命中 CoW 换尾：allocate_new_blocks 发现 _partial_hit_reqs 有账 → 取 1 块私有 cow 块（预算里 get_num_blocks_to_allocate 多记的那块，L226-L230）→ _apply_cow（L405-L425）把请求块表里的共享尾块原地换成 cow 块、登记 (source, cow) 拷贝对、cow 额外 +1 引用"
+    },
+    {
+      "n": 8,
+      "where": "single_type_kv_cache_manager.py:L427-L477",
+      "what": "写回：cache_blocks 收 reachable_boundaries=[replay 边界(num_prompt−1), junction(shared_prefix_boundary)] → reachable_block_mask → cache_full_blocks（block_pool.py:L225-L342）给新满块 set_block_hash+insert 进 BlockHashToBlockMap（partial→full 晋升先摘旧条目）；block_size>hash_block_size 时 _cache_partial_tail_block（L791-L819）把 prompt 尾注册成部分条目；调度侧配合 _mamba_block_aligned_split（scheduler.py:L424-L437）把 chunk 停在 junction 让边界状态真被算出来"
+    },
+    {
+      "n": 9,
+      "where": "scheduler.py:L1181-L1190",
+      "what": "CoW 拷贝过线：take_kv_cache_block_copies（kv_cache_manager.py:L831-L846）drain (source,cow) 对 → SchedulerOutput.kv_cache_block_copies → worker copy_kv_cache_blocks_inplace（gpu_model_runner.py:L1223-L1228）在 GPU 上真拷；两端块引用保留到拷贝跑完（_free_cow_retained_blocks 步序栅栏 scheduler.py:L2356-L2365）"
+    },
+    {
+      "n": 10,
+      "where": "scheduler.py:L1274-L1315",
+      "what": "抢占打回（F2 起点，抢占机制本体归 ch11）：_preempt_request → _free_request_blocks → kv_cache_manager.free（L567-L578）——free 全部块但【不清哈希】：free_blocks 只动 ref_cnt 和队列位置，block_hash 原样留在 map 里；num_computed_tokens=0、回 waiting 队头"
+    },
+    {
+      "n": 11,
+      "where": "block_pool.py:L719-L742",
+      "what": "逆序 free 与 LRU 劈分（双不变量）：manager.free 逆序传入（single_type:L519-L527——尾块先挂回、排更靠驱逐端，FreeKVCacheBlockQueue 类文档 L193-L200 明言此规则在类外维持）；free_blocks 把归零块劈两半——无哈希块 prepend_n 到队头先驱逐（#42656『never match APC』）、有哈希块 append_n 到 LRU 尾——被抢占请求的前缀块带哈希排在最可复用端"
+    },
+    {
+      "n": 12,
+      "where": "block_pool.py:L647-L700",
+      "what": "惰性驱逐：池紧时 get_new_blocks 从队头批量取块、逐块 _maybe_evict_cached_block → _remove_cached_block_hashes（L571-L590：主哈希+反向索引别名一次摘干净）——驱逐不发生在 free 时、发生在复用时；move_block_hashes（L629-L645）在 CoW 后把哈希条目重指到私有拷贝。被抢占请求若在重排回来前块被取走复用 → 前缀失效 → 第 3 站退化为全量重 prefill（F2 最坏分支）；没被取走则重走第 3-6 站命中自己的前缀、touch 救回——『重算』变『重载元数据+补算』"
+    }
+  ]
+}

@@ -1,0 +1,1186 @@
+{
+  "chapter_id": "ch15",
+  "part": "IV",
+  "title": "前缀缓存",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "chapter_kind": "code",
+  "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。Part IV 第三章——ch13 已立池/块表/引用计数/逆序 free 的骨架（前缀缓存只作为 allocate_slots 两个黑盒参数出现）、ch14 已立账本/门/混合组化（hash_block_size 的选择已定：GCD 或 prefix_match_unit）。本章打开黑盒：链式哈希怎么算、命中怎么查、LRU 两个不变量怎么保命中率、抢占恢复为什么撞上哈希表反而变便宜（F2 收口）、半截共享块怎么 CoW、混合模型的 junction 怎么钉住。L0 缩放 = KV 账本列缓存区（kv_column）。",
+  "hook_suggestion": "「同一个 system prompt 一天被 prefill 一万遍，凭什么第二遍开始能整段跳过？vLLM 里没有 radix 树、也没有专门的 LRU cache 对象——靠的是每满 hash_block_size（默认 16）个 token 拌上前缀哈希、塞进一个平面 dict：命中凭什么『断一处即停、无需回溯』？驱逐顺序凭什么保住最长的可复用前缀（两个藏在注释里的不变量）？ch11 被抢占打回原形的请求，撞上这张哈希表怎么就『重算变重载』了？两个人共享半截没写满的块，谁接着写、凭什么写不坏对方？混合模型一层稠密一层稀疏，共享前缀的 junction 怎么才不被稀疏驻留裁掉？」（从 Part IV hook『显存就那么多，KV cache 必须活到最后』+ 本章主题『前缀缓存』+ deepread/memory-kv.json why_chains[2]（链式哈希非 radix）、why_chains[3]（LRU 双不变量）、why_chains[4]（抢占重算被缓存变便宜=F2）、why_chains[7]（块内 CoW）、why_chains[8]（Marconi 钉住）提炼）",
+  "scope_note": "主线 = 前缀的『算→查→挂→写→留→逐』一生 + 三个 v0.27.1 新面：(A) 链式哈希与平面哈希表——请求侧增量算哈希（request_block_hasher 只算新满块、parent 链式、extra_keys 防跨语义）、NONE_HASH 随机种子、BlockHashToBlockMap 平面 dict（故意不去重保块表 append-only、union 省 GC）、radix 迷思澄清（v0=hash+Evictor、SGLang=radix 树、v1 从 day one 就是链式哈希——全仓 v1 core grep radix 零命中）；(B) 命中与复用——get_computed_blocks（max_cache_hit_length=num_tokens−1 全命中退一 token）、FullAttentionManager.find_longest_cache_hit phase 1 沿链 miss 即停 + phase 2 块内细粒度探测、touch 救回（ref_cnt+1 出队）、cache_full_blocks 满块注册（block_mask 控入表）；(C) LRU 双不变量——逆序 free（尾块=更长前缀更难复用先驱逐，类文档明言次序规则在类外）+ free_blocks 劈分（无哈希块 prepend 队头先驱逐，#42656；缓存关闭跳过劈分保 GPU 局部性）+ 惰性驱逐（get_new_blocks 复用时才 _maybe_evict_cached_block 摘哈希、反向索引清别名、move_block_hashes 重指 CoW 拷贝）；(D) F2 收口——抢占 free 不清哈希 → 被抢占请求重排回 waiting 重走准入查询 → get_computed_blocks 重命中自己的前缀 → touch 救回：『重算』变『重载元数据+补算』，最坏（块被挤出哈希表）退化为全量重 prefill；(E) 块内 CoW 部分命中（v0.27.1 新）——hash_block_size<block_size 时 cache_partial_block 在块内边界注册细粒度条目（不分配新块）、find phase 2 探测、命中后共享尾块换私有 cow 块（_apply_cow 登记拷贝对）→ 跨进程拷贝管线（take_kv_cache_block_copies → SchedulerOutput.kv_cache_block_copies → worker copy_kv_cache_blocks_inplace，两端引用步序栅栏）；(F) 混合不动点与 Marconi 钉住——HybridKVCacheCoordinator.find_longest_cache_hit 不动点（每类型接受或缩短、full 排首向下封闭只查一次、simple hybrid 一轮）、num_uncached_common_prefix_tokens=longest−reconciled 是 junction 原料 → shared_prefix_boundary 写回 Request → cache_blocks reachable_boundaries 特赦 + _mamba_block_aligned_split 把 chunk 停在 junction；稀疏驻留 retention_interval 三态（VLLM_PREFIX_CACHE_RETENTION_INTERVAL：None 稠密/0 只留 replay 边界/正数每段一条）。边界与邻章分工：池的构造/块表/槽位恒等式/引用计数骨架归 ch13；账本/准入门/水位/混合组化与 hash_block_size 的选择归 ch14（本章消费 hash_block_size）；KVConnector 双面契约/外部命中/WAITING_FOR_REMOTE_KVS/partial-tail offload 归 ch16（本章只在 delay_cache_blocks/外部命中处一句带过）；SWA 窗外回收与 null 换位归 ch14（本章只消费 [NULL,...] 形态与 block_mask）；eagle/投机解码的丢尾块分支、DCP/PCP 乘子为可省略分支。",
+  "code_spine": [
+    "vllm/v1/core/kv_cache_utils.py:L596-L623 —— hash_block_tokens：链式哈希本体（parent+tokens+extra_keys）",
+    "vllm/v1/core/kv_cache_utils.py:L691-L748 —— get_request_block_hasher/request_block_hasher：请求侧增量 hasher（只算新满 hash_block_size 块）",
+    "vllm/v1/core/kv_cache_utils.py:L430-L447 + L558-L593 —— extra keys：need_extra_keys 谓词 + 四源组装（mm/lora/cache_salt 仅首块/prompt_embeds）",
+    "vllm/v1/request.py:L249-L265 —— append_output_token_ids → update_block_hashes：哈希随 token 到达增量补算",
+    "vllm/v1/engine/core.py:L220-L229 —— 装配开关：enable_prefix_caching（默认 True，config/cache.py:L93）或有 connector 才建 hasher + init_none_hash",
+    "vllm/v1/core/sched/scheduler.py:L744-L766 —— waiting 循环准入查命中（num_computed_tokens==0 时 get_computed_blocks；被抢占者重排回来同路）",
+    "vllm/v1/core/kv_cache_manager.py:L229-L295 —— get_computed_blocks：对外命中入口（skip 谓词/max_cache_hit_length=num_tokens−1/junction 三元组）",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L682-L777 —— FullAttentionManager.find_longest_cache_hit：phase 1 满块链 miss 即停 + phase 2 块内细粒度探测",
+    "vllm/v1/core/kv_cache_coordinator.py:L685-L817 —— Hybrid 不动点：每类型接受或缩短、full 排首只查一次、num_uncached_common_prefix_tokens",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L232-L289 —— add_local_computed_blocks：touch 救回 + 挂进 req_to_blocks + 部分命中记 _partial_hit_reqs",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L347-L369 + L405-L425 —— allocate_new_blocks 的 CoW 换尾 + _apply_cow 登记拷贝对",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L427-L477 —— cache_blocks：reachable_boundaries（replay+junction）→ mask → cache_full_blocks",
+    "vllm/v1/core/block_pool.py:L225-L342 —— cache_full_blocks：满块 set_block_hash + insert（block_mask 控入表；partial→full 晋升摘旧插新）",
+    "vllm/v1/core/block_pool.py:L445-L544 —— cache_partial_block：块内边界注册细粒度条目（不分配新块）",
+    "vllm/v1/core/block_pool.py:L702-L717 —— touch：命中救回（ref_cnt+1、free queue O(1) remove 出队）",
+    "vllm/v1/core/kv_cache_manager.py:L831-L846 + vllm/v1/core/sched/scheduler.py:L1181-L1190 + vllm/v1/worker/gpu_model_runner.py:L1223-L1228 —— CoW 拷贝跨进程管线（retained 块步序栅栏 scheduler.py:L2356-L2365）",
+    "vllm/v1/core/sched/scheduler.py:L1274-L1315 —— _preempt_request：free 全部块【哈希保留】+ num_computed_tokens=0 + 回 waiting 队头（F2 起点）",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L519-L527 —— manager.free：逆序传入（LRU 不变量一）",
+    "vllm/v1/core/block_pool.py:L719-L742 —— free_blocks 劈分：无哈希块 prepend 队头先驱逐、有哈希块 append LRU 尾（LRU 不变量二）",
+    "vllm/v1/core/block_pool.py:L647-L700 —— get_new_blocks + _maybe_evict_cached_block：惰性驱逐（复用才摘哈希；反向索引 L571-L590 清别名）",
+    "vllm/v1/core/block_pool.py:L629-L645 —— move_block_hashes：CoW 后哈希条目重指到私有拷贝（块表 append-only 的兜底）",
+    "vllm/v1/core/kv_cache_utils.py:L2245-L2314 + L2321-L2351 —— BlockHashListWithBlockSize 惰性重串 + resolve_block_hashes（细粒度保留/粗粒度视图）",
+    "vllm/v1/core/kv_cache_coordinator.py:L30-L57 —— retention 校验（VLLM_PREFIX_CACHE_RETENTION_INTERVAL：非负、整除 scheduler_block_size、只对 SWA/Mamba）",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L996-L1053 + L1359-L1414 —— SWA/Mamba reachable_block_mask：分段尾稀疏驻留 + reachable 边界特赦（Marconi 面落地）",
+    "vllm/v1/core/sched/scheduler.py:L424-L437 —— _mamba_block_aligned_split 强制停点：partial-tail 边界 + junction 块对齐下取整"
+  ],
+  "stations": [
+    {
+      "n": 1,
+      "where": "request.py:L249-L265",
+      "what": "请求侧增量哈希：构造尾与每次 append token 后 update_block_hashes → request_block_hasher（kv_cache_utils.py:L705-L748）对每个新满 hash_block_size 块算 hash_block_tokens（parent 链式 + extra_keys）追加 block_hashes——哈希归 Request 持有，账本只读不写"
+    },
+    {
+      "n": 2,
+      "where": "engine/core.py:L220-L229",
+      "what": "装配开关：enable_prefix_caching（默认 True，config/cache.py:L93）或装了 connector 才建 request_block_hasher 并 init_none_hash 播种（随机 32 字节或 PYTHONHASHSEED 派生，kv_cache_utils.py:L99-L114）；关缓存则 _block_hasher=None、请求侧从不算哈希"
+    },
+    {
+      "n": 3,
+      "where": "scheduler.py:L744-L766",
+      "what": "准入查询：waiting 循环里 num_computed_tokens==0 的请求查本地命中 get_computed_blocks（kv_cache_manager.py:L229-L295）——skip 谓词挡掉关缓存/prompt logprobs/pooling；max_cache_hit_length=num_tokens−1（全命中也须重算最后一个 token 拿 logits，注释原话；块对齐还可能回退整块）"
+    },
+    {
+      "n": 4,
+      "where": "single_type_kv_cache_manager.py:L682-L777",
+      "what": "链上找最长命中：phase 1 沿满块哈希链逐块 get_cached_block 查平面 dict，第一个 miss 即断——链式哈希保证 miss 之后必 miss、无需回溯；phase 2（fine_grained：hash_block_size<block_size）在第一个不满块内自高向低探块内哈希边界，探到即命中到细粒度边界"
+    },
+    {
+      "n": 5,
+      "where": "kv_cache_coordinator.py:L685-L817",
+      "what": "混合不动点（多组才走）：每注意力类型对候选命中长度『接受或缩短』、任一缩短重启全类型校验、长度单调递减有下界必收敛；full 组排最前且向下封闭（查一次后只 min 裁剪）；simple hybrid（1 full+1 other）一轮即停；num_uncached_common_prefix_tokens = longest − reconciled = 各组都认但稀疏组还没缓的共享前缀（Marconi junction 原料）"
+    },
+    {
+      "n": 6,
+      "where": "single_type_kv_cache_manager.py:L232-L289",
+      "what": "挂命中块：add_local_computed_blocks 调 block_pool.touch（L702-L717：ref_cnt+1；ref_cnt==0 时 O(1) remove 出 free queue——把驱逐候选救回）→ null 填 skipped 段 → 命中块 extend 进 req_to_blocks；部分命中记 _partial_hit_reqs 并把 num_cached_block 压回整块数"
+    },
+    {
+      "n": 7,
+      "where": "single_type_kv_cache_manager.py:L347-L357",
+      "what": "部分命中 CoW 换尾：allocate_new_blocks 发现 _partial_hit_reqs 有账 → 取 1 块私有 cow 块（预算里 get_num_blocks_to_allocate 多记的那块，L226-L230）→ _apply_cow（L405-L425）把请求块表里的共享尾块原地换成 cow 块、登记 (source, cow) 拷贝对、cow 额外 +1 引用"
+    },
+    {
+      "n": 8,
+      "where": "single_type_kv_cache_manager.py:L427-L477",
+      "what": "写回：cache_blocks 收 reachable_boundaries=[replay 边界(num_prompt−1), junction(shared_prefix_boundary)] → reachable_block_mask → cache_full_blocks（block_pool.py:L225-L342）给新满块 set_block_hash+insert 进 BlockHashToBlockMap（partial→full 晋升先摘旧条目）；block_size>hash_block_size 时 _cache_partial_tail_block（L791-L819）把 prompt 尾注册成部分条目；调度侧配合 _mamba_block_aligned_split（scheduler.py:L424-L437）把 chunk 停在 junction 让边界状态真被算出来"
+    },
+    {
+      "n": 9,
+      "where": "scheduler.py:L1181-L1190",
+      "what": "CoW 拷贝过线：take_kv_cache_block_copies（kv_cache_manager.py:L831-L846）drain (source,cow) 对 → SchedulerOutput.kv_cache_block_copies → worker copy_kv_cache_blocks_inplace（gpu_model_runner.py:L1223-L1228）在 GPU 上真拷；两端块引用保留到拷贝跑完（_free_cow_retained_blocks 步序栅栏 scheduler.py:L2356-L2365）"
+    },
+    {
+      "n": 10,
+      "where": "scheduler.py:L1274-L1315",
+      "what": "抢占打回（F2 起点，抢占机制本体归 ch11）：_preempt_request → _free_request_blocks → kv_cache_manager.free（L567-L578）——free 全部块但【不清哈希】：free_blocks 只动 ref_cnt 和队列位置，block_hash 原样留在 map 里；num_computed_tokens=0、回 waiting 队头"
+    },
+    {
+      "n": 11,
+      "where": "block_pool.py:L719-L742",
+      "what": "逆序 free 与 LRU 劈分（双不变量）：manager.free 逆序传入（single_type:L519-L527——尾块先挂回、排更靠驱逐端，FreeKVCacheBlockQueue 类文档 L193-L200 明言此规则在类外维持）；free_blocks 把归零块劈两半——无哈希块 prepend_n 到队头先驱逐（#42656『never match APC』）、有哈希块 append_n 到 LRU 尾——被抢占请求的前缀块带哈希排在最可复用端"
+    },
+    {
+      "n": 12,
+      "where": "block_pool.py:L647-L700",
+      "what": "惰性驱逐：池紧时 get_new_blocks 从队头批量取块、逐块 _maybe_evict_cached_block → _remove_cached_block_hashes（L571-L590：主哈希+反向索引别名一次摘干净）——驱逐不发生在 free 时、发生在复用时；move_block_hashes（L629-L645）在 CoW 后把哈希条目重指到私有拷贝。被抢占请求若在重排回来前块被取走复用 → 前缀失效 → 第 3 站退化为全量重 prefill（F2 最坏分支）；没被取走则重走第 3-6 站命中自己的前缀、touch 救回——『重算』变『重载元数据+补算』"
+    }
+  ],
+  "stations_note": "站号 = 一个前缀的『算→查→挂→写→留→逐』一生：第 1-2 站请求侧把哈希备好（开关决定算不算）；第 3-5 站查命中（主路径链上走 → 混合不动点调和多组）；第 6-8 站挂块复用与写回（touch 救回 / CoW 换尾 / 满块+部分条目入表）；第 9 站 CoW 拷贝跨进程落地；第 10-12 站是『留与逐』——抢占打回不清哈希（F2 起点）→ 逆序+劈分挂回自由队列 → 池紧时才惰性摘哈希。F2 回收在第 12 站注释收口：被抢占者重排回来重走 3-6 站。正文按讲解需要编排——建议先立『哈希怎么算/为什么链式』（m1-m2），再『查与挂』（m5-m6），再『LRU 双不变量』（m8-m9），然后 F2 收口（m11），最后细粒度 CoW（m13-m14）与混合不动点/Marconi（m15-m17）作进阶幕。radix 迷思在开篇即澄清（deepread first_read_suggestion 点名必做）。",
+  "key_classes": [
+    {
+      "name": "hash_block_tokens / request_block_hasher",
+      "file": "vllm/v1/core/kv_cache_utils.py",
+      "responsibility": "链式哈希的算与攒：单块哈希=H(parent_hash, 本块 tokens, extra_keys)（L596-L623，首块 parent=NONE_HASH）；请求侧闭包只算新满 hash_block_size 的块、逐块链式追加（L691-L748）。块哈希即整条前缀的指纹（Merkle 链）。"
+    },
+    {
+      "name": "BlockHashToBlockMap",
+      "file": "vllm/v1/core/block_pool.py",
+      "responsibility": "前缀缓存查找表：{BlockHashWithGroupId(哈希+group_id 打包 bytes, kv_cache_utils.py:L57-L66) → KVCacheBlock | dict[block_id, KVCacheBlock]}。故意不去重（NOTE #1：保 block_id 不变、块表 append-only）；union 类型省 GC（NOTE #2）。get_one_block/insert/pop 三原语。"
+    },
+    {
+      "name": "BlockPool（前缀面）",
+      "file": "vllm/v1/core/block_pool.py",
+      "responsibility": "缓存登记与驱逐的管家：cache_full_blocks（满块+block_mask 入表、partial→full 晋升）、cache_partial_block（块内细粒度条目）、_insert_block_hash/_remove_cached_block_hashes（主哈希+反向索引双向维护）、touch（救回）、free_blocks（劈分）、get_new_blocks+_maybe_evict_cached_block（惰性驱逐）、move_block_hashes（CoW 重指）。cached_block_hashes_by_block（L185）是部分条目时代的反向索引。"
+    },
+    {
+      "name": "FullAttentionManager",
+      "file": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "responsibility": "全注意力组的前缀面：find_longest_cache_hit（phase 1 链上走 + phase 2 块内细粒度探测，L682-L777）、cache_blocks 重载 + _cache_partial_tail_block（prompt 尾部分条目，L779-L819）、add_local_computed_blocks（touch+挂块+部分命中记账）、allocate_new_blocks（CoW 换尾）、_apply_cow。supports_fine_grained_hash_lookup=True。"
+    },
+    {
+      "name": "SingleTypeKVCacheManager (ABC)",
+      "file": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "responsibility": "各注意力类型块管理器的基类：定义 reachable_block_mask（默认 None=稠密全缓存；SWA/Mamba 重写为稀疏+边界特赦）、free（逆序）、cache_blocks（reachable_boundaries 面向全部子类）、_partial_hit_reqs/_pending_cow_copies 部分命中簿记。"
+    },
+    {
+      "name": "HybridKVCacheCoordinator / UnitaryKVCacheCoordinator / KVCacheCoordinatorNoPrefixCache",
+      "file": "vllm/v1/core/kv_cache_coordinator.py",
+      "responsibility": "命中查找的协调层三态：单组直接委托唯一 manager（Unitary，L486-L503）；混合走不动点（L685-L817，full 排首向下封闭、收敛后产出 num_uncached_common_prefix_tokens）；关缓存返回恒空命中（L424-L432）。retention_interval 在基类构造校验（L30-L57 + L112-L116）。"
+    },
+    {
+      "name": "KVCacheManager（前缀面）",
+      "file": "vllm/v1/core/kv_cache_manager.py",
+      "responsibility": "对调度器的门面：get_computed_blocks（L229-L295，含 skip 谓词/junction 写回）、free（L567-L578 先放 pins 再逆序）、take_kv_cache_block_copies（L831-L846 CoW 拷贝对+retained）、record_prefix_cache_stats/make_prefix_cache_stats（L202-L227 观测）。"
+    },
+    {
+      "name": "Request（哈希面）",
+      "file": "vllm/v1/request.py",
+      "responsibility": "block_hashes 的唯一持有者：构造时与每次 append token 后增量补算（L249-L265）；shared_prefix_boundary 字段（L190-L193，调度器写、缓存读的跨模块协议）；skip_reading_prefix_cache（L211 + L291-L302，prompt logprobs/pooling 跳读）。"
+    },
+    {
+      "name": "Scheduler（前缀面）",
+      "file": "vllm/v1/core/sched/scheduler.py",
+      "responsibility": "准入查询与配合面：waiting 循环查命中（L744-L766）、_mamba_block_aligned_split 强制停点（L424-L437，junction/partial-tail 边界对齐）、CoW 拷贝打包与步序栅栏（L1181-L1190 + L2356-L2365）、_preempt_request（L1274-L1315，free 不清哈希——F2 起点）。"
+    }
+  ],
+  "data_flow": [
+    "总述：本章数据流 = deepread/memory-kv.json data_flow 的 [入场]（Request 构造时增量算 block_hashes）+ [调度]（waiting 循环 get_computed_blocks → find_longest_cache_hit）+ [分配] 的命中/CoW/写回段（allocate_new_computed_blocks 两阶段 touch → allocate_new_blocks 部分命中 CoW → cache_blocks 满/部分条目入表）+ [终局]（逆序 free + 劈分挂回——前缀留在哈希表里等下一个请求命中）四段，引用不重挖。",
+    "【入场·算哈希】Request 构造尾 request.py:L209 update_block_hashes → L262-L265 闭包 hasher（kv_cache_utils.py:L705-L748）：只算新满 hash_block_size 块、逐块 hash_block_tokens（L596-L623，parent 链式、extra_keys 四源 L558-L593）→ 每生成 token append 后同路增量（L249-L260）。",
+    "【调度·查命中】scheduler.py:L744-L766（num_computed_tokens==0 时）→ kv_cache_manager.get_computed_blocks L229-L295：skip 谓词 → max_cache_hit_length=num_tokens−1 → coordinator.find_longest_cache_hit——单组 Unitary 委托 FullAttentionManager（single_type:L682-L777：phase 1 链上 miss 即停 L731-L739 / phase 2 块内探测 L741-L762）；混合 Hybrid 不动点（coordinator:L685-L817）→ 三元组（块/命中长/junction）。",
+    "【分配·挂与写】allocate_slots（ch13 已立骨架，本章打开命中段）：coordinator.allocate_new_computed_blocks 两阶段（先全组 touch 本地命中再分外部块，防 A 组 get_new_blocks 驱逐 B 组未 touch 的命中块 #33775/#44409）→ manager.add_local_computed_blocks（single_type:L232-L289：touch 救回 + 挂 req_to_blocks + 部分命中记账）→ allocate_new_blocks（L330-L369：CoW 换尾 L347-L357 + _apply_cow L405-L425）→ cache_blocks（L427-L477：reachable_boundaries → mask → cache_full_blocks block_pool.py:L259-L299 满/部分条目入表 + _cache_partial_tail_block L791-L819）。",
+    "【过线·CoW 拷贝】take_kv_cache_block_copies（kv_cache_manager.py:L831-L846）→ scheduler.py:L1181-L1190 打包进 SchedulerOutput（retained 块挂步序栅栏 _free_cow_retained_blocks L2356-L2365）→ worker gpu_model_runner.py:L1223-L1228 copy_kv_cache_blocks_inplace 在 GPU 上执行块拷贝。",
+    "【终局·留与逐】请求完成/被抢占 → kv_cache_manager.free L567-L578 → manager.free 逆序（single_type:L519-L527）→ block_pool.free_blocks L719-L742 劈分挂回（无哈希块队头先驱逐、有哈希块 LRU 尾）——哈希保留在 map 里；下一个请求（或被抢占者重排回来）get_computed_blocks 命中 → touch 救回复用；池紧时 get_new_blocks L647-L677 从队头取块、_maybe_evict_cached_block L679-L700 才摘哈希（反向索引 L571-L590 清别名）。"
+  ],
+  "why_chains": [
+    {
+      "id": "WC1",
+      "card": "deepread/memory-kv.json why_chains[2]",
+      "decision": "前缀缓存 = 链式块哈希 + 平面哈希表（重要澄清：vLLM v0/v1 主线从来不是 radix 树）",
+      "old_design": "两条旧路线：v0 自己的 APC = hash + Evictor（2024-03-02 commit ce4f5a29f \"Add Automatic Prefix Caching (#2762)\"）；SGLang RadixAttention = radix 树（arXiv:2312.07104）。很多读者带着「vLLM=论文+SGLang radix」的混合印象来。V1 alpha（2024-10-22 commit 6c5af09b3）落地时 get_computed_blocks 是存根，注释「# TODO(woosuk): Implement hash-based caching.」——TODO 里写的就是 hash-based。2024-11-07 commit 201fc0773 \"[V1] Prefix caching (take 2) (#9972)\" 落地。",
+      "pain": "共享前缀（system prompt/few-shot/多轮历史）重复 prefill 烧算力。radix 树在 Python 侧指针密集：节点对象分配给 GC 压力大、match/insert/evict 不变量复杂、与 chunked prefill/SWA 的块对齐语义难严丝合缝——这些正是 v1 高并发调度循环最付不起的 CPU 成本。",
+      "solution": "Merkle 式链式哈希：hash_i = H(parent_hash_{i-1}, tokens_i, extra_keys)（vllm/v1/core/kv_cache_utils.py:L596-L623 hash_block_tokens）；请求侧随 token 到达增量计算（request.py:L249-L265）；查找沿哈希链顺序走到第一个 miss 即停（single_type_kv_cache_manager.py:L682-L777，phase 1 L731-L739）；存储=平面 dict（block_pool.py:L33-L140 BlockHashToBlockMap）。满块才缓存 cache_full_blocks（L225-L342）。extra_keys 把 LoRA 名/MM 哈希/cache_salt 织进哈希防跨请求污染（kv_cache_utils.py:L430-L593）。",
+      "cost": "① 满块粒度之外的命中要靠 v0.27.1 的部分块条目（WC5）；全命中时必须重算最后一个 token 才有 logits（kv_cache_manager.py:L253-L258 注释原话）；② 故意不去重——同哈希允许多块并存，为块表 append-only（NOTE #1，block_pool.py:L47-L53），代价是相同前缀的显存冗余；③ 链式意味着前缀任何一处改动后面全部失效；④ 驱逐惰性隐式：块被重新分配时才摘哈希（get_new_blocks→_maybe_evict_cached_block，block_pool.py:L647-L700）。"
+    },
+    {
+      "id": "WC2",
+      "card": "deepread/memory-kv.json why_chains[3]",
+      "decision": "LRU 驱逐顺序的两个隐藏不变量：free 必须逆序 + 无哈希块先于缓存块驱逐",
+      "old_design": "朴素做法双坑：其一，free 按分配顺序挂回空闲表——LRU 头部会是一条缓存链的前几个块，驱逐从「前缀的头」开始把最长可复用前缀拦腰斩断；其二（v0.21 之前），所有释放块一律当 LRU 缓存条目——从未进过哈希表的块（不可能是命中）排在缓存块后面驱逐，白占显存。",
+      "pain": "被卡的指标是前缀命中率（尤其共享 system prompt 场景）：驱逐顺序错 = 命中率静默劣化，不炸不错只是慢。无哈希块滞留 = 可用容量被「永不命中」的块挤占。",
+      "solution": "不变量一（逆序 free）：docstring 原话「We free the blocks in reverse order so that the tail blocks are evicted first when caching is enabled」（kv_cache_manager.py:L567-L574；实现 single_type_kv_cache_manager.py:L519-L527 free_blocks(reversed(...))）。次序规则写在 FreeKVCacheBlockQueue 类文档（kv_cache_utils.py:L184-L204）：「The least recent used block is at the front (LRU)」「the one with more hash tokens (the tail of a block chain) is at the front」。不变量二（2026-06-16 commit 520828789 \"Apply LRU policy only to proper cache entries (#42656)\"）：free_blocks 把释放块劈两半——无哈希块 prepend_n 到队头（先驱逐）、有哈希块 append_n 到 LRU 尾（block_pool.py:L719-L742，注释「Blocks without hash get evicted first」）；缓存关闭时跳过劈分保持 append 以获得 GPU 局部性（2026-07-25 commit a82f1b388 #48017）。侵入式双向链表零对象分配（L188-L191 类文档原话「does not allocate any Python objects」）。",
+      "cost": "两个不变量都靠约定维持、无断言保护——任何新的 free 路径不遵守就静默劣化命中率（「顺序即策略」的教学样本）；劈分路径让 free_blocks 多一次遍历（缓存关闭时已优化掉）。"
+    },
+    {
+      "id": "WC3",
+      "card": "deepread/memory-kv.json why_chains[4]（本章消费其『前缀缓存让重算变便宜』半条；抢占机制本体归 ch11）",
+      "decision": "分配失败→抢占只重算（recompute-only），前缀缓存让重算变便宜——F2 回收的机制内核",
+      "old_design": "v0 双模抢占 SWAP/RECOMPUTE（v0.6.6 vllm/core/scheduler.py 可考）；v1 只留 recompute。",
+      "pain": "裸 recompute 的死穴：被抢占请求 num_computed_tokens 清零回 waiting，从 0 重 prefill——若无缓存，算过的几百上千 token 全部重算，TTBT 雪上加霜。",
+      "solution": "关键链路四步：① _preempt_request free 全部块但 free_blocks 不动 block_hash（scheduler.py:L1274-L1315 + block_pool.py:L719-L742）——前缀留在哈希表里；② 逆序+劈分让这些块排在 LRU 尾（最可复用端）；③ 被抢占请求重排回 waiting 队头，重走准入查询 get_computed_blocks（scheduler.py:L744-L766）——对自己的前缀全量重命中；④ touch 救回（block_pool.py:L702-L717）。「重算」变成「重载元数据+补算」。",
+      "cost": "最坏情况无界：若被抢占期间块已被 get_new_blocks 取走复用（惰性驱逐真发生），重算就是完整 prefill 重来；被抢占请求 TTBT 直接受损（公平换活性）；正确性依赖「块表 append-only + 哈希保留」隐式链路，任何一环清哈希都退化为全量重算。"
+    },
+    {
+      "id": "WC4",
+      "card": "deepread/memory-kv.json why_chains[7]",
+      "decision": "细粒度部分命中与块内 Copy-on-Write（v0.27.1 新增：partial prefix cache，#45939/#46384）",
+      "old_design": "命中只能落在满块边界：混合模型里最粗组的 block_size（如 Mamba align 的 1024-token 块）决定命中粒度——比它细的前缀复用全部损失；prompt 尾部不足一块的部分永不入缓存；请求共享的尾块只读不可写，谁继续写谁就得整块重算。",
+      "pain": "命中粒度 = 最粗组块大小：1024-token 块的模型上两个 prompt 共享 1000 token 前缀也命不中；P/D 场景 producer 的 prompt 边界状态（sub-block tail）无法被下一个请求复用，被迫整块重传/重算。",
+      "solution": "三件套（commit 6bc6f2d86 \"[1/N][Core] add partial prefix cache primitives (#45939)\" + 481e481be \"[2/N][Core] support partial prefix cache hit for hybrid model (#46384)\"）：① 部分块条目——cache_partial_block 把已存在块在块内前缀边界注册进哈希表、不分配新块（block_pool.py:L445-L544；块记 _block_hash_num_tokens，反向索引 cached_block_hashes_by_block=L185 供驱逐/晋升摘干净全部别名）；② 细粒度查找——find phase 2 满块链停后在第一个不满块内自高向低探测（single_type:L741-L762）；resolve_block_hashes 在 alignment<block_size 时保留原始哈希粒度列表（kv_cache_utils.py:L2321-L2351）；粒度由 prefix_match_unit 配置（config/cache.py:L56-L67）。③ 命中后 CoW——共享尾块不能直接写：_apply_cow 把请求块表里的共享块原地换私有 cow_block、登记 (source, cow) 拷贝对（single_type:L405-L425）；拷贝对经 take_kv_cache_block_copies（kv_cache_manager.py:L831-L846）→ scheduler.py:L1181-L1190 → worker copy_kv_cache_blocks_inplace（gpu_model_runner.py:L1223-L1228）执行，两端块保留引用直到拷贝跑完（_free_cow_retained_blocks L2356-L2365 带步序栅栏）。running 请求块表必须 append-only：cache 条目被 move_block_hashes 重指到 cow 块而非请求换块（block_pool.py:L629-L645）。远端命中 vs 本地子块尾的仲裁（scheduler.py:L791-L811）归 ch16。",
+      "cost": "① 每次部分命中 +1 块（CoW 目标）+ 一次 GPU 块拷贝带宽；② 三套簿记叠加：_partial_hit_reqs、_pending_cow_copies、cached_blocks_this_step（防同步命中未填充的 cow 块）；③ 只支持 full-attention + mamba-align 且无 CP（kv_cache_coordinator.py:L581-L588 enable_partial_hash_hits；SWA 明确 assert 不支持 single_type:L914-L917）；④ 块内条目让驱逐/重置必须查反向索引，否则哈希表泄漏悬空键。"
+    },
+    {
+      "id": "WC5",
+      "card": "deepread/memory-kv.json why_chains[8]",
+      "decision": "Marconi 式共享前缀钉住 + 稀疏驻留（retention interval）：稀疏缓存不杀死跨请求复用",
+      "old_design": "稠密缓存（默认）：每个满块/每个状态边界都进哈希表。对 Mamba/SWA 这类「状态稀疏可复用」的层，条目数随序列长度线性涨；一度引入的稀疏驻留会把共享 system prompt 的 junction 也稀疏掉——下一个请求命中不了 junction，稀疏省下的显存又被重算吃回去。",
+      "pain": "被卡的指标是混合模型的前缀命中率与显存占用的平衡：Mamba 每步只有一个状态可复用，但「哪个边界的状态值得留」决定命中率。",
+      "solution": "三层机制（commit dc66e01a7 \"[Hybrid] Marconi-style admission policy for hybrid cache (#37898)\" + 430a95ae3 \"#45845\" + 8ac837527 \"#47782\"）：① junction 检测——不动点收敛时若有组命中更长，差值即「各组都认但稀疏组还没缓的共享前缀」（num_uncached_common_prefix_tokens = longest_hit_length − hit_length，kv_cache_coordinator.py:L810-L813）；get_computed_blocks 把它折进 shared_prefix_boundary 返回并写回 Request（kv_cache_manager.py:L286-L295；request.py:L190-L193）。② 钉住落地——cache_blocks 的 reachable_boundaries 把 replay 边界（num_prompt−1）与 junction 边界的可达尾强制置 True（single_type:L452-L466；SWA mask L1044-L1053、Mamba mask L1404-L1412）。③ 调度配合——_mamba_block_aligned_split 把 prefill chunk 停在 junction 上，让该边界状态确实被算出来并缓存（scheduler.py:L424-L437）。retention_interval 由 env VLLM_PREFIX_CACHE_RETENTION_INTERVAL 控制，必须整除 scheduler_block_size 且只对 SWA/Mamba 生效（kv_cache_coordinator.py:L30-L57 校验；None=稠密/0=只留 replay 边界/正数=每段一条）。",
+      "cost": "① chunk 被强制截断在 junction → prefill 步数变多、每步 token 数变碎；② Request 上多了跨模块字段 shared_prefix_boundary（调度器写、cache 读）的隐式协议；③ 稀疏度即命中率赌注：interval 调大省显存但错过非 junction 复用；④ 只对 SWA/Mamba 生效，full attention 恒稠密。"
+    },
+    {
+      "id": "WC6",
+      "card": "deepread/memory-kv.json why_chains[6] 的命中半条（组化/页统一半条已被 ch14 消费）",
+      "decision": "跨类型最长命中用迭代不动点：每种注意力类型要么接受当前候选长度要么收缩之（混合模型的多组一致命中）",
+      "old_design": "早期 v1 只有一张块表、一种注意力类型，命中=单链扫描；混合模型要么不支持要么退化为全按 full 处理。",
+      "pain": "不同注意力类型对「前缀命中到哪」判定不一致：full 要求从头连续、SWA 只要求窗内连续、Mamba 只要边界状态——命中长度必须让所有组同时成立，单次扫描给不出。",
+      "solution": "HybridKVCacheCoordinator.find_longest_cache_hit 迭代不动点（kv_cache_coordinator.py:L685-L817）：以 max_cache_hit_length 为初值，逐注意力类型校验（每类型要么接受要么缩短候选长度），任一类型缩短则重启全类型校验；因长度单调递减且有下界 0 必收敛。full attention 排最前（verify_and_split L631-L635：左到右扫描给最紧初始上界）且向下封闭——查一次后只 min 裁剪（L738-L745）；simple hybrid（1 full+1 other）一轮即停（L716-L720）。full 组块表最后裁剪到最终 hit_length（L798-L808）。SWA 的 finder 从右往左找窗口连续段（single_type:L897-L994，命中表形如 [NULL,NULL,8,3]）、Mamba 的 finder 只要边界那一个状态块（L1280-L1358，前段 null 占位）。",
+      "cost": "① 最坏多轮往返（上界 max_len/lcm_block_size 轮）；② 官方自认只干净支持「full + 恰好一种其它类型」（假设 6，kv_cache_utils.py:L1189-L1194）；③ full+Mamba 的 per-group 发散回退逻辑另有一条补丁链（get_computed_blocks_for_connector，kv_cache_manager.py:L297-L342，归 ch16）。"
+    }
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/request.py",
+      "lines": "L249-L265",
+      "what": "哈希的归属与时机：block_hashes 长在 Request 上，构造尾与每次 append token 后增量补算（_block_hasher 不绑定 self，避免引用环挡 GC）",
+      "elide": [],
+      "code": "    def append_output_token_ids(\n        self,\n        token_ids: int | list[int],\n    ) -> None:\n        if isinstance(token_ids, int):\n            self._output_token_ids.append(token_ids)\n            self._all_token_ids.append(token_ids)\n        else:\n            self._output_token_ids.extend(token_ids)\n            self._all_token_ids.extend(token_ids)\n\n        self.update_block_hashes()\n\n    def update_block_hashes(self) -> None:\n        \"\"\"Compute block hashes for any new full blocks and append them.\"\"\"\n        if self._block_hasher is not None:\n            self.block_hashes.extend(self._block_hasher(self))"
+    },
+    {
+      "path": "vllm/v1/request.py",
+      "lines": "L190-L193",
+      "what": "Marconi 钉住的落点字段：shared_prefix_boundary（块对齐 token 位；0=无）——调度器在准入时写、cache_blocks/_mamba_block_aligned_split 读，跨模块隐式协议",
+      "elide": [],
+      "code": "        # Block-aligned token position of a proven shared prefix worth pinning\n        # in the (sparse) prefix cache; 0 means none. Set at admission for\n        # hybrid/Mamba models when a shared prefix is detected (Marconi-style).\n        self.shared_prefix_boundary = 0"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L596-L623",
+      "what": "链式哈希本体：hash_i = H(parent_hash, 本块 token_ids, extra_keys)；首块 parent 用 NONE_HASH 种子——本块哈希=整条前缀的指纹",
+      "elide": [],
+      "code": "def hash_block_tokens(\n    hash_function: Callable[[Any], bytes],\n    parent_block_hash: BlockHash | None,\n    curr_block_token_ids: Sequence[int],\n    extra_keys: tuple[Any, ...] | None = None,\n) -> BlockHash:\n    \"\"\"Computes a hash value corresponding to the contents of a block and\n    the contents of the preceding block(s). The hash value is used for\n    prefix caching. We use LRU cache for this function to avoid recomputing\n    hash values for the same block contents.\n    Args:\n        hash_function: The hash function used to compute block hash.\n        parent_block_hash: The hash of the parent block. None\n            if this is the first block.\n        curr_block_token_ids: A list of token ids in the current\n            block. The current block is assumed to be full.\n        extra_keys: Extra keys for the block.\n    Returns:\n        The hash value of the block and the token ids in the block.\n        The entire tuple is used as the hash key of the block.\n    \"\"\"\n    if not parent_block_hash:\n        parent_block_hash = NONE_HASH\n\n    curr_block_token_ids_tuple = tuple(curr_block_token_ids)\n    return BlockHash(\n        hash_function((parent_block_hash, curr_block_token_ids_tuple, extra_keys))\n    )"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L705-L748",
+      "what": "请求侧增量 hasher：只算新满 hash_block_size 的块（早停/只哈希满块）、逐块链式（prev=上一块哈希）、每块问一次 extra_keys",
+      "elide": [],
+      "code": "    def request_block_hasher(request: Request) -> list[BlockHash]:\n        start_token_idx = len(request.block_hashes) * hash_block_size\n        num_tokens = request.num_tokens\n\n        if start_token_idx + hash_block_size > num_tokens:\n            # Early stop when there no new full blocks created.\n            return []\n\n        curr_mm_idx = 0\n        if start_token_idx > 0:\n            # Set curr_mm_idx = -1 to indicate the last mm input.\n            # Note that since we reach to this branch only when the block is\n            # completed with generated tokens, we only need to consider the\n            # last mm input.\n            curr_mm_idx = -1\n\n        prev_block_hash_value = (\n            request.block_hashes[-1] if request.block_hashes else None\n        )\n        new_block_hashes: list[BlockHash] = []\n        while True:\n            end_token_idx = start_token_idx + hash_block_size\n            if end_token_idx > num_tokens:\n                # We only hash full blocks\n                break\n\n            # MM and LoRA requests need extra keys for block-hash computation.\n            extra_keys, curr_mm_idx = generate_block_hash_extra_keys(\n                request, start_token_idx, end_token_idx, curr_mm_idx\n            )\n\n            # Compute the hash of the current block\n            block_tokens = request.all_token_ids[start_token_idx:end_token_idx]\n            block_hash = hash_block_tokens(\n                caching_hash_fn, prev_block_hash_value, block_tokens, extra_keys\n            )\n\n            new_block_hashes.append(block_hash)\n            start_token_idx += hash_block_size\n            prev_block_hash_value = block_hash\n\n        return new_block_hashes\n\n    return request_block_hasher"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L430-L447",
+      "what": "extra keys 谓词：多模态 / LoRA / cache_salt 任一存在则本请求的块哈希要拌额外键——防跨语义误命中",
+      "elide": [],
+      "code": "def need_extra_keys(request: Request) -> bool:\n    \"\"\"Check whether the blocks allocated to this request need extra hash keys.\n\n    Args:\n        request (Request): The request.\n\n    Returns:\n        bool: Whether blocks allocated to this request need extra hash keys.\n    \"\"\"\n\n    # Multimodal requests need to include the MM hash.\n    # LoRA requests need to include the LoRA name.\n    # Request with provided cache salt need to include the salt.\n    return (\n        bool(request.mm_features)\n        or (request.lora_request is not None)\n        or (request.cache_salt is not None)\n    )"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L558-L593",
+      "what": "extra keys 组装：lora + mm + cache_salt(仅首块 start_token_idx==0) + prompt_embeds 四源合并成 tuple",
+      "elide": [
+        "_gen_mm_extra_hash_keys/_gen_lora_extra_hash_keys/_gen_prompt_embeds_extra_hash_keys 三个内部函数（L450-L557）可概述：mm 返回 (mm_hash, 块内偏移)、lora 返回适配器名列表、prompt_embeds 返回按块预哈希——正文点到即可。"
+      ],
+      "code": "def generate_block_hash_extra_keys(\n    request: Request, start_token_idx: int, end_token_idx: int, start_mm_idx: int\n) -> tuple[tuple[Any, ...] | None, int]:\n    \"\"\"Generate extra keys for the block hash. The extra keys can come from\n    the multi-modal inputs, request specific metadata (e.g., LoRA names), and\n    hashed data from prompt embeddings.\n\n    Args:\n        request: The request object.\n        start_token_idx: The start token index of the block.\n        end_token_idx: The end token index of the block.\n        start_mm_idx: The start multi-modal index of the block.\n\n    Returns:\n        A tuple of extra keys and the next multi-modal index.\n    \"\"\"\n    mm_extra_keys: list[Any]\n    mm_extra_keys, new_start_mm_idx = _gen_mm_extra_hash_keys(\n        request, start_token_idx, end_token_idx, start_mm_idx\n    )\n    lora_extra_keys: list[str] = _gen_lora_extra_hash_keys(request)\n    cache_salt_keys: list[str] = (\n        [request.cache_salt] if (start_token_idx == 0 and request.cache_salt) else []\n    )\n    prompt_embeds_keys = _gen_prompt_embeds_extra_hash_keys(\n        request, start_token_idx, end_token_idx\n    )\n\n    extra_keys: list[Any] = (\n        lora_extra_keys + mm_extra_keys + cache_salt_keys + prompt_embeds_keys\n    )\n\n    if not extra_keys:\n        return None, new_start_mm_idx\n\n    return tuple(extra_keys), new_start_mm_idx"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L184-L204",
+      "what": "自由队列的次序规则（类文档原文）：前端=LRU 最先驱逐；同一次释放的块『哈希覆盖 token 更多者（链尾）排更前』——靠 free 时逆序传入维持，注释明言『This operation is outside of this class』（顺序即策略，约定在类外）",
+      "elide": [],
+      "code": "class FreeKVCacheBlockQueue:\n    \"\"\"This class organizes a list of KVCacheBlock objects to a doubly linked\n    list of free blocks. We implement this class instead of using Python\n    builtin deque to support removing a block in the middle of the queue\n    in O(1) time. To close the performance gap to the builtin deque which is\n    implemented in C++, this class does not allocate any Python objects when\n    manipulating the linked list. Instead, this class manipulates the\n    prev_free_block and next_free_block attributes of the given blocks.\n\n    The queue is ordered by block ID in the beginning. When a block is allocated\n    and then freed, it will be appended back with the eviction order:\n    1. The least recent used block is at the front (LRU).\n    2. If two blocks have the same last accessed time (allocated by the\n       same sequence), the one with more hash tokens (the tail of a block\n       chain) is at the front.\n    Note that we maintain this order by reversing the block order when free\n    blocks of a request. This operation is outside of this class.\n\n    Args:\n        blocks: A list of KVCacheBlock objects.\n    \"\"\""
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L349-L368",
+      "what": "prepend_n：把一串块插到队头（劈分不变量二的取头原语）——无哈希块从这头进、先被取走驱逐",
+      "elide": [],
+      "code": "    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:\n        \"\"\"Put a list of blocks at the front of the free list.\"\"\"\n        if len(blocks) == 0:\n            return\n\n        first_block = self.fake_free_list_head.next_free_block\n        assert first_block is not None, (\n            \"next_free_block of fake_free_list_head should always exist\"\n        )\n\n        prev_block = self.fake_free_list_head\n        for block in blocks:\n            block.prev_free_block = prev_block\n            prev_block.next_free_block = block\n            prev_block = block\n\n        prev_block.next_free_block = first_block\n        first_block.prev_free_block = prev_block\n\n        self.num_free_blocks += len(blocks)"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L2245-L2277",
+      "what": "BlockHashListWithBlockSize：哈希粒度惰性重串——每个 hash_block_size 哈希已链住整条前缀，粗块（target_block_size）的哈希=块内最后一个细粒度哈希（16 粒度第 2 个哈希直接当 32 粒度用，docstring 自带图例）",
+      "elide": [],
+      "code": "class BlockHashListWithBlockSize:\n    \"\"\"\n    Convert block-hash granularity from `hash_block_size` to `target_block_size`.\n    Used when KV cache groups have different block sizes: `hash_block_size`\n    is the size used to compute the original `block_hashes`; `target_block_size`\n    is the group's actual block size.\n\n    Currently, only scaling up by an integer factor is supported (i.e.,\n    `target_block_size` is a multiple of `hash_block_size`). Conversion is\n    performed lazily on access for efficiency. Each `hash_block_size` hash is\n    already chained over its entire prefix, so the hash at the last\n    `hash_block_size` boundary of a `target_block_size` block uniquely\n    fingerprints that block's prefix; we use it directly.\n\n    Example (`hash_block_size` = 16, `target_block_size` = 32):\n    the second 16-size hash already covers tokens 0-31, so it is the 32-size\n    hash:\n\n    Block hashes with block_size 16:\n    | Token Range | 0-15 | 16-31 | 32-47 | 48-63 |\n    |-------------|------|-------|-------|-------|\n    | Hash        | A    | B     | C     | D     |\n\n    Block hashes with block_size 32:\n    | Token Range | 0-31 | 32-63 |\n    |-------------|------|-------|\n    | Hash        | B    | D     |\n\n    Args:\n        block_hashes: Block hashes to convert, computed at `hash_block_size`.\n        hash_block_size: Block size at which `block_hashes` were computed.\n        target_block_size: Desired block size; must be a multiple of `hash_block_size`.\n    \"\"\""
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L2321-L2351",
+      "what": "resolve_block_hashes：按块尺寸取哈希视图——等粒度直接复用；细粒度查找（supports_fine_grained_hash_lookup 且 alignment<block_size）保留原始细粒度列表供块内探测；否则包成 BlockHashListWithBlockSize 粗视图",
+      "elide": [],
+      "code": "def resolve_block_hashes(\n    block_hashes: BlockHashList,\n    hash_block_size: int,\n    block_size: int,\n    *,\n    supports_fine_grained_hash_lookup: bool = False,\n    alignment_tokens: int | None = None,\n) -> BlockHashList:\n    \"\"\"Resolve the block-hash view at ``block_size``.\n\n    When ``block_size`` equals ``hash_block_size``, reuse the precomputed block\n    hashes directly; otherwise view them at ``block_size`` granularity.\n    Fine-grained lookup keeps the original hashes for partial cache hits.\n    \"\"\"\n    if block_size == hash_block_size:\n        return block_hashes\n    if isinstance(block_hashes, BlockHashListWithBlockSize):\n        # Already a block-size view\n        assert block_hashes.scale_factor == block_size // hash_block_size\n        return block_hashes\n    # Fine-grained partial hits keep the raw hashes. The caller passes\n    # alignment_tokens = hash_block_size to enable them, else >= block_size.\n    if (\n        supports_fine_grained_hash_lookup\n        and alignment_tokens is not None\n        and alignment_tokens < block_size\n        and block_size % alignment_tokens == 0\n    ):\n        return block_hashes\n    assert block_size % hash_block_size == 0\n    return BlockHashListWithBlockSize(block_hashes, hash_block_size, block_size)"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L33-L54",
+      "what": "平面哈希表的身份证（类文档）：{hash+group_id → block 或 {block_id: block}}；NOTE #1 故意不去重（保 block_id 不变、块表 append-only）；NOTE #2 union 类型省内层 dict 的 GC",
+      "elide": [],
+      "code": "class BlockHashToBlockMap:\n    \"\"\"\n    Cache of blocks that are used for prefix caching. It caches blocks\n    from hash directly to a block or multiple blocks\n    (i.e. {block_hash: KVCacheBlocks})\n    - Mostly block_hash maps to a single KVCacheBlock, and KVCacheBlocks\n        would simply be a KVCacheBlock.\n    - Otherwise, KVCacheBlocks is a dict from {block_id: KVCacheBlock}\n\n    A cached block is a full block with a block hash that can be used\n    for prefix caching.\n    The cached block may be used by running requests or in the\n    free_block_queue that could potentially be evicted.\n\n    NOTE #1: We currently don't de-duplicate the blocks in the cache,\n    meaning that if a block becomes full and is cached, we don't check\n    if there is already an identical block in the cache. This is because\n    we want to make sure the allocated block IDs won't change so that\n    block tables are append-only.\n    NOTE #2: The union type is introduced in order to reduce GC costs\n    from the inner dict.\n    \"\"\""
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L198-L223",
+      "what": "get_cached_block：逐 group 把 block_hash+group_id 打包成 bytes 键查 map——任一 group miss 整体 miss（多组一致才命中）",
+      "elide": [],
+      "code": "    def get_cached_block(\n        self, block_hash: BlockHash, kv_cache_group_ids: list[int]\n    ) -> list[KVCacheBlock] | None:\n        \"\"\"Get the cached block by the block hash for each group in\n        `kv_cache_group_ids`, or None if cache miss for any group.\n        If there are duplicated blocks, we return the first block in the cache.\n\n        Args:\n            block_hash: The hash value of the block.\n            kv_cache_group_ids: The ids of the KV cache groups.\n\n        Returns:\n            The cached blocks if exists, or None.\n        \"\"\"\n        cached_blocks = []\n        for group_id in kv_cache_group_ids:\n            block_hash_with_group_id = make_block_hash_with_group_id(\n                block_hash, group_id\n            )\n            block = self.cached_block_hash_to_block.get_one_block(\n                block_hash_with_group_id\n            )\n            if not block:\n                return None\n            cached_blocks.append(block)\n        return cached_blocks"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L259-L299",
+      "what": "cache_full_blocks 核心环：算哈希视图 → 逐新满块跳过 null/掩码块 → partial→full 晋升先摘旧条目 → set+insert 进 map；block_mask 文档注明『永不可能服务命中的块不入哈希表』（SWA 尾窗/Mamba align 用）",
+      "elide": [
+        "L268-L270 enable_kv_cache_events 的事件收集变量与 L301-L342 整段事件发布可省略（观测旁路）；L278 num_hash_tokens 的 partial 语义见 cache_partial_block 条目。"
+      ],
+      "code": "        if num_cached_blocks >= num_full_blocks:\n            return\n        new_full_blocks = blocks[num_cached_blocks:num_full_blocks]\n        assert block_mask is None or len(block_mask) == len(new_full_blocks)\n        block_hashes = resolve_block_hashes(\n            request.block_hashes, self.hash_block_size, block_size\n        )\n\n        new_block_hashes = block_hashes[num_cached_blocks:]\n        new_hashes: list[ExternalBlockHash] | None = (\n            [] if self.enable_kv_cache_events else None\n        )\n        for i, blk in enumerate(new_full_blocks):\n            # Some blocks may be null or masked out when enabling sparse attention\n            # like sliding window attention, or Mamba models with prefix-caching\n            # in align mode. We skip null blocks here.\n            if blk.is_null or (block_mask is not None and not block_mask[i]):\n                continue\n            block_hash = new_block_hashes[i]\n            num_hash_tokens = (num_cached_blocks + i + 1) * block_size\n\n            # Update and added the full block to the cache.\n            block_hash_with_group_id = make_block_hash_with_group_id(\n                block_hash, kv_cache_group_id\n            )\n            if blk.block_hash is not None:\n                # The only valid case where a \"new full block\" already has a\n                # hash is partial->full promotion of the same cache block.\n                assert (\n                    blk.block_hash_num_tokens is not None\n                    and blk.block_hash_num_tokens < num_hash_tokens\n                )\n                removed_hashes = self._remove_cached_block_hashes(blk)\n                self._emit_block_removed_events(removed_hashes)\n            self._insert_block_hash(\n                block_hash_with_group_id,\n                blk,\n                num_tokens=num_hash_tokens,\n            )\n            if new_hashes is not None:\n                new_hashes.append(maybe_convert_block_hash(block_hash))"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L484-L512",
+      "what": "cache_partial_block 核心：在已存在块的块内前缀边界注册细粒度条目——不分配新块；哈希=该边界的前缀链哈希（block_hashes[num_tokens/hash_bs − 1]）；已有更短条目则先摘再插长条目",
+      "elide": [
+        "L513-L543 enable_kv_cache_events 事件发布可省略；断言组（L487-L489）说明前提：block_size>hash_block_size 且边界不落整块。"
+      ],
+      "code": "        if block.is_null:\n            return None\n\n        assert block_size > self.hash_block_size\n        assert block_size % self.hash_block_size == 0\n        assert num_tokens % block_size != 0\n        block_hash = self._get_partial_block_hash(request, num_tokens)\n        num_hash_blocks = num_tokens // self.hash_block_size\n        block_hash_with_group_id = make_block_hash_with_group_id(\n            block_hash, kv_cache_group_id\n        )\n        already_cached = block.block_hash == block_hash_with_group_id or (\n            self.cached_block_hash_to_block.contain(\n                block_hash_with_group_id, block.block_id\n            )\n        )\n        if (\n            not already_cached\n            and block.block_hash is not None\n            and block.block_hash_num_tokens is not None\n            and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size\n        ):\n            removed_hashes = self._remove_cached_block_hashes(block)\n            self._emit_block_removed_events(removed_hashes)\n        self._insert_block_hash(\n            block_hash_with_group_id,\n            block,\n            num_tokens=num_hash_blocks * self.hash_block_size,\n        )"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L571-L590",
+      "what": "_remove_cached_block_hashes：摘块的全部哈希别名——主哈希 + cached_block_hashes_by_block 反向索引（部分条目挂这）——摘干净才不留悬空键",
+      "elide": [],
+      "code": "    def _remove_cached_block_hashes(\n        self,\n        block: KVCacheBlock,\n    ) -> list[BlockHashWithGroupId]:\n        block_hashes: list[BlockHashWithGroupId] = []\n        if block.block_hash is not None:\n            block_hashes.append(block.block_hash)\n        block_hashes.extend(self.cached_block_hashes_by_block.pop(block.block_id, ()))\n        if not block_hashes:\n            return []\n\n        removed_hashes: list[BlockHashWithGroupId] = []\n        for block_hash in block_hashes:\n            if (\n                self.cached_block_hash_to_block.pop(block_hash, block.block_id)\n                is not None\n            ):\n                removed_hashes.append(block_hash)\n        block.reset_hash()\n        return removed_hashes"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L607-L627",
+      "what": "_insert_block_hash：主哈希直接挂块；块已有主哈希时新条目进反向索引——一票主、多票别名",
+      "elide": [],
+      "code": "    def _insert_block_hash(\n        self,\n        block_hash_with_group_id: BlockHashWithGroupId,\n        block: KVCacheBlock,\n        num_tokens: int | None,\n    ) -> None:\n        if block.block_hash == block_hash_with_group_id:\n            return\n\n        if self.cached_block_hash_to_block.contain(\n            block_hash_with_group_id, block.block_id\n        ):\n            return\n\n        if block.block_hash is None:\n            block.set_block_hash(block_hash_with_group_id, num_tokens=num_tokens)\n        else:\n            self.cached_block_hashes_by_block.setdefault(block.block_id, set()).add(\n                block_hash_with_group_id\n            )\n        self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L629-L645",
+      "what": "move_block_hashes：CoW 后把 src 块的全部前缀缓存条目重指到 dst 私有拷贝——条目活着不摘，请求侧块表 append-only 由它兜住",
+      "elide": [],
+      "code": "    def move_block_hashes(\n        self,\n        src_block: KVCacheBlock,\n        dst_block: KVCacheBlock,\n    ) -> None:\n        \"\"\"Re-point ``src_block``'s prefix-cache entries to ``dst_block``.\n\n        Used when the request owning ``src_block`` keeps writing into it\n        : the prefix cache holds a private copy (``dst_block``)\n        under the same hashes instead. Entries stay live; no events emitted.\n        \"\"\"\n        assert dst_block.block_hash is None\n        assert dst_block.block_id not in self.cached_block_hashes_by_block\n        num_tokens = src_block.block_hash_num_tokens\n        for block_hash in self._remove_cached_block_hashes(src_block):\n            # `num_tokens` only applies to the first (primary) insertion.\n            self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L647-L677",
+      "what": "get_new_blocks：从队头批量取块 + 逐块 _maybe_evict_cached_block（惰性驱逐）+ ref_cnt+1——池满时驱逐就发生在这里",
+      "elide": [
+        "metrics_collector.on_block_allocated 调用（L669-L670/L675-L676）可省略（纯观测）。"
+      ],
+      "code": "    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:\n        \"\"\"Get new blocks from the free block pool.\n\n        Note that we do not check block cache in this function.\n\n        Args:\n            num_blocks: The number of blocks to allocate.\n\n        Returns:\n            A list of new block.\n        \"\"\"\n        if num_blocks > self.get_num_free_blocks():\n            raise ValueError(f\"Cannot get {num_blocks} free blocks from the pool\")\n\n        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)\n\n        # In order to only iterate the list once, we duplicated code a bit\n        if self.enable_caching:\n            for block in ret:\n                self._maybe_evict_cached_block(block)\n                assert block.ref_cnt == 0\n                block.ref_cnt += 1\n                if self.metrics_collector:\n                    self.metrics_collector.on_block_allocated(block)\n        else:\n            for block in ret:\n                assert block.ref_cnt == 0\n                block.ref_cnt += 1\n                if self.metrics_collector:\n                    self.metrics_collector.on_block_allocated(block)\n        return ret"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L679-L700",
+      "what": "_maybe_evict_cached_block：块被复用才摘哈希——驱逐是惰性隐式的，不发生在 free 时",
+      "elide": [
+        "metrics_collector.on_block_evicted（L691-L692）可省略。"
+      ],
+      "code": "    def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:\n        \"\"\"\n        If a block is cached in `cached_block_hash_to_block`, we reset its hash\n        metadata and evict it from the cache.\n\n        Args:\n            block: The block to evict.\n\n        Returns:\n            True if the block is evicted, False otherwise.\n        \"\"\"\n        # Clean up metrics tracking first to prevent leaks\n        if self.metrics_collector:\n            self.metrics_collector.on_block_evicted(block)\n\n        evicted_hashes = self._remove_cached_block_hashes(block)\n        if not evicted_hashes:\n            # The block doesn't have hash, eviction is not needed\n            return False\n\n        self._emit_block_removed_events(evicted_hashes)\n        return True"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L702-L717",
+      "what": "touch：命中块的救回——ref_cnt+1；ref_cnt==0（在 free queue 里当驱逐候选）则 O(1) remove 出队——共享前缀的物理基础",
+      "elide": [
+        "metrics_collector.on_block_accessed（L716-L717）可省略。"
+      ],
+      "code": "    def touch(self, blocks: Sequence[KVCacheBlock]) -> None:\n        \"\"\"Touch a block increases its reference count by 1, and may remove\n        the block from the free queue. This is used when a block is hit by\n        another request with the same prefix.\n\n        Args:\n            blocks: A list of blocks to touch.\n        \"\"\"\n        for block in blocks:\n            # ref_cnt=0 means this block is in the free list (i.e. eviction\n            # candidate), so remove it.\n            if block.ref_cnt == 0 and not block.is_null:\n                self.free_block_queue.remove(block)\n            block.ref_cnt += 1\n            if self.metrics_collector:\n                self.metrics_collector.on_block_accessed(block)"
+    },
+    {
+      "path": "vllm/v1/core/block_pool.py",
+      "lines": "L719-L742",
+      "what": "free_blocks 劈分（LRU 不变量二，2026-06 #42656）：ref_cnt-1 归零的块劈两半——无哈希块 prepend_n 到队头先驱逐（『never match APC』）、有哈希块 append_n 到 LRU 尾；注释明言缓存关闭时跳过劈分保 GPU 局部性（代码里表现为 block_hash is None 且非 enable_caching 时也走 with_hash 分支）",
+      "elide": [],
+      "code": "    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:\n        \"\"\"Free a list of blocks. The blocks should be ordered by their\n        eviction priority, where the first block will be evicted first.\n\n        Args:\n            ordered_blocks: A list of blocks to free ordered by their eviction\n                priority.\n        \"\"\"\n        # Identify blocks with hash (LRU cache) and without it (never match APC)\n        blocks_with_hash = []\n        blocks_without_hash = []\n        for block in ordered_blocks:\n            block.ref_cnt -= 1\n            if block.ref_cnt == 0 and not block.is_null:\n                # When caching is disabled we always append for better\n                # GPU cache locality from reusing recently used blocks\n                if block.block_hash is None and self.enable_caching:\n                    blocks_without_hash.append(block)\n                else:\n                    blocks_with_hash.append(block)\n\n        # Blocks without hash get evicted first - prepend them last to the tail\n        self.free_block_queue.prepend_n(blocks_without_hash)\n        self.free_block_queue.append_n(blocks_with_hash)"
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L232-L289",
+      "what": "add_local_computed_blocks：挂命中块三步——touch（ref_cnt+1 救回）→ null 填 skipped 段 → 剩余命中块 extend 进 req_to_blocks；部分命中记 _partial_hit_reqs 并把 num_cached_block 压回整块数（私有拷贝满块后再补登）",
+      "elide": [],
+      "code": "    def add_local_computed_blocks(\n        self,\n        request_id: str,\n        new_computed_blocks: Sequence[KVCacheBlock],\n        num_local_computed_tokens: int,\n        num_external_computed_tokens: int,\n    ) -> None:\n        \"\"\"\n        Add the locally cached (prefix-hit) blocks to the request:\n        1. Touch the computed blocks (paired with adding them to `req_blocks`)\n           so their ref_cnt exactly tracks the referencing requests.\n        1.5. (Optional) For sliding window, skipped blocks are padded with nulls.\n        2. Add the remaining computed blocks.\n\n        Args:\n            request_id: The request ID.\n            new_computed_blocks: The new computed blocks just hitting the\n                prefix cache.\n            num_local_computed_tokens: The number of local computed tokens.\n            num_external_computed_tokens: The number of external computed tokens.\n        \"\"\"\n        # The coordinator only calls this for first-time allocations (running\n        # requests are short-circuited there), so the request has no blocks yet.\n        req_blocks = self.req_to_blocks[request_id]\n        assert len(req_blocks) == 0\n        num_total_computed_tokens = (\n            num_local_computed_tokens + num_external_computed_tokens\n        )\n        num_skipped_tokens = self.get_num_skipped_tokens(num_total_computed_tokens)\n        num_skipped_blocks = num_skipped_tokens // self.block_size\n        if num_skipped_blocks > 0:\n            # It is possible that all new computed blocks are skipped when\n            # num_skipped_blocks > len(new_computed_blocks).\n            new_computed_blocks = new_computed_blocks[num_skipped_blocks:]\n\n        # Touch the computed blocks to make sure they won't be evicted.\n        if self.enable_caching:\n            self.block_pool.touch(new_computed_blocks)\n        else:\n            assert not any(new_computed_blocks), (\n                \"Computed blocks should be empty when prefix caching is disabled\"\n            )\n\n        # Skip blocks are padded with null blocks.\n        req_blocks.extend([self._null_block] * num_skipped_blocks)\n        # Add the remaining computed blocks.\n        req_blocks.extend(new_computed_blocks)\n        # All cached hits (including skipped nulls) are already cached; mark\n        # them so cache_blocks() will not try to re-cache blocks that already\n        # have a block_hash set.\n        self.num_cached_block[request_id] = len(req_blocks)\n        if self._has_partial_local_hit(new_computed_blocks, num_local_computed_tokens):\n            # Record the partial tail for the CoW redirect in\n            # allocate_new_blocks; cap the cached count at the full blocks so\n            # cache_blocks() re-caches the private copy once full.\n            block_idx = num_local_computed_tokens // self.block_size\n            self._partial_hit_reqs[request_id] = (block_idx, new_computed_blocks[-1])\n            self.num_cached_block[request_id] = block_idx"
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L347-L369",
+      "what": "allocate_new_blocks 的 CoW 换尾：_partial_hit_reqs 命中则先取 1 块私有 cow 块、_apply_cow 原地替换共享尾块（预算里多要的那 1 块在这用掉），再正常按长度补新块",
+      "elide": [],
+      "code": "        cow_blocks: list[KVCacheBlock] = []\n        if request_id in self._partial_hit_reqs:\n            # Partial hit: redirect the shared tail to a private CoW block.\n            # Replacing in place keeps the length-based allocation below\n            # correct; the extra block was reserved by\n            # get_num_blocks_to_allocate.\n            block_idx, source_block = self._partial_hit_reqs.pop(request_id)\n            cow_block = self.block_pool.get_new_blocks(1)[0]\n            self._apply_cow(request_id, block_idx, source_block, cow_block)\n            self.new_block_ids.append(cow_block.block_id)\n            cow_blocks.append(cow_block)\n\n        req_blocks = self.req_to_blocks[request_id]\n        num_required_blocks = cdiv(num_tokens, self.block_size)\n        num_new_blocks = num_required_blocks - len(req_blocks)\n        if num_new_blocks <= 0:\n            return cow_blocks\n        else:\n            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)\n            req_blocks.extend(new_blocks)\n            if self._record_new_block_ids:\n                self.new_block_ids.extend(b.block_id for b in new_blocks)\n            return cow_blocks + new_blocks"
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L405-L425",
+      "what": "_apply_cow：把请求块表里的共享尾块原地换成 cow 私有块、登记 (source, cow) 拷贝对、cow 额外 +1 引用——两端都保留到 worker 真拷完",
+      "elide": [],
+      "code": "    def _apply_cow(\n        self,\n        request_id: str,\n        block_idx: int,\n        source_block: KVCacheBlock,\n        cow_block: KVCacheBlock,\n    ) -> None:\n        \"\"\"Redirect a partial prefix-cache hit to a private CoW block.\n\n        Both copy endpoints stay retained until the copy has run on the worker,\n        so a same-step free cannot recycle them: ``source_block`` keeps its\n        hit-ref, ``cow_block`` takes an extra ref beyond the one handed to the\n        request.\n        \"\"\"\n        req_blocks = self.req_to_blocks[request_id]\n        assert block_idx < len(req_blocks)\n        assert req_blocks[block_idx] is source_block\n        assert not source_block.is_null and source_block.ref_cnt > 0\n        req_blocks[block_idx] = cow_block\n        self._pending_cow_copies.append((source_block, cow_block))\n        cow_block.ref_cnt += 1"
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L427-L477",
+      "what": "cache_blocks：写回入口——reachable_boundaries = [replay 边界(num_prompt−1), junction(shared_prefix_boundary)]；算 reachable_block_mask 后交 cache_full_blocks；满块数记进 num_cached_block 防重复登记",
+      "elide": [],
+      "code": "    def cache_blocks(\n        self,\n        request: Request,\n        num_tokens: int,\n        retention_interval: int | None = None,\n    ) -> None:\n        \"\"\"\n        Cache the blocks for the request.\n\n        Args:\n            request: The request.\n            num_tokens: The total number of tokens that need to be cached\n                (including tokens that are already cached).\n            retention_interval: Sparse local-checkpoint granularity. ``None``\n                keeps dense checkpointing; ``0`` keeps only the latest replay\n                boundary; a positive multiple of ``scheduler_block_size`` keeps\n                a tail once per that-sized segment. Only SWA acts on it.\n        \"\"\"\n        num_cached_blocks = self.num_cached_block.get(request.request_id, 0)\n        num_full_blocks = num_tokens // self.block_size\n\n        if num_cached_blocks >= num_full_blocks:\n            return\n\n        # Token boundaries whose reachable tail must be retained under sparse\n        # retention: the replay boundary (``num_prompt - 1``, capped by\n        # ``get_computed_blocks``) and any detected shared-prefix junction.\n        reachable_boundaries = [request.num_prompt_tokens - 1]\n        if request.shared_prefix_boundary:\n            reachable_boundaries.append(request.shared_prefix_boundary)\n\n        block_mask = self.reachable_block_mask(\n            start_block=num_cached_blocks,\n            end_block=num_full_blocks,\n            alignment_tokens=self.scheduler_block_size,\n            kv_cache_spec=self.kv_cache_spec,\n            use_eagle=self.use_eagle,\n            retention_interval=retention_interval,\n            reachable_boundaries=reachable_boundaries,\n        )\n        self.block_pool.cache_full_blocks(\n            request=request,\n            blocks=self.req_to_blocks[request.request_id],\n            num_cached_blocks=num_cached_blocks,\n            num_full_blocks=num_full_blocks,\n            block_size=self.block_size,\n            kv_cache_group_id=self.kv_cache_group_id,\n            block_mask=block_mask,\n        )\n\n        self.num_cached_block[request.request_id] = num_full_blocks"
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L519-L527",
+      "what": "free 逆序（LRU 不变量一）：pop_blocks_for_free 后 reversed 传入——尾块先挂回、排更靠驱逐端",
+      "elide": [],
+      "code": "    def free(self, request_id: str) -> None:\n        \"\"\"\n        Free the blocks for the request.\n\n        Args:\n            request_id: The request ID.\n        \"\"\"\n        # Free blocks in reverse order so that the tail blocks are freed first.\n        self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))"
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L682-L777",
+      "what": "FullAttentionManager.find_longest_cache_hit（本章主算法）：resolve 哈希视图 → fine_grained 判定 → phase 1 沿满块链逐块查、miss 即断（链式保证后必 miss）→ phase 2 细粒度在第一个不满块内自高向低探边界 → eagle 丢尾（可省略）→ 对齐取整裁块",
+      "elide": [
+        "drop_eagle_block 分支（L764-L769）属投机解码，可省略；dcp_world_size 乘子（L701-L704）单卡为 1。"
+      ],
+      "code": "    def find_longest_cache_hit(\n        cls,\n        block_hashes: BlockHashList,\n        max_length: int,\n        kv_cache_group_ids: list[int],\n        block_pool: BlockPool,\n        kv_cache_spec: KVCacheSpec,\n        drop_eagle_block: bool,\n        alignment_tokens: int,\n        dcp_world_size: int = 1,\n        pcp_world_size: int = 1,\n    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:\n        assert isinstance(\n            kv_cache_spec, FullAttentionSpec | ChunkedLocalAttentionSpec\n        ), (\n            \"FullAttentionManager can only be used for full attention \"\n            \"and chunked local attention groups\"\n        )\n        block_size = kv_cache_spec.block_size\n        if dcp_world_size > 1:\n            # DCP shards each block's KV across ranks; hashes must be viewed at\n            # the sharded block size.\n            block_size *= dcp_world_size\n        block_hashes = resolve_block_hashes(\n            block_hashes,\n            block_pool.hash_block_size,\n            block_size,\n            supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,\n            alignment_tokens=alignment_tokens,\n        )\n\n        # Fine-grained mode (alignment_tokens == hash_block_size <\n        # block_size): resolve_block_hashes kept the raw hash-granularity\n        # list so interior boundaries can be probed.\n        fine_grained = (\n            alignment_tokens < block_size and block_size % alignment_tokens == 0\n        )\n        if fine_grained:\n            # list or lazy BlobBlockHashes view\n            assert isinstance(block_hashes, Sequence)\n            full_block_hashes: BlockHashList = BlockHashListWithBlockSize(\n                block_hashes, alignment_tokens, block_size\n            )\n        else:\n            full_block_hashes = block_hashes\n\n        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(\n            [] for _ in range(len(kv_cache_group_ids))\n        )\n        # Phase 1: longest run of cached full blocks from the start. A missing\n        # block implies every later block misses too (chained hashes).\n        for block_hash in itertools.islice(full_block_hashes, max_length // block_size):\n            cached_block = block_pool.get_cached_block(block_hash, kv_cache_group_ids)\n            if not cached_block:\n                break\n            for computed, cached in zip(computed_blocks, cached_block):\n                computed.append(cached)\n        hit_length = len(computed_blocks[0]) * block_size\n\n        # Phase 2 (fine-grained only): extend into the first non-full block by\n        # probing its interior hash boundaries high-to-low (longest hit first).\n        if fine_grained:\n            # list or lazy BlobBlockHashes view\n            assert isinstance(block_hashes, Sequence)\n            scale_factor = block_size // alignment_tokens\n            first_partial_idx = len(computed_blocks[0]) * scale_factor\n            max_partial_idx = min(\n                first_partial_idx + scale_factor - 1,\n                max_length // alignment_tokens,\n                len(block_hashes),\n            )\n            for fine_idx in range(max_partial_idx - 1, first_partial_idx - 1, -1):\n                cached_tail = block_pool.get_cached_block(\n                    block_hashes[fine_idx], kv_cache_group_ids\n                )\n                if not cached_tail:\n                    continue\n                for computed, cached in zip(computed_blocks, cached_tail):\n                    computed.append(cached)\n                hit_length = (fine_idx + 1) * alignment_tokens\n                break\n\n        # Eagle needs the tokens right before the generation point recomputed:\n        # drop one hash unit when fine-grained (the tail block's KV is\n        # append-only, so it still covers the reduced length), else one cache\n        # block.\n        if drop_eagle_block and hit_length > 0:\n            hit_length -= min(alignment_tokens, block_size)\n        # Round down to the alignment; a no-op when fine-grained (hits land on\n        # hash boundaries by construction) and when alignment_tokens ==\n        # block_size. Then trim blocks past the new tail.\n        hit_length -= hit_length % alignment_tokens\n        num_blocks = cdiv(hit_length, block_size)\n        for computed in computed_blocks:\n            del computed[num_blocks:]\n        return computed_blocks, hit_length"
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L779-L819",
+      "what": "FullAttentionManager.cache_blocks 重载 + _cache_partial_tail_block：block_size>hash_block_size 时把 prompt 尾部最后一个哈希边界注册成部分条目（中间边界故意不登——只登『下一个请求最可能对齐』的 prompt 边界）",
+      "elide": [],
+      "code": "    def cache_blocks(\n        self,\n        request: Request,\n        num_tokens: int,\n        retention_interval: int | None = None,\n    ) -> None:\n        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)\n        hash_block_size = self.block_pool.hash_block_size\n        if self.block_size == hash_block_size:\n            return\n        self._cache_partial_tail_block(request, num_tokens)\n\n    def _cache_partial_tail_block(\n        self,\n        request: Request,\n        num_tokens: int,\n    ) -> None:\n        \"\"\"Cache the prompt tail when it ends inside a cache block.\n\n        Only the final prompt hash boundary is registered as a partial\n        prefix-cache entry; intermediate hash boundaries inside the same cache\n        block are intentionally skipped.\n        \"\"\"\n        hash_block_size = self.block_pool.hash_block_size\n        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size\n        if boundary_tokens == 0 or boundary_tokens > num_tokens:\n            return\n        if boundary_tokens % self.block_size == 0:\n            return\n\n        blocks = self.req_to_blocks[request.request_id]\n        block_idx = boundary_tokens // self.block_size\n        if block_idx >= len(blocks):\n            return\n        self.block_pool.cache_partial_block(\n            request=request,\n            block=blocks[block_idx],\n            num_tokens=boundary_tokens,\n            kv_cache_group_id=self.kv_cache_group_id,\n            block_size=self.block_size,\n        )"
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L1026-L1053",
+      "what": "SWA reachable_block_mask 的稀疏驻留两段：(1) 分段尾（retention_interval 三态：None 稠密/0 无/正数每段一尾）(2) reachable 边界特赦——replay 边界与 junction 的 need 块尾强制置 True，稀疏不掉复用点",
+      "elide": [
+        "L996-L1025 的 need/shift 计算（含 eagle）可概述：need=窗口连续块数（eagle 多 1）。"
+      ],
+      "code": "        # (1) Segment-boundary tails. ``retention_interval``:\n        #   None -> dense (a tail at every ``alignment_tokens`` boundary);\n        #   0    -> no dense tails (only the replay boundary below);\n        #   >0   -> a tail once per ``retention_interval``-sized segment.\n        segment_tokens = (\n            alignment_tokens\n            if retention_interval is None\n            else (None if retention_interval == 0 else retention_interval)\n        )\n        if segment_tokens is not None:\n            per_segment = segment_tokens // block_size\n            if need >= per_segment:\n                # Every block is reachable; cache them all.\n                return None\n            for i in range(start_block, end_block):\n                if i >= shift and (i - shift) % per_segment >= per_segment - need:\n                    mask[i - start_block] = True\n\n        # (2) Reachable-boundary tails: the replay boundary (``num_prompt - 1``,\n        # capped by ``get_computed_blocks``) and any shared-prefix junction. Both\n        # land before segments would cover them under sparse retention, so keep\n        # the ``need``-block tail ending on each boundary explicitly.\n        if retention_interval is not None:\n            for boundary_tokens in reachable_boundaries:\n                aligned = boundary_tokens // alignment_tokens * alignment_tokens\n                end = aligned // block_size + shift\n                for j in range(max(start_block, end - need), min(end_block, end)):\n                    mask[j - start_block] = True"
+    },
+    {
+      "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+      "lines": "L1369-L1412",
+      "what": "Mamba reachable_block_mask（docstring 明写 Marconi-style APC）：同两段——分段状态 + reachable 边界（replay/junction）特赦；Mamba 命中只要边界上那一个状态块",
+      "elide": [
+        "L1385-L1399 (1) 分段计算可概述（per_segment<=1 时全稠密）。"
+      ],
+      "code": "        \"\"\"Sparse Mamba state-snapshot retention.\n\n        ``retention_interval``:\n\n          ``None`` -> dense (cache every block; default, unchanged behavior)\n          ``0``    -> keep only the ``reachable_boundaries`` states\n          ``> 0``  -> keep one state per ``retention_interval``-sized segment\n\n        ``reachable_boundaries`` are proven reuse points (the replay boundary and\n        any cross-request shared-prefix junction, Marconi-style APC); their\n        boundary state is always kept so sparse retention does not defeat reuse.\n        \"\"\"\n        if retention_interval is None or alignment_tokens is None:\n            # Dense caching (default) or no alignment constraint imposed.\n            return None\n        assert isinstance(kv_cache_spec, MambaSpec)\n        block_size = kv_cache_spec.block_size\n        mask = [False] * (end_block - start_block)\n\n        # (1) Segment-boundary states. A Mamba hit needs exactly the single\n        # state block ending on the boundary (no window, and draft models have\n        # no mamba layers, so no eagle shift). Block ``i`` ends at token\n        # ``(i + 1) * block_size``.\n        segment_tokens = None if retention_interval == 0 else retention_interval\n        if segment_tokens is not None:\n            per_segment = segment_tokens // block_size\n            if per_segment <= 1:\n                # Interval at/below the block size: every block is a boundary.\n                return None\n            first_boundary = (\n                start_block + per_segment\n            ) // per_segment * per_segment - 1\n            for i in range(first_boundary - start_block, len(mask), per_segment):\n                mask[i] = True\n\n        # (2) Reachable-boundary states: the replay boundary (``num_prompt - 1``,\n        # capped by ``get_computed_blocks``) and any shared-prefix junction, both\n        # of which segments would otherwise skip under sparse retention. A Mamba\n        # hit needs exactly the single state block ending on the boundary.\n        for boundary_tokens in reachable_boundaries:\n            aligned = boundary_tokens // alignment_tokens * alignment_tokens\n            boundary_block = aligned // block_size - 1\n            if start_block <= boundary_block < end_block:\n                mask[boundary_block - start_block] = True"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_manager.py",
+      "lines": "L229-L295",
+      "what": "get_computed_blocks（对外命中入口）：skip 谓词（关缓存/prompt logprobs/pooling 跳读）→ max_cache_hit_length=num_tokens−1（全命中也须重算最后一 token 拿 logits；块对齐可能回退整块）→ coordinator.find_longest_cache_hit 三元组（块/命中长/junction）→ shared_prefix_boundary = 命中长 + 未缓共享前缀",
+      "elide": [
+        "L266-L284 kv_cache_report_mode='full' 的事件发布可省略（观测旁路）。"
+      ],
+      "code": "    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:\n        \"\"\"Get the computed (cached) blocks for the request.\n        Note that the computed blocks must be full.\n\n        Args:\n            request: The request to get the computed blocks.\n\n        Returns:\n            A tuple containing:\n                - A list of blocks that are computed for the request.\n                - The number of computed tokens.\n                - ``shared_prefix_boundary``: the block-aligned token position of\n                  a shared prefix that a sparse-retention group (Mamba / sliding\n                  window) has not cached yet (Marconi-style APC), or 0 if none.\n                  Pinned so ``VLLM_PREFIX_CACHE_RETENTION_INTERVAL`` does not drop\n                  the junction and defeat cross-request reuse.\n        \"\"\"\n        # We skip finding the prefix cache hit when prefix caching is\n        # disabled or the request is marked as skipping kv cache read\n        # (which happens when the request requires prompt logprobs\n        # or calls a pooling model with all pooling).\n        if not self.prefix_cache_lookup_enabled(request):\n            return self.empty_kv_cache_blocks, 0, 0\n\n        # NOTE: When all tokens hit the cache, we must recompute the last token\n        # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.\n        # This can trigger recomputation of an entire block, rather than just\n        # the single last token, because allocate_slots() requires\n        # num_computed_tokens to be block-size aligned. Removing this limitation\n        # could slightly improve performance in the future.\n        max_cache_hit_length = request.num_tokens - 1\n        computed_blocks, num_new_computed_tokens, num_uncached = (\n            self.coordinator.find_longest_cache_hit(\n                request.block_hashes, max_cache_hit_length\n            )\n        )\n\n        # When kv_cache_report_mode is \"full\", emit BlockStored events\n        # for the reused prefix cache blocks so that external consumers\n        # (e.g. gateway) can learn about them.\n        if (\n            num_new_computed_tokens > 0\n            and self.enable_kv_cache_events\n            and getattr(request, \"kv_cache_report_mode\", \"incremental\") == \"full\"\n        ):\n            for group_idx, group_blocks in enumerate(computed_blocks):\n                num_blocks = len(group_blocks)\n                if num_blocks > 0:\n                    group = self.kv_cache_config.kv_cache_groups[group_idx]\n                    block_size = group.kv_cache_spec.block_size\n                    self.block_pool.emit_cached_block_events(\n                        request,\n                        num_blocks,\n                        block_size,\n                        group_idx,\n                    )\n\n        # The junction to pin is where the lagging sparse-retention group stops\n        # (``num_new_computed_tokens``) plus the uncached shared prefix -- i.e.\n        # the longest single-group hit. Sub-block gaps are left to the mask,\n        # which floors to the alignment boundary (a no-op there).\n        shared_prefix_boundary = (\n            num_new_computed_tokens + num_uncached if num_uncached else 0\n        )\n\n        blocks = self.create_kv_cache_blocks(computed_blocks)\n        return blocks, num_new_computed_tokens, shared_prefix_boundary"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_manager.py",
+      "lines": "L567-L578",
+      "what": "KVCacheManager.free：先放 partial-tail pins（connector 面，ch16），再 coordinator.free → 逐 manager 逆序 free_blocks——注释原话『tail blocks are evicted first』",
+      "elide": [],
+      "code": "    def free(self, request: Request) -> None:\n        \"\"\"Free the blocks allocated for the request.\n        We free the blocks in reverse order so that the tail blocks are evicted\n        first when caching is enabled.\n\n        Args:\n            request: The request to free the blocks.\n        \"\"\"\n        pins = self._partial_tail_pins.pop(request.request_id, None)\n        if pins:\n            self.block_pool.free_blocks(pins)\n        self.coordinator.free(request.request_id)"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_manager.py",
+      "lines": "L831-L846",
+      "what": "take_kv_cache_block_copies：drain 各 manager 的 (source, cow) 对 → 转成 (src_block_id, dst_block_id) 跨进程负载 + retained 两端块（拷完前不许回收）",
+      "elide": [],
+      "code": "    def take_kv_cache_block_copies(\n        self,\n    ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:\n        \"\"\"Drain pending copies and return their retained endpoints.\"\"\"\n        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []\n        for mgr in self.coordinator.single_type_managers:\n            pending_copies.extend(mgr.take_pending_cow_copies())\n        copies = [\n            KVCacheBlockCopy(\n                src_block_id=source_block.block_id,\n                dst_block_id=cow_block.block_id,\n            )\n            for source_block, cow_block in pending_copies\n        ]\n        retained_blocks = [block for pair in pending_copies for block in pair]\n        return copies, retained_blocks"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_coordinator.py",
+      "lines": "L685-L720",
+      "what": "Hybrid find_longest_cache_hit 签名+docstring+setup：不动点迭代（每类型接受或缩短、缩短即重启、单调递减有下界必收敛）；is_simple_hybrid（1 full+1 other）一轮即停",
+      "elide": [],
+      "code": "    def find_longest_cache_hit(\n        self,\n        block_hashes: list[BlockHash],\n        max_cache_hit_length: int,\n    ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:\n        \"\"\"\n        Find the longest cache hit using an iterative fixed-point algorithm.\n\n        Each attention type either accepts the current candidate length or\n        reduces it. If any type reduces the length, restart checks over all\n        types. This converges because length monotonically decreases and is\n        bounded below by 0.\n\n        Args:\n            block_hashes: The block hashes of the request.\n            max_cache_hit_length: The maximum length of the cache hit.\n\n        Returns:\n            A tuple containing:\n                - A tuple of the cache hit blocks for each single type manager.\n                - The number of tokens of the reconciled (combined) cache hit.\n                - ``num_uncached_common_prefix_tokens``: a shared prefix that a\n                  sparse-retention group has not cached yet (0 unless hybrid).\n        \"\"\"\n\n        num_groups = len(self.kv_cache_config.kv_cache_groups)\n        hit_length = max_cache_hit_length\n        longest_hit_length = 0\n        hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups\n        hit_length_by_group: list[int] = [0] * num_groups\n\n        # Simple hybrid (1 full attn + 1 other): one iteration suffices.\n        # Full attn is always first if it exists.\n        is_simple_hybrid = len(self.attention_groups) == 2 and isinstance(\n            self.attention_groups[0].spec, FullAttentionSpec\n        )"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_coordinator.py",
+      "lines": "L727-L796",
+      "what": "不动点主循环：full 组向下封闭（查一次后只 min 裁剪）；其余类型 manager_cls.find_longest_cache_hit 可能缩短长度 → curr<hit 则重开一轮；eagle_verified 集合防同长度重复丢块（可省略）",
+      "elide": [
+        "eagle 分支（L747-L747、L755-L765、L780-L784）属投机解码，可省略——保留主干『接受或缩短→重启』即可。"
+      ],
+      "code": "        while True:\n            curr_hit_length = hit_length\n\n            for idx, (spec, group_ids, manager_cls, use_eagle) in enumerate(\n                self.attention_groups\n            ):\n                first_group_id = group_ids[0]\n                # DCP/PCP shard each block's KV across ranks, so the manager's\n                # effective block size may exceed the spec's.\n                group_block_size = self.single_type_managers[first_group_id].block_size\n                cached_blocks = hit_blocks_by_group[first_group_id]\n                if isinstance(spec, FullAttentionSpec) and cached_blocks is not None:\n                    # Full attention is downward-closed: we only need to look\n                    # up cached blocks once; on subsequent iterations just trim\n                    # to the (reduced) current hit length.\n                    curr_hit_length = min(\n                        curr_hit_length, hit_length_by_group[first_group_id]\n                    )\n                    continue\n\n                drop_eagle_block = use_eagle and idx not in eagle_verified\n\n                _max_length = curr_hit_length\n                # Eagle matches one extra drop unit (one hash unit for\n                # fine-grained managers, else one cache block) and then drops\n                # it, landing back at the candidate length. No margin for\n                # mamba: its finder never drops (draft models have no mamba\n                # layers), so the hit would grow past the candidate.\n                if drop_eagle_block and not isinstance(spec, MambaSpec):\n                    eagle_margin = (\n                        self.hash_block_size\n                        if self.enable_partial_hash_hits\n                        and manager_cls.supports_fine_grained_hash_lookup\n                        and group_block_size > self.hash_block_size\n                        else group_block_size\n                    )\n                    _max_length = min(\n                        curr_hit_length + eagle_margin, max_cache_hit_length\n                    )\n                hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(\n                    block_hashes=block_hashes,\n                    max_length=_max_length,\n                    kv_cache_group_ids=group_ids,\n                    block_pool=self.block_pool,\n                    kv_cache_spec=spec,\n                    drop_eagle_block=drop_eagle_block,\n                    alignment_tokens=self._cache_hit_alignment_tokens,\n                    dcp_world_size=(\n                        self.dcp_world_size\n                        if isinstance(spec, FullAttentionSpec)\n                        else 1\n                    ),\n                )\n                if drop_eagle_block:\n                    eagle_verified.add(idx)\n                elif _new_hit_length < curr_hit_length:\n                    # length shrunk; invalidate previous eagle verifications\n                    eagle_verified.clear()\n                curr_hit_length = _new_hit_length\n                for group_id, blocks in zip(group_ids, hit_blocks):\n                    hit_blocks_by_group[group_id] = blocks\n                    hit_length_by_group[group_id] = _new_hit_length\n\n                longest_hit_length = max(longest_hit_length, curr_hit_length)\n\n            if curr_hit_length >= hit_length:\n                break\n            hit_length = curr_hit_length\n            if is_simple_hybrid:\n                break"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_coordinator.py",
+      "lines": "L798-L817",
+      "what": "收尾：full 组块表裁剪到最终 hit_length → num_uncached_common_prefix_tokens = longest_hit_length − hit_length（有组曾查到更长=各组都认但稀疏组还没缓的共享前缀——Marconi junction 的原料）",
+      "elide": [],
+      "code": "        # Truncate full attention blocks to final hit_length (if present)\n        first_group = self.attention_groups[0]\n        if isinstance(first_group.spec, FullAttentionSpec):\n            group_block_size = self.single_type_managers[\n                first_group.group_ids[0]\n            ].block_size\n            num_blocks = cdiv(hit_length, group_block_size)\n            for group_id in first_group.group_ids:\n                if (blks := hit_blocks_by_group[group_id]) is not None:\n                    del blks[num_blocks:]\n                    hit_length_by_group[group_id] = hit_length\n\n        # Uncached shared prefix detection: if any attn. group cached a longer\n        # prefix than the reconciled hit, it is an uncached common prefix across\n        # requests that a sparse-retention group hasn't cached yet.\n        num_uncached_common_prefix_tokens = longest_hit_length - hit_length\n        cache_hit_blocks = tuple(\n            blocks if blocks is not None else [] for blocks in hit_blocks_by_group\n        )\n        return cache_hit_blocks, hit_length, num_uncached_common_prefix_tokens"
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_coordinator.py",
+      "lines": "L30-L57",
+      "what": "retention 校验：只对 SWA/Mamba 组有意义（无此类组设了直接 raise）；必须非负且整除 scheduler_block_size",
+      "elide": [],
+      "code": "def _validate_prefix_cache_retention_interval(\n    retention_interval: int | None,\n    scheduler_block_size: int,\n    kv_cache_config: KVCacheConfig,\n) -> None:\n    if retention_interval is None:\n        return\n\n    # Retention sparsifies sliding-window and Mamba (linear-attention)\n    # checkpoints; full-attention and chunked-local groups cache densely and\n    # ignore it (their hit granularity must stay fine).\n    if not any(\n        isinstance(g.kv_cache_spec, (SlidingWindowSpec, MambaSpec))\n        for g in kv_cache_config.kv_cache_groups\n    ):\n        raise ValueError(\n            \"VLLM_PREFIX_CACHE_RETENTION_INTERVAL is set but this model has \"\n            \"no sliding-window or Mamba KV cache group, so retention has no \"\n            \"effect. Unset it (it only applies to sliding-window and Mamba \"\n            \"attention).\"\n        )\n\n    if retention_interval < 0 or retention_interval % scheduler_block_size != 0:\n        raise ValueError(\n            f\"VLLM_PREFIX_CACHE_RETENTION_INTERVAL ({retention_interval}) \"\n            \"must be non-negative and a multiple of scheduler_block_size \"\n            f\"({scheduler_block_size}).\"\n        )"
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L744-L766",
+      "what": "准入查命中（waiting 循环）：num_computed_tokens==0 时查本地命中（无 connector 走 get_computed_blocks，顺手写回 shared_prefix_boundary）——被抢占请求重排回来也从这再进（F2）",
+      "elide": [
+        "L749-L759 connector 分支（get_computed_blocks_for_connector）归 ch16，标注即可。"
+      ],
+      "code": "                # Get already-cached tokens.\n                if request.num_computed_tokens == 0:\n                    did_prefix_cache_lookup = True\n                    hit_diverged = False\n                    # Get locally-cached tokens.\n                    if self.connector is not None:\n                        # A KV connector transfers the missing suffix, which needs a\n                        # hybrid-aware lookup that can diverge across groups.\n                        (\n                            new_computed_blocks,\n                            num_new_local_computed_tokens,\n                            request.shared_prefix_boundary,\n                            hit_diverged,\n                        ) = self.kv_cache_manager.get_computed_blocks_for_connector(\n                            request\n                        )\n                    else:\n                        (\n                            new_computed_blocks,\n                            num_new_local_computed_tokens,\n                            # Marconi shared-prefix junction to pin; 0 if none.\n                            request.shared_prefix_boundary,\n                        ) = self.kv_cache_manager.get_computed_blocks(request)"
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L424-L437",
+      "what": "_mamba_block_aligned_split 的强制停点：partial-tail 哈希边界 + Marconi junction（块对齐下取整）——chunk 停在 junction 上，该边界状态才真被算出来并缓存，钉住才有着落",
+      "elide": [],
+      "code": "            # registered by a chunk ending exactly at its last hash boundary.\n            tail_boundary\n            if last_cache_position < tail_boundary < request.num_prompt_tokens\n            else 0,\n            # Marconi shared-prefix junction, block-floored (a sub-block\n            # junction's state is not separately cacheable): cache its state\n            # so sibling requests sharing the prefix can reuse it.\n            start + (request.shared_prefix_boundary - start) // block_size * block_size\n            if start < request.shared_prefix_boundary < end\n            else 0,\n        )\n        # Stop at the earliest mandatory position strictly inside the chunk.\n        end = min((s for s in stops if start < s < end), default=end)\n        return max(end - start, 0)"
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1181-L1190",
+      "what": "CoW 拷贝过线：take_kv_cache_block_copies → SchedulerOutput.kv_cache_block_copies；retained 块的释放挂步序栅栏（拷贝与本拍执行同飞、完成即放）",
+      "elide": [],
+      "code": "        kv_cache_block_copies, cow_retained_blocks = (\n            self.kv_cache_manager.take_kv_cache_block_copies()\n        )\n        if kv_cache_block_copies:\n            # The copies run with this step's execution; the first non-empty\n            # step at or after it gets seq `sched_step_seq + 1` (0-token steps\n            # do not advance the seq), and its completion implies the copies\n            # have run.\n            self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)\n        pending_kv_cache_block_copies = kv_cache_block_copies or None"
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1274-L1315",
+      "what": "_preempt_request（F2 起点）：free 全部块【哈希保留】+ num_computed_tokens=0 + PREEMPTED + num_preemptions+1 + 回 waiting 队头——前缀留在哈希表与自由队列里等重排",
+      "elide": [
+        "drop_stale_output/stale 协议细节归 ch11，本章只取『free 不清哈希』这一条事实。"
+      ],
+      "code": "    def _preempt_request(\n        self, request: Request, timestamp: float, drop_stale_output: bool = False\n    ) -> None:\n        \"\"\"Preempt a request and put it back to the waiting queue.\n\n        NOTE: The request should be popped from the running queue outside of this\n        method.\n\n        drop_stale_output: drop (rather than deliver) any in-flight output; used\n        by reset_prefix_cache, whose same-step resume would otherwise deliver\n        tokens out of order, and for connectors with a pending KV hand-off,\n        which the preemption's block free would leave without valid KV.\n        \"\"\"\n        assert request.status == RequestStatus.RUNNING, (\n            \"Only running requests can be preempted\"\n        )\n        self._free_request_blocks(request)\n        self.encoder_cache_manager.free(request)\n        self._inflight_prefills.discard(request)\n        request.status = RequestStatus.PREEMPTED\n        request.num_computed_tokens = 0\n        if request.spec_token_ids:\n            request.spec_token_ids = []\n        # Async scheduling: mark all in-flight output as stale. Its tokens are\n        # still delivered on return (dropping them would perturb spec-decode\n        # acceptance) but must not mutate the reset counters; each step drains\n        # its share in update_from_output. num_in_flight_tokens already\n        # includes any undrained stale share, so assign rather than accumulate.\n        # An undrained drop-mode share stays dropped: its positions have\n        # already been resampled.\n        request.drop_stale_output = drop_stale_output or (\n            request.drop_stale_output and request.num_stale_output_tokens > 0\n        )\n        request.num_stale_output_tokens = request.num_in_flight_tokens\n        request.num_output_placeholders = 0\n        request.num_preemptions += 1\n        if self.log_stats:\n            request.record_event(EngineCoreEventType.PREEMPTED, timestamp)\n\n        # Put the request back to the waiting queue.\n        self.waiting.prepend_request(request)\n        self.reset_preempted_req_ids.add(request.request_id)"
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L2356-L2365",
+      "what": "_free_cow_retained_blocks：CoW 两端引用的延迟释放——拷贝所在步未处理完先进 deferred_frees（倒序入队），fence 过了才真 free",
+      "elide": [],
+      "code": "    def _free_cow_retained_blocks(\n        self, blocks: list[KVCacheBlock], fence_seq: int\n    ) -> None:\n        \"\"\"Release CoW copy retentions, deferring their return to the block\n        pool while the step that runs the copy may still be in flight.\n        \"\"\"\n        if not self.defer_block_free or fence_seq <= self.processed_step_seq:\n            self.kv_cache_manager.block_pool.free_blocks(blocks)\n            return\n        self.deferred_frees.append((fence_seq, blocks[::-1]))"
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L1219-L1228",
+      "what": "worker 侧两件副作用：新块清零（防陈旧 NaN）+ copy_kv_cache_blocks_inplace 在 GPU 上执行 CoW 块拷贝——调度器只给 (src,dst) 块号对，真拷贝在 worker",
+      "elide": [],
+      "code": "        # Zero GPU memory for freshly allocated cache blocks to prevent\n        # stale NaN/data from corrupting attention or SSM computation.\n        if scheduler_output.new_block_ids_to_zero:\n            self._zero_block_ids(scheduler_output.new_block_ids_to_zero)\n        if scheduler_output.kv_cache_block_copies:\n            copy_kv_cache_blocks_inplace(\n                self.kv_caches,\n                self.kv_cache_config.num_blocks,\n                scheduler_output.kv_cache_block_copies,\n            )"
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L220-L229",
+      "what": "装配开关：enable_prefix_caching（默认 True）或装了 connector 才建 request_block_hasher + init_none_hash 种子——关缓存则请求侧根本不算哈希",
+      "elide": [],
+      "code": "        self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None\n        if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:\n            caching_hash_fn = get_hash_fn_by_name(\n                vllm_config.cache_config.prefix_caching_hash_algo\n            )\n            init_none_hash(caching_hash_fn)\n\n            self.request_block_hasher = get_request_block_hasher(\n                hash_block_size, caching_hash_fn\n            )"
+    },
+    {
+      "path": "vllm/config/cache.py",
+      "lines": "L56-L67",
+      "what": "prefix_match_unit 配置：前缀命中可落的最细 token 边界（如 32 vs 1024-token 混合模型块）；只控匹配粒度不控存储频率；= 代码里贯穿的 hash_block_size",
+      "elide": [],
+      "code": "    prefix_match_unit: int | None = Field(default=None, gt=0)\n    \"\"\"The finest token boundary (in tokens) a prefix-cache hit can land on.\n\n    Prefix-cache keys are computed every `prefix_match_unit` tokens. It can\n    be set finer than the physical KV cache block sizes (e.g. 32 vs a\n    1024-token hybrid-model block) as long as every KV cache group's\n    `block_size` is divisible by it, enabling cache hits at boundaries\n    inside a physical block. It controls matching granularity only, not how\n    often states are stored.\n\n    This equals to the `hash_block_size` used throughout the KV cache code.\n    \"\"\""
+    }
+  ],
+  "theory": [
+    "命中长度推导：prompt 共 P token、块大小 B（单组 hash_block_size=B），有 ⌊P/B⌋ 个满块哈希。find_longest_cache_hit 沿链查到第一个 miss 即停，命中 k 块 ⇒ 复用 k·B 个 token 的 KV、num_new_computed_tokens=k·B，本步只需 prefill P−k·B token。全命中时 max_cache_hit_length=P−1 强制退一 token（要 logits）；又因 num_computed_tokens 须块对齐，实际可能回退整块（kv_cache_manager.py:L253-L258 注释自认此损失）。",
+    "链式哈希的『断一处即停』正确性（Merkle 性质）：hash_i 递归依赖 hash_{i-1} ⇒ hash_i 是前 i+1 块全部内容的指纹。两请求前缀一致 ⇔ 沿链哈希逐一相等；反之若 hash_i 未命中（表里没有该键），则对任何 j>i，hash_j 也必不一致（hash_j 含 hash_i 的依赖）——所以 miss 后无需回溯、链上扫描一断即停是正确的，不是启发式。",
+    "LRU 双不变量的正确性：不变量一（逆序 free）——同一请求释放的块链中，位置 i 的块可被复用当且仅当来者的前缀 ≥ (i+1)·B；链尾块（i 最大）对应最长前缀要求、潜在复用者最少，应最先驱逐；逆序 append_n 恰好把它排在队头附近。不变量二（劈分）——block_hash is None 的块从未入表、永不可能是命中，让它们插队到队头驱逐不损失任何命中率、只回收死容量。两条都是『顺序即策略』：无断言保护，靠 free 路径的调用约定维持。",
+    "F2 量化：被抢占请求已算 C token。抢占 free 后这些满块带哈希回自由队列（LRU 尾）；重排回 waiting 重走 get_computed_blocks 命中 min(⌊C/B⌋·B, 仍在表的块) token——重算成本退化为命中长度之外的部分 + 重挂账本的 O(命中块数) touch。最坏：被抢占期间池紧、块被 get_new_blocks 取走复用（惰性驱逐摘了哈希）→ 全量重 prefill。『重算』的下界=一个 token（全命中），上界=完整 prefill。",
+    "CoW 的账：部分命中省下的计算 = 共享块内已缓存部分的重 prefill 算力；付出的 = +1 块显存（cow 目标）+ 一次 GPU 块拷贝带宽 + 三套簿记。当共享前缀以块内边界结束且请求还要继续写时，不 CoW 就得整块重算或写坏别人的缓存——copy 一块（显存带宽级）远便宜于重算一块（矩阵乘级）。",
+    "部分命中粒度：hash_block_size=h、block_size=B（B=m·h）。满块链 phase 1 给出 k 个整块命中；phase 2 在第 k+1 块内自高向低探 ≤m−1 个块内边界（block_hashes[k·m .. (k+1)·m−1]），命中即 hit_length=(fine_idx+1)·h。探测顺序自高向低=先试最长。粗块哈希重串零成本：链尾即前缀指纹（BlockHashListWithBlockSize docstring 图例：16 粒度第 2 个哈希直接当 32 粒度哈希用）。",
+    "不动点复杂度：候选长度 L 单调不增、取值在 {0, lcm, 2·lcm, ...} 有限集 ⇒ 至多 max_cache_hit_length/lcm_block_size 轮；full 组只查一次（下封闭）；simple hybrid 一轮。实践中常见混合（full+SWA 或 full+Mamba）一轮即收敛，退化为两次单类型扫描。",
+    "radix 对比账（教学素材，非源码断言）：链式哈希+平面 dict 的查找=O(命中块数) 次 dict 命中、零节点对象分配（KVCacheBlock slots + 侵入式链表）；radix 树查找=O(深度) 指针跳转+节点分配/合并 GC 压力、块对齐需树上额外维护。v1 选前者的判据=调度循环 CPU 时间是主战场（deepread why_chains[2]）。"
+  ],
+  "mechanisms": [
+    {
+      "id": "m1",
+      "name": "链式哈希：hash_i = H(parent_hash, 本块 tokens, extra_keys)——请求侧增量计算、只算新满块；NONE_HASH 随机种子（PYTHONHASHSEED 可共享）；块哈希=整条前缀的指纹",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L596-L623",
+        "vllm/v1/core/kv_cache_utils.py:L691-L748",
+        "vllm/v1/request.py:L249-L265",
+        "vllm/v1/core/kv_cache_utils.py:L87-L114"
+      ]
+    },
+    {
+      "id": "m2",
+      "name": "非 radix 的平面哈希表 BlockHashToBlockMap：{hash+group_id(bytes) → block | {block_id: block}}；故意不去重（保块表 append-only，NOTE #1）、union 省 GC（NOTE #2）——radix 迷思澄清（v0=hash+Evictor、SGLang=radix、v1 day one 链式哈希，全仓 v1 core grep radix 零命中）",
+      "kind": "layout",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/core/block_pool.py:L33-L54",
+        "vllm/v1/core/block_pool.py:L88-L140",
+        "vllm/v1/core/kv_cache_utils.py:L57-L66"
+      ]
+    },
+    {
+      "id": "m3",
+      "name": "extra keys 语义隔离：mm_hash/lora_name/cache_salt(仅首块)/prompt_embeds 四源拌进哈希——同 token 不同语义（不同 LoRA/MM 特征/盐）必不同哈希，防跨请求污染命中",
+      "kind": "algorithm",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L430-L447",
+        "vllm/v1/core/kv_cache_utils.py:L558-L593"
+      ]
+    },
+    {
+      "id": "m4",
+      "name": "命中查找主路径 find_longest_cache_hit phase 1：沿满块哈希链逐块 get_cached_block、第一个 miss 即停（链式保证 miss 后必 miss、无需回溯）；get_computed_blocks 的 max_cache_hit_length=num_tokens−1（全命中退一 token 拿 logits）",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/single_type_kv_cache_manager.py:L682-L739",
+        "vllm/v1/core/kv_cache_manager.py:L229-L295",
+        "vllm/v1/core/sched/scheduler.py:L744-L766",
+        "vllm/v1/core/block_pool.py:L198-L223"
+      ]
+    },
+    {
+      "id": "m5",
+      "name": "touch 救回与共享挂账 add_local_computed_blocks：命中块 ref_cnt+1、ref_cnt==0 时 O(1) remove 出 free queue——多请求共享同一物理块的引用计数基础；skip 段 null 填充",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/block_pool.py:L702-L717",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L232-L289"
+      ]
+    },
+    {
+      "id": "m6",
+      "name": "满块写回 cache_full_blocks：新满块 set_block_hash+insert 进 map；block_mask 控哪些块入表（永不能服务命中的块不占表）；partial→full 晋升摘旧条目插新条目",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/block_pool.py:L225-L342",
+        "vllm/v1/core/block_pool.py:L607-L627",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L427-L477"
+      ]
+    },
+    {
+      "id": "m7",
+      "name": "LRU 双不变量一·逆序 free：manager.free 把块逆序传入 free_blocks——同请求尾块（更长前缀、潜在复用者更少）先挂回、排更靠驱逐端；次序规则写在 FreeKVCacheBlockQueue 类文档且明言『在类外维持』",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/single_type_kv_cache_manager.py:L519-L527",
+        "vllm/v1/core/kv_cache_manager.py:L567-L578",
+        "vllm/v1/core/kv_cache_utils.py:L184-L204"
+      ]
+    },
+    {
+      "id": "m8",
+      "name": "LRU 双不变量二·free_blocks 劈分：无哈希块（never match APC）prepend_n 到队头先驱逐、有哈希块 append_n 到 LRU 尾（#42656）；缓存关闭跳过劈分保 GPU 局部性（#48017）——无断言保护、靠调用约定维持",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/block_pool.py:L719-L742",
+        "vllm/v1/core/kv_cache_utils.py:L349-L368"
+      ]
+    },
+    {
+      "id": "m9",
+      "name": "惰性驱逐与别名清理：块被 get_new_blocks 复用时才 _maybe_evict_cached_block 摘哈希（驱逐不发生在 free 时）；_remove_cached_block_hashes 靠 cached_block_hashes_by_block 反向索引把部分条目别名一次摘干净",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/block_pool.py:L647-L700",
+        "vllm/v1/core/block_pool.py:L571-L590"
+      ]
+    },
+    {
+      "id": "m10",
+      "name": "move_block_hashes：CoW 后把 src 块全部前缀缓存条目重指到 dst 私有拷贝——条目活着不摘，请求块表 append-only 由它兜住",
+      "kind": "algorithm",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/block_pool.py:L629-L645"
+      ]
+    },
+    {
+      "id": "m11",
+      "name": "F2 回收·抢占恢复撞前缀缓存：free 不清哈希 → 被抢占请求重排回 waiting 重走准入查询 → get_computed_blocks 重命中自己的前缀 → touch 救回——『重算』变『重载元数据+补算』；最坏（块被惰性驱逐取走复用）退化为全量重 prefill",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L1274-L1315",
+        "vllm/v1/core/sched/scheduler.py:L744-L766",
+        "vllm/v1/core/block_pool.py:L719-L742",
+        "vllm/v1/core/block_pool.py:L702-L717"
+      ]
+    },
+    {
+      "id": "m12",
+      "name": "哈希粒度分离与惰性重串：hash_block_size（=prefix_match_unit 或 GCD，ch14 定）可小于 block_size；BlockHashListWithBlockSize 把细粒度哈希零成本视图成粗块哈希（链尾即前缀指纹）；resolve_block_hashes 细粒度查找时保留原始列表",
+      "kind": "layout",
+      "difficulty": "supporting",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L2245-L2314",
+        "vllm/v1/core/kv_cache_utils.py:L2321-L2351",
+        "vllm/config/cache.py:L56-L67"
+      ]
+    },
+    {
+      "id": "m13",
+      "name": "块内 CoW 部分命中三件套：cache_partial_block 在块内边界注册细粒度条目（不分配新块、块记 _block_hash_num_tokens）+ find phase 2 第一个不满块内自高向低探测 + 命中后共享尾块换私有 cow 块（_partial_hit_reqs → allocate_new_blocks 预留块 → _apply_cow 登记拷贝对）；enable_partial_hash_hits 只限 full+mamba-align 无 CP",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/block_pool.py:L445-L544",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L741-L762",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L347-L357",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L405-L425",
+        "vllm/v1/core/kv_cache_coordinator.py:L581-L599"
+      ]
+    },
+    {
+      "id": "m14",
+      "name": "CoW 拷贝跨进程管线：take_kv_cache_block_copies drain (source,cow) 对 → SchedulerOutput.kv_cache_block_copies → worker copy_kv_cache_blocks_inplace GPU 执行；两端块引用保留到拷贝跑完（_free_cow_retained_blocks 步序栅栏 + deferred_frees 倒序）",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_manager.py:L831-L846",
+        "vllm/v1/core/sched/scheduler.py:L1181-L1190",
+        "vllm/v1/core/sched/scheduler.py:L2356-L2365",
+        "vllm/v1/worker/gpu_model_runner.py:L1223-L1228"
+      ]
+    },
+    {
+      "id": "m15",
+      "name": "混合不动点最长命中：每注意力类型对候选长度『接受或缩短』、任一缩短重启全类型校验、单调递减有下界必收敛；full 排首且向下封闭（查一次后只 min 裁剪）；simple hybrid 一轮早停；SWA finder 右到左找窗口连续段（[NULL,NULL,8,3]）、Mamba finder 只要边界状态块",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_coordinator.py:L685-L817",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L897-L994",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L1280-L1358",
+        "vllm/v1/core/kv_cache_coordinator.py:L601-L650"
+      ]
+    },
+    {
+      "id": "m16",
+      "name": "Marconi 钉住 shared_prefix_boundary：不动点产出 num_uncached_common_prefix_tokens=longest−reconciled（各组都认但稀疏组还没缓的共享前缀）→ get_computed_blocks 折进 boundary 写回 Request → cache_blocks 的 reachable_boundaries 把 replay 边界与 junction 尾强制置 True（SWA/Mamba mask 特赦段）→ 调度器 _mamba_block_aligned_split 把 chunk 停在 junction 让状态真被算出来",
+      "kind": "protocol",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_coordinator.py:L810-L817",
+        "vllm/v1/core/kv_cache_manager.py:L286-L295",
+        "vllm/v1/request.py:L190-L193",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L452-L466",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L1044-L1053",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L1404-L1412",
+        "vllm/v1/core/sched/scheduler.py:L424-L437"
+      ]
+    },
+    {
+      "id": "m17",
+      "name": "稀疏驻留 retention interval：VLLM_PREFIX_CACHE_RETENTION_INTERVAL 三态（None=稠密 / 0=只留 replay 边界 / 正数=每段一条）；只对 SWA/Mamba 组生效（无此类组设了 raise）、必须整除 scheduler_block_size——省显存与命中率的显式交易旋钮",
+      "kind": "config",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_coordinator.py:L30-L57",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L1026-L1053",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L1369-L1412"
+      ]
+    },
+    {
+      "id": "m18",
+      "name": "开关面：enable_prefix_caching 默认 True（关=不装 hasher、NoPrefixCache 协调器命中恒 0、free_blocks 跳过劈分保局部性）；请求级 skip_reading_prefix_cache（prompt logprobs/pooling 跳读）；hash 算法 prefix_caching_hash_algo（默认 sha256）",
+      "kind": "config",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/config/cache.py:L93-L110",
+        "vllm/v1/engine/core.py:L220-L229",
+        "vllm/v1/core/kv_cache_coordinator.py:L385-L432",
+        "vllm/v1/request.py:L291-L302",
+        "vllm/v1/core/kv_cache_manager.py:L214-L227"
+      ]
+    },
+    {
+      "id": "m19",
+      "name": "PrefixCacheStats 观测面：准入时 record（num_tokens/num_hits/preempted 旗标；跳过查询的请求不计数），make_prefix_cache_stats 取走清零——命中率的官方口径",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_manager.py:L202-L227",
+        "vllm/v1/core/sched/scheduler.py:L1017-L1021"
+      ]
+    },
+    {
+      "id": "m20",
+      "name": "reset_prefix_cache（RLHF 权重更新失效面）：要求全部块空闲才清（否则 warning 拒绝）、重建空 map + 全块 reset_hash——权重变了缓存必须整体作废",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/core/block_pool.py:L763-L797",
+        "vllm/v1/core/kv_cache_manager.py:L627-L642"
+      ]
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "KV cache events 全套（enable_kv_cache_events、kv_event_queue、BlockStored/BlockRemoved/AllBlocksCleared、_build_block_stored_event、emit_cached_block_events、maybe_convert_block_hash 的调用点、take_events、cache_full_blocks/cache_partial_block 内事件段、get_computed_blocks 内 kv_cache_report_mode='full' 发布段）",
+        "why_safe": "纯观测旁路（供网关/外部订阅），默认 False；删除不改分配/命中/驱逐控制流。v2 ch15/ch16 已删同款。"
+      },
+      {
+        "what": "metrics_collector / KVCacheMetricsCollector 全部调用与构造参数（on_block_allocated/evicted/accessed、kv_cache_metrics.py 的 1% 采样）",
+        "why_safe": "纯统计旁路，删除后行为不变。"
+      },
+      {
+        "what": "eagle/投机解码分支（drop_eagle_block、use_eagle、eagle_group_ids、eagle_verified 集合、find 的丢尾与 eagle_margin、mask 的 shift=1、Hybrid cache_blocks 的 eagle lookahead 一块）",
+        "why_safe": "投机解码草稿头专用；非投机路径恒 False/空集，分支不触发。保留签名参数默认值即可。"
+      },
+      {
+        "what": "DCP/PCP 乘子（dcp_world_size/pcp_world_size 及 find/block_size 的 ×dcp 分支）",
+        "why_safe": "上下文并行扩展；单卡均为 1，分支不触发。"
+      },
+      {
+        "what": "connector 相关面（get_computed_blocks_for_connector、find_longest_cache_hit_per_group、allocate_external_computed_blocks 的外部段、_pending_partial_tail_offloads、take_partial_tail_offloads、_partial_tail_pins、evict_blocks、delay_cache_blocks 早退分支、scheduler.py:L769-L825 的外部命中/仲裁段）",
+        "why_safe": "KVConnector/P-D 归 ch16；本地前缀缓存主流程不经过这些面。保留 delay_cache_blocks 参数占位即可。"
+      },
+      {
+        "what": "MambaManager 的 align 分配内部（find 的 fine 分支可保留概念壳、_allocated_block_reqs/cached_blocks_this_step/num_speculative_blocks、get_num_blocks_to_allocate/allocate_new_blocks 重写、pop_blocks_for_free 重写、_cache_partial_tail_block 的 mamba 版）与 partial-tail offload 记账",
+        "why_safe": "本章聚焦 full-attention 主路径 + Marconi 钉住面（reachable_block_mask 保留）；Mamba 状态块语义自成体系，保留类壳与 spec_manager_map 条目即可。"
+      },
+      {
+        "what": "RSWAManager / ChunkedLocalAttentionManager / CrossAttentionManager / SinkFullAttentionManager 及其 spec_manager_map 条目的内部实现（保留条目壳）",
+        "why_safe": "特化注意力类型；主路径不触发，保留注册表完整性即可。"
+      },
+      {
+        "what": "prompt_embeds extra keys（_gen_prompt_embeds_extra_hash_keys、_prompt_embeds_per_block_hashes）",
+        "why_safe": "prompt embeds 输入专用；常规 token 请求不触发，保留 mm/lora/cache_salt 三源已够讲语义隔离。"
+      },
+      {
+        "what": "调试/测试辅助（KVCacheBlock.__repr__、FreeKVCacheBlockQueue.get_all_free_blocks、iter_blocks_after）",
+        "why_safe": "仅调试与测试遍历用，非控制流。"
+      },
+      {
+        "what": "log_stats/PrefixCacheStats 记录（record_prefix_cache_stats/make_prefix_cache_stats、scheduler.py:L1015-L1020 的 record 调用）",
+        "why_safe": "纯统计；机制概念在正文讲清即可，精简版可留空实现。"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "hash_block_tokens",
+        "why": "链式哈希本体（m1）——本章第一主角，parent 链式结构必须逐行可读。"
+      },
+      {
+        "symbol": "request_block_hasher",
+        "why": "请求侧增量 hasher：只算新满块、链式推进、extra_keys 逐块问询。"
+      },
+      {
+        "symbol": "NONE_HASH",
+        "why": "首块种子（随机 32 字节/PYTHONHASHSEED）——链的起点。"
+      },
+      {
+        "symbol": "block_hashes",
+        "why": "Request 上的哈希账本，命中查找的输入。"
+      },
+      {
+        "symbol": "update_block_hashes",
+        "why": "增量时机（构造尾+每次 append）——『哈希随 token 到达』的落点。"
+      },
+      {
+        "symbol": "need_extra_keys",
+        "why": "extra keys 谓词（mm/lora/salt 三条件）。"
+      },
+      {
+        "symbol": "generate_block_hash_extra_keys",
+        "why": "四源组装；cache_salt 仅首块（start_token_idx==0）的细节在此。"
+      },
+      {
+        "symbol": "make_block_hash_with_group_id",
+        "why": "哈希+group_id 打包 bytes 键——平面表的键构造。"
+      },
+      {
+        "symbol": "BlockHashToBlockMap",
+        "why": "平面哈希表本体；NOTE #1 不去重/NOTE #2 union 是 must 讲设计。"
+      },
+      {
+        "symbol": "get_one_block",
+        "why": "命中查询原语（任取一块）。"
+      },
+      {
+        "symbol": "get_cached_block",
+        "why": "逐 group 查、任一 miss 整体 miss 的入口。"
+      },
+      {
+        "symbol": "insert",
+        "why": "登记原语（单块→dict 的退化路径）。"
+      },
+      {
+        "symbol": "cached_block_hashes_by_block",
+        "why": "部分条目反向索引——别名清理的钥匙。"
+      },
+      {
+        "symbol": "cache_full_blocks",
+        "why": "满块写回主干（含 block_mask 与晋升段）。"
+      },
+      {
+        "symbol": "cache_partial_block",
+        "why": "块内细粒度条目注册（m13 第一件）。"
+      },
+      {
+        "symbol": "_block_hash_num_tokens",
+        "why": "部分条目覆盖 token 数——KVCacheBlock 上新增字段，条目语义核心。"
+      },
+      {
+        "symbol": "set_block_hash",
+        "why": "带 num_tokens 的哈希落块原语。"
+      },
+      {
+        "symbol": "reset_hash",
+        "why": "驱逐/重置清哈希原语。"
+      },
+      {
+        "symbol": "_insert_block_hash",
+        "why": "主哈希 vs 反向索引的双向维护。"
+      },
+      {
+        "symbol": "_remove_cached_block_hashes",
+        "why": "摘全部别名（主+反向索引）——防悬空键。"
+      },
+      {
+        "symbol": "move_block_hashes",
+        "why": "CoW 后哈希重指——块表 append-only 的兜底（m10）。"
+      },
+      {
+        "symbol": "touch",
+        "why": "命中救回（ref_cnt+1 出队）——m5 核心，F2 的第四步。"
+      },
+      {
+        "symbol": "free_blocks",
+        "why": "劈分挂回（LRU 不变量二）——m8 核心。"
+      },
+      {
+        "symbol": "blocks_with_hash",
+        "why": "劈分的两半之一（局部变量名也要保留可读）。"
+      },
+      {
+        "symbol": "blocks_without_hash",
+        "why": "劈分的另一半（先驱逐端）。"
+      },
+      {
+        "symbol": "prepend_n",
+        "why": "插队头原语——不变量二的执行器。"
+      },
+      {
+        "symbol": "append_n",
+        "why": "挂队尾原语（LRU 端）。"
+      },
+      {
+        "symbol": "get_new_blocks",
+        "why": "池紧取块+惰性驱逐（m9）。"
+      },
+      {
+        "symbol": "_maybe_evict_cached_block",
+        "why": "复用才摘哈希——惰性驱逐本体。"
+      },
+      {
+        "symbol": "find_longest_cache_hit",
+        "why": "命中查找主算法（phase 1/phase 2）——全章核心；Hybrid 不动点版本同名方法也在 must_keep 范围。"
+      },
+      {
+        "symbol": "fine_grained",
+        "why": "phase 2 的判定旗标（alignment<block_size 且整除）。"
+      },
+      {
+        "symbol": "hit_length",
+        "why": "命中长度的贯穿变量。"
+      },
+      {
+        "symbol": "resolve_block_hashes",
+        "why": "哈希视图按块尺寸解析（细粒度保留/粗粒度包装）。"
+      },
+      {
+        "symbol": "BlockHashListWithBlockSize",
+        "why": "惰性重串视图——『链尾即前缀指纹』的实现。"
+      },
+      {
+        "symbol": "add_local_computed_blocks",
+        "why": "挂命中块三步（touch/null 填充/extend）+部分命中记账。"
+      },
+      {
+        "symbol": "_partial_hit_reqs",
+        "why": "部分命中账（CoW 的触发器）。"
+      },
+      {
+        "symbol": "_has_partial_local_hit",
+        "why": "部分命中判定（命中长不对齐块界）。"
+      },
+      {
+        "symbol": "allocate_new_blocks",
+        "why": "CoW 换尾 + 正常补块。"
+      },
+      {
+        "symbol": "_apply_cow",
+        "why": "共享尾块原地换私有块、登记拷贝对、+1 引用。"
+      },
+      {
+        "symbol": "_pending_cow_copies",
+        "why": "拷贝对账本（跨进程管线的源）。"
+      },
+      {
+        "symbol": "take_pending_cow_copies",
+        "why": "drain 拷贝对。"
+      },
+      {
+        "symbol": "take_kv_cache_block_copies",
+        "why": "manager 层 drain → KVCacheBlockCopy + retained。"
+      },
+      {
+        "symbol": "cache_blocks",
+        "why": "写回入口：reachable_boundaries 组装 + mask + 委托。"
+      },
+      {
+        "symbol": "reachable_block_mask",
+        "why": "入表掩码（基类稠密 / SWA、Mamba 稀疏+特赦）。"
+      },
+      {
+        "symbol": "reachable_boundaries",
+        "why": "replay 边界 + junction——Marconi 钉住的载体。"
+      },
+      {
+        "symbol": "_cache_partial_tail_block",
+        "why": "prompt 尾部分条目（只登最后一个哈希边界）。"
+      },
+      {
+        "symbol": "free",
+        "why": "manager 逆序 free 与 KVCacheManager.free（注释原话『tail blocks are evicted first』）。"
+      },
+      {
+        "symbol": "pop_blocks_for_free",
+        "why": "先摘账后还块的分离（延迟释放面用）。"
+      },
+      {
+        "symbol": "num_cached_block",
+        "why": "请求→已缓存满块数（防重复入表；部分命中时压回）。"
+      },
+      {
+        "symbol": "req_to_blocks",
+        "why": "请求块表（ch13 已立，本章挂命中/CoW 都在它上面操作）。"
+      },
+      {
+        "symbol": "get_computed_blocks",
+        "why": "对外命中入口：skip 谓词/max_cache_hit_length/三元组。"
+      },
+      {
+        "symbol": "max_cache_hit_length",
+        "why": "num_tokens−1 的全命中退一 token——注释级细节必须可讲。"
+      },
+      {
+        "symbol": "shared_prefix_boundary",
+        "why": "Marconi junction 字段（request.py:L190-L193）。"
+      },
+      {
+        "symbol": "num_uncached_common_prefix_tokens",
+        "why": "junction 原料（longest−reconciled）。"
+      },
+      {
+        "symbol": "UnitaryKVCacheCoordinator",
+        "why": "单组协调器（主路径委托点）。"
+      },
+      {
+        "symbol": "HybridKVCacheCoordinator",
+        "why": "混合协调器（不动点宿主）。"
+      },
+      {
+        "symbol": "KVCacheCoordinatorNoPrefixCache",
+        "why": "关缓存三态之一（命中恒 0）。"
+      },
+      {
+        "symbol": "attention_groups",
+        "why": "分桶结果（full 排首的载体）。"
+      },
+      {
+        "symbol": "is_simple_hybrid",
+        "why": "一轮早停优化——复杂度论述落点。"
+      },
+      {
+        "symbol": "enable_partial_hash_hits",
+        "why": "细粒度命中的装配前提（full+mamba-align 无 CP）。"
+      },
+      {
+        "symbol": "_cache_hit_alignment_tokens",
+        "why": "对齐粒度选择（细粒度 hash_bs / 粗粒度 scheduler_bs）。"
+      },
+      {
+        "symbol": "retention_interval",
+        "why": "稀疏驻留旋钮（coordinator 构造读 env）。"
+      },
+      {
+        "symbol": "_validate_prefix_cache_retention_interval",
+        "why": "三态校验（非负/整除/只对 SWA-Mamba）。"
+      },
+      {
+        "symbol": "prefix_match_unit",
+        "why": "配置面（=hash_block_size）。"
+      },
+      {
+        "symbol": "hash_block_size",
+        "why": "贯穿全章的粒度参数（BlockPool/resolve/探测上界都用它）。"
+      },
+      {
+        "symbol": "enable_prefix_caching",
+        "why": "总开关（默认 True）。"
+      },
+      {
+        "symbol": "skip_reading_prefix_cache",
+        "why": "请求级跳读（prompt logprobs/pooling）。"
+      },
+      {
+        "symbol": "_preempt_request",
+        "why": "F2 起点（free 不清哈希那一步在调度器侧的入口）。"
+      },
+      {
+        "symbol": "_mamba_block_aligned_split",
+        "why": "junction 停点（chunk 停在边界状态才可缓存）。"
+      },
+      {
+        "symbol": "copy_kv_cache_blocks_inplace",
+        "why": "worker 侧 CoW 执行（跨进程管线终点）。"
+      },
+      {
+        "symbol": "kv_cache_block_copies",
+        "why": "跨进程拷贝负载字段。"
+      },
+      {
+        "symbol": "_free_cow_retained_blocks",
+        "why": "CoW retained 步序栅栏。"
+      },
+      {
+        "symbol": "reset_prefix_cache",
+        "why": "RLHF 权重更新失效面（m20）。"
+      },
+      {
+        "symbol": "PrefixCacheStats",
+        "why": "命中率观测口径（record 的 num_hits/preempted）。"
+      }
+    ]
+  },
+  "foreshadow_due": {
+    "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，取回必错，不跑）",
+    "should_plant": [],
+    "should_payoff": [
+      {
+        "id": "F2",
+        "text": "抢占恢复撞前缀缓存（planted=11, paid=15）",
+        "recover_how": "ch11 埋在 _preempt_request 的『free 不清哈希』与恢复重命中（ch11 m7 只取事实、机制留本章）。本章收口三件套：① WC2/WC3 讲清 free 的逆序+劈分为何把带哈希的块排在最可复用端（LRU 双不变量就是为命中率服务的）；② 第 10-12 站把链路走完——free 哈希保留 → 重排回 waiting → 重走第 3 站 get_computed_blocks 重命中自己的前缀 → 第 6 站 touch 救回；③ theory 的 F2 量化给上下界（下界一个 token、上界全量重 prefill——块被惰性驱逐取走复用时）。正文收口处显式回指『第 11 章埋的 X，现在看清了』。"
+      }
+    ],
+    "note": "本章不埋新伏笔（F7 block_table 间接寻址 ch13 埋 ch22 收、F8 KVConnector 双面契约 ch16 埋——本章第 9 站 CoW 拷贝过线与 WC4 的远端仲裁句可留一句『→ ch16』的路标，不算埋点）。邻章钩子：ch14 第 8 站把 hash_block_size=GCD/prefix_match_unit 交给本章消费；ch16 将消费本章的池/哈希/delay_cache_blocks/partial-tail offload 全部接口。"
+  },
+  "l2_spec": "book/cartography/l2-specs/ch15.json（stations 与本档案 stations 同一份账本）"
+}

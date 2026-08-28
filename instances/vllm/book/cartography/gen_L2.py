@@ -138,6 +138,13 @@ def ov(a, b):
     return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
 
 
+def ov2(a, b, t=2.0):
+    """ov 的带容差版：两轴各实叠 >t px 才算——贴边/0.5px 级亲吻不算（center 容器
+    头带避让用；与 linter 的 3px / 45% 容差口径留出误差距）。"""
+    return (min(a[2], b[2]) - max(a[0], b[0]) > t
+            and min(a[3], b[3]) - max(a[1], b[1]) > t)
+
+
 def expand(r, m):
     return (r[0] - m, r[1] - m, r[2] + m, r[3] + m)
 
@@ -544,7 +551,7 @@ def _elbow_flow(f, a, b, lane_y, R, badges, note_names, vsegs=None, label_adj=No
 
 
 def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vsegs=None,
-              label_adj=None, chip_geom=None, lane_obs=None):
+              label_adj=None, chip_geom=None, lane_obs=None, cf_hdr=None, nf_bands=()):
     a, b = R[f['from']], R[f['to']]
     color = ROLE.get(f.get('color_role') or 'plain', lc.C_MUTE)
     dash = bool(f.get('dash'))
@@ -665,6 +672,31 @@ def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vse
             # 贴下侧框顶边之上 6px（行间净空带；north→center 行距在有下沉说明行时已加宽，
             # 两拨文字各占一带不再相撞——箭头中点可能穿进旁注框的 y 带，不用中点）
             mid = max(y1, y2) - 6
+            # 直落标签 vs center 容器头带（exp-2026-08-28 ch18）：容器标题/where 图注
+            # 横贯框顶带（基线 cfy+19），而直落标签按惯例贴拍片顶-6 = cfy+22——字带
+            # [cfy+13.2, cfy+25.7] 与标题带天然同 y 带；标签 x 区一触标题/图注的 x 区
+            # 即实撞（ch18「SchedulerOutput 差量过线」×「execute_model 一拍五段…」，
+            # geometry linter text-text + tag-on-title 双红）。徽标防撞链不知道容器头带
+            # 这一障碍——此前各章靠箭头落点偏右（标题没画到那）/两侧徽标把标签兜进
+            # 别档而侥幸避开。解法：north↔center 直落流，若「级联实际会选的锚侧」触
+            # 头带（ov2 ≥2px 实叠；up 流无条件 start 侧，下行先 end 后 start——被选侧
+            # 脏才算撞）→ 整体抬进行间走廊（容器顶-6；走廊已由 build 的「直落流标签
+            # 走廊预算」对带标签直落 nc 流撑到 ≥31px，容纳无虞）。触发式：头带干净的
+            # 章落位逐字节不变。
+            if cf_hdr and {zone_of.get(f['from']), zone_of.get(f['to'])} == {'north', 'center'}:
+                _ct, _hbs = cf_hdr
+                _lw2 = lc.tw(label, 8.5)
+                _be = (x - 9 - _lw2, mid - 8.8, x - 5, mid + 3.7)
+                _bs = (x + 5, mid - 8.8, x + 9 + _lw2, mid + 3.7)
+                _hit = (any(ov2(_bs, hb) for hb in _hbs) if f.get('up')
+                        else (any(ov2(_be, hb) for hb in _hbs)
+                              and any(ov2(_bs, hb) for hb in _hbs)))
+                if _hit:
+                    if _ct - 6 - 8.8 >= min(y1, y2) + 2:
+                        mid = _ct - 6
+                    else:
+                        print(f'  [warn] L2 直落标签『{label[:14]}』触 center 头带且行间'
+                              f'走廊不足，保持原位——需人工核图')
             # 直落标签 vs 肘形车道横线（exp-2026-08-27 ch12 盲审②轻碰）：mid 落进某车道
             # 横线 y 带（线半宽 0.9+2px 余量）且**本锚侧**x 区相触 → 车道线/拐点从标签
             # 字中穿过（ch12「对照：一条线 vs 两态重叠」@310，batch_queue→⑤ 车道 y307
@@ -691,8 +723,18 @@ def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vse
                 # 压缩略图框角、锥形虚线贴着字形过（ch2 回程紫色标签盲审三连）→ 改锚流线
                 # 右侧 'start'。y 不用 max-6（目标行框顶带）：站号徽标骑框顶上探 8px
                 # （tab 式），y2-6 的字底正好落进徽标矩形里（ch2 第16站徽标穿 PULL 字腰）——
-                # 改贴**源框底边之内** 6px（center 框底自带 56px 内衬净空，无内容冲突）
-                lc.text(x + 7, y1 - 6, label, 8.5, color, 'start', maxw=640, tag='L2fl:' + label[:10])
+                # 改贴**源框底边之内** 6px（center 框底自带 56px 内衬净空，无内容冲突）。
+                # 北行源框例外（exp-2026-08-28 ch15）：北框底内 6px 正是自家 file 行文字带
+                # （comp_draw 画在 y+h-7）——『block_hashes 随请求带来…』y310 与 请求侧增量
+                # 哈希 file 行 y309 逐字相叠（text-text + tag-on-title 双红）。命中 nf_bands
+                # 即下推到带底之下（+8.8 字高 +2 净空；ch15 推至 323.5，落框下 ragged 带）。
+                # 触发式：不压带的章（center/south 源恒不压）输出逐字节不变。
+                ly0 = y1 - 6
+                _bb0 = (x + 5, ly0 - 8.8, x + 9 + lc.tw(label, 8.5), ly0 + 3.7)
+                _hit0 = [nb for nb in nf_bands if ov(_bb0, nb)]
+                if _hit0:
+                    ly0 = max(nb[3] for nb in _hit0) + 8.8 + 2
+                lc.text(x + 7, ly0, label, 8.5, color, 'start', maxw=640, tag='L2fl:' + label[:10])
             else:
                 # 'end' 锚左伸同样可能扫进**目标行**的站号徽标（ch3 盲审②：worker 标签
                 # 左端压进工厂②顶上第16站徽标下部 ~7px——徽标骑框顶 y-8..y+9，y2-6 基线
@@ -715,6 +757,16 @@ def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vse
                         # 走廊（走廊预算见 build 的直落流加宽；下行流 y1-6=源框底内衬，
                         # 原位本就安全，不动）。
                         ly = y2 + 13 if y2 < y1 else y1 - 6
+                        # 北行目标框例外（exp-2026-08-28 ch15，同上方 y1-6 分支一族）：上行
+                        # 流落位 y2+13 = 北框底之下 13px——北行框高矮不齐，更深处还有**更高
+                        # 邻框**的 file 行文字带（ch15：『insert：满块条目 + 块内边界条目』
+                        # y329 与 哈希粒度 框 file 行 y326 相叠，x 区间实叠 117px）。命中
+                        # nf_bands 即下推到带底之下；两侧锚的检查一并纳入 nf_bands（'end'
+                        # 锚左伸可扫进另一框的 file 行）。触发式：不压带的章输出逐字节不变。
+                        _bb0 = (x + 5, ly - 8.8, x + 9 + lc.tw(label, 8.5), ly + 3.7)
+                        _hit0 = [nb for nb in nf_bands if ov(_bb0, nb)]
+                        if _hit0:
+                            ly = max(nb[3] for nb in _hit0) + 8.8 + 2
                         # 走廊 'start' 锚还须过 frame 右缘关（ch8：⑩→出门 上行流箭头
                         # x≈2096，253px 标签 start 锚只能伸出框右缘 180px、越画布被裁——
                         # 上一档 bb_start 分支自带右缘判定，本兜底位漏了同一检查）。
@@ -725,11 +777,11 @@ def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vse
                         _bb_s = (x + 5, ly - 8.8, x + 9 + _lw, ly + 3.7)
                         _bb_e = (x - 9 - _lw, ly - 8.8, x - 5, ly + 3.7)
                         if (_bb_s[2] <= R['frame']['x'] + R['frame']['w'] - 12
-                                and not any(ov(_bb_s, bd) for bd in badges)):
+                                and not any(ov(_bb_s, bd) for bd in badges + nf_bands)):
                             lc.text(x + 7, ly, label, 8.5, color, 'start', maxw=640,
                                     tag='L2fl:' + label[:10])
                         elif (_bb_e[0] >= R['frame']['x'] + 12
-                                and not any(ov(_bb_e, bd) for bd in badges)):
+                                and not any(ov(_bb_e, bd) for bd in badges + nf_bands)):
                             lc.text(x - 7, ly, label, 8.5, color, 'end', maxw=640,
                                     tag='L2fl:' + label[:10])
                         else:
@@ -929,6 +981,38 @@ def build(spec_path):
             bw = 14 + 10 * len(bd)
             badges.append((r['x'] + r['w'] - bw - 8, r['y'] - 10, r['x'] + r['w'] - 4, r['y'] + 11))
     note_names = {c['name'] for c in comps if c.get('kind') == 'note'}
+    # 北行 file 行文字带（垂直流标签防撞障碍，exp-2026-08-28 ch15）：北行各框高矮不齐
+    # （ragged bottoms），「源框底内 6px / 目标框底+13px」的标签兜底位只对 center/south 框
+    # 成立（底衬净空），对北框正落在自家或更高邻框的 file 行文字带上（ch15 两处：
+    # geometry linter text-text×2 + tag-on-title×2）。带宽按未缩字的 tw 上界取（fit_draw
+    # 只缩不涨，保守超集无误报漏报）。触发式：不压带的章标签落位逐字节不变。
+    nf_bands = []
+    for c in comps:
+        if c.get('zone') != 'north' or not c.get('file') or c['name'] not in R:
+            continue
+        r = R[c['name']]
+        fls = file_lines(c, r['w'])
+        for k, fl in enumerate(fls):
+            base = r['y'] + r['h'] - 7 - 11.5 * (len(fls) - 1 - k)
+            nf_bands.append((r['x'] + 12, base - 8.8,
+                             r['x'] + 12 + lc.tw(fl, 8.5), base + 3.7))
+    # center 容器头带（标题 + where 图注的实占盒；draw_flow 直落标签避让用，见其
+    # 「直落标签 vs center 容器头带」块）。where 的徽标避让位移与下方容器绘制块
+    # 逐字镜像；宽度按 fit 上限封顶（实际绘制只会更窄——保守取盒=超集，无误报漏报）。
+    cf_hdr = None
+    if ccfg.get('name'):
+        _hbs = []
+        _ttl_w = min(lc.tw(ccfg.get('title', ''), 11.5), iw - 360)
+        _hbs.append((ix + 12, cfy + 19 - 11.5, ix + 12 + _ttl_w, cfy + 19 + 3.45))
+        if ccfg.get('where'):
+            _wy = cfy + 19
+            _wb0 = (ix + iw - 14 - lc.tw(ccfg['where'], 9), cfy + 9.85,
+                    ix + iw - 10, cfy + 22.75)
+            if any(ov(_wb0, bd) for bd in badges):
+                _wy = cfy + 12
+            _ww = min(lc.tw(ccfg['where'], 9), 320)
+            _hbs.append((ix + iw - 12 - _ww, _wy - 9, ix + iw - 12, _wy + 2.7))
+        cf_hdr = (cfy, _hbs)
 
     # ---- 肘形流标签防撞预算（ch7 盲审②续修，触发式：不触发不写 adj、落位逐字节不变） ----
     # 病灶：同源同向两条肘形流车道只差 16px（_stack 阶差）→ 两条标签都贴「源框出线
@@ -1184,7 +1268,7 @@ def build(spec_path):
                            for i in range(len(chip_xr) - 1)]) if chip_xr else None
     for f in flows:
         draw_flow(f, R, zone_of, captions, badges, note_names, lanes, vsegs, label_adj,
-                  chip_geom, lane_obs)
+                  chip_geom, lane_obs, cf_hdr, nf_bands)
     loop_vs = []          # 回环两竖段 (x, y0, y1)——下沉说明行避让用（下方 captions 块）
     if nb > 1 and spec.get('loop'):
         # 回环两端锚到首/末拍片的**实际**底边（R 里是真实 rect）——此前统一用 chips_bottom
