@@ -238,7 +238,7 @@ if (!A.skip_research) {
     '任务：为本章做**概念深度研究**，产 ' + CH + '/research/concepts.json（结构见你的契约）。\n' +
     '**本章 introduces 清单（pedagogy-plan 概念首现表——阶梯门禁的门表，这些概念在本章首现处必须讲透）**：' + (R.introduces.join('、') || '（无）') + '\n' +
     '章备注：' + (R.notes || '（无）') + '\n' +
-    '流程：① 逐个判断 introduces 条目与正文将出现的「初学者看描述还是不懂、需例子或背景」的非常识名词/标准记法/项目自定义模式/竞争性外部项目，哪些需要读者定向外部背景；② **先查 v2 存量**（v2 映射章已查透的可复用——拷条目、保留 sources/writer_note，版本敏感处改锚 v0.27.1 现状）：\n  ' + (V2RES.join('\n  ') || '（无）') + '\n' +
+    '流程：① 逐个判断 introduces 条目与正文将出现的「初学者看描述还是不懂、需例子或背景」的非常识名词/标准记法/项目自定义模式/竞争性外部项目，哪些需要读者定向外部背景——**OS/系统级底座词（进程隔离/虚拟内存/页表/用户态内核态/系统调用/共享内存/零拷贝语义/socket 搬运/页锁定/中断/NUMA 等）默认按非常识产卡**（exp-2026-08-28：真实读者被 ch5 这类词四连问卡死，团队反复高估读者的 OS 底座，宁多勿漏）；② **先查 v2 存量**（v2 映射章已查透的可复用——拷条目、保留 sources/writer_note，版本敏感处改锚 v0.27.1 现状）：\n  ' + (V2RES.join('\n  ') || '（无）') + '\n' +
     '③ 缺的补研（WebSearch/WebFetch 真去查：如 Mooncake / DSpark 落地 / v0.27.1 新机制——每条断言给出处+版本/日期，不靠陈旧记忆）。\n' +
     '**只做读者定向的外部/常识背景，不解读本仓 pin 源码**；notation/custom_pattern 必给具体可核的例子；竞争性外部项目给各自独特特征+何时选它+一条权威链接。版本敏感的锚定本章 pin。深入浅出、刨根问底；无外部 gap 就如实少产、别硬凑（多为纯内部机制的章可能只有 0-2 项）。若无法联网立刻 status=BLOCKED 报告。' + ESC,
     mo({ schema: STATUS_SCHEMA, label: 'research', phase: 'Research', agentType: 'researcher' }, 'research', false)
@@ -610,15 +610,16 @@ for (let r = 1; r <= 3; r++) {
       )
     }
   })
-  // 读者视角理解检查：顾问性（不门控）；primer 换「第一次读论文的工程师」人格 + 台阶四问 + 一致性第五问（可 blocking）
+  // 读者视角理解检查：**门控**（①首现未解释/②③⑤真卡住可 blocking——exp-2026-08-28 真实读者 ch5 四连问后升级，原「一律 negotiable」被证明咬不住）；primer 换「第一次读论文的工程师」人格 + 台阶四问 + 一致性第五问（可 blocking）
   const readerPrompt = PRIMER
     ? ('你是第一次读这篇论文的工程师（高级工程师，懂 Transformer 基础，但**没读过这篇论文**）。只读 ' + CH + '/narrative/chapter.md（含它引用的图），把前面章节当已读背景，**不准看论文原文、不准看源码、不准上网**。\n' +
        '逐个关键公式做台阶四问：①符号都认识吗——前文/符号表解释过？②公式前有没有直觉铺垫？③从上一步到这一步是否跳步（缺推导环节）？④是否需要先读别的论文才能看懂？\n' +
        '再做第五问·全章一致性（跨段落、非单公式）：⑤同一个量/概念是否自始至终同名？若在数学符号、代码标识符、中文术语之间换了称呼，换名处有没有就地点明「这就是前面的 X」？源码块里的标识符，是否在出现处就绑回它对应的数学符号？有没有某段源码/论断依赖了要到后文才解释的概念（顺序颠倒）？\n' +
        '①–⑤ 任一真卡住 → blocking=true（卡回 writer），并给 problem + suggested_fix + rationale；其余风格性建议 negotiable=true、blocking=false。全部台阶都过 → pass=true、issues=[]。')
-    : ('你是这本书的目标读者（高级工程师，但**没读过这个仓库的源码**）。只读 ' + CH + '/narrative/chapter.md（含它引用的图），把前面章节当已读背景，**不准看源码、不准上网**。\n' +
-       '站读者视角挑"读不懂/卡住"处：① 术语/缩写首现未解释；② 逻辑跳跃、缺中间步骤；③ 引入了本章没建立的概念；④ 只有结论无直觉/例子；⑤ 全章一致性：同一概念多个叫法未打通、代码标识符没就地绑回其含义/数学符号、某段依赖后文才讲的概念（顺序颠倒）。\n' +
-       '每条给 problem + suggested_fix + rationale；全部 negotiable=true、blocking=false（可读性不卡章）。读得顺则 pass=true、issues=[]。')
+    : ('你是这本书的目标读者：高级工程师（应用/算法背景扎实），但**没有操作系统方向的日常**——OS 底座词（用户态/内核态/系统调用/页表/虚拟地址/虚拟内存/物理内存/共享内存/mmap/进程隔离/零拷贝/socket 的搬运语义/中断/上下文切换/NUMA/页锁定内存）对你同样是生词，首现没当场讲清你就真的卡住；你也**没读过这个仓库的源码**。只读 ' + CH + '/narrative/chapter.md（含它引用的图），**不准看源码、不准上网、不准看 dossier/concepts 等任何素材产物**。\n' +
+       '流程必须两步走（不许省第一步）：**第一步建清单**——通读全章，列出所有非常识术语/缩写/记号，五类都要扫到：OS 底座词、系统/网络词、Python 生态词、本书自定义词、数学记号；**第二步逐词首现回查**——每个词的首现处（本句或往前几句内）有没有讲清到「能说出它是什么、为什么在这里出现」？不带任何解释的括注不算讲清。判「前章已立、可豁免」必须先 Grep 已定稿前章的 narrative 找到出处行、把出处写进 rationale；找不到出处＝未解释。\n' +
+       '清单之外继续挑"读不懂/卡住"处：② 逻辑跳跃、缺中间步骤；③ 引入了本章没建立的概念；④ 只有结论无直觉/例子；⑤ 全章一致性：同一概念多个叫法未打通、代码标识符没就地绑回其含义/数学符号、某段依赖后文才讲的概念（顺序颠倒）。\n' +
+       '每条给 problem + suggested_fix + rationale。分级：①类首现未解释与②③⑤里真卡住的 → blocking=true（exp-2026-08-28：真实读者被 ch5 的共享内存/用户态/零拷贝四连问卡死，①类就是这种）；④类与纯风格建议 → negotiable。读得顺则 pass=true、issues=[]。')
   const readerThunk = function () {
     return agent(readerPrompt, mo({ schema: DIM_SCHEMA, label: 'review:reader r' + r, phase: 'Review', agentType: 'general-purpose' }, 'reader', false))
   }
@@ -639,7 +640,7 @@ for (let r = 1; r <= 3; r++) {
   const ok = dims.filter(Boolean)
   if (ok.length < DIMS.length) return { chapter: CHID, escalated: 'review-agents-failed', stage: 'Review', round: r, note: '部分评审 agent 失败(限流/崩溃)，评审未完成，不假通过' }
   if (PRIMER && !derivation) return { chapter: CHID, escalated: 'review-agents-failed', stage: 'Review', round: r, note: '推导审计 agent 失败(限流/崩溃)，primer 章不得免审通过' }
-  const readerIssues = ((reader && reader.issues) || []).map(function (i) { return Object.assign({}, i, { dimension: 'reader-comprehension' }, PRIMER ? {} : { blocking: false, negotiable: true }) })
+  const readerIssues = ((reader && reader.issues) || []).map(function (i) { return Object.assign({}, i, { dimension: 'reader-comprehension' }, PRIMER ? {} : { negotiable: !i.blocking }) })
   const derivationIssues = ((derivation && derivation.issues) || []).map(function (i) { return Object.assign({}, i, { dimension: 'derivation-audit' }) })
   const issues = ok.flatMap(function (d) { return d.issues || [] }).concat(readerIssues).concat(derivationIssues)
   const blocking = issues.filter(function (i) { return i.blocking })
