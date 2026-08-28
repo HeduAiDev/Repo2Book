@@ -1,4 +1,4 @@
-# v3 ch13《分页 KV：虚拟内存思想进显存》定稿交付（2026-08-31 归档）
+# v3 ch13《分页 KV：虚拟内存思想进显存》定稿交付（2026-08-27 定稿 28e39c53；bible/state 补归档 2026-08-29）
 
 ## 状态
 - **全章定稿**：narrative 1145 行 + L1-partIV/L2-ch13 + 8 张机制图
@@ -13,3 +13,4 @@ PagedAttention 血统（三重浪费 20-38%→近满）/ 块池+逻辑块表 / s
 ## 归档注意
 - dossier.json 曾三轮修复（批默认顺序归位 → subtraction 切雕 → 形状串）
 - 素材真相源口径：层内真实形状由注意力后端仲裁，说明性视图 [num_blocks, 2, block_size, kv_heads, head_dim]
+- **2026-08-29 补归档**（archivist）：bible v3 侧车回写完成——glossary +20（另勘正逆序 free 首现章 ch15→ch11）、concepts +15、interfaces +27、figures +10、foreshadow +F7（planted done:true，收款 ch22 未到期）；state.json v3.chapters.ch13 落段；lint_figures_registered 显式章目录 exit 0。本文首段「F2 伏笔已埋」实况为信息性回指（F2 由 ch11 埋、ch15 已收，ch13 正文 L719/L1135 提「哈希留表」未新埋）。
