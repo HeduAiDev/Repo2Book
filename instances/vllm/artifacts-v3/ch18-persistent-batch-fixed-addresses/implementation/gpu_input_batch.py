@@ -1,0 +1,1279 @@
+# SOURCE: vllm/v1/worker/gpu_input_batch.py
+# 本章主角文件：InputBatch——跨引擎拍存活的多请求容器（持久批次）。token_
+# ids_cpu [max_num_reqs, max_model_len] 一行一请求的全长缓冲 + 列式 CPU 镜像 +
+# MultiGroupBlockTable + 全套采样参数列；增删走 add_request/remove_request +
+# condense（打洞→复用→压实），BatchUpdateBuilder 是 slot 复用与压实的索引
+# 真相源。CachedRequestState 是 worker 端单请求快照（调度器此后只发差量的
+# 根本载体）。
+# SUBTRACTED（dossier.subtraction_plan.delete 批准项落点）：
+#   第 1 条 prompt_embeds：add_request 的 embeds 分支（L383-L386）——
+#     【不删】L148-L151 req_prompt_embeds 空dict 分配（swap_states L641-L651
+#     与 condense L771-L774 读端在保留主路径上，对空 dict 无害空转）；
+#   第 2 条 pooling：is_pooling_model 早退与装填（L120、L473-L481、L560-L563、
+#     L660-L663、L792-L795、L843-L847）——【不删】L306-L307 两 dict 分配与
+#     CachedRequestState pooling 字段（get_pooling_* 读端 L965-L986 保留，
+#     生成式主线两 dict 恒空、原样保留无害）；
+#   第 3 条 LoRA：request_lora_mapping/lora_id_to_* 分配与装填、swap/condense
+#     搬移、make_lora_inputs（L259-L262、L488-L499、L550-L558、L655-L658、
+#     L788-L790、L1005-L1028——读端全随删，无悬空）。
+# 【不删（防悬空，delete[6] 明示）】thinking budget holder（L112-L119）、
+#   replayssm 环形起点（L174-L183、L392-L395）、logits_processing_needs_
+#   token_ids（L290）——读端全在保留区，只删分配必留悬空属性。
+# HOST SEAM：PIN_MEMORY 恒 False（torch_utils.py）；ThinkingBudgetStateHolder/
+#   LateInteraction 面经 _host_seams 占位。
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import cast
+
+import numpy as np
+import torch
+
+from ._host_seams import (
+    LoRARequest,
+    MultiModalFeatureSpec,
+    PoolingMetadata,
+    PoolingParams,
+    PoolingStates,
+    ReasoningConfig,
+    SamplingParams,
+    SamplingType,
+    length_from_prompt_token_ids_or_embeds,
+    maybe_create_thinking_budget_state_holder,
+    swap_dict_values,
+)
+from .logits_processor import (
+    BatchUpdateBuilder,
+    LogitsProcessors,
+    MoveDirectionality,
+)
+from .metadata import SamplingMetadata
+from .torch_utils import PIN_MEMORY
+from .utils import copy_slice
+from .block_table import MultiGroupBlockTable, SlotMappingMode
+
+
+# SOURCE: vllm/v1/worker/gpu_input_batch.py:L34 CachedRequestState
+@dataclass
+class CachedRequestState:
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L36-L44
+    req_id: str
+    prompt_token_ids: list[int] | None
+    mm_features: list[MultiModalFeatureSpec]
+    sampling_params: SamplingParams | None
+    generator: torch.Generator | None
+
+    block_ids: tuple[list[int], ...]
+    num_computed_tokens: int
+    output_token_ids: list[int]
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L46-L47（mrope 字段保留——
+    #   delete[0] 只删 runner 侧的初始化/计算调用点，字段无害）
+    mrope_positions: torch.Tensor | None = None
+    mrope_position_delta: int | None = None
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L49
+    xdrope_positions: torch.Tensor | None = None
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L51-L58（lora_request/prompt_
+    #   embeds/prompt logprobs/prompt_is_token_ids/prev_num_draft_len 字段保留
+    #   ——【不删】防悬空：删除项只删装填/搬移支，字段注解-only 或有守卫写点）
+    lora_request: LoRARequest | None = None
+    prompt_embeds: torch.Tensor | None = None
+    # To accumulate prompt logprobs tensor chunks across prefill steps.
+    in_progress_prompt_logprobs_cpu: object | None = None
+
+    # Per-position mask for mixed-mode inputs (e.g chat completion with
+    # prompt_embeds content parts). See `Request.prompt_is_token_ids`.
+    prompt_is_token_ids: list[bool] | None = None
+
+    # Used when both async_scheduling and spec_decode are enabled.
+    prev_num_draft_len: int = 0
+
+    # for pooling models
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L63-L65【不删】（delete[2] 注②：
+    #   get_pooling_* 读端保留，删字段必悬空）
+    pooling_params: PoolingParams | None = None
+    pooling_states: PoolingStates | None = None
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L67-L73 __post_init__
+    def __post_init__(self):
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L68-L70
+        self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+            self.prompt_token_ids, self.prompt_embeds
+        )
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L72-L73
+        if self.pooling_params is not None:
+            self.pooling_states = PoolingStates()
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L75-L77 num_tokens
+    @property
+    def num_tokens(self) -> int:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L77
+        return self.num_prompt_tokens + len(self.output_token_ids)
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L79-L89 get_token_id
+    def get_token_id(self, idx: int) -> int:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L80-L88
+        if idx < self.num_prompt_tokens:
+            if self.prompt_token_ids is None:
+                raise ValueError(
+                    f"Tried to access token index {idx}, but that token was "
+                    "provided via prompt_embeds, and its ID is unknown."
+                )
+            return self.prompt_token_ids[idx]
+        if idx - self.num_prompt_tokens < len(self.output_token_ids):
+            return self.output_token_ids[idx - self.num_prompt_tokens]
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L89
+        return -1
+
+
+# SOURCE: vllm/v1/worker/gpu_input_batch.py:L92 InputBatch —— 持久批次容器
+class InputBatch:
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L93-L111 __init__ 签名
+    def __init__(
+        self,
+        max_num_reqs: int,
+        max_model_len: int,
+        max_num_batched_tokens: int,
+        device: torch.device,
+        vocab_size: int,
+        block_sizes: list[int],  # The block_size of each kv cache group
+        kernel_block_sizes: list[int],
+        max_num_blocks_per_req: list[int],
+        logitsprocs: LogitsProcessors | None = None,
+        logitsprocs_need_output_token_ids: bool = False,
+        num_spec_tokens: int = 0,
+        is_pooling_model: bool = False,
+        cp_kv_cache_interleave_size: int = 1,
+        reasoning_config: ReasoningConfig | None = None,
+        use_replayssm: bool = False,
+        slot_mapping_modes: list[SlotMappingMode] | None = None,
+    ):
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L112-L118 thinking budget
+        #   holder【不删（delete[6] 防悬空：读端 refresh_metadata L853-L854/
+        #   _make_sampling_metadata L908-L917 在保留区）】
+        self.thinking_budget_state_holder = maybe_create_thinking_budget_state_holder(
+            reasoning_config,
+            max_num_reqs,
+            num_spec_tokens,
+            device,
+            PIN_MEMORY,
+        )
+        self.thinking_token_budget_reqs: set[str] = set()
+        # SUBTRACTED: self.is_pooling_model = is_pooling_model（L120——
+        #   delete[2]：全部读端（remove L560-L563 / swap L660-L663 /
+        #   condense L792-L795 / refresh L843-L847）同条删除）。
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L121-L125
+        self.max_num_reqs = max_num_reqs
+        self.max_model_len = max_model_len
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.device = device
+        self.vocab_size = vocab_size
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L127-L128
+        self._req_ids: list[str | None] = []
+        self.req_id_to_index: dict[str, int] = {}
+
+        # TODO(woosuk): This buffer could be too large if max_model_len is big.
+        # Find a way to reduce the CPU memory usage.
+        # This buffer is not directly transferred to the GPU, so it does not
+        # need to be pinned.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L134-L140 token_ids_cpu
+        #   ——持久全长 token 缓冲（一行一请求）
+        self.token_ids_cpu_tensor = torch.zeros(
+            (max_num_reqs, max_model_len),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=False,
+        )
+        self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L141-L147 is_token_ids
+        self.is_token_ids_tensor = torch.zeros(
+            (max_num_reqs, max_model_len),
+            device="cpu",
+            dtype=bool,
+            pin_memory=False,
+        )
+        self.is_token_ids = self.is_token_ids_tensor.numpy()
+        # Store prompt embeddings per request to avoid OOM from large upfront
+        # allocation if max_model_len is big.
+        # Maps req_index -> tensor of shape (num_prompt_tokens, hidden_size)
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L148-L151【不删（delete[1]：
+        #   swap_states L641-L651 与 condense L771-L774 读端保留，删分配必炸）】
+        self.req_prompt_embeds: dict[int, torch.Tensor] = {}
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L152-L158 num_tokens_no_spec
+        self.num_tokens_no_spec_cpu_tensor = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=PIN_MEMORY,
+        )
+        self.num_tokens_no_spec = self.num_tokens_no_spec_cpu_tensor.numpy()
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L159-L165 num_prompt_tokens
+        self.num_prompt_tokens_cpu_tensor = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=PIN_MEMORY,
+        )
+        self.num_prompt_tokens = self.num_prompt_tokens_cpu_tensor.numpy()
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L166-L172 num_computed_
+        #   tokens_cpu
+        self.num_computed_tokens_cpu_tensor = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=PIN_MEMORY,
+        )
+        self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
+
+        # Mamba2 ReplaySSM decode ring origin (num_computed at each request's
+        # last full-state write); populated only when the feature is on.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L174-L183【不删（delete[6]：
+        #   读端 condense L779-L782 在保留区）】
+        self.use_replayssm = use_replayssm
+        self.replayssm_decode_base_cpu_tensor = torch.zeros(
+            (max_num_reqs,),
+            device="cpu",
+            dtype=torch.int32,
+            pin_memory=PIN_MEMORY,
+        )
+        self.replayssm_decode_base = self.replayssm_decode_base_cpu_tensor.numpy()
+
+        # Block table.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L185-L196
+        self.block_table = MultiGroupBlockTable(
+            max_num_reqs=max_num_reqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+            pin_memory=PIN_MEMORY,
+            device=device,
+            block_sizes=block_sizes,
+            kernel_block_sizes=kernel_block_sizes,
+            max_num_blocks=max_num_blocks_per_req,
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            slot_mapping_modes=slot_mapping_modes,
+        )
+
+        # Sampling-related.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L198-L221 采样参数列族
+        #   （temperature/top_p/top_k 的 CPU/GPU 双镜像与请求集合）
+        self.temperature = torch.empty(
+            (max_num_reqs,), dtype=torch.float32, device=device
+        )
+        self.temperature_cpu_tensor = torch.empty(
+            (max_num_reqs,), dtype=torch.float32, device="cpu", pin_memory=PIN_MEMORY
+        )
+        self.temperature_cpu = self.temperature_cpu_tensor.numpy()
+        self.greedy_reqs: set[str] = set()
+        self.random_reqs: set[str] = set()
+
+        self.top_p = torch.empty((max_num_reqs,), dtype=torch.float32, device=device)
+        self.top_p_cpu_tensor = torch.empty(
+            (max_num_reqs,), dtype=torch.float32, device="cpu", pin_memory=PIN_MEMORY
+        )
+        self.top_p_cpu = self.top_p_cpu_tensor.numpy()
+        self.top_p_reqs: set[str] = set()
+
+        self.top_k = torch.empty((max_num_reqs,), dtype=torch.int32, device=device)
+        self.top_k_cpu_tensor = torch.empty(
+            (max_num_reqs,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
+        )
+        self.top_k_cpu = self.top_k_cpu_tensor.numpy()
+        self.top_k_reqs: set[str] = set()
+
+        # Frequency penalty related data structures
+        self.frequency_penalties = torch.empty(
+            (max_num_reqs,), dtype=torch.float, device=device
+        )
+        self.frequency_penalties_cpu_tensor = torch.empty(
+            (max_num_reqs,), dtype=torch.float, device="cpu", pin_memory=PIN_MEMORY
+        )
+        self.frequency_penalties_cpu = self.frequency_penalties_cpu_tensor.numpy()
+        self.frequency_penalties_reqs: set[str] = set()
+
+        # Presence penalty related data structures
+        self.presence_penalties = torch.empty(
+            (max_num_reqs,), dtype=torch.float, device=device
+        )
+        self.presence_penalties_cpu_tensor = torch.empty(
+            (max_num_reqs,), dtype=torch.float, device="cpu", pin_memory=PIN_MEMORY
+        )
+        self.presence_penalties_cpu = self.presence_penalties_cpu_tensor.numpy()
+        self.presence_penalties_reqs: set[str] = set()
+
+        # Repetition penalty related data structures
+        self.repetition_penalties = torch.empty(
+            (max_num_reqs,), dtype=torch.float, device=device
+        )
+        self.repetition_penalties_cpu_tensor = torch.empty(
+            (max_num_reqs,), dtype=torch.float, device="cpu", pin_memory=PIN_MEMORY
+        )
+        self.repetition_penalties_cpu = self.repetition_penalties_cpu_tensor.numpy()
+        self.repetition_penalties_reqs: set[str] = set()
+
+        # Speculative decoding
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L253-L257 num_accepted_
+        #   tokens_cpu
+        self.num_accepted_tokens_cpu_tensor = torch.ones(
+            (max_num_reqs,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
+        )
+        self.num_accepted_tokens_cpu = self.num_accepted_tokens_cpu_tensor.numpy()
+
+        # SUBTRACTED: lora related 三分配（L259-L262——delete[3]：装填/解绑/
+        #   搬移/make_lora_inputs 读端全随删）。
+
+        # req_index -> generator
+        # NOTE(woosuk): The indices of the requests that do not have their own
+        # generator should not be included in the dictionary.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L264-L267
+        self.generators: dict[int, torch.Generator] = {}
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L269-L273 logprobs 记账
+        self.num_logprobs: dict[str, int] = {}
+
+        # req_id -> list of specific token IDs to compute logprobs for
+        # More efficient than num_logprobs=-1 when only a few tokens are needed
+        self.logprob_token_ids: dict[str, list[int]] = {}
+
+        # Internal representation of per-step batch state changes, used for
+        # reordering persistent batch and generating logitsprocs batch state
+        # updates. Should reset each step.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L275-L278 BatchUpdateBuilder
+        self.batch_update_builder = BatchUpdateBuilder()
+
+        # TODO convert this to LogitsProcessor
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L280-L285
+        self.has_allowed_token_ids: set[str] = set()
+        # NOTE(lufang): In the mask tensor, if the corresponding token allowed,
+        # the value is False. Since we use masked_fill_ to set -inf.
+        self.allowed_token_ids_mask: torch.Tensor | None = None
+        self.allowed_token_ids_mask_cpu_tensor: torch.Tensor | None = None
+
+        # req_index -> bad_words_token_ids
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L287-L288
+        self.bad_words_token_ids: dict[int, list[list[int]]] = {}
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L290【不删（delete[6]：
+        #   读端 _make_sampling_metadata L891 在保留区）】
+        self.logits_processing_needs_token_ids = np.zeros(max_num_reqs, dtype=bool)
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L292
+        self.req_output_token_ids: list[list[int] | None] = []
+
+        # Store provided logitsprocs. If none are provided, initialize empty
+        # data structure
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L294-L297
+        self.logitsprocs = logitsprocs or LogitsProcessors()
+        self.logitsprocs_need_output_token_ids = logitsprocs_need_output_token_ids
+
+        # Store last speculative tokens for sampler.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L299-L300
+        self.spec_token_ids: list[list[int]] = [[] for _ in range(max_num_reqs)]
+
+        # This is updated each time the batch constituents change.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L302-L303
+        self.sampling_metadata = self._make_sampling_metadata()
+
+        # for pooling models
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L305-L307【不删（delete[2]
+        #   注②：get_pooling_params/get_pooling_states 读端保留）】
+        self.pooling_params: dict[str, PoolingParams] = {}
+        self.pooling_states: dict[str, PoolingStates] = {}
+
+        # Cached reference to the GPU tensor of previously sampled tokens
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L309-L316 两个影子字段 +
+        #   penalties 上拍快照三件（m09 异步写回的载体）
+        self.prev_sampled_token_ids: torch.Tensor | None = None
+        self.prev_req_id_to_index: dict[str, int] | None = None
+        # These are used to update output_token_ids with real sampled
+        # ids from prior step, if required by current sampling params
+        # (e.g. penalties).
+        self.sampled_token_ids_cpu: torch.Tensor | None = None
+        self.async_copy_ready_event: object | None = None
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L318-L322 req_ids property
+    @property
+    def req_ids(self) -> list[str]:
+        # None elements should only be present transiently
+        # while performing state updates to the batch.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L321-L322
+        return cast(list[str], self._req_ids)
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L324 _register_add_request ——
+    #   slot 复用的机制核心（pop_removed 复用最小空 slot）
+    def _register_add_request(self, request: "CachedRequestState") -> int:
+        """Track add-request operations for logits processors.
+        Not applicable to pooling models.
+        """
+
+        # Fill the next empty index if there is one.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L329-L332
+        if (new_req_index := self.batch_update_builder.pop_removed()) is None:
+            # Append to end otherwise.
+            new_req_index = self.num_reqs
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L334-L346
+        assert new_req_index < self.max_num_reqs
+        self.batch_update_builder.batch_changed = True
+        if request.sampling_params:
+            # Detailed added request metadata is only required for non-pooling
+            # models, to support logitsprocs.
+            self.batch_update_builder.added.append(
+                (
+                    new_req_index,
+                    request.sampling_params,
+                    request.prompt_token_ids,
+                    request.output_token_ids,
+                )
+            )
+
+        return new_req_index
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L350 add_request —— 把
+    #   CachedRequestState 写进 slot 的各 CPU 镜像列
+    def add_request(
+        self,
+        request: "CachedRequestState",
+    ) -> int:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L354
+        req_index = self._register_add_request(request)
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L356-L364 _req_ids 追加 vs
+        #   复用两分支的列表簿记
+        req_id = request.req_id
+        if req_index == len(self._req_ids):
+            self._req_ids.append(req_id)
+            self.req_output_token_ids.append(request.output_token_ids)
+            self.spec_token_ids.append([])
+        else:
+            self._req_ids[req_index] = req_id
+            self.req_output_token_ids[req_index] = request.output_token_ids
+            self.spec_token_ids[req_index].clear()
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L366
+        self.req_id_to_index[req_id] = req_index
+
+        # Copy the prompt token ids and output token ids.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L368-L374
+        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+            request.prompt_token_ids, request.prompt_embeds
+        )
+        self.num_prompt_tokens[req_index] = num_prompt_tokens
+        start_idx = num_prompt_tokens
+        end_idx = start_idx + len(request.output_token_ids)
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L375-L382 prompt 落行
+        if request.prompt_token_ids is not None:
+            self.token_ids_cpu[req_index, :num_prompt_tokens] = request.prompt_token_ids
+            if request.prompt_is_token_ids is not None:
+                self.is_token_ids[req_index, :num_prompt_tokens] = (
+                    request.prompt_is_token_ids
+                )
+            else:
+                self.is_token_ids[req_index, :num_prompt_tokens] = True
+        # SUBTRACTED: embeds 分支 else 与 req_prompt_embeds 落位（L383-L386
+        #   ——delete[1]：纯文本主线 prompt_token_ids 恒非 None；req_prompt_
+        #   embeds 分配本身【不删】防悬空）。
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L387-L390 output 落行 +
+        #   num_tokens_no_spec
+        self.token_ids_cpu[req_index, start_idx:end_idx] = request.output_token_ids
+        self.is_token_ids[req_index, start_idx:end_idx] = True
+        # Number of tokens without spec decode tokens.
+        self.num_tokens_no_spec[req_index] = request.num_tokens
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L392-L395【不删（delete[6]：
+        #   use_replayssm 精简配置恒 False，守卫天然不触发）】
+        if self.use_replayssm:
+            # Ring origin = full context at (re)admission (prompt + any resumed
+            # output), so a resumed request re-anchors past the prompt.
+            self.replayssm_decode_base[req_index] = request.num_tokens
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L397-L398 num_computed 落列
+        #   + 块表整行写
+        self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+        self.block_table.add_row(request.block_ids, req_index)
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L400-L472 采样参数装填
+        if sampling_params := request.sampling_params:
+            if sampling_params.sampling_type == SamplingType.GREEDY:
+                # Should avoid division by zero later when apply_temperature.
+                self.temperature_cpu[req_index] = 0.0
+                self.greedy_reqs.add(req_id)
+            else:
+                self.temperature_cpu[req_index] = sampling_params.temperature
+                self.random_reqs.add(req_id)
+
+            self.top_p_cpu[req_index] = sampling_params.top_p
+            if sampling_params.top_p < 1:
+                self.top_p_reqs.add(req_id)
+            top_k = sampling_params.top_k
+            if 0 < top_k < self.vocab_size:
+                self.top_k_reqs.add(req_id)
+            else:
+                top_k = self.vocab_size
+            self.top_k_cpu[req_index] = top_k
+            self.frequency_penalties_cpu[req_index] = sampling_params.frequency_penalty
+            if sampling_params.frequency_penalty != 0.0:
+                self.frequency_penalties_reqs.add(req_id)
+            self.presence_penalties_cpu[req_index] = sampling_params.presence_penalty
+            if sampling_params.presence_penalty != 0.0:
+                self.presence_penalties_reqs.add(req_id)
+            self.repetition_penalties_cpu[req_index] = (
+                sampling_params.repetition_penalty
+            )
+            if sampling_params.repetition_penalty != 1.0:
+                self.repetition_penalties_reqs.add(req_id)
+
+            # NOTE(woosuk): self.generators should not include the requests that
+            # do not have their own generator.
+            if request.generator is not None:
+                self.generators[req_index] = request.generator
+
+            if sampling_params.logprobs is not None:
+                self.num_logprobs[req_id] = (
+                    self.vocab_size
+                    if sampling_params.logprobs == -1
+                    else sampling_params.logprobs
+                )
+
+            # Store specific token IDs to compute logprobs for (more efficient)
+            if sampling_params.logprob_token_ids is not None:
+                self.logprob_token_ids[req_id] = sampling_params.logprob_token_ids
+
+            if sampling_params.allowed_token_ids:
+                self.has_allowed_token_ids.add(req_id)
+                if self.allowed_token_ids_mask_cpu_tensor is None:
+                    # Lazy allocation for this tensor, which can be large.
+                    # False means we don't fill with -inf.
+                    self.allowed_token_ids_mask = torch.zeros(
+                        self.max_num_reqs,
+                        self.vocab_size,
+                        dtype=torch.bool,
+                        device=self.device,
+                    )
+                    self.allowed_token_ids_mask_cpu_tensor = torch.zeros(
+                        self.max_num_reqs,
+                        self.vocab_size,
+                        dtype=torch.bool,
+                        device="cpu",
+                    )
+                self.allowed_token_ids_mask_cpu_tensor[req_index] = True
+                # False means we don't fill with -inf.
+                self.allowed_token_ids_mask_cpu_tensor[req_index][
+                    sampling_params.allowed_token_ids
+                ] = False
+
+            if sampling_params.bad_words_token_ids:
+                self.bad_words_token_ids[req_index] = (
+                    sampling_params.bad_words_token_ids
+                )
+        # SUBTRACTED: pooling elif 装填支（L473-L481——delete[2]）。
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L482-L483
+        else:
+            raise NotImplementedError("Unrecognized request type")
+
+        # Speculative decoding: by default 1 token is generated.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L485-L486
+        self.num_accepted_tokens_cpu[req_index] = 1
+
+        # SUBTRACTED: Add request lora ID 的 if/else 装填（L488-L499——
+        #   delete[3]：request_lora_mapping 分配已随删，两臂同删）。
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L501
+        return req_index
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L503 update_req_spec_token_ids
+    #   —— spec draft 占位写行（写回闭环的 spec 分支；async 下 -1 占位语义）
+    def update_req_spec_token_ids(
+        self, request: CachedRequestState, scheduled_spec_tokens: dict[str, list[int]]
+    ) -> None:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L506-L519
+        req_id = request.req_id
+        req_index = self.req_id_to_index[req_id]
+        cur_spec_token_ids = self.spec_token_ids[req_index]
+        # When speculative decoding is used with structured output,
+        # the scheduler can drop draft tokens that do not
+        # conform to the schema. This can result in
+        # scheduler_output.scheduled_spec_decode_tokens being empty,
+        # even when speculative decoding is enabled.
+        cur_spec_token_ids.clear()
+        spec_token_ids = scheduled_spec_tokens.get(req_id, ())
+        num_spec_tokens = len(spec_token_ids)
+        request.prev_num_draft_len = num_spec_tokens
+        if not spec_token_ids:
+            return
+
+        # For async scheduling, token_ids_cpu assigned from
+        # spec_token_ids are placeholders and will be overwritten in
+        # _prepare_input_ids.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L521-L528
+        start_index = self.num_tokens_no_spec[req_index]
+        end_token_index = start_index + num_spec_tokens
+        self.token_ids_cpu[req_index, start_index:end_token_index] = spec_token_ids
+        self.is_token_ids[req_index, start_index:end_token_index] = True
+        cur_spec_token_ids.extend(spec_token_ids)
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L530 remove_request —— 打洞
+    #   标记移除（不搬数据；must always be followed by condense()）
+    def remove_request(self, req_id: str) -> int | None:
+        """This method must always be followed by a call to condense().
+
+        Args:
+          req_id: request to remove
+
+        Returns:
+          Removed request index, or `None` if `req_id` not recognized
+        """
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L540-L541
+        req_index = self.req_id_to_index.pop(req_id, None)
+        if req_index is None:
+            return None
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L544-L548 打洞五连
+        self.batch_update_builder.removed_append(req_index)
+        self._req_ids[req_index] = None
+        self.req_output_token_ids[req_index] = None
+        self.spec_token_ids[req_index].clear()
+        self.block_table.clear_row(req_index)
+
+        # SUBTRACTED: LoRA 解绑（L550-L558——delete[3]）。
+        # SUBTRACTED: is_pooling_model 早退（L560-L563——delete[2]）。
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L565-L583 对称清理
+        self.greedy_reqs.discard(req_id)
+        self.random_reqs.discard(req_id)
+        self.top_p_reqs.discard(req_id)
+        self.top_k_reqs.discard(req_id)
+        self.frequency_penalties_reqs.discard(req_id)
+        self.presence_penalties_reqs.discard(req_id)
+        self.repetition_penalties_reqs.discard(req_id)
+        self.generators.pop(req_index, None)
+        self.num_logprobs.pop(req_id, None)
+        self.logprob_token_ids.pop(req_id, None)
+        if self.prev_req_id_to_index is not None:
+            self.prev_req_id_to_index.pop(req_id, None)
+
+        self.has_allowed_token_ids.discard(req_id)
+        if self.allowed_token_ids_mask_cpu_tensor is not None:
+            # False means we don't fill with -inf.
+            self.allowed_token_ids_mask_cpu_tensor[req_index].fill_(False)
+        self.bad_words_token_ids.pop(req_index, None)
+        self.thinking_token_budget_reqs.discard(req_id)
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L584
+        return req_index
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L586 swap_states —— 重排时的
+    #   行交换（只交换活跃前缀窗口；m12）
+    def swap_states(self, i1: int, i2: int) -> None:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L587-L593
+        old_id_i1 = self._req_ids[i1]
+        old_id_i2 = self._req_ids[i2]
+        # Only swap the active token prefix for each request. Copying full
+        # max_model_len rows is expensive and unnecessary during reordering.
+        i1_active_token_count = self._get_active_token_count(i1)
+        i2_active_token_count = self._get_active_token_count(i2)
+        max_active_token_count = max(i1_active_token_count, i2_active_token_count)
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L595-L625 簿记列交换
+        self._req_ids[i1], self._req_ids[i2] = self._req_ids[i2], self._req_ids[i1]  # noqa
+        self.req_output_token_ids[i1], self.req_output_token_ids[i2] = (
+            self.req_output_token_ids[i2],
+            self.req_output_token_ids[i1],
+        )
+        self.spec_token_ids[i1], self.spec_token_ids[i2] = (
+            self.spec_token_ids[i2],
+            self.spec_token_ids[i1],
+        )
+        assert old_id_i1 is not None and old_id_i2 is not None
+        self.req_id_to_index[old_id_i1], self.req_id_to_index[old_id_i2] = (
+            self.req_id_to_index[old_id_i2],
+            self.req_id_to_index[old_id_i1],
+        )
+        self.num_tokens_no_spec[i1], self.num_tokens_no_spec[i2] = (
+            self.num_tokens_no_spec[i2],
+            self.num_tokens_no_spec[i1],
+        )
+        self.num_prompt_tokens[i1], self.num_prompt_tokens[i2] = (
+            self.num_prompt_tokens[i2],
+            self.num_prompt_tokens[i1],
+        )
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L617-L621【不删（delete[6]：
+        #   use_replayssm 恒 False）】
+        if self.use_replayssm:
+            self.replayssm_decode_base[i1], self.replayssm_decode_base[i2] = (
+                self.replayssm_decode_base[i2],
+                self.replayssm_decode_base[i1],
+            )
+        self.num_computed_tokens_cpu[i1], self.num_computed_tokens_cpu[i2] = (
+            self.num_computed_tokens_cpu[i2],
+            self.num_computed_tokens_cpu[i1],
+        )
+
+        # NOTE: the following is unsafe
+        # self.token_ids_cpu[i1, ...], self.token_ids_cpu[i2, ...], =\
+        #     self.token_ids_cpu[i2, ...], self.token_ids_cpu[i1, ...]
+        # instead, we need to temporarily copy the data for one of the indices
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L631-L639 行交换（活跃窗）
+        tmp_token_ids = self.token_ids_cpu[i1, :max_active_token_count].copy()
+        self.token_ids_cpu[i1, :max_active_token_count] = self.token_ids_cpu[
+            i2, :max_active_token_count
+        ]
+        self.token_ids_cpu[i2, :max_active_token_count] = tmp_token_ids
+
+        self.is_token_ids[[i1, i2], :max_active_token_count] = self.is_token_ids[
+            [i2, i1], :max_active_token_count
+        ]
+
+        # Swap prompt embeddings if they exist
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L641-L651【不删（delete[1]：
+        #   req_prompt_embeds 恒空 dict，无害空转）】
+        embeds_i1 = self.req_prompt_embeds.get(i1)
+        embeds_i2 = self.req_prompt_embeds.get(i2)
+        if embeds_i1 is not None:
+            self.req_prompt_embeds[i2] = embeds_i1
+        else:
+            self.req_prompt_embeds.pop(i2, None)
+        if embeds_i2 is not None:
+            self.req_prompt_embeds[i1] = embeds_i2
+        else:
+            self.req_prompt_embeds.pop(i1, None)
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L653
+        self.block_table.swap_row(i1, i2)
+
+        # SUBTRACTED: request_lora_mapping 交换（L655-L658——delete[3]）。
+        # SUBTRACTED: is_pooling_model 早退（L660-L663——delete[2]）。
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L664-L701 重排簿记 + 采样
+        #   参数列交换
+        # For autoregressive models, track detailed request reordering info
+        # to support logitsprocs.
+        self.batch_update_builder.moved.append((i1, i2, MoveDirectionality.SWAP))
+
+        self.temperature_cpu[i1], self.temperature_cpu[i2] = (
+            self.temperature_cpu[i2],
+            self.temperature_cpu[i1],
+        )
+        self.top_p_cpu[i1], self.top_p_cpu[i2] = self.top_p_cpu[i2], self.top_p_cpu[i1]
+        self.top_k_cpu[i1], self.top_k_cpu[i2] = self.top_k_cpu[i2], self.top_k_cpu[i1]
+        self.frequency_penalties_cpu[i1], self.frequency_penalties_cpu[i2] = (
+            self.frequency_penalties_cpu[i2],
+            self.frequency_penalties_cpu[i1],
+        )
+        self.presence_penalties_cpu[i1], self.presence_penalties_cpu[i2] = (
+            self.presence_penalties_cpu[i2],
+            self.presence_penalties_cpu[i1],
+        )
+        self.repetition_penalties_cpu[i1], self.repetition_penalties_cpu[i2] = (
+            self.repetition_penalties_cpu[i2],
+            self.repetition_penalties_cpu[i1],
+        )
+        self.num_accepted_tokens_cpu[i1], self.num_accepted_tokens_cpu[i2] = (
+            self.num_accepted_tokens_cpu[i2],
+            self.num_accepted_tokens_cpu[i1],
+        )
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L691-L692
+        swap_dict_values(self.generators, i1, i2)
+        swap_dict_values(self.bad_words_token_ids, i1, i2)
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L694-L701
+        if self.allowed_token_ids_mask_cpu_tensor is not None:
+            (
+                self.allowed_token_ids_mask_cpu_tensor[i1],
+                self.allowed_token_ids_mask_cpu_tensor[i2],
+            ) = (
+                self.allowed_token_ids_mask_cpu_tensor[i2],
+                self.allowed_token_ids_mask_cpu_tensor[i1],
+            )
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L703 _get_active_token_count ——
+    #   活跃前缀长度的定义（搬移/交换只拷前缀）
+    def _get_active_token_count(self, req_index: int) -> int:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L704-L706
+        return int(self.num_tokens_no_spec[req_index]) + len(
+            self.spec_token_ids[req_index]
+        )
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L708 condense —— 尾部活请求
+    #   滑入空洞，[0, num_reqs) 连续（双指针 + 降序 removed）
+    def condense(self) -> None:
+        """Slide non-empty requests down into lower, empty indices.
+
+        Any consecutive empty indices at the very end of the list are not
+        filled.
+
+        Returns:
+          swaps: list of (from,to) swap tuples for moved requests
+          empty_req_indices: indices not filled by condensation
+        """
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L718-L729 两个早退
+        num_reqs = self.num_reqs
+
+        if not (empty_req_indices := self.batch_update_builder.removed):
+            # All removed requests were replaced by added requests, or else no
+            # requests were removed at all. No condense() needed
+            return
+        if num_reqs == 0:
+            # The batched states are empty.
+            self._req_ids.clear()
+            self.req_output_token_ids.clear()
+            self.spec_token_ids.clear()
+            return
+
+        # NOTE(woosuk): This function assumes that the empty_req_indices
+        # is sorted in descending order.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L731-L743 双指针骨架
+        last_req_index = num_reqs + len(empty_req_indices) - 1
+        while empty_req_indices:
+            # Find the largest non-empty index.
+            while last_req_index in empty_req_indices:
+                last_req_index -= 1
+
+            # Find the smallest empty index.
+            empty_index = self.batch_update_builder.peek_removed()
+            assert empty_index is not None
+            if empty_index >= last_req_index:
+                break
+
+            # Move active request down into empty request
+            # index.
+            # SOURCE: vllm/v1/worker/gpu_input_batch.py:L747-L755 头部簿记搬移
+            self.batch_update_builder.pop_removed()
+            req_id = self._req_ids[last_req_index]
+            output_token_ids = self.req_output_token_ids[last_req_index]
+            assert req_id is not None
+            self._req_ids[empty_index] = req_id
+            self._req_ids[last_req_index] = None
+            self.req_output_token_ids[empty_index] = output_token_ids
+            self.req_output_token_ids[last_req_index] = None
+            self.req_id_to_index[req_id] = empty_index
+
+            # SOURCE: vllm/v1/worker/gpu_input_batch.py:L757-L786 列搬移（token
+            #   只拷活跃前缀、块表 move_row）
+            num_tokens = self._get_active_token_count(last_req_index)
+
+            (self.spec_token_ids[last_req_index], self.spec_token_ids[empty_index]) = (
+                self.spec_token_ids[empty_index],
+                self.spec_token_ids[last_req_index],
+            )
+            self.spec_token_ids[last_req_index].clear()
+
+            self.token_ids_cpu[empty_index, :num_tokens] = self.token_ids_cpu[
+                last_req_index, :num_tokens
+            ]
+            self.is_token_ids[empty_index, :num_tokens] = self.is_token_ids[
+                last_req_index, :num_tokens
+            ]
+            # SOURCE: vllm/v1/worker/gpu_input_batch.py:L771-L774【不删（delete[1]：
+            #   空 dict 的 in 是无害空转）】
+            if last_req_index in self.req_prompt_embeds:
+                self.req_prompt_embeds[empty_index] = self.req_prompt_embeds.pop(
+                    last_req_index
+                )
+            self.num_tokens_no_spec[empty_index] = self.num_tokens_no_spec[
+                last_req_index
+            ]
+            self.num_prompt_tokens[empty_index] = self.num_prompt_tokens[last_req_index]
+            # SOURCE: vllm/v1/worker/gpu_input_batch.py:L779-L782【不删（delete[6]：
+            #   use_replayssm 恒 False）】
+            if self.use_replayssm:
+                self.replayssm_decode_base[empty_index] = self.replayssm_decode_base[
+                    last_req_index
+                ]
+            self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[
+                last_req_index
+            ]
+            # SOURCE: vllm/v1/worker/gpu_input_batch.py:L786
+            self.block_table.move_row(last_req_index, empty_index)
+
+            # SUBTRACTED: request_lora_mapping 搬移（L788-L790——delete[3]）。
+            # SUBTRACTED: is_pooling_model continue 支（L792-L795——delete[2]）。
+            # SOURCE: vllm/v1/worker/gpu_input_batch.py:L797-L830 自回归簿记 +
+            #   采样参数列搬移
+            # Autoregressive models require detailed tracking of condense
+            # operations to support logitsprocs
+            self.batch_update_builder.moved.append(
+                (last_req_index, empty_index, MoveDirectionality.UNIDIRECTIONAL)
+            )
+
+            self.temperature_cpu[empty_index] = self.temperature_cpu[last_req_index]
+            self.top_p_cpu[empty_index] = self.top_p_cpu[last_req_index]
+            self.top_k_cpu[empty_index] = self.top_k_cpu[last_req_index]
+            self.frequency_penalties_cpu[empty_index] = self.frequency_penalties_cpu[
+                last_req_index
+            ]
+            self.presence_penalties_cpu[empty_index] = self.presence_penalties_cpu[
+                last_req_index
+            ]
+            self.repetition_penalties_cpu[empty_index] = self.repetition_penalties_cpu[
+                last_req_index
+            ]
+            self.num_accepted_tokens_cpu[empty_index] = self.num_accepted_tokens_cpu[
+                last_req_index
+            ]
+            generator = self.generators.pop(last_req_index, None)
+            if generator is not None:
+                self.generators[empty_index] = generator
+
+            # TODO convert these to LogitsProcessors
+            if self.allowed_token_ids_mask_cpu_tensor is not None:
+                self.allowed_token_ids_mask_cpu_tensor[empty_index] = (
+                    self.allowed_token_ids_mask_cpu_tensor[last_req_index]
+                )
+
+            bad_words_token_ids = self.bad_words_token_ids.pop(last_req_index, None)
+            if bad_words_token_ids is not None:
+                self.bad_words_token_ids[empty_index] = bad_words_token_ids
+
+            # Decrement last_req_index since it is now empty.
+            # SOURCE: vllm/v1/worker/gpu_input_batch.py:L832-L833
+            last_req_index -= 1
+
+        # Trim lists to the batch size.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L835-L838 尾部截断
+        del self._req_ids[num_reqs:]
+        del self.req_output_token_ids[num_reqs:]
+        del self.spec_token_ids[num_reqs:]
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L840 refresh_metadata —— 批次
+    #   变更后重建采样元数据的收尾
+    def refresh_metadata(self):
+        """Apply any batch updates to sampling metadata."""
+
+        # SUBTRACTED: is_pooling_model 支（L843-L847——delete[2]）。
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L849-L858 非 pooling 主线
+        # For non-pooling models - generate and apply logitsprocs update;
+        # reset batch update tracking.
+        # Update sampling metadata if batch state is changed.
+        batch_update = self.batch_update_builder.get_and_reset(self.num_reqs)
+        if self.thinking_budget_state_holder is not None and batch_update:
+            self.thinking_budget_state_holder.sync_batch(batch_update)
+        for logit_proc in self.logitsprocs.all:
+            logit_proc.update_state(batch_update)
+        if batch_update:
+            self.sampling_metadata = self._make_sampling_metadata()
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L860 _make_sampling_metadata
+    def _make_sampling_metadata(self) -> SamplingMetadata:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L861-L871
+        num_reqs = self.num_reqs
+        if not self.all_greedy:
+            temperature = copy_slice(
+                self.temperature_cpu_tensor, self.temperature, num_reqs
+            )
+        else:
+            temperature = None
+        if not self.no_top_p:
+            copy_slice(self.top_p_cpu_tensor, self.top_p, num_reqs)
+        if not self.no_top_k:
+            copy_slice(self.top_k_cpu_tensor, self.top_k, num_reqs)
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L873-L887
+        if not self.no_penalties:
+            # Since syncing these tensors is expensive only copy them
+            # if necessary i.e. if there are requests which require
+            # penalties to be applied during sampling.
+            copy_slice(
+                self.frequency_penalties_cpu_tensor, self.frequency_penalties, num_reqs
+            )
+            copy_slice(
+                self.presence_penalties_cpu_tensor, self.presence_penalties, num_reqs
+            )
+            copy_slice(
+                self.repetition_penalties_cpu_tensor,
+                self.repetition_penalties,
+                num_reqs,
+            )
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L889-L892
+        needs_prompt_token_ids = (
+            not self.no_penalties
+            or self.logits_processing_needs_token_ids[:num_reqs].any()
+        )
+        # The prompt tokens are used only for applying penalties or
+        # step pooling during the sampling/pooling process.
+        # Hence copy these tensors only when there are requests which
+        # need penalties/step_pooler to be applied.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L897-L904
+        prompt_token_ids_cpu = (
+            self._make_prompt_token_ids_cpu_tensor() if needs_prompt_token_ids else None
+        )
+        prompt_token_ids = (
+            prompt_token_ids_cpu.to(device=self.device, non_blocking=True)
+            if prompt_token_ids_cpu is not None
+            else None
+        )
+
+        # Only set output_token_ids if required by the current requests'
+        # sampling parameters.
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L906-L922
+        holder = self.thinking_budget_state_holder
+        thinking_budget_tracks_reqs = (
+            holder is not None and holder.has_tracked_requests()
+        )
+        needs_output_token_ids = (
+            not self.no_penalties
+            or bool(self.bad_words_token_ids)
+            or self.logitsprocs_need_output_token_ids
+            or thinking_budget_tracks_reqs
+        )
+        output_token_ids = (
+            cast(list[list[int]], self.req_output_token_ids)
+            if needs_output_token_ids
+            else []
+        )
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L924-L932
+        allowed_token_ids_mask: torch.Tensor | None = None
+        if not self.no_allowed_token_ids:
+            assert self.allowed_token_ids_mask is not None
+            copy_slice(
+                self.allowed_token_ids_mask_cpu_tensor,
+                self.allowed_token_ids_mask,
+                num_reqs,
+            )
+            allowed_token_ids_mask = self.allowed_token_ids_mask[:num_reqs]
+
+        # Build per-request logprob_token_ids mapping: req_index -> token_ids
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L934-L941
+        logprob_token_ids_by_index: dict[int, list[int]] | None = None
+        if self.logprob_token_ids:
+            logprob_token_ids_by_index = {}
+            for req_id, token_ids in self.logprob_token_ids.items():
+                if req_id in self.req_id_to_index:
+                    req_index = self.req_id_to_index[req_id]
+                    logprob_token_ids_by_index[req_index] = token_ids
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L943-L963 SamplingMetadata
+        #   装配
+        return SamplingMetadata(
+            temperature=temperature,
+            all_greedy=self.all_greedy,
+            all_random=self.all_random,
+            top_p=None if self.no_top_p else self.top_p[:num_reqs],
+            top_k=None if self.no_top_k else self.top_k[:num_reqs],
+            generators=self.generators,
+            max_num_logprobs=self.max_num_logprobs,
+            logprob_token_ids=logprob_token_ids_by_index,
+            prompt_token_ids=prompt_token_ids,
+            frequency_penalties=self.frequency_penalties[:num_reqs],
+            presence_penalties=self.presence_penalties[:num_reqs],
+            repetition_penalties=self.repetition_penalties[:num_reqs],
+            output_token_ids=output_token_ids,
+            spec_token_ids=self.spec_token_ids,
+            no_penalties=self.no_penalties,
+            allowed_token_ids_mask=allowed_token_ids_mask,
+            bad_words_token_ids=self.bad_words_token_ids,
+            logitsprocs=self.logitsprocs,
+            thinking_budget_state_holder=self.thinking_budget_state_holder,
+        )
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L965 get_pooling_params【不删
+    #   （delete[2] 注②：runner L1081 消费位保留）】
+    def get_pooling_params(self) -> list[PoolingParams]:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L966-L967
+        assert len(self.req_ids) == len(self.pooling_params)
+        return [self.pooling_params[req_id] for req_id in self.req_ids]
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L969 get_pooling_states【不删】
+    def get_pooling_states(self) -> list[PoolingStates]:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L970-L971
+        assert len(self.req_ids) == len(self.pooling_states)
+        return [self.pooling_states[req_id] for req_id in self.req_ids]
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L973 get_pooling_metadata【不删】
+    def get_pooling_metadata(self) -> PoolingMetadata:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L974-L986
+        pooling_params = self.get_pooling_params()
+        pooling_states = self.get_pooling_states()
+        prompt_token_ids_cpu = None
+        if any(p.requires_token_ids for p in pooling_params):
+            prompt_token_ids_cpu = self._make_prompt_token_ids_cpu_tensor()
+
+        return PoolingMetadata(
+            prompt_lens=self.num_prompt_tokens_cpu_tensor[: self.num_reqs].clone(),
+            prompt_token_ids=self.sampling_metadata.prompt_token_ids,
+            prompt_token_ids_cpu=prompt_token_ids_cpu,
+            pooling_params=pooling_params,
+            pooling_states=pooling_states,
+        )
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L988 _make_prompt_token_ids_cpu_
+    #   tensor
+    def _make_prompt_token_ids_cpu_tensor(self) -> torch.Tensor:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L989-L1003
+        num_reqs = self.num_reqs
+        max_prompt_len = self.num_prompt_tokens[:num_reqs].max()
+        prompt_token_ids_cpu_tensor = torch.empty(
+            (self.num_reqs, max_prompt_len),
+            device="cpu",
+            dtype=torch.int64,
+            pin_memory=PIN_MEMORY,
+        )
+        prompt_token_ids = prompt_token_ids_cpu_tensor.numpy()
+        prompt_token_ids[:] = self.token_ids_cpu[:num_reqs, :max_prompt_len]
+        # Use the value of vocab_size as a pad since we don't have a
+        # token_id of this value.
+        for i in range(num_reqs):
+            prompt_token_ids[i, self.num_prompt_tokens[i] :] = self.vocab_size
+        return prompt_token_ids_cpu_tensor
+
+    # SUBTRACTED: make_lora_inputs（L1005-L1028——delete[3]：唯一调用方
+    #   set_active_loras 随 runner 侧 LoRA 热切换块同删）。
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1030 set_async_sampled_token_
+    #   ids（penalties 消费的上拍采样快照位）
+    def set_async_sampled_token_ids(
+        self,
+        sampled_token_ids_cpu: torch.Tensor,
+        async_copy_ready_event,
+    ) -> None:
+        """
+        In async scheduling case, store ref to sampled_token_ids_cpu
+        tensor and corresponding copy-ready event. Used to repair
+        output_token_ids prior to sampling, if needed by logits processors.
+        """
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1040-L1045
+        if self.sampling_metadata.output_token_ids:
+            self.sampled_token_ids_cpu = sampled_token_ids_cpu
+            self.async_copy_ready_event = async_copy_ready_event
+        else:
+            self.sampled_token_ids_cpu = None
+            self.async_copy_ready_event = None
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1047 update_async_output_token_
+    #   ids（异步调度下用真采样 id 修复 -1 占位）
+    def update_async_output_token_ids(self) -> None:
+        """
+        In async scheduling case, update output_token_ids in sampling metadata
+        from prior steps sampled token ids once they've finished copying to CPU.
+        This is called right before they are needed by the logits processors.
+        """
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1053-L1056
+        output_token_ids = self.sampling_metadata.output_token_ids
+        if self.sampled_token_ids_cpu is None or not output_token_ids:
+            # Output token ids not needed or not async scheduling.
+            return
+
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1058-L1092
+        assert self.prev_req_id_to_index is not None
+        sampled_token_ids = None
+        for index, req_id in enumerate(self.req_ids):
+            prev_index = self.prev_req_id_to_index.get(req_id)
+            if prev_index is None:
+                continue
+            req_output_token_ids = output_token_ids[index]
+            if not req_output_token_ids or req_output_token_ids[-1] != -1:
+                # Final output id is not a placeholder, some tokens must have
+                # been discarded after a kv-load failure.
+                continue
+            if sampled_token_ids is None:
+                assert self.async_copy_ready_event is not None
+                self.async_copy_ready_event.synchronize()
+                sampled_token_ids = self.sampled_token_ids_cpu.tolist()
+            # Replace placeholder token id(s) with actual sampled id(s).
+            new_ids: list[int] = sampled_token_ids[prev_index]
+            if not new_ids:
+                continue
+            num_sampled_ids = len(new_ids) if new_ids[-1] != -1 else new_ids.index(-1)
+            # Also account for case where there may be a smaller number of
+            # output placeholders (tokens can be discarded after kv-load
+            # failure) or a larger number (async spec decode adds optimistic
+            # placeholders that may exceed the actual acceptance count).
+            first_placeholder = len(req_output_token_ids)
+            while (
+                first_placeholder > 0
+                and req_output_token_ids[first_placeholder - 1] == -1
+            ):
+                first_placeholder -= 1
+            num_placeholders = len(req_output_token_ids) - first_placeholder
+            num_to_replace = min(num_sampled_ids, num_placeholders)
+            del new_ids[num_to_replace:]
+            req_output_token_ids[first_placeholder:] = new_ids
+            # ^ Implicitly resizes to (first_placeholder + num_to_replace)
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1094 update_async_spec_token_
+    #   ids（rejection sampler 的 penalty/bad_words 消费位——spec 域）
+    def update_async_spec_token_ids(self, draft_token_ids: list[list[int]]) -> None:
+        """
+        In async scheduling case, update spec_token_ids in sampling metadata with
+        real draft token ids from prior step. This is called right before they are
+        needed by the rejection sampler for penalty/bad_words computation.
+        """
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1100-L1112
+        if not draft_token_ids or not self.prev_req_id_to_index:
+            return
+
+        if (spec_token_ids := self.sampling_metadata.spec_token_ids) is not None:
+            for req_id, spec_ids in zip(self.req_ids, spec_token_ids):
+                if spec_ids:
+                    prev_index = self.prev_req_id_to_index.get(req_id)
+                    if prev_index is not None:
+                        draft_ids = draft_token_ids[prev_index]
+                        if draft_ids:
+                            del draft_ids[len(spec_ids) :]
+                            spec_ids.clear()
+                            spec_ids.extend(draft_ids)
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1114 num_reqs property
+    @property
+    def num_reqs(self) -> int:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1116
+        return len(self.req_id_to_index)
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1118 all_greedy
+    @property
+    def all_greedy(self) -> bool:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1120
+        return len(self.random_reqs) == 0
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1122 all_random
+    @property
+    def all_random(self) -> bool:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1124
+        return len(self.greedy_reqs) == 0
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1126 no_top_p
+    @property
+    def no_top_p(self) -> bool:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1128
+        return len(self.top_p_reqs) == 0
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1130 no_top_k
+    @property
+    def no_top_k(self) -> bool:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1132
+        return len(self.top_k_reqs) == 0
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1134 no_penalties
+    @property
+    def no_penalties(self) -> bool:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1136-L1140
+        return (
+            len(self.presence_penalties_reqs) == 0
+            and len(self.frequency_penalties_reqs) == 0
+            and len(self.repetition_penalties_reqs) == 0
+        )
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1142 no_thinking_budget【不删
+    #   （delete[6]：holder=None 时恒 True）】
+    @property
+    def no_thinking_budget(self) -> bool:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1144-L1147
+        return (
+            self.thinking_budget_state_holder is None
+            or len(self.thinking_token_budget_reqs) == 0
+        )
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1149 max_num_logprobs
+    @property
+    def max_num_logprobs(self) -> int | None:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1151
+        return max(self.num_logprobs.values()) if self.num_logprobs else None
+
+    # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1153 no_allowed_token_ids
+    @property
+    def no_allowed_token_ids(self) -> bool:
+        # SOURCE: vllm/v1/worker/gpu_input_batch.py:L1155
+        return len(self.has_allowed_token_ids) == 0

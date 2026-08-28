@@ -667,14 +667,14 @@ def test_update_states_returns_none_without_async_spec():
 
 
 def _flattening_setup():
-    """3 请求 [2,5,3] 调度窗——源码注释的基准场景。"""
+    """3 请求 [2,5,3] 调度窗——源码注释的基准场景（chunked prefill 第二拍）。"""
     r = _runner()
     r._update_states(_sched_output(new_reqs=[
-        _new_req("a", [100, 101, 102, 103], [5, 7], num_computed=0),
-        _new_req("b", list(range(200, 216)), [9], num_computed=0),
+        _new_req("a", [100, 101, 102, 103, 104, 105], [5, 7], num_computed=0),
+        _new_req("b", list(range(200, 215)), [9], num_computed=0),
         _new_req("c", [300, 301, 302], [3], num_computed=0),
-    ], num_scheduled={"a": 4, "b": 16, "c": 3}, total=23))
-    # 手工推进 computed（正常由调度器拍间下发）
+    ], num_scheduled={"a": 6, "b": 15, "c": 3}))
+    # 手工推进 computed（正常由调度器拍间下发；首拍 chunk 已算部分）
     r.input_batch.num_computed_tokens_cpu[:] = [4, 10, 0] + [0] * 5
     so = _sched_output(
         cached=_cached_data(
@@ -708,13 +708,13 @@ def test_prepare_inputs_flattening_and_index_select():
         np.array([0, 1, 0, 1, 2, 3, 4, 0, 1, 2], dtype=np.int64),
     )
     # token_indices = pos + req_index·M（二维坐标编一维）→ index_select 收齐
-    expected = [101, 102, 210, 211, 212, 213, 214, 300, 301, 302]
+    # a: pos 4,5 → 104,105；b: pos 10..14 → 210..214；c: pos 0..2 → 300..302
+    expected = [104, 105, 210, 211, 212, 213, 214, 300, 301, 302]
     assert r.input_ids.cpu[:10].tolist() == expected
     assert r.input_ids.gpu[:10].tolist() == expected  # 前缀上载（同步拍）
     # logits_indices = 每请求窗尾（非 spec：query_start_loc[1:]−1）
     assert logits_indices.tolist() == [1, 6, 9]
     assert spec_meta is None
-    return r
 
 
 def test_prepare_inputs_query_start_loc_pad_and_seq_lens():
@@ -767,10 +767,13 @@ def test_discard_request_mask_masks_partial_chunked_prefill():
         num_scheduled={"a": 5})
     r._prepare_inputs(so, np.array([5], dtype=np.int32))
     assert r.discard_request_mask.np[0] == True  # noqa: E712
-    # 完整 prompt 已算完的 decode：optimistic >= num_tokens → 采样
-    r.input_batch.num_computed_tokens_cpu[0] = 8
-    r.requests["a"].output_token_ids.append(42)  # num_tokens = 9 > 8
-    r._prepare_inputs(so, np.array([1], dtype=np.int32))
+    # 第二 chunk：computed=5 再排 3 → optimistic 8 == num_tokens 8 → 采样
+    r.input_batch.num_computed_tokens_cpu[0] = 5
+    so2 = _sched_output(
+        cached=_cached_data(req_ids=["a"], new_blocks=[[]], computed=[5],
+                            outputs=[0]),
+        num_scheduled={"a": 3})
+    r._prepare_inputs(so2, np.array([3], dtype=np.int32))
     assert r.discard_request_mask.np[0] == False  # noqa: E712
 
 

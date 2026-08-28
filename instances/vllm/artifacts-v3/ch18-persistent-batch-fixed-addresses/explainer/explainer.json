@@ -1,0 +1,533 @@
+{
+ "chapter_id": "ch18-persistent-batch-fixed-addresses",
+ "chapter_title": "持久批次与固定地址",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "trace_environment": "本章有精简版 companion（implementation/，只做减法、# SOURCE 逐行锚 v0.27.1，host 44 测试绿，见 impl-notes.md）。三个驱动脚本全部 host `python` 实跑、trace_source=run，脚本与原始输出在 explainer/traces/（纯 CPU：真 torch/numpy；worker 侧 CUDA 面以 HOST SEAM 承载——HostEvent/HostCopyStream/脚本化 logits 行，契约语义逐条保留，无 vLLM 运行时/GPU/容器）。与 pin 真实环境的结构性差异（均就近标注）：① 前向是 ENGINE SEAM 脚本化 logits 行（每请求一行 one-hot，argmax=脚本 pick）——真实前向是 compute_logits(hidden_states[logits_indices])（gpu_model_runner.py:L4484-L4485），本章取的批次状态/索引/收集数值不经过前向，不受 seam 影响；② positions/seq_lens 在 CPU device 上由同一源码行（L2188-L2195）算出——GPU 端数值路径与 CUDA graph 回放归 ch19；③ PIN_MEMORY=False（host 无 pinned，只影响拷贝速度不影响行为分支）；④ 块 id 是合成小整数（真实 = GPU 显存物理槽位，ch13/ch14 已立）。地址证据（m14）：CPU 张量 data_ptr 跨拍不变与 CUDA graph 的 data_ptr 断言（cuda_graph.py:L346-L355）是同一不变量在 host 的可观测投影。",
+ "figure_policy": "dossier needs_figure=true 七机制 m01/m02/m03/m04/m05/m06/m14 各配 1 张 figure_spec，均为 FIGURE-SYSTEM §3.3 允许的正文机制图——每张 spec 的 l0_zoom 字段显式回答「它是 L0 哪一块的放大」：本章 l0_region=gpu_column（L0 中列『GPU 执行臂』绿色列，第一原则：GPU 不空转），l0_zoom『执行臂中层』= 该列 GPUModelRunner 框（第ⅤPart 行程区，ch17-22 打开）。每张图 = L2 章图（cartography/l2-specs/ch18.json，已渲染 L2-ch18.png）center ①-⑤ 拍片或 south 支撑块的机制展开，非新架构画法、架构归属回指 L0/L2。",
+ "mechanisms": [
+  {
+   "mechanism_id": "ch18-m01",
+   "intuition": "快递站的老客户档案：第一次寄件要把整套身份材料交全（新请求全量建档），之后每次只发一条短信『+1 号箱』（老请求只发块号差量）；说一声『这单完结』档案才销（finished 通知清缓存）；退货重开的单子整箱换新号（resumed 整体替换而非追加）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch18-fig-diff-protocol",
+     "template": "flow",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』（gpu_column，绿色列）『执行臂中层』GPUModelRunner 框的**入线**——即 L2 章图（l2-specs/ch18.json）north『入 · EngineCore.step ②』→ center ②『_update_states · 差量调和』之间那根标着『SchedulerOutput 差量过线』的箭头的载荷展开。非新架构画法，架构归属回指 L0/L2。",
+     "claim": "同一根 execute_model 入线上，五拍发出五种形状完全不同的载荷——新请求拍背全量（prompt+块+采样参数）、稳态拍只背 2 条 diff（1 个块号+2 个 int）、finished 拍多带 1 个 id、resumed 拍的块号从『追加』变『整体替换』——协议把通信量从『请求数×prompt 长度』压缩到『变更数』。",
+     "numbers": [
+      {
+       "value": "拍1 新请求拍：2 份全量载荷（r1：prompt 2 token+1 块；r2：3 token+1 块）+0 条 cached + total 5",
+       "provenance": "traces/ch18_m02_reconcile.json beats[0].wire（new_reqs 2 条带 prompt_len/block_ids_len；cached req_ids 空；total 5）"
+      },
+      {
+       "value": "拍2 稳态拍：0 份全量，只有 2 条 diff——r1 追加 1 个块号、r2 追加 0 个（None）+ num_computed [2,3]；total 2",
+       "provenance": "traces/ch18_m02_reconcile.json beats[1].wire（new_reqs 空数组；cached new_block_ids_lens [1,0]、num_computed [2,3]）"
+      },
+      {
+       "value": "拍3 mixed 拍：finished 1 个（r2）+ 新全量 1 份（r3）+ diff 1 条——同拍三类载荷并存",
+       "provenance": "traces/ch18_m02_reconcile.json beats[2].wire（finished [r2]；new_reqs 1 条；cached 1 条）"
+      },
+      {
+       "value": "拍5 resumed 拍：r3 标记进 resumed 集，new_block_ids=[5] 语义变为整体替换（原 [4]）而非追加——同一个字段、两种语义，靠 resumed_req_ids 分叉",
+       "provenance": "traces/ch18_m02_reconcile.json beats[4].wire（resumed [r3]、new_block_ids_lens [0,1]）+ beats[4].after_update.block_rows（r3@1 块表行=[5,0]，原 beats[2] 为 [4,0]）"
+      },
+      {
+       "value": "协议注释原文：『We cache the request's data in each worker process, so that we don't need to re-send it every scheduling step』/『we only send the diff to minimize the communication cost』",
+       "provenance": "vllm/v1/core/sched/output.py:L194-L200（dossier embed_excerpts[0]）"
+      },
+      {
+       "value": "resumed 语义注释原文：『For those in the set, new_block_ids will be used as the request block IDs instead of appending』",
+       "provenance": "vllm/v1/core/sched/output.py:L118-L121（dossier embed_excerpts[1]）"
+      }
+     ],
+     "caption_draft": "调度器与 worker 之间不是『每拍发一整批』而是『首次全量建档、此后只发差量』（output.py:L193-L205 注释自述）：稳态拍（拍2）的载荷只有 2 条 diff、1 个块号——通信量与请求数×prompt 长度脱钩，只随本拍变更数走；finished 随下拍下发清缓存；唯一的语义分叉是 resumed——同名的 new_block_ids 字段，普通请求是追加、抢占恢复的请求是整体替换（output.py:L118-L121），消费点在 _update_states L1441-L1452。上游『调度器为何只发 diff』ch10/ch12 已立，本章是 worker 侧的对偶半边。",
+     "illustrator_notes": "横向五列 = 五拍（拍1-拍5），左端一个 Scheduler 方框、右端一个 worker/InputBatch 方框（框样式与配色回指 L2 north/center ②，不另立画法）。每列画一根箭头+载荷票据：票据宽度按载荷量示意（拍1 两张大票、拍2 两张小票、拍3 一大一小+finished 小旗、拍4 一张小票、拍5 小票+r3 票据上打『resumed→整体替换』标记）。拍5 的块号票据特别标注 [5]↗替换[4]。底部一行对照：全量重发（虚影大票 ×5）vs 差量（实票）。数字全部来自 traces/ch18_m02_reconcile.json 的 wire 字段。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch18-m02",
+   "intuition": "酒店前台的一块长住登记板：住客（请求）不退房就不撕牌子（CachedRequestState 快照留缓存），只是暂时划掉房号（移出批次）；新客入住优先填最小的空房（pop_removed），退房的空位批末统一往前压实（condense）；被赶去重开的客人换新房号要整行重写（resumed 整体替换）——登记板本身从不清空重建。",
+   "worked_example": {
+    "params": {
+     "规模": "max_num_reqs=4、max_model_len=32、block_size=16（每请求至多 2 块）、vocab=32、同步调度、greedy 采样（argmax=脚本 pick，采样结果可预测）",
+     "剧本": "r1/r2 首拍全量进批 → 拍2 decode 只收 diff（r1 追加新块）→ 拍3 r2 finished+r3 新请求（同拍删→增，洞复用）→ 拍4 r3 被抢占（unscheduled：出批次留缓存）→ 拍5 r3 resumed（块整体替换+全量重算）",
+     "机制本体": "GPUModelRunner._update_states（vllm/v1/worker/gpu_model_runner.py:L1192-L1566，impl 逐字减法版）",
+     "驱动脚本": "traces/run_ch18_m02_reconcile.py → traces/ch18_m02_reconcile.json（穿真实两段式协议 execute_model→sample_tokens 全闭环，含写回）"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch18_m02_reconcile.json",
+    "table": {
+     "columns": [
+      "拍",
+      "调度器发来的差量载荷",
+      "调和后批内 slot 布局",
+      "requests 缓存",
+      "本拍收出 input_ids（positions）",
+      "采样→写回"
+     ],
+     "rows": [
+      [
+       "1",
+       "new 全量×2（r1：2 token+1 块；r2：3 token+1 块）；cached 0 条；total 5",
+       "[r1@0, r2@1]，num_reqs=2",
+       "{r1, r2}（建档）",
+       "[101,102,201,202,203]（positions [0,1,0,1,2]）",
+       "采样 {r1:11, r2:21} → 行 [101,102,11] / [201,202,203,21]"
+      ],
+      [
+       "2",
+       "new 0；cached 2 条：r1 追加块 [3]、r2 无新块；num_computed 覆盖 [2,3]；total 2",
+       "[r1@0（块 [1,3]）, r2@1]，num_reqs=2——不动结构",
+       "{r1, r2}",
+       "[11,21]（positions [2,3]——恰是上拍写回的两个 token）",
+       "采样 {r1:12, r2:22}；r1 行 4 token、r2 行 5 token"
+      ],
+      [
+       "3",
+       "finished {r2}；new 全量×1（r3：2 token+1 块）；cached 1 条（r1，computed 3）；total 3",
+       "[r1@0, r3@1]——r3 落进 r2 让出的洞 1（pop_removed 最小空位）",
+       "{r1, r3}——r2 出缓存出批次",
+       "[12,301,302]（positions [3,0,1]）",
+       "采样 {r1:13, r3:31}；r3 行 [301,302,31]，洞行的陈旧尾巴 [203,21,22] 不搬不动"
+      ],
+      [
+       "4",
+       "new 0；cached 1 条（r1，computed 4）；num_scheduled 只含 r1；total 1",
+       "[r1@0]，num_reqs=1——r3 出批次",
+       "{r1, r3}——r3 快照仍在（移出批次≠删快照）",
+       "[13]（positions [4]）",
+       "采样 {r1:14}；r1 行 6 token"
+      ],
+      [
+       "5",
+       "cached 2 条：r3 在 resumed 集——new_block_ids=[5] 整体替换（原 [4]）、num_computed 归 0、排 3 token（全量重算）；total 4",
+       "[r1@0, r3@1]（洞 1 回填；r3 块表行=[5]）",
+       "{r1, r3}",
+       "[14,301,302,31]（positions [5,0,1,2]——r3 连自己的 output 31 一起重算）",
+       "采样 {r1:15, r3:30}；r3 行 [301,302,31,30]"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "每拍 _update_states 结束时：批内请求 ⊆ requests 缓存（batch ⊆ cache），且 req_id_to_index 恰与批内活行一一对应——finished 请求两处皆无，被抢请求只在缓存不在批次（gpu_input_batch.py 打洞/解绑 + gpu_model_runner.py L1203-L1253 的相容性由此维持）。",
+    "argument": "按拍内阶段做归纳。基例（空拍）：两集合皆空，命题成立。每拍按固定顺序执行四类动作，逐段验证保持：(a) finished 段先 requests.pop 再 remove_request——两集合同步删，差集不变；(b) unscheduled 段只 remove_request（L1241-L1242）不动缓存——batch 变小，⊆ 仍成立；(c) 新请求段先构造 CachedRequestState 存入 self.requests（L1300-L1309）再 append 进 reqs_to_add——先入缓存后入批，⊆ 保持；(d) 老请求段读 self.requests[req_id]（不存在即 KeyError 崩，L1353）后按 req_index 是否为 None 分流——已在批的只更新列，不在批的经 reqs_to_add→add_request 入批，同样先有缓存后有批。收尾 add_request/condense 只改批内布局（slot 映射），不增删缓存键。四段皆保持 ⊆ 与映射一致性 → 拍末命题成立，归纳完成。"
+   },
+   "quantified": "本玩具刻度（4 请求/32 列）：拍2 稳态拍的调和动作 = 2 条 diff（1 个块号 append + 2 个计数覆盖），零 add/remove/搬移——对照拍1 全量建档（2 份 prompt+块+采样参数写行）。真实刻度：API server 默认 max_num_seqs=256、LLM 类小卡 256/大卡（≥70GiB 非 A100）1024（vllm/engine/arg_utils.py:L2545-L2562）；按 dossier theory[0]，全量重建每拍 O(R·L) 写入 vs 增量调和 O(ΔN·avg_tokens)——R=256、max_model_len=8192 时全量重建 = 256×8192×4B ≈ 8MiB/拍的列重写，而稳态拍 ΔN≈0 只触几行前缀；代价的另一半是内存按 max 预留（token_ids_cpu 是 [max_num_reqs, max_model_len] 的 2D 大数组，TODO(woosuk) 自认 could be too large，gpu_input_batch.py:L129-L141）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch18-fig-reconcile-five-beats",
+     "template": "state-table",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』（gpu_column，绿色列）『执行臂中层』GPUModelRunner 框的 center ② 拍片『_update_states · 差量调和』（站 2-5）——即 L2 章图 center ② 拍片的机制展开（五站：移除/建快照/老请求调和/落位/压实收尾）。非新架构画法，架构归属回指 L0/L2。",
+     "claim": "五拍里同一个持久批次经历 全量建档→稳态不动→finished 打洞+新请求填洞→被抢移出（缓存保留）→resumed 整体替换回填，批容器与 requests 缓存始终不清空重建——每拍只对差量动手。",
+     "numbers": [
+      {
+       "value": "五拍批布局 [r1,r2] → [r1,r2] → [r1,r3]（r3@1 填 r2 的洞）→ [r1] → [r1,r3]",
+       "provenance": "traces/ch18_m02_reconcile.json beats[*].after_update.req_ids / req_id_to_index"
+      },
+      {
+       "value": "拍2 positions [2,3] 收出的 input [11,21]——恰为拍1 写回的两个采样 token（写回→下拍收集的闭环）",
+       "provenance": "traces/ch18_m02_reconcile.json beats[0].sampled 与 beats[1].positions/gathered_input_ids"
+      },
+      {
+       "value": "拍4 批内只剩 r1 但缓存仍 {r1,r3}——『移出批次≠删快照』",
+       "provenance": "traces/ch18_m02_reconcile.json beats[3].after_update（req_ids [r1] vs requests_cache_keys [r1,r3]）"
+      },
+      {
+       "value": "拍5 r3 块表行 [4]→[5] 整体替换 + num_computed 0 + 重算 3 token 含自己的 output 31",
+       "provenance": "traces/ch18_m02_reconcile.json beats[2]/beats[4].after_update.block_rows 与 beats[4].wire/gathered_input_ids"
+      },
+      {
+       "value": "核心假设自白：『The persistent batch optimization assumes that consecutive batches contain mostly the same requests. If batches have low request overlap ... this optimization becomes very inefficient』",
+       "provenance": "vllm/v1/worker/gpu_model_runner.py:L1248-L1251 NOTE(woosuk)（dossier embed_excerpts[5]）"
+      }
+     ],
+     "caption_draft": "持久批次的『调和』不是重建而是记账（gpu_model_runner.py:L1192-L1566）：五拍里批次结构只在拍3/拍4/拍5 变动——每次变动都由 SchedulerOutput 的差量字段驱动（finished 打洞、new 建档填洞、unscheduled 出批留缓存、resumed 整体替换），稳态拍（拍2）批次结构原封不动、只覆盖 2 个计数。拍2 的 positions [2,3] 恰落在拍1 写回的采样 token 上——写回与收集构成闭环，调度器无需回传 token。NOTE(woosuk) 的赌注在图底点明：这一切的前提是『连续批次大部分是同一批请求』。",
+     "illustrator_notes": "五行状态表（一拍一行）+ 右侧常驻的 requests 缓存栏（五拍连续，展示 r2 消失、r3 全程留缓存的对照）。每行左侧小票=差量载荷（同 ch18-fig-diff-protocol 的票据语言），中间=4 格 slot 板（r1/r2/r3 色块、洞=虚线格，r3@1 的填洞/回填用箭头标注），右侧=本拍 positions/input_ids 微型条。拍5 r3 slot 上加『块 [4]→[5] 替换』角标。数字全部来自 traces/ch18_m02_reconcile.json。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch18-m03",
+   "intuition": "剧院座位表的散场管理：退票只是把座位号划掉（打洞，人不挪、包不搬）；新观众优先坐最靠前的空位（pop_removed 弹最小空 slot）；散场毕统一把后排观众往前挪补齐空档（condense 尾部滑入），挪人只搬随身物品、不擦座位上的旧痕迹（只拷活跃前缀，陈旧尾巴无害）。",
+   "worked_example": {
+    "params": {
+     "规模": "InputBatch(max_num_reqs=8, max_model_len=16) 直驱（不经 runner），六请求 a(10 token)/b(3)/c(1)/d(1)/e(2)/f(1)",
+     "剧本": "第一轮：四请求占满 0-3 → remove b、remove c（洞@1、@2）→ condense（d 从 3 滑入 1，只拷 1 个活跃 token）→ refresh_metadata（解封 builder）；第二轮：remove a（洞@0）→ add e（pop 0 最小洞）→ add f（洞尽，落 num_reqs=2）→ condense 零成本早退",
+     "机制本体": "InputBatch._register_add_request / remove_request / condense + BatchUpdateBuilder（gpu_input_batch.py:L324-L348/L530-L548/L708-L838；logits_processor/state.py:L18-L145）",
+     "驱动脚本": "traces/run_ch18_m03_slots.py → traces/ch18_m03_slots.json（removed 表的探针读用私有 _removed 副本——公开属性 removed 首读即封账（state.py:L84-L90），正式读取只在『本拍 remove 已完成』的合法时点做）"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch18_m03_slots.json",
+    "table": {
+     "columns": [
+      "步",
+      "动作",
+      "builder.removed（降序）",
+      "num_reqs",
+      "批内 _req_ids",
+      "关键观察"
+     ],
+     "rows": [
+      [
+       "2",
+       "add a（10 token）",
+       "[]",
+       "1",
+       "[a]",
+       "pop_removed=None → slot=num_reqs=0（追加路径）"
+      ],
+      [
+       "5",
+       "add b、add c、add d（3/1/1 token）",
+       "[]",
+       "4",
+       "[a,b,c,d]",
+       "四请求占满 slot 0 到 3"
+      ],
+      [
+       "6",
+       "remove b → 打洞@1",
+       "[1]",
+       "3",
+       "[a,None,c,d]",
+       "行标记 None、映射解绑、块表行清零；token 数据 [20,21,22] 原地不动"
+      ],
+      [
+       "7",
+       "remove c → 打洞@2",
+       "[2,1]",
+       "2",
+       "[a,None,None,d]",
+       "公开属性读取（合法时点）确认降序 [2,1]"
+      ],
+      [
+       "8",
+       "condense",
+       "[2]",
+       "2",
+       "[a,d]",
+       "last=3、peek=1<3 → d 从 3 滑入 1，moved=[(3,1,UNIDIRECTIONAL)]；只拷活跃前缀 1 个 token——row1=[40,21,22]，b 的陈旧尾巴 [21,22] 留在原地无害；last 降过 2 ∈ removed 再降为 1，peek=2 ≥ 1 → break；尾部截断到 num_reqs=2"
+      ],
+      [
+       "10",
+       "remove a → 打洞@0",
+       "[0]",
+       "1",
+       "[None,d]",
+       "第二轮（refresh_metadata 已解封 builder）"
+      ],
+      [
+       "11",
+       "add e（2 token）",
+       "[]",
+       "2",
+       "[e,d]",
+       "pop_removed=0 → e@0 最小空 slot 优先复用；row0=[50,51,12,13]——a 的陈旧尾巴 [12,13] 同样无害"
+      ],
+      [
+       "12",
+       "add f（1 token）",
+       "[]",
+       "3",
+       "[e,d,f]",
+       "洞已填平 → pop 返回 None → slot=num_reqs=2 追加"
+      ],
+      [
+       "13",
+       "condense",
+       "[]",
+       "3",
+       "[e,d,f]",
+       "removed 空（全被 add 填平）→ 零成本早退（condense 首分支）"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "condense 必然终止，且结束时 [0, num_reqs) 内全是活请求（批前缀连续性不变量）；add_request 永不覆盖活请求。",
+    "argument": "终止性：循环体内每轮要么 pop_removed 一次（removed 表严格减 1）且 last_req_index -= 1，要么 break——removed 长度与 last_req_index 都是单调递减的非负整数（last 被 while last_req_index in empty 环钳在 ≥ peek 结果的下方，且 ≥0），两个计数器任一到底循环即停，有限步必终止。连续性：设洞集 E=removed（降序）。循环每轮取最小洞 e=peek、最大活位 l（>e 才动），把 l 搬进 e——搬后 e 变活、l 变洞并入尾部区域；结束时所有 < 当前 last 的洞都已被填，≥ last 的洞属于尾部截断区（del _req_ids[num_reqs:] 整段删除）→ 剩余列表 [0, num_reqs) 无洞。add 安全性：_register_add_request 要么弹出 removed 中的一个洞（该 slot 的 _req_ids 必为 None——打洞与登记在 remove_request 内原子成对），要么 pop 返回 None 时 removed 已空、由前次 condense 的连续性知 _req_ids[:num_reqs] 全活且 len=num_reqs，new_req_index=num_reqs 落在列表尾部（追加分支），两种情况都不触碰活行。"
+   },
+   "quantified": "本例（8 slot/16 列）：condense 只搬 1 个请求×1 列活跃 token（d 的前缀 1），第 2 个洞（@2）因位于尾部区域分文未花直接截断——搬移成本 ≤ 洞数×活跃前缀长，与 max_num_reqs×max_model_len 的全量规模（本例 8×16=128 列）无关；最坏情形（请求奇偶交替进出）每个洞都要一次滑入，退化为打洞+压实来回搬（NOTE 警告的低重叠场景的算术形态）。跨机制对照：ch18-m02 拍3 的 r3 填洞走的就是本表步 11 的 pop_removed 路径——洞在同一拍内『删→增』闭合，condense 直接早退（步 13 分支）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch18-fig-slot-lifecycle",
+     "template": "tiling",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』（gpu_column，绿色列）『执行臂中层』GPUModelRunner 框内的 InputBatch 结构——即 L2 章图 south『InputBatch · 固定全长内存布局』块的机制展开（L2 该块方法行已列 pop_removed/打洞/condense，本图把三段算法的 slot 级过程摊开）。非新架构画法，架构归属回指 L0/L2。",
+     "claim": "slot 复用与压实是三段式算法：remove 打洞（数据不搬）→ add 弹最小洞优先复用（洞尽才追加）→ condense 双指针把尾部活请求滑进前部空洞（只拷活跃前缀、尾部洞直接截断），结束时 [0, num_reqs) 恒连续。",
+     "numbers": [
+      {
+       "value": "九步 slot 板演化：[a] → [a,b,c,d] → [a,∅,c,d] → [a,∅,∅,d] → [a,d]（d 从 3 滑入 1，moved=[(3,1,UNIDIRECTIONAL)]）→ [∅,d] → [e,d] → [e,d,f] → [e,d,f]（早退不变）",
+       "provenance": "traces/ch18_m03_slots.json steps[*]._req_ids / builder.moved（step8 moved=[[3,1,UNIDIRECTIONAL]]）"
+      },
+      {
+       "value": "removed 表降序演化 [] → [1] → [2,1] →（condense 后残留）[2] → refresh 清空 → [0] →（add e 弹出后）[]",
+       "provenance": "traces/ch18_m03_slots.json steps[*].builder.removed_desc_probe + removed_public_read_at_legal_point（step7=[2,1]、step10=[0]）"
+      },
+      {
+       "value": "只拷活跃前缀的铁证：滑入后 row1=[40,21,22,0]——d 的 1 个活跃 token 在前，b 的陈旧尾巴 [21,22] 原地残留；e 复用洞 0 后 row0=[50,51,12,13] 同理",
+       "provenance": "traces/ch18_m03_slots.json step8/step11 rows.row1.tokens_first4 / rows.row0.tokens_first4（active_prefix_len 分别 1 与 2）"
+      },
+      {
+       "value": "condense 双指针初值：last = num_reqs + len(removed) - 1 = 2+2-1 = 3",
+       "provenance": "vllm/v1/worker/gpu_input_batch.py:L731（dossier embed_excerpts[10] 骨架）+ traces/ch18_m03_slots.json step7（num_reqs=2、removed=[2,1]）"
+      },
+      {
+       "value": "洞尽追加路径：add f 时 pop_removed=None → slot=num_reqs=2（len(_req_ids)=2，追加分支）",
+       "provenance": "traces/ch18_m03_slots.json step12（removed_desc_probe=[]、_req_ids=[e,d,f]、req_id_to_index f:2）"
+      }
+     ],
+     "caption_draft": "持久批次的 slot 从不清空重建，靠三段算法维持 [0, num_reqs) 连续（gpu_input_batch.py:L324-L348 打洞/复用 + L708-L838 压实）：remove 只打洞不搬数据；add 优先弹最小洞（BatchUpdateBuilder 保证 removed 恒降序、pop/peek 恒取最小，state.py:L18-L42）；condense 双指针把尾部活请求滑进前部洞——只拷活跃前缀（row1 里 b 的陈旧尾巴 [21,22] 留在原地，反正下次写入会覆盖），尾部洞直接截断删除。moved=(3,1) 记录进 BatchUpdate 供 logitsprocs 增量重建状态——slot 的每一次搬移都有索引账可查。",
+     "illustrator_notes": "tiling 网格：横轴 9 步（表中步号即 trace steps 2/5/6/7/8/10/11/12/13），纵轴 8 个 slot 行。每格三态：活请求色块（标 req_id+活跃 token 数）/洞（虚线+灰）/不存在（截断后整段收起，用格子变淡消失表达 del）。condense 那一步画 d 的滑入箭头 3→1，箭头下挂小放大镜显示 row1 的 token 级内容 [40,21,22]（活跃 1 + 陈旧尾巴 2，尾巴用灰色）。底部一行双指针仪表：last/peek 值随步演化。数字全部来自 traces/ch18_m03_slots.json。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch18-m04",
+   "intuition": "剧场的一排长椅：每把椅子（slot）自带的不是座位号而是全长储物格（一行 max_model_len 个格子），观众落座把随身的 token 从头摆起；旁边一列小抽屉（列式 CPU 镜像）记每人的提示长度、已算进度——行式大网格 + 列式小账本，同一批请求的两张视图。",
+   "figure_specs": [
+    {
+     "figure_id": "ch18-fig-inputbatch-layout",
+     "template": "layout",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』（gpu_column，绿色列）『执行臂中层』GPUModelRunner 框内的 InputBatch 容器——即 L2 章图 south『InputBatch · 固定全长内存布局』块本体的内存视图展开（该块方法行 1-2 所述布局的画法化）。非新架构画法，架构归属回指 L0/L2。",
+     "claim": "InputBatch 是『行式 R×L 大网格 + 列式 CPU 镜像』的双视图容器：一行=一个请求的全长 token 缓冲（prompt 前缀+output 紧随，写回只前移游标），旁列各记 num_prompt_tokens/num_tokens_no_spec/num_computed_tokens_cpu——一切搬移只动活跃前缀、一切布局按 max 预留。",
+     "numbers": [
+      {
+       "value": "玩具刻度 R×L=8×16（m03 trace 的构造参数），本 trace 各行活跃前缀 10/3/1/1/2/1 token",
+       "provenance": "traces/ch18_m03_slots.json config.max_num_reqs/max_model_len + steps[*].rows[*].active_prefix_len"
+      },
+      {
+       "value": "写行语义：add_request 把 prompt 写进 [req, :num_prompt] 再把 output 紧随其后（[start,end]），num_tokens_no_spec=num_prompt+len(output)",
+       "provenance": "vllm/v1/worker/gpu_input_batch.py:L366-L388（dossier embed_excerpts[8]）+ traces/ch18_m02_reconcile.json beats[1].after_sample（r1 行 [101,102,11,12]：prompt 2+output 2）"
+      },
+      {
+       "value": "真实刻度：token_ids_cpu = max_num_seqs × max_model_len × 4B（int32、不 pinned）——API server 默认 max_num_seqs=256（小卡）/1024（≥70GiB 非 A100），max_model_len 按模型配置（如 8192）时 = 256×8192×4B ≈ 8MiB～1024×8192×4B ≈ 32MiB 的 CPU 常驻",
+       "provenance": "vllm/v1/worker/gpu_input_batch.py:L129-L141（TODO(woosuk)『This buffer could be too large if max_model_len is big』+ int32/pin_memory=False）× vllm/engine/arg_utils.py:L2545-L2562（max_num_seqs 256/1024 默认）——乘积为算术组合，两因子均有锚"
+      },
+      {
+       "value": "陈旧尾巴无害的铁证：洞复用/滑入后 row1=[40,21,22]、row0=[50,51,12,13]——活跃前缀之外的旧数据不清理也不读",
+       "provenance": "traces/ch18_m03_slots.json step7/step10 rows（active_prefix_len 1/2 界定读边界）"
+      }
+     ],
+     "caption_draft": "持久批次的内存形状（gpu_input_batch.py:L92-L172）：一个 [max_num_reqs, max_model_len] 的 int32 大网格（一行一请求的全长 token 缓冲，add_request 写 prompt 前缀+output 紧随、_bookkeeping_sync 写回只前移 num_tokens_no_spec 游标）+ 一组列式 CPU 镜像（num_prompt_tokens/num_tokens_no_spec/num_computed_tokens_cpu/采样参数列）+ req_id_to_index 索引。活跃前缀之外的格子是陈旧数据——不清理也不读（搬移/收集都以活跃前缀为界）。代价按 max 预留：TODO(woosuk) 自认『could be too large if max_model_len is big』，256 请求×8192 长度即 8MiB 级 CPU 常驻。",
+     "illustrator_notes": "layout 图分三栏：左=行式大网格（本例 4 行×16 列的小网格，用 m02 拍5 的真实行内容：r1 行 [101,102,11,12,13,14,15,...] 活跃 7、r3 行 [301,302,31,30,...] 活跃 4，活跃段着色/陈旧段灰点，行首标 req_id@slot）；右=列式镜像条（num_prompt/num_tokens_no_spec/num_computed_tokens_cpu 三列竖条，取值 2/7/5 与 2/4/0）；底部=真实刻度换算条（256×8192×4B≈8MiB，配 TODO 原文引注）。数字分别来自 traces/ch18_m02_reconcile.json beats[4] 与源码锚。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch18-m05",
+   "intuition": "工厂的固定料盘：盘子的格子数（max 形状）开厂时一次浇铸、位置永不挪；每班只往用到的格子摆料（活跃前缀），传送带（copy_to_gpu）也只送用到的格子到车间同一张工作台（GPU 侧地址不变）——工作台上的模具（CUDA graph）认的是位置，不是数量。",
+   "figure_specs": [
+    {
+     "figure_id": "ch18-fig-cpugpubuffer",
+     "template": "layout",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』（gpu_column，绿色列）『执行臂中层』GPUModelRunner 框内的缓冲地基——即 L2 章图 south『CpuGpuBuffer · 地址永不变』块本体的机制展开（该块方法行 1-3 的三视图/前缀拷贝/一次分配）。非新架构画法，架构归属回指 L0/L2。",
+     "claim": "CpuGpuBuffer 把每个 per-step 张量做成『cpu(pinned)+gpu+np 三视图一体』的固定形状双端缓冲：地址一次分配永不再变，copy_to_gpu(n) 只把 [0,n) 活跃前缀送过 PCIe——带宽按需、地址恒定，两个要求同时满足。",
+     "numbers": [
+      {
+       "value": "本 trace 的前缀拷贝实证：input_ids 缓冲按 max_num_batched_tokens=64 分配，五拍实际只拷活跃前缀 total=5/2/3/1/4",
+       "provenance": "traces/ch18_m02_reconcile.json config.max_num_batched_tokens=64 + beats[*].wire.total"
+      },
+      {
+       "value": "query_start_loc 按 max_num_reqs+1=5 分配、值域 [0,2,7,10,10]——尾部 pad 非递减维持固定形状的可捕获性",
+       "provenance": "traces/ch18_m06_gather.json observed.query_start_loc_full_with_pad + config.max_num_reqs=4"
+      },
+      {
+       "value": "runner 持久缓冲清单（一次分配）：input_ids/positions/query_start_loc/seq_lens/optimistic_seq_lens_cpu/num_computed_tokens/prev_num_draft_tokens/req_indices/prev_positions/num_scheduled_tokens/is_token_ids/discard_request_mask/num_decode_draft_tokens/num_accepted_tokens",
+       "provenance": "vllm/v1/worker/gpu_model_runner.py:L763-L810（首行注释 'Persistent buffers for CUDA graphs'，dossier embed_excerpts[12]）"
+      },
+      {
+       "value": "copy_to_gpu(n) 语义原文：gpu[:n].copy_(cpu[:n], non_blocking=True)——n=None 才全量",
+       "provenance": "vllm/v1/utils.py:L139-L142（dossier embed_excerpts[11] CpuGpuBuffer 全文）"
+      },
+      {
+       "value": "六缓冲×五拍 data_ptr 全部不变（input_ids cpu/gpu、positions、query_start_loc cpu、seq_lens、token_ids_cpu_tensor）",
+       "provenance": "traces/ch18_m02_reconcile.json beats[*].data_ptrs + data_ptr_stable_across_5_beats=true"
+      }
+     ],
+     "caption_draft": "喂给 GPU 的每个 per-step 张量都住在一块『三视图』固定缓冲里（vllm/v1/utils.py:L110-L149）：cpu（pinned，走 DMA 快速路径）+ gpu + np（Python 侧零拷贝视图），形状按 max 一次分配（runner __init__ 的 'Persistent buffers for CUDA graphs' 块，L763-L810）；每拍只把 [0,n) 活跃前缀 non_blocking 拷上 GPU——本 trace 五拍的 input_ids 拷贝量 5/2/3/1/4 各不相同，但 GPU 侧接收地址从头到尾没动过。『固定形状』与『活跃前缀』是同一设计在分配侧与传输侧的配对，也是 m14 CUDA graph 回放命中条件的直接供给。",
+     "illustrator_notes": "layout 图三层：上层 cpu(pinned) 长条（64 格，本拍染前 4 格=m02 拍5 的 total 4，其余灰）；中层 PCIe 传送带箭头标 copy_to_gpu(n)、non_blocking（只盖住染色的前缀段）；下层 gpu 长条（同 64 格、地址锚点符号🔒标在条左端，跨拍不变）。右侧小卡列出三视图对应关系（torch cpu / torch gpu / np）与 query_start_loc 的 [0,2,7,10,10] 尾 pad 实例。底部一行：五拍拷贝量 5/2/3/1/4 vs 缓冲恒 64。数字来自 traces/ch18_m02_reconcile.json 与 traces/ch18_m06_gather.json。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch18-m06",
+   "intuition": "图书馆按页码取书：你要的散页清单是（第几排，第几本）二维坐标，管理员先把每排要的本数展开成排号序列（np.repeat），再把二维坐标折算成一个连续流水号（排号×每排容量+本数），一趟小车（index_select）按流水号把所有散页一次取齐——没有一排一趟的往返。",
+   "worked_example": {
+    "params": {
+     "规模": "max_model_len M=16（token_ids_cpu 列数）、3 请求单拍混合进批：r1 前 4 个 token 前缀命中（num_computed=4）续 2、r2 全新 prefill 5、r3 chunked prefill 已算 7 续 3——num_scheduled_tokens=[2,5,3]，恰为源码注释自带的算例（gpu_model_runner.py:L1981-L1989）",
+     "机制本体": "_get_cumsum_and_arange（L1743-L1767）+ _prepare_inputs 收集主段（L1977-L2024），impl 逐字减法版",
+     "驱动脚本": "traces/run_ch18_m06_gather.py → traces/ch18_m06_gather.json（token_indices 为按源码恒等式 token_indices=positions+req_indices·M 从观测量导出的展示量——req_indices/positions 均为 runner 持久缓冲实测值，恒等式见 L2007-L2014，trace 的 derived.identity 字段声明）"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch18_m06_gather.json",
+    "table": {
+     "columns": [
+      "#",
+      "req_index（请求）",
+      "请求内偏移 query_pos",
+      "position（绝对位置）",
+      "扁平索引 token_index",
+      "收出的 token"
+     ],
+     "rows": [
+      [
+       "0",
+       "0（r1）",
+       "0",
+       "4",
+       "4",
+       "15"
+      ],
+      [
+       "1",
+       "0（r1）",
+       "1",
+       "5",
+       "5",
+       "16"
+      ],
+      [
+       "2",
+       "1（r2）",
+       "0",
+       "0",
+       "16",
+       "21"
+      ],
+      [
+       "3",
+       "1（r2）",
+       "1",
+       "1",
+       "17",
+       "22"
+      ],
+      [
+       "4",
+       "1（r2）",
+       "2",
+       "2",
+       "18",
+       "23"
+      ],
+      [
+       "5",
+       "1（r2）",
+       "3",
+       "3",
+       "19",
+       "24"
+      ],
+      [
+       "6",
+       "1（r2）",
+       "4",
+       "4",
+       "20",
+       "25"
+      ],
+      [
+       "7",
+       "2（r3）",
+       "0",
+       "7",
+       "39",
+       "24"
+      ],
+      [
+       "8",
+       "2（r3）",
+       "1",
+       "8",
+       "40",
+       "23"
+      ],
+      [
+       "9",
+       "2（r3）",
+       "2",
+       "9",
+       "41",
+       "22"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "query_start_loc 的相邻区间 [qsl[k], qsl[k+1]) 把 [0, total) 精确划分给请求 k（宽度恰为 num_scheduled[k]），且每个收出的 token 恰等于 token_ids_cpu 扁平视图在 token_indices[i] 处的已写元素——收集不重不漏、永不读到未写格子。",
+    "argument": "划分：cu_num_tokens 是 cumsum（_get_cumsum_and_arange Step 1，L1755-L1757）——对请求序列做归纳：cu[0]=n_0；cu[k]=cu[k-1]+n_k（cumsum 定义）→ 区间 [cu[k-1], cu[k]) 宽度恰 n_k、彼此不交、并集=[0, total)，基例与归纳步都是定义的直接推论；np.repeat 以同一 n_k 展开排号，故展开序与区间序逐元素对齐。不读未写格：position_i = num_computed_tokens_cpu[r]+query_pos_i，其中 query_pos_i ∈ [0, n_r)（Step 3 的 arange 减 cumsum_offsets 构造保证），故 position_i ∈ [computed_r, computed_r+n_r) ⊆ [0, num_tokens_r)——该行的 [0, num_tokens_r) 恰是已写区（prompt 在 add_request L375-L388 写、output 在 _bookkeeping_sync L3815-L3846 写回，num_computed+n_scheduled=num_tokens 是调度器的追赶账），且 num_tokens_r ≤ M（超出即调度错误），故 token_indices=r·M+position 落在本行已写前缀内，index_select 取到的必是真实 token。"
+   },
+   "quantified": "本例：10 个 token 的收集 = 一次 np.repeat（10 元素展开）+ 一次 cumsum（3 元素）+ 10 次整数加乘（positions/token_indices）+ 一次 index_select（10 元素 gather）——总量 O(total)，与请求数无关、无逐请求 Python 循环。真实刻度：total = 本拍调度 token 数，上限即 max_num_batched_tokens——服务端默认 2048（小卡 API server）/8192（≥70GiB 非 A100 API server）、LLM 类 8192/16384（vllm/engine/arg_utils.py:L2545-L2562）：一拍最多 2048~16384 个 token 的 gather 仍是常数次向量算子，这正是对 v0『逐请求 Python 循环组批』的结构性替代（dossier theory[1]）。配套：query_start_loc 尾部 pad 非递减（[0,2,7,10,10]）让固定形状缓冲可被 FlashAttention 类 kernel 直接消费（L2073-L2078 注释）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch18-fig-gather-pipeline",
+     "template": "tensor-flow",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』（gpu_column，绿色列）『执行臂中层』GPUModelRunner 框 center ③ 拍片『_prepare_inputs · 收集装配』——即 L2 章图 center ③ 拍片（站 7『扁平收集』）的机制展开。非新架构画法，架构归属回指 L0/L2。",
+     "claim": "三个请求的 [2,5,3] 份 token 账经过 np.repeat 展开→cumsum 折偏移→二维坐标编一维（token_indices=pos+req_index·16）→一次 index_select，变成一列连续的 10 个 input_ids——收集是 O(total) 的向量算子链，不是逐请求循环。",
+     "numbers": [
+      {
+       "value": "num_scheduled [2,5,3] → req_indices [0,0,1,1,1,1,1,2,2,2]（np.repeat）→ cu [2,7,10]（cumsum）→ query_pos [0,1,0,1,2,3,4,0,1,2]（arange−offsets）",
+       "provenance": "traces/ch18_m06_gather.json observed.req_indices/query_pos/cu_num_tokens_from_query_start_loc + 源码注释同一算例 vllm/v1/worker/gpu_model_runner.py:L1981-L1989"
+      },
+      {
+       "value": "positions = num_computed[req] + query_pos = [4,5, 0,1,2,3,4, 7,8,9]（r1 前缀命中 4 起、r2 从 0 起、r3 从 7 起——无 prefill/decode 相位之分的统一形态）",
+       "provenance": "traces/ch18_m06_gather.json observed.positions + requests.*.num_computed（4/0/7）"
+      },
+      {
+       "value": "token_indices = positions + req_indices×16 = [4,5, 16,17,18,19,20, 39,40,41] → index_select 收出 [15,16, 21,22,23,24,25, 24,23,22]",
+       "provenance": "traces/ch18_m06_gather.json derived.token_indices + observed.gathered_input_ids + config.M_token_ids_cpu_cols=16（恒等式 L2007-L2014）"
+      },
+      {
+       "value": "query_start_loc=[0,2,7,10,10]：CU 偏移 + 尾部 pad 到非递减（FlashAttention 要求）；logits_indices=qsl[1:]−1=[1,6,9]（每请求末 token=采样位，接 ch17）",
+       "provenance": "traces/ch18_m06_gather.json observed.query_start_loc_full_with_pad / observed.logits_indices + vllm/v1/worker/gpu_model_runner.py:L2073-L2078"
+      },
+      {
+       "value": "算子选型自述：『We use torch.index_select instead of np.take here because torch.index_select is much faster than np.take for large tensors』",
+       "provenance": "vllm/v1/worker/gpu_model_runner.py:L2016-L2018 NOTE(woosuk)（dossier embed_excerpts[13]）"
+      }
+     ],
+     "caption_draft": "收集的主干是四步向量算术（gpu_model_runner.py:L1743-L1767 + L1977-L2024，注释自带的 [2,5,3] 算例在此真跑）：np.repeat 把每请求份数展开成排号、cumsum+arange 折出请求内偏移、positions=num_computed+偏移（前缀命中的 r1 从 4 起、全新的 r2 从 0 起、续块的 r3 从 7 起——同一公式无相位分叉），最后 token_indices=pos+排号×16 把 (行,列) 二维坐标编成一维流水号，一次 index_select 从 token_ids_cpu 扁平视图收齐 10 个 token。chunked prefill 与 decode 在这里只是 num_scheduled 的大小不同——这正是 ch10『调度只认 token 数』在 worker 侧的镜像。",
+     "illustrator_notes": "tensor-flow 四泳道从上到下：①num_scheduled [2,5,3] 三色票据 → ②np.repeat 展开条（10 格三色段）+ cu [2,7,10] 刻度线 → ③positions 双行（query_pos 与 num_computed 相加的竖式示意，右端标 r1 起 4/r2 起 0/r3 起 7）→ ④左侧画 token_ids_cpu 3×16 网格（16 列标尺 0/16/32），收集格子高亮 [4,5|16..20|39..41]，右侧一列箭头汇出 gathered 10 格；底部小条：qsl=[0,2,7,10,10] 尾 pad + logits_indices=[1,6,9]。数字全部来自 traces/ch18_m06_gather.json。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch18-m14",
+   "intuition": "预录的烹饪节目回放：录像机把『往 3 号锅加油、开 5 档火』的动作连同锅架位置一并录死——重播时工作人员只需把新食材放进同一口 3 号锅（写回固定地址），绝不会重新读菜谱决定火候（replay 不重读 shape/地址）；锅挪了位置，录的就成了错误指令。",
+   "figure_specs": [
+    {
+     "figure_id": "ch18-fig-fixed-address-replay",
+     "template": "before-after",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』（gpu_column，绿色列）『执行臂中层』GPUModelRunner 框 center ④ 拍片『前向 · 固定地址喂图』与 south『why · 固定地址 → CUDA graph』注——即 L2 章图该拍片/该注的机制展开（完整捕获-回放链归 ch19，本图只画『地址不变』这半边证据）。非新架构画法，架构归属回指 L0/L2。",
+     "claim": "回放命中 = BatchDescriptor 全等 AND 输入张量地址不变——后半条件由本章全部设计供给：五拍里批次从 2 请求变 1 再变 2、token 账从 5 变 1 再变 4，但六个喂图缓冲的 data_ptr 一个都没动。",
+     "numbers": [
+      {
+       "value": "六缓冲×五拍 data_ptr 全等：input_ids(cpu/gpu)、positions、query_start_loc(cpu)、seq_lens、token_ids_cpu_tensor——批形状五拍四变（2→2→2→1→2 请求、total 5→2→3→1→4），地址恒定",
+       "provenance": "traces/ch18_m02_reconcile.json beats[*].data_ptrs + data_ptr_stable_across_5_beats=true + beats[*].wire（形状变化）"
+      },
+      {
+       "value": "回放前断言原文：DEBUG 模式逐 data_ptr 比对捕获时地址——『Input addresses for cudagraphs are different during replay. Expected …, got …』",
+       "provenance": "vllm/compilation/cuda_graph.py:L346-L355（is_debugging_mode 下 assert new_input_addresses == entry.input_addresses）"
+      },
+      {
+       "value": "回放命中的另一半：BatchDescriptor(num_tokens, num_reqs, uniform, has_lora, num_active_loras) 全等——形状侧由 padding 到捕获形状满足（归 ch19）",
+       "provenance": "vllm/forward_context.py:L29-L58（frozen dataclass 字段面；deepread/gpu-exec.json why_chains[10]）"
+      },
+      {
+       "value": "持久缓冲分配注释原文：『Persistent buffers for CUDA graphs』——地址永不变的 why 直指回放",
+       "provenance": "vllm/v1/worker/gpu_model_runner.py:L763-L764（dossier embed_excerpts[12] 首行）"
+      },
+      {
+       "value": "地址稳定的跨拍前提：复用同一块 pinned CPU buffer 必须自管同步——synchronize_input_prep 每拍先等上拍 prepare_inputs_event 再写（先等后录）",
+       "provenance": "vllm/v1/worker/gpu_model_runner.py:L3864-L3877（m13 防踩协议；impl 同段逐字，tests/test_persistent_batch.py test_synchronize_input_prep_waits_then_records 断言调用序）"
+      }
+     ],
+     "caption_draft": "本章一切固定缓冲设计的 why 终点（cuda_graph.py:L346-L355）：CUDA graph 捕获时把 kernel 的指针与 grid 烤死在图里、replay 不重读张量元数据——所以回放命中要求 BatchDescriptor 全等 AND data_ptr 不变。本 trace 五拍是这半边不变量的活体证据：批内请求 2→2→2→1→2、token 账 5→2→3→1→4 拍拍在变，六个喂图缓冲的地址纹丝不动（形状侧的 padding 配套归 ch19）。复用同一块 buffer 的代价是自管同步——synchronize_input_prep 的先等后录协议（L3864-L3877）是地址稳定的跨拍前提。",
+     "illustrator_notes": "before-after 两联：左联『捕获时刻』（六缓冲条各标 data_ptr 锚点符号🔒+当时的批形状 2 请求/5 token）；右联『第 4 拍回放』（同一组缓冲条——锚点符号逐一相同（六个✔对齐），批形状换成 1 请求/1 token，前缀着色段缩短、条全长与锚点不变）。中间竖排断言框引用 cuda_graph.py:L346-L355 原文（DEBUG 模式 data_ptr 逐个比对）。底部一行小字：BatchDescriptor(num_tokens,num_reqs,…) 全等 = 另一半条件 → ch19。数字来自 traces/ch18_m02_reconcile.json（data_ptrs 全等 + wire 形状）。"
+    }
+   ]
+  }
+ ]
+}
