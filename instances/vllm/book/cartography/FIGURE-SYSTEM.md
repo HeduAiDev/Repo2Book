@@ -6,7 +6,7 @@
 ## 0. 硬规则
 
 1. **一张图原则**：全书只有一种架构画法 = L0 的画法。任何新图必须能回答「它是 L0 哪一块的放大」，答不出就不许存在。
-2. **同源强制**：L0/L1/L2 共享布局常量模块（`l0_common.py`）、配色常量（C_API_S 蓝/C_ZMQ_S 紫/C_ENG_S 橙/C_GPU_S 绿/C_KV_S 青/C_TXT/C_MUTE）、字体栈、图例样式。改配色/术语只许改常量，全层联动。
+2. **同源强制**：L0/L1/L2 共享布局常量模块（`l0_common.py`）、配色常量（C_API_S 蓝/C_ZMQ_S 紫/C_ENG_S 橙/C_GPU_S 绿/C_KV_S 青/C_TXT/C_MUTE）、字体栈、图例样式。改配色/术语只许改常量，全层联动。**角色色即身份**（exp-2026-08-28：ch18-fig-diff-protocol 把 worker 框画成橙色、与 ch12 的绿色 worker 泳道分叉）：worker/GPU 执行臂在任何图里恒用 C_GPU_S 绿、EngineCore 恒用 C_ENG_S 橙——角色色不得按图内美观改用他色，角色变了颜色没变 = 图系分叉。
 3. **几何同源**：L1 = L0 的 viewBox 裁切放大（物理保证）；L2 = L1 对应块的展开（组件框位置从 L1 坐标推导，方法级细节在框内展开）。
 4. **文字与门禁**：图上文字全走 `fit()`（防越界）；箭头端点必须落框边（strict 几何门禁 `lint_diagram_geometry.py`——cartography 路径自动 strict）。
 5. **Part 标注**：L0 上每块标「第几 Part 打开」（F9 伏笔：逐章点亮）。
