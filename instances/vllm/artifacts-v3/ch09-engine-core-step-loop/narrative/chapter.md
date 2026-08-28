@@ -169,7 +169,7 @@ docstring 自己说明用途：「post-initialization config that may differ fro
 
 docstring 原话：「allow request initialization running in parallel with Model forward」。`Request.from_engine_core_request` 把线格式请求变成引擎自己的 `Request` 实体（顺带算好前缀哈希——前缀缓存要用的那本账，Part IV 展开）；带结构化输出约束的请求在这里启动 `grammar_init`（语法编译，异步的，编译完才允许被调度）。这些都是 CPU 大户，全放在 IO 线程做掉，忙循环只消费结果——这是「慢操作出循环」清单的第一笔，后面还会看到 encoding、detokenize、GC（garbage collection，Python 垃圾回收）各归各位。两段「Note on thread safety: no race condition」注释值得多看一眼：它们不是拍胸脯，是在说明**为什么**无竞态——这个方法只在输入线程被调用、编译又是异步的，忙循环摸到请求时编译早已在别处排队。预处理抛错也不炸引擎，走该请求自己的 ERROR 回程（`_handle_request_preproc_error`，`core.py:L1829-L1836`）。
 
-数据从此归位：IO 线程把 `(request_type, request)` 投进 `input_queue`，这个对象此后归引擎进程独占可变（第 1 站到此）。忙循环消费侧的分派函数 `_handle_client_request`（`core.py:L1507-L1540`）按消息类型走：ADD 转 `EngineCore.add_request` 校验后交调度器登记进 waiting 队尾（`scheduler.py:L2213-L2231`；章图同一锚标到 L2235——那是整个函数体，尾四行是 KV connector 钩子与统计事件，本论断只到登记入队），ABORT 落 `abort_requests`，UTILITY 走[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)讲过的反射薄 RPC，WAKEUP 哨兵直接 return（它的戏在收场一节）。
+数据从此归位：IO 线程把 `(request_type, request)` 投进 `input_queue`，这个对象此后归引擎进程独占可变（第 1 站到此）。忙循环消费侧的分派函数 `_handle_client_request`（`core.py:L1507-L1540`）按消息类型走：ADD 转 `EngineCore.add_request` 校验后交调度器登记进 waiting 队尾（`scheduler.py:L2213-L2231`；章图同一锚标到 L2235——那是整个函数体，尾四行是 KV connector 钩子与统计事件——KVConnector＝跨机搬运 KV cache 的接入组件（机制本体在 Part IV 末章 KVConnector 章，P/D 分离部署形态归 Part VIII），本论断只到登记入队），ABORT 落 `abort_requests`，UTILITY 走[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)讲过的反射薄 RPC，WAKEUP 哨兵直接 return（它的戏在收场一节）。
 
 ## 轮子：忙循环，专职而不空转
 
@@ -299,7 +299,7 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
         self.aborts_queue = queue.Queue[list[str]]()
 ```
 
-`batch_queue`（批队列，`max_concurrent_batches > 1` 时才建，`core.py:L206-L212`）非空就绑 `step_with_batch_queue`——批 A 在 GPU 跑的同时调度批 B 的重叠版。而 v0.27.1 的服务场景**默认就是这个重叠版**：异步调度配置为 None 时，规则是「Enable async scheduling unless there is an incompatible option」（`vllm/config/vllm.py:L1095-L1143`），只有池化模型、部分投机解码方法、部分执行后端才降级关闭。本章接下来一整章讲同步版 `step()`——教学顺序与生产默认相反，必须先说破。为什么这么教：同步版的四段骨架——schedule → execute → sample → update，③的掩码是塞在 execute 与 sample 之间窗口里的步骤——是理解重叠版的唯一地基，重叠版只是把「等上一拍结束再调度下一拍」的串行段折叠掉；地基的账算不清，重叠版省了什么就无从判断。重叠版怎么折、付什么代价，Part III 末章（异步调度）整章拆。
+`batch_queue`（批队列，`max_concurrent_batches > 1` 时才建，`core.py:L206-L212`）非空就绑 `step_with_batch_queue`——批 A 在 GPU 跑的同时调度批 B 的重叠版。而 v0.27.1 的服务场景**默认就是这个重叠版**：异步调度配置为 None 时，规则是「Enable async scheduling unless there is an incompatible option」（`vllm/config/vllm.py:L1095-L1143`），只有池化模型（pooling model——不做逐 token 生成、只取整段表示向量做池化输出的那类，embedding/rerank 是典型用法）、部分投机解码方法、部分执行后端才降级关闭。本章接下来一整章讲同步版 `step()`——教学顺序与生产默认相反，必须先说破。为什么这么教：同步版的四段骨架——schedule → execute → sample → update，③的掩码是塞在 execute 与 sample 之间窗口里的步骤——是理解重叠版的唯一地基，重叠版只是把「等上一拍结束再调度下一拍」的串行段折叠掉；地基的账算不清，重叠版省了什么就无从判断。重叠版怎么折、付什么代价，Part III 末章（异步调度）整章拆。
 
 ## 一拍五段：顺序就是性能设计（站 2-6）
 
@@ -748,7 +748,7 @@ vLLM v0.27.1 里这张表由默认后端 xgrammar 提供（版本钉 `xgrammar >
 
 ## 收场：退出与死讯
 
-循环怎么停、进程怎么死，是心跳故事的最后一章。先看信号。`run_engine_core` 尾段装了 SIGTERM/SIGINT 两个处理器：
+循环怎么停、进程怎么死，是心跳故事的最后一章。先看信号——信号（signal）是操作系统异步递给进程的通知：`kill` 命令默认发的 SIGTERM（终止）、终端里 Ctrl+C 发的 SIGINT（中断）都是信号；进程可以登记处理器函数，操作系统会在任意时刻中断主线程、插进去调它。`run_engine_core` 尾段装的就是 SIGTERM/SIGINT 两个处理器：
 
 ```python
 # vllm/v1/engine/core.py:L1318-L1342

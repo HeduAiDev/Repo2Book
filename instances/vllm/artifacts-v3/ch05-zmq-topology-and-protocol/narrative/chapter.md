@@ -110,7 +110,7 @@
             logger.info("Using tensor IPC queue for multimodal tensor sharing")
 ```
 
-`identity = engine_index.to_bytes(length=2, byteorder="little")`——引擎编号写成 2 字节小端整数（engine 0 是 `b"\x00\x00"`、engine 1 是 `b"\x01\x00"`）。client 要给哪个引擎发消息，就把哪个引擎的这 2 字节放进消息首帧；ROUTER 剥帧一看就知道投给谁。这段还顺手立了引擎进程内部的两条 `queue.Queue`（`input_queue`/`output_queue`，下一节展开）和 `EXECUTOR_FAILED` 哨兵的注入点（执行器失败时往输入队列塞一条带标签的空消息，本章末节回收）。
+`identity = engine_index.to_bytes(length=2, byteorder="little")`——引擎编号写成 2 字节小端整数（小端＝little-endian，多字节整数的低位字节排在前面；engine 0 是 `b"\x00\x00"`、engine 1 是 `b"\x01\x00"`——1 的低位字节 0x01 恰在首位）。client 要给哪个引擎发消息，就把哪个引擎的这 2 字节放进消息首帧；ROUTER 剥帧一看就知道投给谁。这段还顺手立了引擎进程内部的两条 `queue.Queue`（`input_queue`/`output_queue`，下一节展开）和 `EXECUTOR_FAILED` 哨兵的注入点（执行器失败时往输入队列塞一条带标签的空消息，本章末节回收）。
 
 ### 进出为什么不对称
 
@@ -372,7 +372,7 @@ class EngineCoreRequest(
 vLLM 真正干活的库不是 msgpack 官方 Python 库，是 **msgspec**——msgpack 之上提供「带 schema 的超快编解码」：解码时直接按类型构造消息对象，类型即 schema，省掉先解成 dict 再逐字段校验的开销。`EngineCoreRequest` 的基类 `msgspec.Struct` 带三个开关，逐一拆：
 
 - **`array_like=True`**：结构编成「按位置的数组」而非「键值映射」——官方文档原话，收益是「removing the field names from the encoded message」（字段名不上船）。官方最小例（说明性、外部文档示例）：两字段 `Point(x, y)`，普通 Struct 编成 `{"x":1,"y":2}`，`array_like` 编成 `[1,2]`——两端各持一份 schema（字段表），按位置对号，格子名不必运过海。解码端 `decode(b"[3,4]", type=Point2)` 按位置还原 `Point2(x=3, y=4)`。这也立着一条隐性契约：**字段增删换序必须两端同步**，否则位置错位——vLLM 靠同仓同版本保证。
-- **`omit_defaults=True`**：跳过「值等于默认值」的字段。要对读者诚实的是它在**本章线上不生效**：它只对键值式编码有效，对按位置数组是空操作——本章四个线载体 Struct 全是 array_like（真 msgspec 0.19.0/0.20.0/0.21.1 三个版本容器实测一致；线上 `EngineCoreOutput("r",[1])` 过线是全字段数组 `["r",[1],None,None,None,0]`——例取本章精简版的 6 字段 EngineCoreOutput，真实结构有 14 个字段，同样全字段上船，元素数不同、结论相同）。三开关齐开是双保险的写法，实际起作用的是 array_like 省字段名。
+- **`omit_defaults=True`**：跳过「值等于默认值」的字段。要对读者诚实的是它在**本章线上不生效**：它只对键值式编码有效，对按位置数组是空操作——本章四个线载体 Struct 全是 array_like（真 msgspec 0.19.0/0.20.0/0.21.1 三个版本容器实测一致；线上 `EngineCoreOutput("r",[1])`（单请求一拍的输出明细——request_id 加新 token 那条记录，「回程」一节的主角，此处先当某个过线的 msgspec Struct 看）过线是全字段数组 `["r",[1],None,None,None,0]`——例取本章精简版的 6 字段 EngineCoreOutput，真实结构有 14 个字段，同样全字段上船，元素数不同、结论相同）。三开关齐开是双保险的写法，实际起作用的是 array_like 省字段名。
 - **`gc=False`**：实例永不进 Python GC 追踪——热路径每 step 解码出大量短生命周期消息，免掉 GC 记账。官方警告「only recommended for users who fully understand the implications」：此类结构若成环则永不回收，风险自担。
 
 同款紧凑哲学还有一处：`FinishReason`（结束原因枚举）用 `IntEnum` 而不是字符串枚举，源码注释原话「Int rather than Str for more compact serialization」（`vllm/v1/engine/__init__.py:L43-L65`）——五个状态 STOP/LENGTH/ABORT/ERROR/REPETITION 编成 0-4 一个字节，何必运「repetition」这 11 个字节。最后一条纪律：**不认识的类型默认拒发**——`MsgpackEncoder` 的 `enc_hook` 只认 Tensor/ndarray/slice 等白名单，遇未知类型直接 `TypeError`（`vllm/v1/serial_utils.py:L221-L226`）。这道白名单是被坑出来的：v1 第一版（#9826）用 msgspec 原生编解码，只认它支持的类型；多模态一上线，PIL 图片这类类型它认不了，#10245 干脆整体退回 pickle——PR 原话「multimodal inputs include types incompatible with msgspec (e.g., PIL images), we use pickle」，慢且把「反序列化即执行」的门敞着；#12918 才带着自定义钩子回到 msgpack，白名单就是那次教训的产物。想运任意 Python 对象只有一个逃生舱：`VLLM_ALLOW_INSECURE_SERIALIZATION=1` 回退 pickle——变量名里的 insecure 不是谦虚：Python 官方文档警告原话「It is possible to construct malicious pickle data which will execute arbitrary code during unpickling」，pickle 的字节流里带指令、反序列化即执行，跨进程消息线上「解开就执行」意味着消息可被伪造就等于远程代码执行入口。默认关死这道门，是协议层面的安全边界。
@@ -489,7 +489,7 @@ vLLM 真正干活的库不是 msgpack 官方 Python 库，是 **msgspec**——m
 
 实现里，`copy=False` 买来自由也买来一个安全问题：libzmq 异步发送期间，那块内存**不许被改动或释放**——「zmq 还没发完就不许动」。这件事在收发两侧有两种完全不同的答案，因为两边的 buffer 归属不同。
 
-**客户端的答案：什么都不做。** 上一节 `_send_input_message` 里那段注释就是全部：「Any zero-copy tensor/ndarray frames are kept alive by zmq itself until it's finished sending them (there is a ref chain from the underlying memoryview back to the original owning tensor/ndarray)」。pyzmq 包装一块 buffer 成消息时会给它加引用计数（官方文档：计一次存成实例属性、一次挂在消息上，第二计数保证发完才释放）；而 memoryview 的底层引用链一直指回调用方作用域里活着的原张量——调用方拿着张量，zmq 就找得到内存，保活自动成立。v0.21.0 时代客户端还自己维护一套显式登记（pending_messages 三件套），#50053（2026 年 7 月）把它整个删了——PR 自述原话：那套登记「had no effect beyond looking like protection it did not provide」（除了看起来像保护，实际什么都没保），zmq 自己的引用链早就够了。至于「不许改动」的另一半，客户端没有也不需要机制性防护——靠的是调用纪律：请求张量发出去就不再碰这块内存（通常就此易主交给这条消息）；引擎输出侧为什么不能同样靠纪律、必须显式问「发完了吗」，下一段的复用机制就是答案。
+**客户端的答案：什么都不做。** 上一节 `_send_input_message` 里那段注释就是全部：「Any zero-copy tensor/ndarray frames are kept alive by zmq itself until it's finished sending them (there is a ref chain from the underlying memoryview back to the original owning tensor/ndarray)」。pyzmq 包装一块 buffer 成消息时会给它加引用计数（官方文档：计一次存成实例属性、一次挂在消息上，第二计数保证发完才释放）；而 memoryview 的底层引用链一直指回调用方作用域里活着的原张量——调用方拿着张量，zmq 就找得到内存，保活自动成立。v0.21.0 时代客户端还自己维护一套显式登记（pending_messages 一套登记），#50053（2026 年 7 月）把它整个删了——PR 自述原话：那套登记「had no effect beyond looking like protection it did not provide」（除了看起来像保护，实际什么都没保），zmq 自己的引用链早就够了。至于「不许改动」的另一半，客户端没有也不需要机制性防护——靠的是调用纪律：请求张量发出去就不再碰这块内存（通常就此易主交给这条消息）；引擎输出侧为什么不能同样靠纪律、必须显式问「发完了吗」，下一段的复用机制就是答案。
 
 **引擎输出侧的答案：首帧 tracker。** 引擎的输出线程每 step 都要发消息，为了不每拍分配新内存，它**复用同一批 bytearray**——下一拍就要原地覆写同一块 buffer，光靠引用链不够（引用链只保证「对象不被回收」，不保证「内容不被改写」）。必须显式问「zmq 发完了吗」：
 
@@ -607,7 +607,7 @@ docstring 把缘由说尽：第一帧单独 `send(track=True)` 拿 tracker，其
         return arr.view(torch_dtype).view(shape)
 ```
 
-与编码三分支严格对偶：dict 走 OOB 取货（下节）、int 是 aux 下标、memoryview 是内联字节。`torch.frombuffer` 建的是零拷贝视图——代价写在源码注释里：这个视图**锁住整条接收消息缓冲**（数据还躺在收到的帧里，msgspec 解码完前不许丢帧）。末段的按需拷贝是一次诚实的权衡，分支与紧邻代码严格对齐：非 aux（内联）张量一律 `clone` 一份独立内存；aux 张量拷不拷贝由解码器构造时的 `share_mem` 开关定（默认开）——开着，`elif` 那两行整段跳过、张量直接共享接收帧的内存（实测表轮 3 的「全程未拷贝」走的正是它）；关了才落到拷贝，此时 pin 还是 clone 由 `pin_tensors` 定——它来自 `PIN_MEMORY` 平台能力旗标（CUDA 可用与否，`serial_utils.py:L330`），不按张量大小分岔。大小的取舍写在紧邻的源码注释里（「Pin larger tensors for more efficient CPU->GPU transfer」）：pin 对大张量值回票价——pinned memory（页锁定内存——被 OS 钉住不许换出的物理页，CPU→GPU 拷贝从这里出发快得多、且可异步）付一次拷贝换每次传输提速，小张量 clone 一份更省（pin 本身是贵操作，PyTorch 官方最佳实践原话「pinning is often an expensive operation」）。
+与编码三分支严格对偶：dict 走 OOB 取货（下节）、int 是 aux 下标、memoryview 是内联字节。`torch.frombuffer` 建的是零拷贝视图——代价写在源码注释里：这个视图**锁住整条接收消息缓冲**（数据还躺在收到的帧里，msgspec 解码完前不许丢帧）。末段的按需拷贝是一次诚实的权衡，分支与紧邻代码严格对齐：非 aux（内联）张量一律 `clone` 一份独立内存；aux 张量拷不拷贝由解码器构造时的 `share_mem` 开关定（默认开）——开着，`elif` 那两行整段跳过、张量直接共享接收帧的内存（实测表轮 3 的「全程未拷贝」走的正是它）；关了才落到拷贝，此时 pin 还是 clone 由 `pin_tensors` 定——它来自 `PIN_MEMORY` 平台能力旗标（CUDA 可用与否，`serial_utils.py:L330`），不按张量大小分岔。大小的取舍写在紧邻的源码注释里（「Pin larger tensors for more efficient CPU->GPU transfer」）：pin 对大张量值回票价——pinned memory（页锁定内存——OS 平时会把不常用的页挪出物理内存（换页），钉住＝禁止这桩挪动；被钉住的物理页 CPU→GPU 拷贝从这里出发快得多、且可异步）付一次拷贝换每次传输提速，小张量 clone 一份更省（pin 本身是贵操作，PyTorch 官方最佳实践原话「pinning is often an expensive operation」）。
 
 两侧两种答案 + 拷贝账，实测对账（同一实测环境；「pending 态」一轮是构造性演示——host 回环小数据无法自然触发拥塞，真实部署里它出现在发送管道堆积时）：
 
@@ -674,7 +674,7 @@ torch 这套能力是为多进程 DataLoader 原生设计的（`torch.multiproce
 
 它作为 `oob_tensor_consumer` 钩子挂进编码器——正是 `_encode_tensor` 三分支里的第②支：钩子接单，张量 `share_memory_()`（把底层存储搬进 OS 共享内存段）、`TensorIpcData`（句柄+张量）进 `torch.multiprocessing.Queue`，返回的 metadata dict（`sender_id` 8 位随机十六进制 + 递增的 `message_id`/`tensor_id`，合起来是全局唯一的提货码）嵌进 msgpack 主帧随消息过 ZMQ。except 兜底返回 None = 优雅回退：专线出任何故障，编码器退回普通序列化，消息照发。
 
-两条通道各走各的，**可能乱序到货**——句柄随 ZMQ 先到、张量在队列里后到（或反过来）。接收端 `TensorIpcReceiver` 用「排空并缓冲」（drain-and-buffer）应对：每次解码遇到句柄，先把队列里现有的张量全部取出、按 (sender_id, message_id, tensor_id) 存进缓冲架，再对号取货；同时按 sender 维护消息水位线——水位线＝这个 sender 已成功对上号取走张量的最新 message_id，比它旧的提货句柄不会再有人来取，迟到的旧张量直接丢弃（日志「Ignoring stale tensor」），防止缓冲架泄漏。实测三件事：同一张 16KB 张量，OOB 在场编码 1 帧（主帧 141B 只含句柄）、OOB 缺席 2 帧（aux 帧扛 16384B 过 socket）；乱序请求 (message 1, tensor 1)→(1,0)→(2,0) 全部对号入座；一条迟到的旧张量被丢弃、新消息不受影响。端到端也有实测：4096 元素的张量句柄经真实 client→引擎往返（精简版测试套件的 OOB 端到端用例）。
+两条通道各走各的，**可能乱序到货**——句柄随 ZMQ 先到、张量在队列里后到（或反过来）。接收端 `TensorIpcReceiver` 用「排空并缓冲」（drain-and-buffer）应对：每次解码遇到句柄，先把队列里现有的张量全部取出、按 (sender_id, message_id, tensor_id) 存进缓冲架，再对号取货——这一轮没对上号也不报错、更不重发消息：句柄到了、张量还在专线里飞，就回到队列上阻塞等（`self.queue.get(timeout=10.0)`，`vllm/v1/engine/tensor_ipc.py:L166`——最多等 10 秒，超时抛错兜底，不无限挂死），下一件入架再对一轮号，货总会在途到达；同时按 sender 维护消息水位线——水位线＝这个 sender 已成功对上号取走张量的最新 message_id，比它旧的提货句柄不会再有人来取，迟到的旧张量直接丢弃（日志「Ignoring stale tensor」），防止缓冲架泄漏。实测三件事：同一张 16KB 张量，OOB 在场编码 1 帧（主帧 141B 只含句柄）、OOB 缺席 2 帧（aux 帧扛 16384B 过 socket）；乱序请求 (message 1, tensor 1)→(1,0)→(2,0) 全部对号入座；一条迟到的旧张量被丢弃、新消息不受影响。端到端也有实测：4096 元素的张量句柄经真实 client→引擎往返（精简版测试套件的 OOB 端到端用例）。
 
 适用面窄而明确：仅 `multimodal_config.mm_tensor_ipc='torch_shm'` 时启用（队列在 `launch_core_engines` 创建，`vllm/v1/engine/utils.py:L1078-L1085`），类注释明言两条——单队列只打 rank 0（只有 0 号引擎从这条队列取货）、DP>1 不支持；#32104 另记一条已知限制：多模态处理器缓存开启时此路径失效。它是为视频这类「单次大块、缓存不命中」负载特化的通道；通用路径仍是上一节的多帧零拷贝。整条旁路画成图：
 

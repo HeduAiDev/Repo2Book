@@ -45,7 +45,7 @@
 
 ## 渲染四步流水：一段话变成 EngineInput（站 2-4）
 
-现在请求在 `OnlineRenderer`（OpenAI 层的渲染门面）手里，往下交给渲染基类 `BaseRenderer`。L0 图上，这是蓝色带下行泳道最上面的 `Renderer.render` 块——本章 L2 章图把它展开成中排头三格：① chat 模板展开、② tokenize 下池、③ mm 预处理下 mm 单工池（mm＝multimodal，多模态——仓内惯用缩写，下文「多模态支线」一节专讲）；① 模板展开留在事件循环线程上，哪道工序下哪个池、为什么，线程池一节细算。三格对正文四步的折法交代一下：第一步落在①、第二步落在②，最短的第三步（extras）不占格；第四步装盒也不占格——只有它拐进的多模态支路单独画成③，装盒本体折在①格「render_chat_async 四步」那行里（那格画的就是这条编排流水）。先给直觉：**四道工序的传送带**——第一道把客人的点单（消息列表）抄成标准格式的文本，第二道把文本切成编号，第三道贴附加标签，第四道装进印好类别的餐盒。进门第一行先打一个总时钟，之后无论哪道工序排队多久，延迟都从「收到话」那刻算起。
+现在请求在 `OnlineRenderer`（OpenAI 层的渲染门面）手里，往下交给渲染基类 `BaseRenderer`。L0 图上，这是蓝色带下行泳道最上面的 `Renderer.render` 块——本章 L2 章图把它展开成中排头三格：① chat 模板展开、② tokenize 下池、③ mm 预处理下 mm 单工池（mm＝multimodal，多模态——仓内惯用缩写，下文「多模态支线」一节专讲）；① 模板展开留在事件循环线程上，哪道工序下哪个池、为什么，线程池一节细算。三格对正文四步的折法，一行对照先记下：模板展开→①、tokenize→②、extras→不占格、装盒→折在①、多模态支路→③。两句解释：第三步（extras）最短，不值得占格；第四步的装盒本体折在①格「render_chat_async 四步」那行里（那格画的就是这条编排流水），只有它拐进的多模态支路单独画成③。先给直觉：**四道工序的传送带**——第一道把客人的点单（消息列表）抄成标准格式的文本，第二道把文本切成编号，第三道贴附加标签，第四道装进印好类别的餐盒。进门第一行先打一个总时钟，之后无论哪道工序排队多久，延迟都从「收到话」那刻算起。
 
 编排全貌就一个函数：
 
@@ -122,7 +122,7 @@
 
 > *图注：放大自本章 L2 站 1-4——L0 图蓝色 API 进程带的渲染段。进门条（serving 层交棒）打的 `arrival_time` 是全批共用的时间戳；传送带四道工序间标注产物形状（DictPrompt → input_ids → EngineInput）；批量面板是 3 路对话的实测轨迹——step1/tokenize/装盒各 3 份、extras 整批 1 份、多模态预处理恰 1 次且只落在带图的那路；右侧 completion 面同四步、第一步直通。图中 token 编号（如 [3,4,5]）为示意值，见下文说明。*
 
-批量并行的形态值得点破：**批内每路对话独立跑，能并的步骤全用 `asyncio.gather` 并**（[第 4 章](../../ch04-two-usage-faces-one-trio/narrative/chapter.md)立过事件循环的基本盘：`await` 让出、不平行新增线程）。实测轨迹（本章配套精简版在宿主机跑出，控制流与 v0.27.1 逐行同构）：3 路对话的批量请求，trace 是 3×模板展开 → 3×切词 → 1×extras → 3×装盒（其中多模态预处理恰 1 次、落在带图那路），三个 `EngineInput` 携带**逐位相同**的 `arrival_time`；纯文本请求的 trace 恰 4 步、多模态工序不进入；completion 面同样 4 步、第一步直通。
+批量并行的形态值得点破：**批内每路对话独立跑，能并的步骤全用 `asyncio.gather` 并**（gather＝把一批协程凑在一起、等它们全部完成再继续；[第 4 章](../../ch04-two-usage-faces-one-trio/narrative/chapter.md)立过事件循环的基本盘：`await` 让出、不平行新增线程）。实测轨迹（本章配套精简版在宿主机跑出，控制流与 v0.27.1 逐行同构）：3 路对话的批量请求，trace 是 3×模板展开 → 3×切词 → 1×extras → 3×装盒（其中多模态预处理恰 1 次、落在带图那路），三个 `EngineInput` 携带**逐位相同**的 `arrival_time`；纯文本请求的 trace 恰 4 步、多模态工序不进入；completion 面同样 4 步、第一步直通。
 
 **取证环境说明**（本章数值第一次出现，先交代清楚）：本章的运行数值全部来自配套精简版在宿主机上的实测——其中分词器与多模态处理器换成了固定的示意实现（文档化替换点），所以 token 编号（如 `[3,4,5]`）、占位 token 长度（如图 2 个、音频 3 个）与真实 HF 切词器、真实视觉编码器的数值不同（真实一张图的占位是数百个 token）；控制流、线程归属、排序与缓存语义与 v0.27.1 源码逐行同构。凡示意值，正文就近标注「示意」。
 
@@ -268,9 +268,9 @@ def make_async(
         )
 ```
 
-第一个池 `_executor`：工位数取 `renderer_num_workers`（配置项，默认 1，`vllm/config/model.py:L355`），承担切词、解码、嵌入加载。第二个池 `_mm_executor`：**恒单工**，专门跑多模态预处理。为什么分开、为什么单工？两层理由，源码注释与上游 PR 各说了一层，都成立：
+第一个池 `_executor`：工位数取 `renderer_num_workers`（配置项，默认 1，`vllm/config/model.py:L355`），承担切词、解码、嵌入加载。第二个池 `_mm_executor`：**恒单工**，专门跑多模态预处理。为什么分开、为什么单工？先立一块路标：mm 预处理有两个可能的家——渲染正路恒走 mm 单工池，「绕过渲染层直塞原始 prompt」的兜底路径则把它带进切词池的工位（兜底是谁，段中自会交代）。两层理由，源码注释与上游 PR 各说了一层，都成立：
 
-一层是**排队隔离**（注释前半句「tokenization never queues behind MM preprocessing」）：切词与图片预处理轻重悬殊，混在一个队列里，长任务会把小任务饿在后面——分开两个池，互不排队。另一层是**顺序与并发安全**（注释后半句「must stay single-worker per #38418 (P0/P1 order)」）：多模态预处理要产出两级缓存键——P0（处理器输出缓存，键 `mm_hash`，前端侧）与 P1（编码器缓存，键 `identifier`，引擎侧；这两级各缓在哪一侧、存的是什么，多模态支线一节展开）。先把「键序」说准：它防的不是单条请求内部乱序——单条请求的预处理本来就在一条线程上从头跑到尾，乱不起来；防的是**多条请求并发**写这些缓存：每次命中与写入都要动 LRU 的换链淘汰，交错改一个非线程安全的链表，坏得悄无声息。而 workers>1 真能放大的并发写，源头不在渲染正路——站 5 的兜底分支里，原始 prompt 的 `process_inputs` 整段跑在切词池 `_executor` 上，其中的 `input_preprocessor.preprocess` 内含现场多模态预处理（正是下面站 6 代码块里 else 分支那几行）；`renderer_num_workers>1` 时，多条走兜底的请求就并发写同一个处理器缓存。[#38418](https://github.com/vllm-project/vllm/pull/38418) 的 PR 描述钉死了底线：「Neither the LRU nor SHM multimodal processor cache is thread-safe」——LRU（最近最少使用置换）缓存与 SHM（共享内存环形缓冲）都不是线程安全结构。配置上于是有一道硬拒绝（`vllm/config/model.py:L783-L794`）：预处理会跑在 renderer 工位上的组合（报错原话点名的是 pooling 面——嵌入/打分类模型的预处理全走这条道），开了多模态缓存还想多工，启动即报错；渲染正路的 mm 预处理恒走单工 `_mm_executor`，不受 `renderer_num_workers` 影响。
+一层是**排队隔离**（注释前半句「tokenization never queues behind MM preprocessing」）：切词与图片预处理轻重悬殊，混在一个队列里，长任务会把小任务饿在后面——分开两个池，互不排队。另一层是**顺序与并发安全**（注释后半句「must stay single-worker per #38418 (P0/P1 order)」）：多模态预处理要产出两级缓存键——P0（处理器输出缓存，键 `mm_hash`，前端侧）与 P1（编码器缓存，键 `identifier`，引擎侧；这两级各缓在哪一侧、存的是什么，多模态支线一节展开）。先把「键序」说准：它防的不是单条请求内部乱序——单条请求的预处理本来就在一条线程上从头跑到尾，乱不起来；防的是**多条请求并发**写这些缓存：每次命中与写入都要动 LRU 的换链淘汰，交错改一个非线程安全的链表，坏得悄无声息。而 workers>1 真能放大的并发写，源头不在渲染正路——站 5 的兜底分支里，原始 prompt 的 `process_inputs` 整段跑在切词池 `_executor` 上，其中的 `input_preprocessor.preprocess` 内含现场多模态预处理（正是下面站 6 代码块里 else 分支那几行）；`renderer_num_workers>1` 时，多条走兜底的请求就并发写同一个处理器缓存。[#38418](https://github.com/vllm-project/vllm/pull/38418) 的 PR 描述钉死了底线：「Neither the LRU nor SHM multimodal processor cache is thread-safe」——LRU（最近最少使用置换）缓存与 SHM 处理器缓存（SHM＝shared memory 共享内存——P0/P1 两级 mm 缓存的跨进程形态，数据躺在两个进程映射的同一块共享内存段里）都不是线程安全结构。配置上于是有一道硬拒绝（`vllm/config/model.py:L783-L794`）：预处理会跑在 renderer 工位上的组合（报错原话点名的是 pooling 面——嵌入/打分类模型的预处理全走这条道），开了多模态缓存还想多工，启动即报错；渲染正路的 mm 预处理恒走单工 `_mm_executor`，不受 `renderer_num_workers` 影响。
 
 再往下挖一层，单工与深拷贝防的是同一个真实事故。2026 年 3 月，vLLM 自己撞上了：[#36557](https://github.com/vllm-project/vllm/pull/36557)「Fix RuntimeError: Already borrowed that degrades VLM serving throughput under concurrent load」（VLM＝视觉语言模型，即带视觉输入的多模态模型）——`BaseRenderer` 把**同一个** HF tokenizer 实例同时给了微批切词线程与多模态处理器线程，两边各自调 `tokenizer(...)`。HF fast tokenizer 的 Python 包装每次编码前都要改 Rust 侧 tokenizer 的截断/填充配置（`enable_truncation` / `enable_padding`，改的是同一个共享对象），Rust 绑定对同一对象的并发「改配置 + 编码」触发 `RuntimeError: Already borrowed`；当时的重试机制（5 次、每次歇 0.5 秒）把错误从客户端面前藏住了，代价是严重的延迟毛刺。修法的初版口径就写在上面代码的第一段注释里——「给多模态处理器一份深拷的 tokenizer」。
 
@@ -435,11 +435,11 @@ docstring 自带教学例：prompt `AAAA BBBB What is in these images?`，两张
 | 轮次 | 输入 | 关键标量 | 判定 |
 |---|---|---|---|
 | 轮 0 · 源码教学例 | prompt = AAAA BBBB What is in these images? | A=(offset 0,length 4)；B=(offset 5,length 4)；两座位号间隙 1 | is_embed=None → get_num_embeds()=length（4/4）：无掩码时整段占位都要嵌入 |
-| 轮 1 · is_embed 掩码 | offset=2、length=6、mask=[1,1,0,0,1,0] | embeds_cumsum=[1,2,2,2,3,3]；get_num_embeds()=3 | 嵌入数 3 < 占位 6；range 查询 (0,4)→(0,2)；两个嵌入区段 (2,3) 与 (6,6)（闭区间） |
+| 轮 1 · is_embed 掩码 | offset=2、length=6、mask=[1,1,0,0,1,0] | embeds_cumsum=[1,2,2,2,3,3]；get_num_embeds()=3 | 嵌入数 3 < 占位 6；range 查询 [0,4)→[0,2)；两个嵌入区段 [2,3] 与 [6,6]（闭区间） |
 | 轮 2 · 预算 4 拦截 | image item 展开 6 占位 token | get_num_embeds()=6 > encoder_cache_size=4 | VLLMValidationError 在 process_inputs 内抛出——ADD 帧 0 条，不过线即拦 |
 | 轮 3 · 预算 8 放行 | 同一 item | 6 ≤ 8 | 正常构造并过线——ADD 帧 1 条 |
 
-轮 1 的掩码算术值得亲手过一遍：`mask=[1,1,0,0,1,0]` 长度 6，逐位累加 `[1,2,2,2,3,3]`，末位 3——六个座位里 3 个填嵌入、3 个走真 token。轮 2 与轮 3 是同一件行李两种预算的对照：预算 4 拦截时 `VLLMValidationError` 在 `process_inputs` 内抛出、`ADD` 帧 0 条（控制流上校验点在构造请求与一切发送之前，抛错即整条 `add_request` 中断）；错误文案给足了自救信息——「exceeds the pre-allocated encoder cache size … increase the encoder cache size by setting --limit-mm-per-prompt at startup」。单遍前置校验比进了引擎再炸便宜得多：后者要回程报错、还要清理半途状态。表里轮 1 判定栏的两个记号也交代下来路：`range 查询 (0,4)→(0,2)` 是 `get_embeds_indices_in_range(0, 4)`（`vllm/multimodal/inputs.py`）的实测——问「占位内第 0 到 4 格（左闭右开）装的是第几到第几枚嵌入」，它拿两端前缀和相减、O(1) 答出 `[0, 2)`：前 4 格里有第 0、1 枚；`两个嵌入区段 (2,3) 与 (6,6)` 是 `extract_embeds_range()` 的实测——把掩码里连续 True 的段换算回 prompt 坐标：`mask=[1,1,0,0,1,0]` 加 `offset=2`，True 落在 prompt 第 2、3、6 格，连成闭区间 (2,3) 与 (6,6) 两段，引擎照这两段把送来的嵌入切进对应座位。
+轮 1 的掩码算术值得亲手过一遍：`mask=[1,1,0,0,1,0]` 长度 6，逐位累加 `[1,2,2,2,3,3]`，末位 3——六个座位里 3 个填嵌入、3 个走真 token。轮 2 与轮 3 是同一件行李两种预算的对照：预算 4 拦截时 `VLLMValidationError` 在 `process_inputs` 内抛出、`ADD` 帧 0 条（控制流上校验点在构造请求与一切发送之前，抛错即整条 `add_request` 中断）；错误文案给足了自救信息——「exceeds the pre-allocated encoder cache size … increase the encoder cache size by setting --limit-mm-per-prompt at startup」。单遍前置校验比进了引擎再炸便宜得多：后者要回程报错、还要清理半途状态。表里轮 1 判定栏的两个记号也交代下来路：`range 查询 [0,4)→[0,2)` 是 `get_embeds_indices_in_range(0, 4)`（`vllm/multimodal/inputs.py`）的实测——问「占位内第 0 到 4 格（左闭右开）装的是第几到第几枚嵌入」，它拿两端前缀和相减、O(1) 答出 `[0, 2)`：前 4 格里有第 0、1 枚；`两个嵌入区段 [2,3] 与 [6,6]` 是 `extract_embeds_range()` 的实测——把掩码里连续 True 的段换算回 prompt 坐标：`mask=[1,1,0,0,1,0]` 加 `offset=2`，True 落在 prompt 第 2、3、6 格，连成闭区间 [2,3] 与 [6,6] 两段，引擎照这两段把送来的嵌入切进对应座位。
 
 ### 特征载荷与展平：从分箱到上菜线
 
@@ -558,7 +558,7 @@ class MultiModalFeatureSpec:
         )
 ```
 
-`return EngineCoreRequest(...)` 就是站 9 的构造点，下一节拆它。顺带补一句 return 里三个 `prompt_*` 变量的来路——它们不是这段里冒出来的：站 6 校验完之后、站 7 克隆之前，有几行按 `type` 从 `decoder_inputs` 把它们抽好（`input_processor.py:L311-L318`：embeds 面取 `prompt_embeds` 与混合模式掩码，token 面只填 `prompt_token_ids`），站 7 算 `seq_len` 用的也是它们。先用一个交错请求把展平跑通——`'look at <图B> then hear <音A> finally <图A>'`，image → audio → image，品类分组序与 prompt 出现序刻意错开：
+`return EngineCoreRequest(...)` 就是站 9 的构造点，下一节拆它。顺带补一句 return 里三个 `prompt_*` 变量的来路——它们不是这段里冒出来的：站 6 校验完之后、站 7 克隆之前，有几行按 `type` 从 `decoder_inputs` 把它们抽好（`input_processor.py:L311-L318`：embeds 面取 `prompt_embeds` 与混合模式掩码，token 面只填 `prompt_token_ids`），站 7 算 `seq_len` 用的也是它们。return 里还有一个此前没露过面的键 `cache_salt`——调用方可选的「缓存盐」：一串随机字符串，随请求过线，引擎把它掺进前缀缓存（prefix cache，把相同前缀请求的 KV 块存下来复用的引擎侧机制，引擎篇展开）首块的哈希里（`vllm/v1/core/kv_cache_utils.py:L579-L580`，只有 `start_token_idx == 0` 才掺），让不同盐的请求即使 prompt 全同也命中不了彼此的缓存块；OpenAI 协议各接口有同名参数，字段说明的动机原话是「prevent an attacker to guess prompts in multi-user environments」（多用户环境下防止攻击者猜出别人的 prompt，`vllm/entrypoints/openai/chat_completion/protocol.py:L453-L458`）。先用一个交错请求把展平跑通——`'look at <图B> then hear <音A> finally <图A>'`，image → audio → image，品类分组序与 prompt 出现序刻意错开：
 
 <!-- trace: m8 -->
 | 轮次 | 动作 | 展平前（dict-of-list，品类分组） | 展平后 list[MultiModalFeatureSpec] | 判定 |
@@ -617,7 +617,7 @@ class EngineCoreRequest(
     # … 省略：reasoning_ended/reasoning_parser_kwargs/abort_immediately 三个旁支字段 …
 ```
 
-把「用户输入」相关的前几个字段数一遍：`prompt_token_ids`（token 编号）、`prompt_embeds`（预制嵌入）、`prompt_is_token_ids`（混合模式掩码）、`mm_features`（多模态特征与座位号）——**没有 prompt 字符串**。开篇那条 why 链在这里兑现成字段表本身：文本在过线之前就已经完成使命，#11963 从「调用侧停发」走到「字段彻底移除」。几个熟面孔也都在：`client_index` 的注释就是[第 4 章](../../ch04-two-usage-faces-one-trio/narrative/chapter.md)盖进每请求的那枚回程路由章——「回程路由键写进请求本身」；`external_req_id` 的注释预告了下一节「出发前改名」；`arrival_time` 是渲染进门打的那个时钟。
+把「用户输入」相关的前几个字段数一遍：`prompt_token_ids`（token 编号）、`prompt_embeds`（预制嵌入）、`prompt_is_token_ids`（混合模式掩码）、`mm_features`（多模态特征与座位号）——**没有 prompt 字符串**。开篇那条 why 链在这里兑现成字段表本身：文本在过线之前就已经完成使命，#11963 从「调用侧停发」走到「字段彻底移除」。几个熟面孔也都在：`client_index` 的注释就是[第 4 章](../../ch04-two-usage-faces-one-trio/narrative/chapter.md)盖进每请求的那枚回程路由章——「回程路由键写进请求本身」；`external_req_id` 的注释预告了下一节「出发前改名」；`arrival_time` 是渲染进门打的那个时钟；`cache_salt` 就是上一节补过的那味「缓存盐」。
 
 类声明那三个开关是序列化策略，[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)拆过字节账——这里补一句本章视角的账：`array_like`（按位置编码、字段名不进帧）是实际主力，多数常态请求真正过线的可变字节就剩 `prompt_token_ids` 数组加 `sampling_params`——这正是「文本不过线」的量化面。至于 `omit_defaults`（等于默认值的字段不进帧）的意图，如实记一个保留：它与 `array_like` 组合的实际效果有未决的[上游 issue](https://github.com/msgspec/msgspec/issues/720)（2024 年开、至今无维护者回应），安全口径是「三开关齐开算双保险，字节主力看 array_like」。
 
@@ -663,6 +663,8 @@ class EngineCoreRequest(
 | 轮 3 · 预设 external_req_id | 调用方预填该内部字段 | preset-by-caller | —（未过线） | ValueError 拒绝：该字段是 vLLM 内部专用，不许外部携带 |
 
 （后缀样本为本次运行值，每次运行不同。）轮 1 就是双轨存在的理由：同一个外部 id 发两次，两次内部 id 互异，分发表（demux，按 id 把回程消息分发回各请求的那张表）里一个外部键下挂两个内部键，引擎见到两个互不干扰的请求；回程侧的组装、abort 的双轨语义（外部 id 展开杀全部、内部 id 单杀）[第 4 章](../../ch04-two-usage-faces-one-trio/narrative/chapter.md)从账本侧讲过，本章不重讲。
+
+改名还差下半句才算闭环：**进门换工牌、出门换回来**。换工牌是两面都做的——在线面 `AsyncLLM.add_request`（流式输入变体同）与离线面 `LLMEngine.add_request` 都在出港前调同一个 `assign_request_id`（`vllm/v1/engine/async_llm.py:L388` 与 `L473`、`vllm/v1/engine/llm_engine.py:L263`）；而出门组装 `RequestOutput` 时填回去的是 `external_req_id`（原 id）——`make_request_output` 先取 `external_req_id = self.external_req_id`（`vllm/v1/engine/output_processor.py:L315`），构造时用它当 `request_id`（`output_processor.py:L374`，源码注释原话 `request_id is what was provided externally`）。于是带随机尾的内部 id 只在引擎内部与前端对账表里流转，从不出现在用户可见的输出上；[第 4 章](../../ch04-two-usage-faces-one-trio/narrative/chapter.md)离线收尾按 `int(request_id)` 排序之所以永远解析得动，靠的正是这一换——离线自动生成的外部 id 是自增整数串（`vllm/entrypoints/offline_utils.py:L563` 的 `str(next(self.request_counter))`），出门写回的恰是它；若写回的是内部 id，`int("…-a6ab4a96")` 当场 ValueError。
 
 「32 bit 够不够」这笔账，上游自己算过——用**生日界**（birthday bound）：把 n 个东西随机丢进 s 个桶，任意两个同桶的概率约 n²/2s（就是「23 人里两人同生日概率过半」那条数学，碰撞概率随 n 平方增长）。8 hex 是 2³² 个桶，同一外部 id 重复 n 次，撞率约 n²/2³³。[PR #27987](https://github.com/vllm-project/vllm/pull/27987) 原文代入的数字：一万个并发共享同一外部 id，撞率约 1.16%——真撞也只退化为 v0 行为（错误路由）而非崩溃，判定可接受；常规重试十次量级时撞率是亿分之一量级，实际不可见（[生日问题](https://en.wikipedia.org/wiki/Birthday_problem)的近似式与精确式见链接）。
 

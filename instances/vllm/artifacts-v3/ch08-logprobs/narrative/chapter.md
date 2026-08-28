@@ -159,7 +159,7 @@
 - **旧设计**：v0 采样器对每请求统一走温度+截断（temperature=0 的贪心请求也在做无意义的 softmax/排序）；且 v0 用惩罚+温度之后的 logits 算 top-k logprobs。
 - **痛点**：惩罚（presence/frequency/repetition——对已出现 token 压分的采样干预，具体公式归后面的采样章）和温度会改写整个分布。用户拿 logprobs 多半是想看**模型自己的意见**——最想要哪个词、第二想要哪个。被惩罚扭曲的报告会把模型的 top1 压到十名开外，下游全被带偏。
 - **v1 方案**：logprobs 在一切变换之前先算好（L84-L93）；随后 logits 才进加工管线，而且 `log_softmax` 产的是新张量（非原地），后面管线全程原地改写的是 logits 张量、物理碰不到已物化的 raw_logprobs。
-- **代价（如实记）**：额外一份 `[batch, vocab]` 的 fp32 张量驻留峰值显存——真实词表 129280（DeepSeek 规模）时一个 32 行批 ≈ 32 × 129280 × 4B ≈ 16MB/步；这就是下一站「gather 要窄」的原因：留底要早，带出 GPU 的只有 k+1 列。另有两笔小账：raw 与 processed 两个视角共享同一个 tensor，投机解码分支需要显式 clone 保住 raw（`vllm/v1/sample/rejection_sampler.py:L157-L159` 注释原话「preserve the original raw logits ... since apply_logits_processors modifies the tensor in-place」，投机解码章展开）；批全贪心时有条快路径提前返回，那里的留底走另一条物化路（下一小节）。
+- **代价（如实记）**：额外一份 `[batch, vocab]` 的 fp32 张量驻留峰值显存——真实词表 129280（DeepSeek 规模）时一个 32 行批 ≈ 32 × 129280 × 4B ≈ 16MB/步；这就是下一站「gather 要窄」的原因：留底要早，带出 GPU 的只有 k+1 列。另有两笔小账：raw 与 processed 两个视角共享同一个 tensor——这条说的不是上面那份留底（那是 log_softmax 新物化的张量，物理碰不到），而是投机解码分支里 logits 自身兼任 raw 载体的路径，处理器原地改写前需要显式 clone 保住 raw（`vllm/v1/sample/rejection_sampler.py:L157-L159` 注释原话「preserve the original raw logits ... since apply_logits_processors modifies the tensor in-place」，投机解码章展开）；批全贪心时有条快路径提前返回，那里的留底走另一条物化路（下一小节）。
 
 「惩罚是采样干预、不是模型意见」——这句话的下游论据最硬的一条来自 RL（强化学习）训练。策略梯度类算法（PPO 一脉——Proximal Policy Optimization，近端策略优化，[arXiv:1707.06347](https://arxiv.org/abs/1707.06347)）的核心量是新旧策略对同一动作的概率比，并把它裁剪在有界区间——OpenAI 官方教学页对裁剪的概括：「clipping serves as a regularizer by removing incentives for the policy to change dramatically」（[Spinning Up](https://spinningup.openai.com/en/latest/algorithms/ppo.html)）。映射到语言模型：动作就是 token，$`\pi_\theta(a|s)`$ 就是模型给该 token 的概率，推理引擎在 RL 循环里扮演的是「产 token + logprob 的数据服务器」。要是引擎报的 logprob 是惩罚之后的值，它描述的分布已不是任何策略：惩罚随序列内容漂移、温度是外加缩放。拿它算 ratio——设某位置 raw logprob = −0.2（P ≈ 0.82）、重复惩罚把它改到 −2.0（P ≈ 0.14），两数当分子分母，ratio 直接差 $`e^{1.8} \approx 6`$ 倍；clip 上限典型才 1+ε（ε ≈ 0.2）。这不是噪声，是方向性错误。今天 LLM RL 的主力算法 GRPO（组相对策略优化）同谱系（自述「a variant of Proximal Policy Optimization」，[arXiv:2402.03300](https://arxiv.org/abs/2402.03300)），同样逐 token 消费 logprob——这就是引擎把「logprobs 必须是 raw」做成默认的生态压力。
 
@@ -296,7 +296,7 @@ def batched_count_greater_than(x: torch.Tensor, values: torch.Tensor) -> torch.T
 |---|---|---|---|---|
 | 0 | [5, 7] / 3 | [3, 5, 7] | [-0.9143, -2.4143, -4.4143] | 1 |
 | 1 | [2] / 1 | [1, 2, 0]（第 3 列是 padding 位） | [-1.4729, -2.4729, -inf] | 2 |
-| 双开关在场（forward 面） | max_num_logprobs=1 与稀疏字典同设 | forward 返回 3 列（稠密路只会给 2 列） | 稀疏优先覆盖（prefer 分支） | forward 自采 [3, 0] |
+| 双开关在场（forward 面） | max_num_logprobs=1 与稀疏字典同设 | forward 返回 3 列（稠密路只会给 2 列） | 稀疏优先覆盖（prefer 分支） | forward 自采 [3, 0]（本次探测改由 forward 走真采样、自行采出） |
 
 省的账一眼见底：指定 2 个 id，GPU 只 gather 3 格；`logprobs=-1` 全词表是 13 万格/行。打分场景（固定标签集比较概率）该用它。这条稀疏路与 generative scoring API 的完整故事超出本书范围，留给后续的 scoring 专题。
 
@@ -320,7 +320,7 @@ gather 之后，logprobs 缩成了 k+1 列的小张量。接下来三站横穿 L
                 if self._logprobs_tensors
                 else None
             )
-            # … 省略：routed_experts 拷贝、EP 故障查询、event.record()——
+            # … 省略：routed_experts 拷贝、EP（专家并行）故障查询、event.record()——
             #         并行搬运的其他载荷与完成标记 …
 ```
 
@@ -999,7 +999,7 @@ prompt logprobs 要的是「对 prompt 的每个位置重算一遍 logits」—�
 
 - **旧设计**：HF transformers（HuggingFace 的模型库）的 `ForCausalLM.forward`（vLLM 的模型类就是从 `modeling_llama.py` 改编的，文件头注明 Adapted from）在 forward 里一口气跑 lm_head（词表投影层——意见向量变 logits 的最后一层变换）、返回**全部位置**的 logits——训练语义（每个位置都要算 loss）。v0 早期推理沿用这个形状。
 - **痛点**：decode 批次每请求只有**最后 1 个**位置需要下一词分布；vocab 约 13 万（DeepSeek 129280）时一个 4096-token 的 prefill 块全量物化 fp32 logits ≈ 4096 × 129280 × 4B ≈ 2GB，纯属浪费；且张量并行（[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)点过名的并行方式）下 lm_head 按词表分片，全量物化意味着全量 gather（跨卡归拢），通信量同倍放大。
-- **v1 方案**：模型契约拆两方法——`forward` 只出 hidden_states（意见向量），`compute_logits(hidden_states)` 独立（`vllm/model_executor/models/llama.py:L516-L533`，内部走 lm_head 投影 → 张量并行 gather → 裁词表 padding）。「哪些位置要 logits」的策略归 runner：普通 decode 只取每请求最后一行，prompt logprobs 取 prompt 的行——同一份契约，两种取法。
+- **v1 方案**：模型契约拆两方法——`forward` 只出 hidden_states（意见向量），`compute_logits(hidden_states)` 独立（`vllm/model_executor/models/llama.py:L516-L533`，内部走 lm_head 投影 → 张量并行 gather → 裁掉词表 padding（词表为让张量并行各卡均分而补的空位列））。「哪些位置要 logits」的策略归 runner：普通 decode 只取每请求最后一行，prompt logprobs 取 prompt 的行——同一份契约，两种取法。
 - **代价（如实记）**：模型类接入面变大（两个方法都要实现）；「哪里要 logits」的策略散在 runner 各处（prompt logprobs / 投机解码 / 池化各不同），模型层无法自洽；流水线并行（模型竖切多段各居一卡）的场景还要把 logits 跨进程广播。
 
 **prompt 支路之所以能「事后补考」，正建立在这个契约上**——logits 没在 forward 里全量物化，才可能事后按需补算。
@@ -1107,7 +1107,7 @@ prompt logprobs 要的是「对 prompt 的每个位置重算一遍 logits」—�
 
 （循环收尾在 L5717-L5727：交付过的请求从 `num_prompt_logprobs` 字典注销、挂账字段置 None，最后 `_sync_device()` 同步非阻塞拷贝——纯记账，不再展开。）
 
-L5631-L5632 那两行注释先记下——「prompt logprobs 是个罕见特性，优先简单可维护而非最优性能」，这条支路的实现取舍全在这句话里。主线五步：**整本预分配**（L5656-L5657：首次遇到就给整个 prompt 开好 CPU 张量，位次 = prompt 长度 − 1——首 token 没有条件概率、不计分）；**定位本块**（start_idx = 已算过的 token 数，随 chunk 推进）；**补算 logits**（L5689：两方法契约的兑现——对 prompt 的 hidden_states 行调 `compute_logits`）；**gather**（目标 token 恒为 prompt[i+1]——位置 i 的「被采样者」就是下一位真实写下的字，L5694）；**分块拷入、末块交付**（L5709：结果按位次区间拷进预分配张量；只有覆盖到最后一块的请求才把它放进交付字典——中间块全部押在请求的 `in_progress_prompt_logprobs_cpu` 挂账字段上）。
+L5631-L5632 那两行注释先记下——「prompt logprobs 是个罕见特性，优先简单可维护而非最优性能」，这条支路的实现取舍全在这句话里。主线五步：**整本预分配**（L5656-L5657：首次遇到就给整个 prompt 开好 CPU 张量，位次 = prompt 长度 − 1——首 token 没有条件概率、不计分）；**定位本块**（start_idx = 已算过的 token 数，随 chunk 推进）；**补算 logits**（L5689：两方法契约的兑现——先用 `query_start_loc`（批张量里每个请求的 token 起点表，`.np` 是转成 numpy 视图取值的写法）定出本请求在压平的批 hidden_states 里的行起点、切出 prompt 各行，再调 `compute_logits`）；**gather**（目标 token 恒为 prompt[i+1]——位置 i 的「被采样者」就是下一位真实写下的字，L5694）；**分块拷入、末块交付**（L5709：结果按位次区间拷进预分配张量；只有覆盖到最后一块的请求才把它放进交付字典——中间块全部押在请求的 `in_progress_prompt_logprobs_cpu` 挂账字段上）。
 
 实测（配套精简版，五 token prompt [1,2,0,2,1] 分两块消化；模型用恒等 compute_logits——hidden 行即 logits 行，专为可心算；gather/log_softmax 逐字真码，如位 0 的分数可手算复核：log_softmax([5,4,3,2,1,0]) 对目标 2 = −2.4562）：
 

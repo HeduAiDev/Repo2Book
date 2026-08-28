@@ -4,7 +4,7 @@
 
 第二问更扎手：就算认了 token 数这本账，一个 8192 的长 prompt 要连吃好几拍预算才消化得完——正在逐字吐字的老用户，他们的下一个字会不会被这口大锅拖住？把长 prompt 切成小块、混进 decode 的批里分期消化，这笔账到底谁在付？付到什么程度，有没有上限？
 
-[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)结尾留了话：循环框亮了，旁边那列「调度 · 显存账本」还黑着。本章就打开它——第 ① 拍 `schedule()` 的内部：一个 token 预算、两个阶段、三道闸门，一本账从请求进门翻到批出发。
+[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)结尾留了话：循环框亮了，旁边那列「调度 · 显存账本」还黑着。本章就打开它——第 ① 拍 `schedule()` 的内部：一个 token 预算、两个阶段，收新的两道闸、切块的三道闸、准入的一扇门——一本账从请求进门翻到批出发。
 
 ## 你在这里
 
@@ -427,7 +427,7 @@ woosuk 那段「没有 decoding 相位也没有 prefill 相位，只有已算追
                 break                                                # 阶段一收摊    # L629
 ```
 
-None 就抢占，抢谁？FCFS 下抢 running 列表的**队尾**——最晚进来、最「年轻」的请求。像剧场满座时来了一位必须落座的客人：请走最晚进场、重看损失最小的观众，座位腾给来客；被请走的下次从片头重看（v1 的抢占是 recompute-only——已算的全部作废重算，没有 v0 时代的换出到内存；重看怎么重、被抢请求怎么活着回来，是下一章的主戏，本章只立因果）。抢完重试，直到拿到块或把自己抢掉。这个环也停得下来：每轮 None 之后 `running` 都少一个成员，至多初始长度轮后要么拿到块、要么把自己抢掉出环；而且 FCFS 下被抢的队尾排在当前扫描点之后、本拍还没记账——抢它不需要回滚 `num_scheduled_tokens` 的账。这段环还有一个下游后果要记住：**`preempted_reqs` 非空 = 本拍发生过抢占 = 显存紧张的信号**——它马上成为阶段二入口的守卫条件。
+None 就抢占，抢谁？FCFS 下抢 running 列表的**队尾**——最晚进来、最「年轻」的请求。像剧场满座时来了一位必须落座的客人：请走最晚进场、重看损失最小的观众，座位腾给来客；被请走的下次从片头重看（v1 的抢占是 recompute-only——已算的全部作废重算，没有 v0 时代的 swap 换出（把 KV 数据从显存挪到主存暂存、恢复时再搬回的老办法）；重看怎么重、被抢请求怎么活着回来，是下一章的主戏，本章只立因果）。抢完重试，直到拿到块或把自己抢掉。这个环也停得下来：每轮 None 之后 `running` 都少一个成员，至多初始长度轮后要么拿到块、要么把自己抢掉出环；而且 FCFS 下被抢的队尾排在当前扫描点之后、本拍还没记账——抢它不需要回滚 `num_scheduled_tokens` 的账。这段环还有一个下游后果要记住：**`preempted_reqs` 非空 = 本拍发生过抢占 = 显存紧张的信号**——它马上成为阶段二入口的守卫条件。
 
 实测抢占环的轮次（配套精简版；块池 2 块 × 16 token，r1/r2 各占一块后池空；allocate 调用序列由驱动侧代理记录——包一层日志不改语义；拍 5 的 r1 退场由第五拍完成路径在驱动侧显式调用）：
 
@@ -441,7 +441,7 @@ None 就抢占，抢谁？FCFS 下抢 running 列表的**队尾**——最晚进
 
 拍 2 一目了然：r1 要 1 个 token 的块拿不到 → 抢队尾 r2 → 重试成功；r2 的已算清零、回 waiting 队头。拍 5 的 17 也值得看一眼：被抢时已生成的 1 个输出 token 现在成了重算的输入——**抢占的账单按整条序列计**。
 
-岔口走完，在途请求领到 token、拿到块，记账入册——`{req_id: num_tokens}` 账本的一行就是这几行（其中 `prefill_scheduled |= request.is_prefill_chunk` 是给本拍批记「有没有混进 prefill 块」的总标记，它唯一的消费点在后文「切蛋糕」省略注释里那段投机解码均匀 pad——新 decode 请求只在纯 decode 批上才 pad 到均匀尺寸、保 CUDA graph；本章无投机解码，扫一眼即可）：
+岔口走完，在途请求领到 token、拿到块，记账入册——`{req_id: num_tokens}` 账本的一行就是这几行（其中 `prefill_scheduled |= request.is_prefill_chunk` 是给本拍批记「有没有混进 prefill 块」的总标记，它唯一的消费点在后文「切蛋糕」省略注释里那段投机解码均匀 pad——新 decode 请求只在纯 decode 批上才 pad 到均匀尺寸、保 CUDA graph——同形状的批才能整段重播，[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)立过一句定义、[第 3 章](../../ch03-engineargs-to-vllmconfig/narrative/chapter.md)补全了机制课；本章无投机解码，扫一眼即可）：
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L631-L638
@@ -530,7 +530,8 @@ a·拍2 是第一道闸最锋利的证据：空闲还有 1 块、预算还剩 20
                     hit_diverged = False
                     # Get locally-cached tokens.
                     if self.connector is not None:
-                        # … 省略：KV connector 的远程命中分支（P/D 分离场景，
+                        # … 省略：KV connector 的远程命中分支（P/D 分离——
+                        #       prefill 与 decode 拆到不同引擎/机器的部署形态，
                         #       Part VIII 的话头）……
                     else:
                         (
@@ -738,7 +739,7 @@ class SchedulerOutput:
     finished_req_ids: set[str]
 ```
 
-注释把协议说尽了：首次调度的请求发 `NewRequestData` **全量**（整段 prompt token、采样参数、块表——worker 存档保管）；已调度过的发 `CachedRequestData` **增量**（本拍的新块、几个数字）。装配现场在 `schedule()` 收尾（`vllm/v1/core/sched/scheduler.py:L1131-L1163`：new 走 `NewRequestData.from_request` 全量打包、老请求走 `_make_cached_request_data` 增量打包、`prev_step_scheduled_req_ids` 每拍刷新标记上拍已调度者——上拍没排过的才补传全量 token 表。后半句的动机一句话：差量协议的基准是「上拍在批」，worker 侧的持久批次（persistent batch，跨拍驻留的执行批）只热着上拍执行过的请求，token 表靠逐拍追加采样结果保持同步；跳了一拍的请求已掉出持久批次、追加史接不上，回来时只能整表重发重建）。实测量级（m1 那组数据的拍 2）：新 r4 首发全量 64 个 prompt token + 2 项块表（首 chunk 只有 29 token，按 16-token 块恰好分到头 2 块——剩下的块随后续拍以增量形式补发）+ 采样参数；三个老请求合计只发三个「1 token」记账条 + 0 个新块 + 空 token 表。**代价**：worker 必须维护匹配的缓存与失效逻辑——两进程的请求视图可能漂移；协议语义也分了叉：resumed 请求的 `new_block_ids` 是**整体替换**而非追加（`vllm/v1/core/sched/output.py:L118-L121` 注释明说）——被抢占恢复的请求块表全变了，追加语义对不上。差量协议的完整深挖（worker 侧持久批次怎么缓存、怎么失效）在执行篇的批次协议章。
+注释把协议说尽了：首次调度的请求发 `NewRequestData` **全量**（整段 prompt token、采样参数、块表——worker 存档保管）；已调度过的发 `CachedRequestData` **增量**（本拍的新块、几个数字）。装配现场在 `schedule()` 收尾（`vllm/v1/core/sched/scheduler.py:L1131-L1163`：new 走 `NewRequestData.from_request` 全量打包、老请求走 `_make_cached_request_data` 增量打包、`prev_step_scheduled_req_ids` 每拍刷新标记上拍已调度者——上拍没排过的才补传全量 token 表。后半句的动机一句话：差量协议的基准是「上拍在批」，worker 侧的持久批次（persistent batch，跨拍驻留的执行批；与前文 LMDeploy 的 persistent batching 同名不同物——那是 continuous batching 的别名，这是 worker 进程里的数据结构）只热着上拍执行过的请求，token 表靠逐拍追加采样结果保持同步；跳了一拍的请求已掉出持久批次、追加史接不上，回来时只能整表重发重建）。实测量级（m1 那组数据的拍 2）：新 r4 首发全量 64 个 prompt token + 2 项块表（首 chunk 只有 29 token，按 16-token 块恰好分到头 2 块——剩下的块随后续拍以增量形式补发）+ 采样参数；三个老请求合计只发三个「1 token」记账条 + 0 个新块 + 空 token 表。**代价**：worker 必须维护匹配的缓存与失效逻辑——两进程的请求视图可能漂移；协议语义也分了叉：resumed 请求的 `new_block_ids` 是**整体替换**而非追加（`vllm/v1/core/sched/output.py:L118-L121` 注释明说）——被抢占恢复的请求块表全变了，追加语义对不上。差量协议的完整深挖（worker 侧持久批次怎么缓存、怎么失效）在执行篇的批次协议章。
 
 ![首件全量，补件只发 diff](../diagrams/ch10-fig-new-full-cached-diff.png)
 

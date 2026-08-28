@@ -517,7 +517,7 @@ class FreeKVCacheBlockQueue:
         return num_new_blocks + num_evictable_blocks               # L230
 ```
 
-三笔账。**主算术**就一行：`cdiv(num_tokens, block_size)`——前文总账表立过的天花板除 ⌈n/k⌉（「100 个 token 装 16 一页的块要几页」）。**fast-path**：running 请求不会再有新前缀命中（断言钉死），直接差值钳零——`max(num_required_blocks - num_req_blocks, 0)`（需块减已持、负数归零）；max 在这里是给投机解码兜底的：草稿 token 被拒后目标可以回缩，需块反而小于已持。**可驱逐命中块**：命中块若正躺在自由队列里（ref_cnt 为 0 的驱逐候选），分配时 touch 会把它从空闲池摘走——它既是「不用新分配」的命中块、又「离开空闲池」，漏数它就会超收，容量检查失真。这条注释是第二条 why 链的另一半——「预测器与分配器严格同构」——的一个样本：预测用的数学必须和分配动作一一对应，漂移没有运行时校验、只有注释和单源公式防着。
+三笔账。**主算术**就一行：`cdiv(num_tokens, block_size)`——前文总账表立过的天花板除 ⌈n/k⌉（「100 个 token 装 16 一页的块要几页」）。**fast-path**：running 请求不会再有新前缀命中（断言钉死），直接差值钳零——`max(num_required_blocks - num_req_blocks, 0)`（需块减已持、负数归零）；max 在这里是给投机解码兜底的：草稿 token 被拒后目标可以回缩，需块反而小于已持。**可驱逐命中块**：命中块（别的请求算过、内容相同、可直接复用的块）若正躺在自由队列里（ref_cnt 为 0 的驱逐候选），分配时 touch 会把它从空闲池摘走——它既是「不用新分配」的命中块、又「离开空闲池」，漏数它就会超收，容量检查失真。这条注释是第二条 why 链的另一半——「预测器与分配器严格同构」——的一个样本：预测用的数学必须和分配动作一一对应，漂移没有运行时校验、只有注释和单源公式防着。
 
 六问实测（预测器与分配器对账，两组各对一次、全部对上）：
 
@@ -667,7 +667,7 @@ class FreeKVCacheBlockQueue:
 | 4 | WAITING r3 入场 | 16 | 1 | 1 | 1 ≤ 1 → 过 | [9] | 0 |
 | 5 | RUNNING r1 长大 | 132 | 1 | 0 | 1 > 0 → None（抢占信号） | 无 | 0 |
 
-五行三处看点。调用 2 被拒之后**账本零变化**——r2 不进 req_to_blocks、空闲计数原地不动：None 的出口都在容量检查段（本章主路径的普通容量检查，加上上方 full_sequence_must_fit 整序列准入门那处），且都排在挂命中块、分新块、写回之前——被拒者一个记账动作都没发生，不是事后回滚。要把话说全：检查段之前有一个簿记调用 `remove_skipped_blocks`——给滑窗类注意力组释放窗外块的动作，源码注释明说即使本请求被拒也照做（kv_cache_manager.py:L495-L508，在节选起点上方）；全注意力主路径下它恒为 no-op（single_type_kv_cache_manager.py:L646-L651 注释原话：全注意力在请求结束前从不释放任何 token）——「零半截账」在本章主路径成立，是路径性质，不是这个函数在所有注意力类型下的保证。调用 4 是踩线过（1 ≤ 1）。调用 5 的 None 发生在 RUNNING 侧——同一句 return None，在 WAITING 侧只 break（等下一拍），在 RUNNING 侧进[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)拆过的抢占环（赶人腾块再重试）：信号只有一个，后果按侧分岔。（「token 目标」列是 num_computed_tokens + num_new_tokens 的合计；真实引擎里这个数由调度器乐观记账推进——[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)，驱动脚本手工维护。）
+五行三处看点。调用 2 被拒之后**账本零变化**——r2 不进 req_to_blocks、空闲计数原地不动：None 的出口都在容量检查段（本章主路径的普通容量检查，加上上方 full_sequence_must_fit 整序列准入门那处），且都排在挂命中块、分新块、写回之前——被拒者一个记账动作都没发生，不是事后回滚。要把话说全：检查段之前有一个簿记调用 `remove_skipped_blocks`——给滑窗类注意力组释放窗外块的动作，源码注释明说即使本请求被拒也照做（kv_cache_manager.py:L495-L508，在节选起点上方）；全注意力主路径下它恒为 no-op（single_type_kv_cache_manager.py:L646-L651 注释原话：全注意力在请求结束前从不释放任何 token）——「零半截账」在本章主路径成立，是路径性质，不是这个函数在所有注意力类型下的保证。调用 4 是踩线过（1 ≤ 1）。调用 5 的 None 发生在 RUNNING 侧——同一句 return None，在 WAITING 侧只 break（等下一拍），在 RUNNING 侧进[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)拆过的抢占环（赶人腾块再重试）：信号只有一个，后果按侧分岔。（「token 目标」列是 num_computed_tokens + num_new_tokens 的合计；真实引擎里这个数由调度器乐观推进——[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)，驱动脚本手工维护。）
 
 ![allocate_slots 三段式与两个出口](../diagrams/ch13-fig-allocate-slots-three-stages.png)
 
@@ -914,7 +914,7 @@ CPU 算法得先把 positions 从 GPU 拉回来（D2H 同步，device to host—
         )
 ```
 
-开头 NONE 分支点名的 GDN 是 Gated DeltaNet（门控 Delta 网络）——与 Mamba 同路、以循环状态代替 KV 的模型，它们的块表整组当循环状态索引用、不做逐 token 槽位换算（混合模型章见）。grid 是 `(num_reqs + 1,)`——每个程序实例处理一个请求的 token 区间（query_start_loc 切段），**多出来的最后一个程序专职填 PAD 尾**。kernel 本体（单卡版——CP 上下文并行的分片三处按常数 1 烘干后就是它；分片原貌归执行篇）：
+开头 NONE 分支点名的 GDN 是 Gated DeltaNet（门控 Delta 网络）——与 Mamba 同路、以循环状态代替 KV 的模型，它们的块表整组当循环状态索引用、不做逐 token 槽位换算（混合模型章见）。grid 是 `(num_reqs + 1,)`——每个程序实例处理一个请求的 token 区间（query_start_loc 切段），**多出来的最后一个程序专职填 PAD 尾**。kernel 本体（单卡版——CP 上下文并行（context parallel：把一条长序列切成多段、分给多卡并行算的部署模式）的分片三处按常数 1 烘干后就是它；分片原貌归执行篇）：
 
 ```python
 # vllm/v1/worker/block_table.py:L379-L442
@@ -964,7 +964,7 @@ def _compute_slot_mapping_kernel(
 slot = block_table[req][pos // block_size] × block_size + pos % block_size
 ```
 
-读法：位置除以块大小得到**逻辑块号**（页表第几项），查块表行拿到**物理块号**，块号乘块大小加**块内偏移**，摊平成全局槽位——开头 OS 那笔 0x0317 → 0x0C17 的翻译，一字不差。PAD 尾那段的 why 顺带记下：CUDA graph（固定形状捕获回放的执行加速机制，执行篇编译章）捕获的是 max 形状的执行，尾部空槽每拍必须重填 -1（PAD_SLOT_ID）——上一拍残留的合法槽位会让本拍的 padding token 写进别人的块。块表行 [3,1,7]、48 个位置全跑一遍（host 上 kernel 的逐行 CPU 镜像——同一恒等式、同一 PAD 尾、同一变量名）：
+读法：位置除以块大小得到**逻辑块号**（页表第几项），查块表行拿到**物理块号**，块号乘块大小加**块内偏移**，摊平成全局槽位——开头 OS 那笔 0x0317 → 0x0C17 的翻译，一字不差。PAD 尾那段的 why 顺带记下：CUDA graph（固定形状捕获回放的执行加速机制，执行篇编译章）捕获的是 max 形状的执行，尾部空槽每拍必须重填 -1（PAD_SLOT_ID）——上一拍残留的合法槽位会让本拍的 padding token（实际 token 数不足 CUDA graph 捕获时的 max 形状时、用来填空位的占位 token——它们也各占槽位表一格）写进别人的块。块表行 [3,1,7]、48 个位置全跑一遍（host 上 kernel 的逐行 CPU 镜像——同一恒等式、同一 PAD 尾、同一变量名）：
 
 <!-- trace: m9 -->
 | pos | pos//16 | 块表项 | 块号 | pos%16 | slot = 块号×16 + 偏移 |
@@ -1060,9 +1060,9 @@ slot = block_table[req][pos // block_size] × block_size + pos % block_size
 | 4 | r2 | 46 | 3 | 2 | [7] | 0 |
 | 5 | r1（触发抢占环） | 65 | 5 | 4 | [7]（弹 r2 后重试所得） | 2 |
 
-（表里 token 数一拍跳好几个——decode 稳态每拍本只 +1，驱动脚本为快进每拍多喂几个 token、专在块界前后落脚，免账拍与块界拍各留了样本，r2 的中间拍省略未列；「token 总数」列是 num_computed_tokens + 本拍喂入数的合计，真实引擎里由调度器乐观记账推进——[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)，驱动脚本手工维护。）
+（表里 token 数一拍跳好几个——decode 稳态每拍本只 +1，驱动脚本为快进每拍多喂几个 token、专在块界前后落脚，免账拍与块界拍各留了样本，r2 的中间拍省略未列；「token 总数」列是 num_computed_tokens + 本拍喂入数的合计，真实引擎里由调度器乐观推进——[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)，驱动脚本手工维护。）
 
-节奏总账（实测的完整刻度）：30 → 2 块、31/32 仍 2 块、33..48 → 3 块、49..64 → 4 块、65..80 → 5 块——相邻两次领块恰好隔 16 个 token，持有块数恒等于 cdiv(总 token, 16)。拍 2 是免账拍的样本（44 ≤ 48，块内还有 4 个空位）；拍 5 是池干的那拍：r1 要第 5 块、空闲 0，None 进抢占环，r2（队尾最年轻）被弹走、3 块按 [7,4,3] 逆序回池，r1 原样重试拿到 7 号——被抢者的代价（重算语义）[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)算过。宏观感受一下这套节奏为什么必须精确：decode 每 token 0.5 MB（Llama-2-7B 口径的计算例），1000 条并发各涨 1 个 token 就是 0.5 GB——「每 16 个 token 多要一块」错一拍，就是几十上百 MB 级的账差。
+节奏总账（实测的完整刻度）：30 → 2 块、31/32 仍 2 块、33..48 → 3 块、49..64 → 4 块、65..80 → 5 块——相邻两次领块恰好隔 16 个 token，持有块数恒等于 cdiv(总 token, 16)。拍 2 是免账拍的样本（44 ≤ 48，块内还有 4 个空位）；拍 5 是池干的那拍：r1 要第 5 块、空闲 0，None 进抢占环，r2（队尾最年轻）被弹走、3 块按 [7,4,3] 逆序回池，r1 原样重试拿到 7 号——被抢者的代价（重算语义）[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)算过。宏观感受一下这套节奏为什么必须精确：decode 每 token 0.5 MB（Llama-2-7B 口径的计算例），1000 条并发各涨 1 个 token 就是 0.5 GB——「每 16 个 token 多要一块」错一拍（一块 ≈ 16 × 0.5 MB = 8 MB），十几条请求在块界附近错拍，就是几十上百 MB 级的账差。
 
 请求终于完成（或被撤单），退房。调用链三级：
 

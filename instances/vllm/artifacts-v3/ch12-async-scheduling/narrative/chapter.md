@@ -42,7 +42,7 @@ L595 的 `schedule()` 要等 L609 的 `update_from_output()` 把上一拍的 tok
 
 解法只有一个方向：把三段相加变成取最大。稳态节拍从 $`T_{gpu}+T_{cpu}+T_{ipc}`$ 压到 $`\max(T_{gpu},\ T_{cpu})`$——批 A 在 GPU 上算的那段时间里，CPU 同时调度批 B、收批 A 的上一轮结果，互相把活藏进对方的时间里。（$`T_{ipc}`$ 并没有从公式里无声消失——搬运交给专用拷贝流异步推进、CPU 只在收货侧等一次事件，worker 半边专拆；稳态下这点搬运被并行的调度时间盖住，节拍公式里只剩 GPU 与 CPU 两项取最大。）这在工程上有个现成的名字：**双缓冲**（double buffering）——图形学的老发明：显示器放上一帧（front buffer）的同时，显卡画下一帧（back buffer），每帧交换角色，读的一方永远拿到完整版本（[Wikipedia：multiple buffering](https://en.wikipedia.org/wiki/Multiple_buffering)）。批队列的两个槽位正是这个结构：一个批在 GPU 上「放映」，另一个在 CPU 侧「绘制」。
 
-这不是 vLLM 一拍脑袋的发明，演进有完整的 git 证据链。**旧设计**：同步 `step()` 串行三段——异步调度（async scheduling）2025 年 7 月才进仓（[PR #19970](https://github.com/vllm-project/vllm/pull/19970)，当时还是 opt-in 开关，要用户显式打开）；**痛点**：上面那笔三段相加的账，GPU 利用率有缝；**v1 方案**：分四步走到今天的形态——① #19970 实现 `AsyncScheduler` 与占位账本；② #23569（2025-09）把「采样 token 不落 CPU」补上；③ #24799（2025-11）打通与投机解码的兼容；④ #27614（2025-12-29）翻转默认——配置为 None 时开启、仅五类不兼容例外降回 False（下一节的仲裁链逐条拆），从此它就是服务场景的默认心跳。作者在 #19970 里把目标说得很直白：「主要目标是让调度与模型执行重叠以压缩调度开销……做法是让调度器比当前执行抢先跑一步」，并且特意注明这套机制「与 NanoFlow 论文描述的做法相似」（[arXiv:2408.12757](https://arxiv.org/abs/2408.12757)，设备内 nano-batch 流水线重叠的学术近亲）。**代价**同样写在明处，后面整章都在还这笔账：调度器状态领先真实进度，一整族补偿机制（占位扣减、块转正、拒绝回扣、stale 排空——stale 指被抢占时遗留的在飞输出）全是它的利息，性能口径上作者自报「吞吐 +3-15%（小模型/大 batch 更明显），TPOT（每 token 生成时间）降、TTFT（首 token 延迟）微涨」——新请求要多等一个调度步，这笔交换不是白拿的。
+这不是 vLLM 一拍脑袋的发明，演进有完整的 git 证据链。**旧设计**：同步 `step()` 串行三段——异步调度（async scheduling）2025 年 7 月才进仓（[PR #19970](https://github.com/vllm-project/vllm/pull/19970)，当时还是 opt-in 开关，要用户显式打开）；**痛点**：上面那笔三段相加的账，GPU 利用率有缝；**v1 方案**：分四步走到今天的形态——① #19970 实现 `AsyncScheduler` 与占位账本；② #23569（2025-09）把「采样 token 不落 CPU」补上；③ #24799（2025-11）打通与投机解码（小模型先草拟 k 个 token、大模型一次前向全验证的加速法，Part VII 专讲）的兼容；④ #27614（2025-12-29）翻转默认——配置为 None 时开启、仅五类不兼容例外降回 False（下一节的仲裁链逐条拆），从此它就是服务场景的默认心跳。作者在 #19970 里把目标说得很直白：「主要目标是让调度与模型执行重叠以压缩调度开销……做法是让调度器比当前执行抢先跑一步」，并且特意注明这套机制「与 NanoFlow 论文描述的做法相似」（[arXiv:2408.12757](https://arxiv.org/abs/2408.12757)，设备内 nano-batch 流水线重叠的学术近亲）。**代价**同样写在明处，后面整章都在还这笔账：调度器状态领先真实进度，一整族补偿机制（占位扣减、块转正、拒绝回扣、stale 排空——stale 指被抢占时遗留的在飞输出）全是它的利息，性能口径上作者自报「吞吐 +3-15%（小模型/大 batch 更明显），TPOT（每 token 生成时间）降、TTFT（首 token 延迟）微涨」——新请求要多等一个调度步，这笔交换不是白拿的。
 
 顺带拆掉一个常见误读：这里的 async **不是** Python 的 asyncio。作者在 #19970 里明说「调度器与 GPU worker 必须跑在独立进程里才能并行执行」——靠的是[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)讲过的进程分工加 Future 提货单（`execute_model(non_block=True)` 立即返回 Future、`result()` 才取货那套），不是协程让出事件循环。你在这里看不到 `async def`/`await`，看到的是队列、Future 和账本。
 
@@ -124,7 +124,7 @@ L595 的 `schedule()` 要等 L609 的 `update_from_output()` 把上一拍的 tok
         return pp_size
 ```
 
-注释自带两句设计动机：流水线并行（pipeline parallelism，模型按层切段多卡接力，PP）需要 pp_size 个并发批把流水线填满——每一段都得有活在算，否则就有「气泡」（bubble：流水线填充与排空阶段某些卡在干等的空转窗口，吃掉的正是理论加速比；这个话题的完整展开在讲分布式的 Part VIII）；异步调度需要 2 个并发批做重叠——一个在 GPU 上算、一个在 CPU 侧备。V2 Model Runner（vLLM 的下一代 runner，仍在实验期）多给 1，消掉流水线末段的气泡。五种配置组合的实测矩阵：
+注释自带两句设计动机：流水线并行（pipeline parallelism，模型按层切段多卡接力，PP）需要 pp_size 个并发批把流水线填满——每一段都得有活在算，否则就有「气泡」（bubble：流水线填充与排空阶段某些卡在干等的空转窗口，吃掉的正是理论加速比；这个话题的完整展开在讲分布式的 Part VIII）；异步调度需要 2 个并发批做重叠——一个在 GPU 上算、一个在 CPU 侧备。V2 Model Runner（vLLM 的下一代 runner，仍在实验期）多给 1，消掉流水线末段的气泡——排空期最后一段本该没活，多备一个在飞批让它仍有活可算。五种配置组合的实测矩阵：
 
 <!-- trace: m2 -->
 | 配置场景 | async（仲裁后） | pp_size | runner | max_concurrent_batches | 装配落点 |
@@ -253,8 +253,8 @@ L595 的 `schedule()` 要等 L609 的 `update_from_output()` 把上一拍的 tok
 docstring 三步走就是设计宣言：**填满队列优先于取模型输出**。逐段读：
 
 - **L648 的断言**：入口保证队列未满——忙循环侧配合 `has_work()`（`core.py:L1365-L1371`，`bool(self.batch_queue)` 算有活）保证队非空时循环不睡。两者合起来，队列长度恒在 `[0, batch_queue_size]`。
-- **L653 盲调度**：此刻上一拍（批 A）可能还在 GPU 上跑、输出未回，调度器照样排本拍（批 B）——「盲调度」是本书对这种「输出未回先排下一拍」的叫法，它凭什么敢，下一节专门拆。`is_ec_consumer` 那两行是分布式 encoder cache 的非消费端小众场景（常规部署恒为 True），看 `model_executed` 的赋值即可：本拍真排了 token 才算执行过。
-- **L655-L657 发起前向**：`execute_model(scheduler_output, non_block=True)` 立即返回 `exec_future`——不等 GPU，这正是[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)两段式契约的 non_block 面（外层包着的 `log_error_detail` 是诊断上下文，无功能影响）。pooling 模型或空批没有采样这一说，`exec_future` 直接当最终 future。
+- **L653 盲调度**：此刻上一拍（批 A）可能还在 GPU 上跑、输出未回，调度器照样排本拍（批 B）——「盲调度」是本书对这种「输出未回先排下一拍」的叫法，它凭什么敢，下一节专门拆。`is_ec_consumer` 那两行服务于一种小众分布式部署——分布式 encoder cache（编码器/多模态输出的缓存由独立实例算好、点对点转运给消费端，`vllm/config/ec_transfer.py`）：纯 producer 端只算只发、这个循环里不采样，这两行就跳过赋值；常规部署没有这套配置，`ec_transfer_config is None or …` 使 `is_ec_consumer` 恒为 True（core.py:L214-L217），直接看 `model_executed` 的赋值即可：本拍真排了 token 才算执行过。
+- **L655-L657 发起前向**：`execute_model(scheduler_output, non_block=True)` 立即返回 `exec_future`——不等 GPU，这正是[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)两段式契约的 non_block 面（外层包着的 `log_error_detail` 是诊断上下文，无功能影响）。pooling 模型或空批没有采样这一说，`exec_future` 直接当最终 future——下文表格里简称 plain future。
 - **L665-L677 采样排程**：`pending_structured_output_tokens` 为假就立即 `get_grammar_bitmask` + `sample_tokens(non_block=True)`——掩码算在前向窗口里、采样发起即返回 future，[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)的③拍夹缝时序原样保留；为真则把 `scheduler_output` 暂存进 `deferred_scheduler_output`，本拍不采样——这一支是结构化输出与异步相乘出的时序难题，专设一节（见[「缺 token 的批」](#缺-token-的批deferred-sampling)）。
 - **L681 入队 + L687 早退**：三元组 `appendleft` 进队；队未满且还有活可调（真排了 token 或调度器手里还有请求），直接 `return (None, model_executed)`——**不等任何结果**，忙循环立刻转下一圈继续调度。这就是「填管道优先」的机器形态。
 
@@ -348,7 +348,7 @@ pop 之后的正路：
 | 4 | [C] → [D,C] → pop C | 批D {}（flush finished_req_ids 空批） | —（无真调度） | pop C（plain future，通知 worker 清缓存） | outputs（空） | 3/0（3） |
 | 5 | [D] → pop D | 无（has_requests=False） | — | pop D 排空 | ({}, False) | 3/0（3）——has_work 转 False |
 
-五次心跳里真前向只有 2 次（批A/批B）——单请求 max_tokens=2 的最小心算规模让空拍占比高得刺眼，这是刻意的；稳态多请求下剪枝空拍与排空拍会被其他请求的调度摊薄。真正要看的是拍 2 那格「盲调度证据」：**schedule 时刻 ph=1（有占位欠条）、output_token_ids 还是空的、批 A 的 D2H 事件未完成**——同步版走到这里公式值为 0、无 token 可排（占位账本一节有双引擎对照表），重叠版照样排出了批 B。这就是「CPU 调度时间藏进 GPU 计算时间」的现场。终止性也有账：每个请求的输出每交货一拍严格 +1 且上界 max_tokens，有限次交货后 FINISHED 进 `finished_req_ids`，下一次 schedule 以空批 flush（拍 4）、队列 FIFO 排空（拍 5），`has_work()` 转 False 引擎静止。
+五次心跳里真前向只有 2 次（批A/批B）——单请求 max_tokens=2 的最小心算规模让空拍占比高得刺眼，这是刻意的；稳态多请求下剪枝空拍与排空拍会被其他请求的调度摊薄。真正要看的是拍 2 那格「盲调度证据」：**schedule 时刻 ph=1（有占位欠条）、output_token_ids 还是空的、批 A 的 D2H 事件未完成**——同步版走到这里公式值为 0、无 token 可排（占位账本一节有双引擎对照表），重叠版照样排出了批 B。这就是「CPU 调度时间藏进 GPU 计算时间」的现场。终止性也有账：每个请求的输出每交货一拍严格 +1 且上界 max_tokens，有限次交货后 FINISHED 进 `finished_req_ids`，下一次 schedule 以空批 flush（拍 4）——`finished_req_ids` 要搭这班 scheduler_output 出城、worker 收到才撤掉请求档案与持久批槽位，没有活可排也得发这趟空车——队列 FIFO 排空（拍 5），`has_work()` 转 False 引擎静止。
 
 ![两态心跳的逐拍状态表](../diagrams/ch12-fig-two-state-queue.png)
 
@@ -563,7 +563,7 @@ L495 那个式子看着像谜题，注释把它拆开了：lhs = (computed+1) �
 | 事件 | computed | ph | 说明 |
 |---|---|---|---|
 | prefill 后（拍1，无 spec） | 5 | 1 | 基线：每拍 1 个采样位 |
-| 注入 spec 账（1 bonus + 3 draft） | 5 | 4 | 与 _update_after_schedule 灌值口径一致；bonus＝接受草稿之外照例多采的那 1 个采样 token（num_sampled_tokens_per_step，无 spec 时恒 1） |
+| 拍1 按 spec 口径重记（1 bonus + 3 draft = 4） | 5 | 4 | 与 _update_after_schedule 灌值口径一致；bonus＝接受草稿之外照例多采的那 1 个采样 token（num_sampled_tokens_per_step，无 spec 时恒 1） |
 | 交货：0 草稿接受 → num_rejected=3 | 2 | 1 | computed −3、ph −3（双回退） |
 | delivery [7] 扣位 | 2 | 0 | cache_blocks(2−0=2) 转正 |
 
@@ -587,7 +587,7 @@ L495 那个式子看着像谜题，注释把它拆开了：lhs = (computed+1) �
         request.num_preemptions += 1
 ```
 
-抢占时把在飞输出整批标记 stale：`num_stale_output_tokens = num_in_flight_tokens`（赋值不累加——in_flight 里本就含未排空的旧 stale 份额）、占位清零（L1308）。**这些 token 恢复后照样送出去**——注释给了理由：丢掉会扰动投机解码的接受率统计——但**不许动已清零的计数器**。交货侧的锁步排空在热循环开头：
+抢占时把在飞输出整批标记 stale：`num_stale_output_tokens = num_in_flight_tokens`（赋值不累加——in_flight 里本就含未排空的旧 stale 份额）、占位清零（L1308）。**这些 token 恢复后照样送出去**——注释给的理由只有一句：丢掉会扰动投机解码的接受率统计（接受率怎么统计、为什么丢 token 会扰动它，源码没展开，机制归 Part VII 投机解码章）——但**不许动已清零的计数器**。交货侧的锁步排空在热循环开头：
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L1736-L1743

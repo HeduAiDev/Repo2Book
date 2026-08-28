@@ -93,7 +93,7 @@ True
 | FINISHED_ERROR | 11 | true | ERROR |
 | FINISHED_REPETITION | 12 | true | REPETITION |
 
-值 2-4 是三个阻塞子态：等语法编译（约束解码，Part VII）、等远程 KV 传送（KVConnector，Part IV 末章）、等流式输入的下一段——共同点是「暂时调度不了但没死」，站 8 会看到它们被隔离进专用队列。表里还有一处刺眼的特例：`WAITING_FOR_STREAMING_REQ` 明明是未完成态（值 4），却映射到 STOP——流式会话挂起等输入时，对外口径仍是「这一段停了」。这个特例是站 16 那个时序约束的一半伏笔，先记下。全序图景一张：
+值 2-4 是三个阻塞子态：等语法编译（约束解码——让输出严格符合 JSON 之类结构的一族方法，vLLM 要先把语法编译成状态机才能逐拍执法，Part VII 的正戏）、等远程 KV 传送（KVConnector——跨机搬运 KV cache 的接入组件：机制本体在 Part IV 末章 KVConnector 章，它的典型场景 P/D 分离，即 prefill 与 decode 拆到不同引擎/机器的部署形态，归 Part VIII）、等流式输入的下一段——共同点是「暂时调度不了但没死」，站 8 会看到它们被隔离进专用队列。表里还有一处刺眼的特例：`WAITING_FOR_STREAMING_REQ` 明明是未完成态（值 4），却映射到 STOP——流式会话挂起等输入时，对外口径仍是「这一段停了」。这个特例是站 16 那个时序约束的一半伏笔，先记下。全序图景一张：
 
 ![请求的一生是一枚整数的取值变化](../diagrams/ch11-fig-status-intenum.png)
 
@@ -307,7 +307,7 @@ FCFS 抢队尾的理由，上一章给过直觉（剧场请走最晚进场的观
 
 六件事里最反直觉的是⑤：被抢请求「已经发出去还没回来」的输出 token 怎么办？直觉的答案要么「照常送达」要么「扔掉」，v1 的答案是**两条都要，但记账分开**：token 照常送达，账本一刀切开——`num_stale_output_tokens = num_in_flight_tokens`（L1307）。
 
-为什么不能直接扔？源码注释给了理由（L1297-L1299 原话的逻辑）："dropping them would perturb spec-decode acceptance"——投机解码的接受率统计要数「草稿对了几个」，凭空吞掉在途 token 会让统计失真，而这套统计是动态调草稿数的依据。为什么送达却又不能记正常的账？因为③刚把 `num_computed_tokens` 清零、把 `num_output_placeholders` 置 0——这些计数器已经归零，stale 输出再走正常路径去扣它们就是 underflow（下溢——把已经归零的计数器再往下扣成负数；下一章 AsyncScheduler 的覆写里有对应的断言注释）。所以协议是：**送达不动账，另立一本冲销账**——stale 记下份额，此后每个在途步的输出回来时，热循环按当拍调度数「锁步冲销」一份（站 12 见 L1737-L1743 原文），份额清零之前**恢复被推迟**（站 8 见 L713-L722）。还有一个源码注释里点破的细节：赋值用的是 `=` 不是 `+=`——注释原话 "num_in_flight_tokens already includes any undrained stale share, so assign rather than accumulate"（在途计数本就含着未排干的旧 stale 份额，赋值即可、累加会重复计）。第二条形态是 **drop-mode**：`drop_stale_output` 旗标立起时整段丢弃、不送达。来源有两种。一是同拍抢占+恢复：`reset_prefix_cache` 是清前缀缓存的管理接口（scheduler.py:L2423-L2449），它会当场把全部在场请求逆序抢占、又在同一步内放回重调度（源码注释原话 "forcing preemption + resumption in the same step"）——「抢」与「恢复」挤进同一拍，那些位置反正马上要重采，交付反而乱序（docstring 原话 "whose same-step resume would otherwise deliver tokens out of order"）。二是 KV connector 有未决交接（P/D——prefill 与 decode 分离部署的场景，Part IV 末章点到即止）：判据正是抢占环里传的 `requires_kv_delivery`——被抢后块已还池、未决交接随之失效，在途输出只能整段丢弃。全协议七幕实测（配套精简版；深度 2 的异步模拟——P1 在调度后、输出回来前人工置 in_flight=2 模拟两步在途，P4 用同一 scheduler_output 二次回账模拟第 2 个在途步返回；同步引擎的对照见 P7）：
+为什么不能直接扔？源码注释给了理由（L1297-L1299 原话的逻辑）："dropping them would perturb spec-decode acceptance"——投机解码的接受率统计要数「草稿对了几个」，凭空吞掉在途 token 会让统计失真，而这套统计是动态调草稿数的依据。为什么送达却又不能记正常的账？因为③刚把 `num_computed_tokens` 清零、把 `num_output_placeholders` 置 0——这些计数器已经归零，stale 输出再走正常路径去扣它们就是 underflow（下溢——把已经归零的计数器再往下扣成负数；下一章 AsyncScheduler 的覆写里有对应的断言注释）。所以协议是：**送达不动账，另立一本冲销账**——stale 记下份额，此后每个在途步的输出回来时，热循环按当拍调度数「锁步冲销」一份（站 12 见 L1737-L1743 原文），份额清零之前**恢复被推迟**（站 8 见 L713-L722）。还有一个源码注释里点破的细节：赋值用的是 `=` 不是 `+=`——注释原话 "num_in_flight_tokens already includes any undrained stale share, so assign rather than accumulate"（在途计数本就含着未排干的旧 stale 份额，赋值即可、累加会重复计）。第二条形态是 **drop-mode**：`drop_stale_output` 旗标立起时整段丢弃、不送达。来源有两种。一是同拍抢占+恢复：`reset_prefix_cache` 是清前缀缓存的管理接口（scheduler.py:L2423-L2449），它会当场把全部在场请求逆序抢占、又在同一步内放回重调度（源码注释原话 "forcing preemption + resumption in the same step"）——「抢」与「恢复」挤进同一拍，那些位置反正马上要重采，交付反而乱序（docstring 原话 "whose same-step resume would otherwise deliver tokens out of order"）。二是 KV connector 有未决交接（P/D——prefill 与 decode 分离部署的场景，部署形态归 Part VIII，KVConnector 搬运机制本体在 Part IV 末章，两处都只点到即止）：判据正是抢占环里传的 `requires_kv_delivery`——被抢后块已还池、未决交接随之失效，在途输出只能整段丢弃。全协议七幕实测（配套精简版；深度 2 的异步模拟——P1 在调度后、输出回来前人工置 in_flight=2 模拟两步在途，P4 用同一 scheduler_output 二次回账模拟第 2 个在途步返回；同步引擎的对照见 P7）：
 
 <!-- trace: m4 -->
 | 阶段 | 动作 | in_flight | stale | drop | 送达 | 状态 |
@@ -320,7 +320,7 @@ FCFS 抢队尾的理由，上一章给过直觉（剧场请走最晚进场的观
 | P6 | drop-mode 抢占（同拍抢占+恢复形态） | 1→0 | 1→0 | true | [] | 整段丢弃：42 不送达不入账 |
 | P7 | 同步版自中和（对照） | 0 | 0 | false | — | 上拍已回账→stale 恒 0 |
 
-P1→P5 是主形态：份额 2→1→0 两拍排空、第三拍恢复，期间 P2/P4 的 token [42][43] 照常送达，P5 恢复后新输出 [44] 接上——用户侧输出流不断流。P5 行「补 3、只送 1」的差额正是协议的收口：补的三个位置（prefill 顺手产出的首 token 与 42、43）都已送达过，此刻只是重建 KV 的输入、不再重复送达；一次算 3 个位置的 forward 只在末位采出新 token（44）——同 recompute「prompt 拼上已生成 token 当新 prompt」的输入化口径。P3 那一拍是「推迟恢复」：stale 还有 1 未排干，此刻恢复会**重采一个稍后要送达的位置**（正确性窗口不超过管线深度——「管线深度」指同时在途、未回账的步数，本模拟为 2；与后文「流水线并行」的「流水线」同一个词）。P6 是 drop-mode：整段作废。P7 是最重要的一行对照——**同步调度下这套协议自中和**：抢占发生在第 ① 拍、而上一拍的第 ⑤ 拍早已把在途账清零，被抢那一刻 in_flight 恒 0、stale 恒 0，协议空转。它是给异步调度（下一章主角、v0.27.1 服务的默认形态）与流水线并行（把模型按层切成几段、分到多卡接力执行的部署形态，第 34 章展开）预备的账单——本 pin 前三个月里此域就有三个修复（#42117、#46066、#48245，外部 PR 史），精巧的协议也是修出来的。双泳道一张图：
+P1→P5 是主形态：份额 2→1→0 两拍排空、第三拍恢复，期间 P2/P4 的 token [42][43] 照常送达，P5 恢复后新输出 [44] 接上——用户侧输出流不断流。P5 行「补 3、只送 1」的差额正是协议的收口。先补一级台阶：被抢清零的只是进度计数器（六件事之③），`_output_token_ids`（请求自记的已生成输出序列账）原样保留——送达过的 42、43 仍在账上，恢复时它们的位置要连 prompt 一起重建 KV。补的三个位置（prefill 顺手产出的首 token 与 42、43）都已送达过，此刻只是重建 KV 的输入、不再重复送达；一次算 3 个位置的 forward 只在末位采出新 token（44）——同 recompute「prompt 拼上已生成 token 当新 prompt」的输入化口径。P3 那一拍是「推迟恢复」：stale 还有 1 未排干，此刻恢复会**重采一个稍后要送达的位置**（正确性窗口不超过管线深度——「管线深度」指同时在途、未回账的步数，本模拟为 2；与后文「流水线并行」的「流水线」同一个词）。P6 是 drop-mode：整段作废。P7 是最重要的一行对照——**同步调度下这套协议自中和**：抢占发生在第 ① 拍、而上一拍的第 ⑤ 拍早已把在途账清零，被抢那一刻 in_flight 恒 0、stale 恒 0，协议空转。它是给异步调度（下一章主角、v0.27.1 服务的默认形态）与流水线并行（把模型按层切成几段、分到多卡接力执行的部署形态，第 34 章展开）预备的账单——本 pin 前三个月里此域就有三个修复（#42117、#46066、#48245，外部 PR 史），精巧的协议也是修出来的。双泳道一张图：
 
 ![stale 输出的平行账](../diagrams/ch11-fig-stale-drain.png)
 
@@ -452,7 +452,7 @@ A-2 是守卫的承重场景：抢占后空闲明明还有 6 块、足够 r2 恢
                     # Get locally-cached tokens.
                     if self.connector is not None:
                         # … 省略：KV connector 的远程命中分支（L749-L759，
-                        #       P/D 场景，Part IV 末章）……
+                        #       P/D 场景，Part VIII 的话头）……
                     else:
                         (
                             new_computed_blocks,
@@ -515,7 +515,7 @@ A-2 是守卫的承重场景：抢占后空闲明明还有 6 块、足够 r2 恢
         max_cache_hit_length = request.num_tokens - 1    # 命中上限=全长-1         # L259
 ```
 
-上限 `num_tokens − 1` 的道理上一章立过（全命中也要重算最后一个 token，否则没有 logits）；NOTE 的后半句是新的：命中数必须**块对齐**，于是「重算最后 1 个 token」会放大成「重算最后**一块**」。命中为什么是连续前缀、查到第一个 miss 为什么能停？这依赖块哈希的**链式结构**——每块哈希把父块哈希和本块 token 一起算进去（$`hash_i = H(parent_{i-1}, tokens_i)`$），前缀任何一处变了、后面全部失效，所以 miss 之后必 miss、连续命中计数无需回溯就是最长可命中前缀。链式哈希怎么增量算、驱逐顺序的两个不变量，是 Part IV 前缀缓存站的正戏；本章只立「free 不清哈希」这一条事实——[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)留的那半句「被 free 的块为什么还能命中」，先把事实这一半还上，机制正戏仍归 Part IV。两个场景实测（配套精简版；场景 A：池 4 块、r1 的 64-token prompt 恰占 4 块——注意 prefill 拍已顺手产出首个输出 token，被抢时账面是 65 token（64 prompt + 1 output），decode 正要为第 65 个位置领第 5 块才见底，自我被抢后恢复；场景 B：池 8 块、rA/rB 同 64-token prompt——rA 跑完退场后 rB 准入，rB 是全新请求、账面恰 64 token）：
+摘录 NOTE 里点到的 pooling 模型即池化模型——不算 token、只做整段打分/嵌入的一类，与逐 token 生成的模型相对。上限 `num_tokens − 1` 的道理上一章立过（全命中也要重算最后一个 token，否则没有 logits）；NOTE 的后半句是新的：命中数必须**块对齐**，于是「重算最后 1 个 token」会放大成「重算最后**一块**」。命中为什么是连续前缀、查到第一个 miss 为什么能停？这依赖块哈希的**链式结构**——每块哈希把父块哈希和本块 token 一起算进去（$`hash_i = H(parent_{i-1}, tokens_i)`$），前缀任何一处变了、后面全部失效，所以 miss 之后必 miss、连续命中计数无需回溯就是最长可命中前缀。链式哈希怎么增量算、驱逐顺序的两个不变量，是 Part IV 前缀缓存站的正戏；本章只立「free 不清哈希」这一条事实——[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)留的那半句「被 free 的块为什么还能命中」，先把事实这一半还上，机制正戏仍归 Part IV。两个场景实测（配套精简版；场景 A：池 4 块、r1 的 64-token prompt 恰占 4 块——注意 prefill 拍已顺手产出首个输出 token，被抢时账面是 65 token（64 prompt + 1 output），decode 正要为第 65 个位置领第 5 块才见底，自我被抢后恢复；场景 B：池 8 块、rA/rB 同 64-token prompt——rA 跑完退场后 rB 准入，rB 是全新请求、账面恰 64 token）：
 
 <!-- trace: m7 -->
 | 拍 | 事件 | 命中 token | 补算 token | cached 哈希 | 备注 |
@@ -531,7 +531,7 @@ A 场景是「v1 敢扔」的直接答案：65 token 的重算账单，实际只
 
 > *图注：free 归还块但不清哈希——被抢者恢复时 get_computed_blocks 重命中自己的前缀：65 token 只补 1（scheduler.py:L744-L766 + block_pool.py:L719-L742 只动 ref_cnt 和自由队列）；同一个机制也让「终点」成为下一个请求的礼物：rA 完成后留下的哈希让同 prompt 的 rB 命中 48/64（cap=num_tokens-1 使第 4 块整块重算）。「重算」从来是「重载+补算」；块被 LRU 逐出后的全量重算那一头，Part IV 前缀缓存站展开。*
 
-（取证边界交代：配套精简版的哈希表无驱逐，「逐出→全量重算」这半边不可运行，上文按真实源码事实陈述；命中块在精简版记 -1 占位，真实实现是引用计数加一共享与写时复制换块，也归 Part IV。）
+（取证边界交代：配套精简版的哈希表无驱逐，「逐出→全量重算」这半边不可运行，上文按真实源码事实陈述；命中块在精简版记 -1 占位，真实实现是引用计数加一共享与写时复制换块（写时复制：要改共享块时才复制一份私有的——[第 15 章](../../ch15-prefix-caching/narrative/chapter.md)前缀缓存站整节展开，即 Part IV）。
 
 ## 恢复第二步：准入与水位（站 10）
 
@@ -697,7 +697,7 @@ class CachedRequestData:
     resumed_req_ids: set[str]
 ```
 
-注释说尽协议（[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)差量协议的代价清单里点过这一句——resumed 请求的 `new_block_ids` 整体替换而非追加、追加语义对不上全变的块表；这里从被抢者的视角补全登记点与通信量）：不在 `resumed_req_ids` 里的请求，本拍新块**追加**到既有块表后；在集合里的，本拍块表**整体替换**旧表。登记发生在拍末打包（`scheduler.py:L1446-L1447`：批次里排在既有成员之后的——被抢重入者必然如此——进集合）。为什么必须替换：被抢时旧块表已全部归还（六件事之①），恢复后的块号组合（命中块挂共享指纹的账、新块是新拨的号）与旧表没有任何继承关系——追加等于把一张已失效的旧表拼在新表后面。实测看通信量的差（配套精简版；池 3 块，r1 48-token prompt 恰 3 块——prefill 拍已顺手产出首个输出 token、账面 49 token（同 m7 场景 A 的口径），cap=48、命中恰 3 块）：
+注释说尽协议（[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)差量协议的代价清单里点过这一句——resumed 请求的 `new_block_ids` 整体替换而非追加、追加语义对不上全变的块表；这里从被抢者的视角补全登记点与通信量）：不在 `resumed_req_ids` 里的请求，本拍新块**追加**到既有块表后；在集合里的，本拍块表**整体替换**旧表。登记发生在拍末打包（`scheduler.py:L1446-L1447`）：拍末打包按「既有成员在前、本拍恢复者殿后」的顺序遍历批次列表，`scheduled_resumed_reqs` 里的请求——它们是本拍才挂回 running 的新成员，在批次列表里排在既有成员之后——逐一登记进 `resumed_req_ids`。为什么必须替换：被抢时旧块表已全部归还（六件事之①），恢复后的块号组合（命中块挂共享指纹的账、新块是新拨的号）与旧表没有任何继承关系——追加等于把一张已失效的旧表拼在新表后面。实测看通信量的差（配套精简版；池 3 块，r1 48-token prompt 恰 3 块——prefill 拍已顺手产出首个输出 token、账面 49 token（同 m7 场景 A 的口径），cap=48、命中恰 3 块）：
 
 <!-- trace: m9 -->
 | 拍 | r1 状态 | 调度 token | new_block_ids 条目 | resumed? | worker 侧语义 |

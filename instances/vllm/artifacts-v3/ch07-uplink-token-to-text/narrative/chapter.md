@@ -135,7 +135,7 @@ class EngineCoreOutput(
 
 上行消费的最小集 = `request_id`（对账键）+ `new_token_ids`（本拍新增的 token）+ `finish_reason`/`stop_reason`（完成原因枚举与停止源，STOP/LENGTH/ABORT 三种本章都会遇到——LENGTH＝token 数撞上 max_tokens（最大生成 token 数）这个采样上限）+ `.finished` 便捷判断。`new_logprobs` 字段本章每次路过都不打开——它是下一章的主角。
 
-还有一条[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)拆紫带时立过的形状事实（按步聚合），本章全程要记着：**每个 forward step、每个前端只来一条 `EngineCoreOutputs`**，整批所有被调度请求的新 token 全打包在里面。引擎侧怎么攒出这条消息归 Part III；源码里甚至留着一条 NOTE(Nick) 自注——行式布局还没榨干，「We could consider ways to make this more compact, e.g. columnwise layout」（可以考虑更紧凑的布局，比如按列排）。代价落在接收侧：单条消息可能非常大，怎么消化它而不憋死整个进程——正是下一节。
+还有一条[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)拆紫带时立过的形状事实（按步聚合），本章全程要记着：**每个 forward step、每个前端只来一条 `EngineCoreOutputs`**，整批所有被调度请求的新 token 全打包在里面。引擎侧怎么攒出这条消息归 Part III；源码里甚至留着一条 NOTE(Nick) 自注——行式布局（每请求一条记录依次排）还没榨干，「We could consider ways to make this more compact, e.g. columnwise layout」（可以考虑更紧凑的布局，比如按列排）。代价落在接收侧：单条消息可能非常大，怎么消化它而不憋死整个进程——正是下一节。
 
 ## 一名柜员与一整车货：分块让出事件循环（站 5）
 
@@ -400,7 +400,7 @@ class EngineCoreOutput(
         return stop_string
 ```
 
-四步流水，逐步读。**第一步：弹停止 token**（L108-114）。`stop_terminated` 是 update 的形参——调用点传的是 `finish_reason == FinishReason.STOP`（引擎判了这个请求撞上了停止 token）。此时若用户不想看停止串（`include_stop_str_in_output`，采样参数：命中的停止内容是否随文交付），末位 token 被弹出**不解码**——文本账不收；但循环后 L126-127 把它补登进 id 账。为什么文本与 id 要各记各的？因为对外 API 承诺的 token 序列**包含**停止 token（账实要相符），而交付文本**不包含**它的字——两本账从第一天起就不是同一个东西。
+四步流水，逐步读。**第一步：弹停止 token**（L108-114）。`stop_terminated` 是 update 的形参——调用点传的是 `finish_reason == FinishReason.STOP`（引擎判了这个请求撞上了停止 token）。此时若用户不想看停止串（`include_stop_str_in_output`，采样参数：命中的停止内容是否随文交付——后文停止串裁判与门口扣留两节把这个「不交付」取态叫作「排他模式」，下表场景 A 即它），末位 token 被弹出**不解码**——文本账不收；但循环后 L126-127 把它补登进 id 账。为什么文本与 id 要各记各的？因为对外 API 承诺的 token 序列**包含**停止 token（账实要相符），而交付文本**不包含**它的字——两本账从第一天起就不是同一个东西。
 
 **第二步：逐 token 现炒**（L117-123）。`decode_next` 是抽象方法——Fast/Slow 两条产线各自的实现是下一节的大戏，此处只管它返回一个字符串增量、拼进文本账。循环里夹着第三步。
 
@@ -714,7 +714,7 @@ def detokenize_incrementally(
 
 > *图注：token 序列条上两根游标（prefix/read）按轮推进，每轮窗口切片 fghij→k→l→m→n、触达 6→2→2→2→2；右上对照折线——全量重解每步触达随序列涨到 12，窗口触达恒 2。窗口唯一理由（docstring 原话 defeat cleanup algorithms）标注在侧。放大自 L2 站 8 的慢线支线。*
 
-回头看快线开头那句预告：DecodeStream 内部的 read/prefix/rest 三段缓冲，与慢线的 `prefix_offset`/`read_offset` 是**同一个思想的 Rust 版与 Python 版**——read 是重读的上下文、prefix 是要减掉的旧账，rest 是还没凑齐的尾巴（对应慢线冻结时留在读窗之外、补全了才一并交付的半个字符）。先读旧段定基线、再读全窗取增量——快慢两线不是两个算法，是一门手艺的两种写法。
+回头看快线开头那句预告：DecodeStream 内部的 read/prefix/rest 三段缓冲，与慢线的 `prefix_offset`/`read_offset` 是**同一个思想的 Rust 版与 Python 版**——read 是重读的上下文、prefix 是要减掉的旧账，rest 是还没凑齐的尾巴（对应慢线冻结时留在读窗之外、补全了才一并交付的半个字符）。注意名字是交叉的：快线的 read 对应慢线的 `prefix_offset`（都是垫在下面的上下文），快线的 prefix 对应慢线的 `read_offset`（都是已交出的账）——两套名字各按各的直觉起，配对时别按字面。先读旧段定基线、再读全窗取增量——快慢两线不是两个算法，是一门手艺的两种写法。
 
 ### 半个字的出口：尾部替换字符与冻结窗口
 
@@ -1355,7 +1355,7 @@ class RequestOutputCollector:
     return wrapper
 ```
 
-`listen_for_disconnect` 持续读 HTTP receive 通道等 `http.disconnect` 消息；`asyncio.wait` 谁先完成听谁的——断连先到，cancellation 方胜出，handler 被 cancel（装饰器 docstring 自述这是照 starlette StreamingResponse 的模式：两个任务同跑、先完成者取消另一个）。第二层是取消的传导：handler 被取消 → StreamingResponse 链路断开 → generate 协程在某个 await 点收到 CancelledError。中间那跳的管道看一眼：handler 任务此刻正 await 着响应体的下一次迭代（SSE 帧一帧帧由这条 await 链吐出），cancel 把 CancelledError 沿链一路传到 generate() 挂起的那一行——正是上一节代码里 L599 的 `q.get()` 或 L606 的 `yield`。语言层机制（取消是把异常扔进协程停住的那一行）[第 4 章](../../ch04-two-usage-faces-one-trio/narrative/chapter.md)拆过，上一节的代码 L611 正是接它的地方：`abort(q.request_id, internal=True)`，注意传的是**内部 id**（信箱自己记的那个地址）。第三层两步落地：
+`listen_for_disconnect` 持续读 HTTP 框架底层的接收通道（receive——服务器把客户端断开这类连接级事件也从它递进来）等 `http.disconnect` 消息；`asyncio.wait` 谁先完成听谁的——断连先到，cancellation 方胜出，handler 被 cancel（装饰器 docstring 自述这是照 starlette StreamingResponse 的模式：两个任务同跑、先完成者取消另一个）。第二层是取消的传导：handler 被取消 → StreamingResponse 链路断开 → generate 协程在某个 await 点收到 CancelledError。中间那跳的管道看一眼：handler 任务此刻正 await 着响应体的下一次迭代（SSE 帧一帧帧由这条 await 链吐出），cancel 把 CancelledError 沿链一路传到 generate() 挂起的那一行——正是上一节代码里 L599 的 `q.get()` 或 L606 的 `yield`。语言层机制（取消是把异常扔进协程停住的那一行）[第 4 章](../../ch04-two-usage-faces-one-trio/narrative/chapter.md)拆过，上一节的代码 L611 正是接它的地方：`abort(q.request_id, internal=True)`，注意传的是**内部 id**（信箱自己记的那个地址）。第三层两步落地：
 
 ```python
 # vllm/v1/engine/async_llm.py:L729-L738
