@@ -62,17 +62,17 @@ class CachedRequestData:
     num_output_tokens: list[int]
 ```
 
-老请求的差量就三样：`new_block_ids`（本拍新分配的 KV 块号——每个请求一个元组、每个 KV cache group（KV 缓存的分池分组，[第 14 章](../../ch14-memory-ledger/narrative/chapter.md)立过）一条列表，没新块就是 `None`，[第 13 章](../../ch13-paged-kv/narrative/chapter.md)把它比作「发电报」，连电报都能省）、`num_computed_tokens`（调度器账本上的已算数）、`num_output_tokens`。稳态 decode 拍下，一条请求的载荷常态是「至多一个块号 + 两个整数」——多数拍连块号都没有（`new_block_ids=None`），每跨一次块边界的那拍才多一个新块号。而代价埋在 `resumed_req_ids` 这个集合里——**同一个字段、两种语义**：不在集合里的请求，`new_block_ids` 是**追加**到旧块表尾部；在集合里的（被抢占后恢复的，[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)立过的 preempted → resumed 生命周期），`new_block_ids` 是**整体替换**——被抢占时块全还给池了，恢复时领的是一套全新的块，追加语义根本对不上。注释原文说得直白：对集合里的请求，「new_block_ids will be used as the request block IDs instead of appending」。消费这个分叉的代码在后面的[「一拍调和的四段动作」](#一拍调和的四段动作)（`gpu_model_runner.py` 的 `_update_states`），这里先把坑记下。
+老请求的差量就三样：`new_block_ids`（本拍新分配的 KV 块号——每个请求一个元组、每个 KV cache group（KV 缓存的分池分组，[第 14 章](../../ch14-memory-ledger/narrative/chapter.md)立过）一条列表，没新块就是 `None`，[第 13 章](../../ch13-paged-kv/narrative/chapter.md)把它比作「发电报」，连电报都能省）、`num_computed_tokens`（调度器账本上的已算数）、`num_output_tokens`（该请求已产出的 output token 计数——worker 拿它核对快照里的 output 列表，快照比它长就裁到这个数对齐）。稳态 decode 拍下，一条请求的载荷常态是「至多一个块号 + 两个整数」——多数拍连块号都没有（`new_block_ids=None`），每跨一次块边界的那拍才多一个新块号。而代价埋在 `resumed_req_ids` 这个集合里——**同一个字段、两种语义**：不在集合里的请求，`new_block_ids` 是**追加**到旧块表尾部；在集合里的（被抢占后恢复的，[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)立过的 preempted → resumed 生命周期），`new_block_ids` 是**整体替换**——被抢占时块全还给池了，恢复时领的是一套全新的块，追加语义根本对不上。注释原文说得直白：对集合里的请求，「new_block_ids will be used as the request's block IDs instead of appending」。消费这个分叉的代码在后面的[「一拍调和的四段动作」](#一拍调和的四段动作)（`gpu_model_runner.py` 的 `_update_states`），这里先把坑记下。
 
 ![差量协议：五拍五种载荷](../diagrams/ch18-fig-diff-protocol.png)
 
-> *图注：同一根 execute_model 入线上，五拍发出五种载荷（`output.py:L193-L205` 的协议二分）：拍 1 两个新请求各背一张全量大票（prompt + 块 + 采样参数）；拍 2 稳态拍只有两条小 diff（1 个块号 + 2 个整数）；拍 3 同拍三类并存（r2 完结的旗子 + r3 的全量大票 + r1 的小 diff）；拍 5 r3 的块号票从「追加」翻成「整体替换」（[4] 换成 [5]），靠的就是 `resumed_req_ids` 语义分叉（`output.py:L118-L121`）。对照条在最底下：全量重发的通信量正比于请求数 × prompt 长度，差量只随本拍变更数走。发件侧的账[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)已算过，这里是收件侧看到的形状。*
+> *图注：同一根 execute_model 入线上，五拍发出五种载荷（`output.py:L193-L205` 的协议二分）：拍 1 两个新请求各背一张全量大票（prompt + 块 + 采样参数）；拍 2 稳态拍只有两条小 diff（每条至多 1 个块号 + 2 个整数）；拍 3 同拍三类并存（r2 完结的旗子 + r3 的全量大票 + r1 的小 diff）；拍 5 r3 的块号票从「追加」翻成「整体替换」（[4] 换成 [5]），靠的就是 `resumed_req_ids` 语义分叉（`output.py:L118-L121`）。对照条在最底下：全量重发的通信量正比于请求数 × prompt 长度，差量只随本拍变更数走。发件侧的账[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)已算过，这里是收件侧看到的形状。*
 
 为什么非要差量？把 why 链四要素摆全。**旧设计**：v0 每步把整批 `SequenceGroupMetadata`（全量 token ids、完整块表、采样参数）序列化发给 worker，更朴素的做法干脆每步从零重建整个批次对象树。**痛点**：IPC（进程间通信，[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)立的进程边界）的序列化带宽和 CPU 时间随「请求数 × prompt 长度」爆炸——decode 稳态下每拍 99% 的下发内容与上一拍完全相同，全量重发是纯浪费；千级并发时这一项就能吃掉调度预算。**v1 方案**：就是上面这份二分协议（`vllm/v1/core/sched/output.py:L193-L205`），worker 缓存请求全量、调度器只发变更。**代价**同样真实：worker 必须维护匹配的缓存与失效逻辑——两个进程的请求视图可能漂移，一边删了另一边不知道就出幽灵行；协议状态有了语义分叉（resumed 的整体替换），理解成本高一截；流水线并行时还得专门回传 `new_token_ids`；连「完结通知集合什么时候清空」都成了跨拍不变量（调度器侧是换新集合而非就地 clear，[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)实测过：就地清空会连着已发出的 `SchedulerOutput` 一起清掉）。其中「worker 怎么维护这份缓存」正是本章余下的全部内容。
 
 ## 过线后的防御与例外
 
-站 1 是 `execute_model` 的入口（`vllm/v1/worker/gpu_model_runner.py:L4166`）。收到 `SchedulerOutput` 之后、正式调和之前，第一段代码是一道防御——它护的正是上面说的「两进程视图不能互相污染」：
+站 1 是 `execute_model` 的入口（`vllm/v1/worker/gpu_model_runner.py:L4166`）。收到 `SchedulerOutput` 之后、正式调和之前的第一道防御——它护的正是上面说的「两进程视图不能互相污染」：
 
 ```python
 # vllm/v1/worker/gpu_model_runner.py:L4180-L4195
@@ -120,7 +120,7 @@ assert s1.tokens["a"] == 99     # 这次动 s3 不再殃及 s1
 
 那到底谁要改这两本账？`ngram_gpu` 是[投机解码](https://docs.vllm.ai/en/latest/features/speculative_decoding/)（小模型先猜、大模型一次验证多个的无损加速法，[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)定义过、验收数学留待 Part VII 专章展开）里**不带草稿模型**的一族：n-gram / Prompt Lookup 投机解码。思路很省事——拿上下文最后 n 个 token 当搜索词，在更早的上下文里找它上一次出现的位置，把后面的续文截出来当草稿。输入里有大量「抄上文」的任务最灵：改代码（第二轮基本在抄第一轮的函数）、做摘要、答上下文问题，原作者实测 2-4 倍加速（[PLD 仓库](https://github.com/apoorvumang/prompt-lookup-decoding)）；开放式闲聊最不灵——上文里没有可抄的 n-gram，草稿命中率趋零，好在猜错回退、不亏。vLLM 的取值是 `speculative_config` 的 `method`，两个标准值：`"ngram"`（CPU 侧查找）与 `"ngram_gpu"`（把这套查找搬上 GPU 的变体——草稿生成在 GPU 上做、省掉一条 CPU 到 GPU 的路），官方文档均已收录。注意 `ngram_gpu` 是独立的 method 取值、不是在 `"ngram"` 上再开的开关：上面片段的门控 `use_ngram_gpu()`（`vllm/config/speculative.py:L1410`）判的正是 `method == "ngram_gpu"`——配成 `"ngram"` 得到的是 CPU 侧 drafter，本节这整段防御一行都不会跑。
 
-搬上 GPU 的代价，就是本节的机关：GPU 端 proposer 数出「每请求实际有效的草稿有几个」之后，要**就地回退**指令单上的 token 账——排了 4 个草稿位、proposer 在上下文里只找到 2 个能抄的续文，账面就得减 2（此处的「有效」是 n-gram 查找的命中数，不是[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)里大模型验收草稿的那个「接受」）。这是全代码库罕见的「worker 改写调度器输出」点：
+搬上 GPU 的代价，就是本节的机关：GPU 端 proposer（草稿生产方——proposer 是源码对这类组件的正式叫法，前文说的 CPU 侧 drafter 就是同一个角色，对应 CPU 侧的 `NgramProposer`）数出「每请求实际有效的草稿有几个」之后，要**就地回退**指令单上的 token 账——排了 4 个草稿位、proposer 在上下文里只找到 2 个能抄的续文，账面就得减 2（此处的「有效」是 n-gram 查找的命中数，不是[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)里大模型验收草稿的那个「接受」）。这是全代码库罕见的「worker 改写调度器输出」点：
 
 ```python
 # vllm/v1/spec_decode/ngram_proposer_gpu.py:L475-L515
@@ -154,7 +154,7 @@ def update_scheduler_for_invalid_drafts(
             ]
 ```
 
-L507-L508 对总账和每请求账就地做减法——注意它减的是入口处 `replace()` 出来的那份**副本的 dict**，引擎进程侧的原件毫发无损。防御与例外，一进一出配成一对：这就是差量协议「worker 只读调度器输出」惯例的唯一豁口，也解释了为什么站 1 的第一段代码值得为它存在。不开 ngram-GPU，整段是空操作，一行不跑。时点也钉得住：proposer 在上一拍的采样之后、GPU 上做 n-gram 查找，数出的有效草稿数异步拷回 CPU 并记一个 CUDA event（`gpu_model_runner.py:L5067-L5085`）；本拍 `_update_states` 调和段开头（L1346，L2 图 ② 拍片内）等这个 event 到货、就地裁账，裁完的 `num_scheduled_tokens` 正是 ③ 收集装配的输入。
+L507-L508 对总账和每请求账就地做减法——注意它减的是入口处 `replace()` 出来的那份**副本的 dict**，引擎进程侧的原件毫发无损。防御与例外，一进一出配成一对——这正是开篇点名的第二个语义坑：小票上的 token 账不是只读账，ngram-GPU 下 worker 会就地改写它。这也是差量协议「worker 只读调度器输出」惯例的唯一豁口，解释了为什么站 1 开头这段防御值得为它存在。不开 ngram-GPU，整段是空操作，一行不跑。时点也钉得住：proposer 在上一拍的采样之后、GPU 上做 n-gram 查找，数出的有效草稿数异步拷回 CPU 并记一个 CUDA event（`gpu_model_runner.py:L5067-L5085`）；本拍 `_update_states` 调和段开头（L1346，L2 图 ② 拍片内）等这个 event 到货、就地裁账，裁完的 `num_scheduled_tokens` 正是 ③ 收集装配的输入。
 
 ## 持久批次这只容器
 
@@ -210,6 +210,7 @@ L507-L508 对总账和每请求账就地做减法——注意它减的是入口�
             self.token_ids_cpu[req_index, :num_prompt_tokens] = request.prompt_token_ids   # L376
         # … 省略：is_token_ids 标记网格的同步写行与 prompt_embeds 分支（多模态混合输入才有分叉）…
         self.token_ids_cpu[req_index, start_idx:end_idx] = request.output_token_ids        # L387
+        self.is_token_ids[req_index, start_idx:end_idx] = True
         # Number of tokens without spec decode tokens.
         self.num_tokens_no_spec[req_index] = request.num_tokens              # L390
         # … 省略：use_replayssm 环形起点记账（Mamba 状态空间模型的 replayssm 变体专用）…
@@ -217,7 +218,7 @@ L507-L508 对总账和每请求账就地做减法——注意它减的是入口�
         self.block_table.add_row(request.block_ids, req_index)               # L398
 ```
 
-L376 与 L387 两刀写行是布局语义的全部：prompt 写进 `[req, :num_prompt]` 前缀，output 紧随其后写进 `[start, end)`——被抢占后恢复的请求带着已生成的 output 回来，也是这一刀重建整行。L362 那个 else 分支（往 `_req_ids` 指定位置**覆盖**写而不是 append）先按下，下一节讲它是怎么被安全复用的。L398 把块表行也立起来——`block_table` 就住在批次里，[第 13 章](../../ch13-paged-kv/narrative/chapter.md)叫它「页表的显存版」，它的载体正是后面[「固定地址的地基」](#固定地址的地基)一节要打开的 CpuGpuBuffer。
+L376 与 L387 两刀 token 写行是布局语义的全部：prompt 写进 `[req, :num_prompt]` 前缀，output 紧随其后写进 `[start, end)`——被抢占后恢复的请求带着已生成的 output 回来，也是这一刀重建整行。紧随其后的 L388 给这批格子顺手盖上「真是 token」的标记——就是省略注释里那面 `is_token_ids` 同形布尔网格的一行。片段里那对 `req_output_token_ids` 行则是每行 output 的 Python 列表镜像：大网格服务收集算术，这份列表服务逐 token 追加与搬移的读者（condense 搬行、slot 对换、异步采样的 -1 占位记账都读写它）。L362 那个 else 分支（往 `_req_ids` 指定位置**覆盖**写而不是 append）先按下，下一节讲它是怎么被安全复用的。L398 把块表行也立起来——`block_table` 就住在批次里，[第 13 章](../../ch13-paged-kv/narrative/chapter.md)叫它「页表的显存版」，它的载体正是后面[「固定地址的地基」](#固定地址的地基)一节要打开的 CpuGpuBuffer。
 
 ![InputBatch 内存布局](../diagrams/ch18-fig-inputbatch-layout.png)
 
@@ -352,7 +353,8 @@ L330 的海象表达式（walrus，Python 的 `:=` 行内赋值）就一句话�
 
             # Move active request down into empty request
             # … 省略：while 循环体逐列搬移——token_ids_cpu 只拷该行活跃前缀、
-            #    块表 move_row、采样参数列与 moved 登记 …
+            #    块表 move_row、采样参数列与 moved 登记（并把刚填掉的洞从 removed
+            #    弹出——pop_removed 就在这一步）…
 ```
 
 骨架是**双指针**：`last_req_index` 从最大活位往下找（跳过洞）——起点取 `num_reqs + 洞数 - 1`（L733）不是随手写的：打洞时 `num_reqs` 已随映射解绑缩掉了洞数，加回来才是全网格最大行号（九步表步 8 的 `last = 2 + 2 - 1 = 3` 正是这笔账）；`peek_removed()` 从头取最小洞往上等。最小洞比最大活位小，就把大活位滑进小洞；洞反超活位，说明剩下的洞全在尾部——直接截断删除（`del _req_ids[num_reqs:]` 整段），分文不花。两个早退也值得记：removed 空则整拍零成本返回（洞全被新人填平的常见好局）；批空则清列表走人。
@@ -484,7 +486,7 @@ L1247 一行集合差：批里有、本拍没排的（被抢占的、或[第 10 
                 self.input_batch.block_table.append_row(new_block_ids, req_index)       # L1474
 ```
 
-三分支看清：**在批且常规**——块号追加进 `req_state.block_ids`（L1445）并写进批次块表行（L1474，就是[第 13 章](../../ch13-paged-kv/narrative/chapter.md)嵌过的 `append_row`「发电报」落地），已算数就地覆盖（L1472，调度器账本过线后的对账）；**在批但 resumed**——不可能，被抢占时早被移出批了（所以 L1448 敢 assert）；**不在批**（被抢恢复的、或上拍没排这拍回来的）——块表整体替换（L1452，那套全新的块），请求挂进 `reqs_to_add` 等落位。`num_computed_tokens` 的覆盖在 resumed 请求上尤其要紧：恢复时它归零（全量重算），覆盖掉快照里的旧值——盖快照的那行赋值在调和循环开头未展示的 L1406（`req_state.num_computed_tokens = num_computed_tokens`，用调度器送来的值直接盖），上面片段里可见的 L1472 盖的是批次列镜像；拍 5 r3 的 positions 从 0 起步，就是 L1406 这笔覆盖的可见后果。
+三分支看清：**在批且常规**——块号追加进 `req_state.block_ids`（L1445）并写进批次块表行（L1474，就是[第 13 章](../../ch13-paged-kv/narrative/chapter.md)嵌过的 `append_row`「发电报」落地），已算数就地覆盖（L1472，调度器账本过线后的对账）；**在批但 resumed**——不可能，被抢占时早被移出批了（所以 L1448 敢 assert）；**不在批**（被抢恢复的、或上拍没排这拍回来的）——块表整体替换（L1452，那套全新的块），请求挂进 `reqs_to_add` 等落位。`num_computed_tokens` 的覆盖在 resumed 请求上尤其要紧：恢复时它归零（全量重算），覆盖掉快照里的旧值——盖快照的那行赋值在调和循环开头未展示的 L1406（`req_state.num_computed_tokens = num_computed_tokens`，用调度器送来的值直接盖），上面片段里可见的 L1472 盖的是批次列镜像；拍 5 r3 的 positions 从 0 起步，就是 L1406 这笔覆盖的可见后果。片段里还有个 `ngram_gpu_new_reqs.append`——ngram-GPU 专用的收集器，攒下本拍新进批的请求，批布局稳定后 GPU 侧 token 镜像的增量更新靠它知道哪些行要整行全量拷（不开 ngram-GPU 则恒空，一行不用管）。
 
 **第四段，落位**，收尾四连：
 
@@ -504,7 +506,7 @@ L1247 一行集合差：批里有、本拍没排的（被抢占的、或[第 10 
         self.input_batch.refresh_metadata()                                   # L1520
 ```
 
-`reqs_to_add` 逐个 `add_request`（注释明说「小空洞优先填」——上一节的 `pop_removed`）；`condense` 压实；`_may_reorder_batch`（`L1115-L1138`）把重排权交给注意力后端——docstring 点名 MLA（Multi-head Latent Attention，DeepSeek 系模型把 KV 压进低秩潜空间的注意力变体）：想把 decode（带宽受限）与 prefill/长 extend（算力受限）的请求分开各排各的，混在一起 kernel 选不出好路子（实作按本拍 token 数过不过 `reorder_batch_threshold` 阈值分桶），重排用的 `swap_states`（`gpu_input_batch.py:L586`）也遵守「只动活跃前缀」的纪律，它记进 moved 账的方向是 `SWAP`（双向对换，L666）——正是方向枚举里与 condense 单向滑入（`UNIDIRECTIONAL`）相对的另一档；最后 `refresh_metadata` 重建采样元数据（把 builder 攒的 added/moved 账结算给 logitsprocs、解封 builder 开下一拍）。
+`reqs_to_add` 逐个 `add_request`（注释明说「小空洞优先填」——上一节的 `pop_removed`），紧跟的 `update_req_spec_token_ids` 把调度器送来的投机草稿 token 写进该行行尾（异步调度下先落占位、准备输入时再覆写真值；不开投机则查无条目、整步空操作）；`condense` 压实；`_may_reorder_batch`（`L1115-L1138`）把重排权交给注意力后端——docstring 点名 MLA（Multi-head Latent Attention，DeepSeek 系模型把 KV 压进低秩潜空间的注意力变体）：想把 decode（带宽受限）与 prefill/长 extend（算力受限）的请求分开各排各的，混在一起 kernel 选不出好路子（实作按本拍 token 数过不过 `reorder_batch_threshold` 阈值分桶），重排用的 `swap_states`（`gpu_input_batch.py:L586`）也遵守「只动活跃前缀」的纪律，它记进 moved 账的方向是 `SWAP`（双向对换，L666）——正是方向枚举里与 condense 单向滑入（`UNIDIRECTIONAL`）相对的另一档；最后 `refresh_metadata` 重建采样元数据（把 builder 攒的 added/moved 账结算给 logitsprocs、解封 builder 开下一拍）。
 
 四段连播一遍。取证口径先交代：下面的推演表出自配套精简版在纯 CPU 主机上的实跑——没有 GPU、没有 vLLM 运行时，前向一段用脚本写死的 logits 行顶替（批次状态、索引、收集这些数值不经过前向，不受影响），CUDA 侧的流/事件/锁页由行为等价的替身承载（只影响速度、不影响任何分支），块号是合成的小整数。剧本五拍：r1/r2 首拍全量进批 → 拍 2 decode 只收 diff → 拍 3 r2 完结 + r3 新请求（同拍删→增，洞复用）→ 拍 4 r3 被抢占（出批留缓存）→ 拍 5 r3 恢复（块整体替换 + 全量重算）：
 
@@ -547,7 +549,7 @@ CUDA graph 捕获时，把一整串 kernel launch 连同全部参数（张量指
 
 所以回放命中 = **批描述符全等 AND 地址不变**（`BatchDescriptor`：num_tokens/num_reqs/uniform（是否所有请求本拍 token 数一致）/has_lora/num_active_loras（批里挂没挂 LoRA 低秩适配器、挂了几个），`vllm/forward_context.py:L29-L58`）。前一半靠把小批 padding 到捕获形状（下一章的主菜），后一半就是本章全部固定缓冲设计的 why 终点。顺带一句值得抬头看路的：PyTorch 文档讲「变长批次共享静态缓冲池」这个模式时点名 vLLM is a notable example——本书正在读的就是官方文档里的正面教材。
 
-供给端的第一块基石是 `CpuGpuBuffer`（`vllm/v1/utils.py:L110`）——[第 13 章](../../ch13-paged-kv/narrative/chapter.md)说块表「CPU 侧写、一次 commit 拷上 GPU」的双镜像，内景就是它。全文不长，值得整段读：
+现在下到 L2 图南行第二个固定结构。供给端的第一块基石是 `CpuGpuBuffer`（`vllm/v1/utils.py:L110`）——[第 13 章](../../ch13-paged-kv/narrative/chapter.md)说块表「CPU 侧写、一次 commit 拷上 GPU」的双镜像，内景就是它。全文不长，值得整段读：
 
 ```python
 # vllm/v1/utils.py:L110-L149
@@ -593,7 +595,7 @@ class CpuGpuBuffer:
         return self.cpu[:n].copy_(self.gpu[:n], non_blocking=True)
 ```
 
-一个对象、三个视图：`self.cpu`（torch 张量，页锁定内存——GPU 能直接 DMA（直接内存访问：不经 CPU 中转，由专用硬件单元直接搬数据）的那块 CPU 内存，[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)立过三件套基础）、`self.gpu`（同形状的 GPU 张量）、`self.np`（CPU 张量的 numpy 零拷贝视图，L137——Python 侧的算术全在它上面做，不用再过 torch）。形状一次定死、两端一次分配。精髓在 `copy_to_gpu(n)`（L142）：**只把 `[0, n)` 活跃前缀送过 PCIe（CPU 与 GPU 之间的总线），且 non_blocking（异步发起）**——「固定形状」与「活跃前缀」是同一设计的两侧：缓冲按 max 尺寸备好（GPU 侧地址从此不变），每拍只灌实际用到的开头一段（带宽按需）。
+一个对象、三个视图：`self.cpu`（torch 张量，页锁定内存——GPU 能直接 DMA（直接内存访问：不经 CPU 中转，由专用硬件单元直接搬数据）的那块 CPU 内存，[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)立过流/事件/锁页这三个 CUDA 原语的底座）、`self.gpu`（同形状的 GPU 张量）、`self.np`（CPU 张量的 numpy 零拷贝视图，L137——Python 侧的算术全在它上面做，不用再过 torch）。形状一次定死、两端一次分配。精髓在 `copy_to_gpu(n)`（L142）：**只把 `[0, n)` 活跃前缀送过 PCIe（CPU 与 GPU 之间的总线），且 non_blocking（异步发起）**——「固定形状」与「活跃前缀」是同一设计的两侧：缓冲按 max 尺寸备好（GPU 侧地址从此不变），每拍只灌实际用到的开头一段（带宽按需）。
 
 两个外部细节把这几行撑满。**为什么 pin**：普通 CPU 内存是可分页的——操作系统随时可能把页换出去，GPU 的 DMA 引擎没法对「可能被换走的页」直接寻址，驱动只能先偷偷复制到一块钉死的暂存区再搬（[NVIDIA 官方博客](https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/)的原话：GPU cannot access data directly from pageable host memory，须先 copy the host data to the pinned array）——这条隐藏中转既拖带宽（同篇实测：同一台机器页锁定传输 2.3→5.8 GB/s，成倍）也阻断重叠；直接把缓冲开成页锁定就绕开了它。**pin 了之后的新纪律**：PyTorch 默认「automatically performs necessary synchronization when copying data between CPU and GPU」（CPU↔GPU 拷贝自动做必要同步），而 `non_blocking=True` 是调用方**主动放弃这层默认保护**——拷贝调用立即返回、数据还在路上。这对一次性拷贝无所谓，对**反复复用同一块**的固定缓冲是结构性隐患：本拍的「写新数据」可能追上上一拍还没搬完的「拷贝」。所以必须显式等上一班——vLLM 把这道闸门写成了上下文管理器：
 
@@ -712,7 +714,7 @@ class CpuGpuBuffer:
         return cu_num_tokens
 ```
 
-docstring 自带算例：输入 `[2,5,3]`，产出两样——CU 偏移（cumulative，逐项前缀和）`[2,7,10]`（第 k 项 = 前 k 个请求的 token 数之和，即每个请求在展平大列里的起终点），和**批内 arange** `[0,1,0,1,2,3,4,0,1,2]`（每个 token 在自己请求内的序号——请求一换就从 0 重新数起）。三步全是向量算子，且全部写在预分配缓冲上（`arange_out` 就是 runner 持久缓冲 `query_pos` 的 numpy 视图，连 `[0,1,2,...]` 源序列都是缓存复用的 `arange_np`）。收集主段把它们串起来：
+docstring 自带算例：输入 `[2,5,3]`，产出两样——CU 偏移（cumulative，逐项前缀和）`[2,7,10]`（第 k 项 = 前 k 个请求的 token 数之和，即每个请求在展平大列里的起终点），和**批内 arange** `[0,1,0,1,2,3,4,0,1,2]`（每个 token 在自己请求内的序号——请求一换就从 0 重新数起）。三步全是向量算子，且全部写在预分配缓冲上（`arange_out` 就是 runner 持久缓冲 `query_pos` 的 numpy 视图——`query_pos` 不在上一节那段 L763-L810 片段里，它住在同一初始化区块稍后的 arange 缓存段（L844，就是点过名的那句「Cache the arange tensors」），同批一次分配、地址同样永不再变；连 `[0,1,2,...]` 源序列都是缓存复用的 `arange_np`）。收集主段把它们串起来：
 
 ```python
 # vllm/v1/worker/gpu_model_runner.py:L1981-L2024
@@ -774,7 +776,7 @@ docstring 自带算例：输入 `[2,5,3]`，产出两样——CU 偏移（cumula
 
 ![收集管线：四步向量算子链](../diagrams/ch18-fig-gather-pipeline.png)
 
-> *图注：收集是 O(total) 的向量算子链，不是逐请求循环（`gpu_model_runner.py:L1743-L1767` + `L1977-L2024`，源码注释自带的 [2,5,3] 算例在此真跑）：np.repeat 展开排号 → cumsum+arange 折出请求内偏移 → positions = num_computed + 偏移（r1 从 4 起、r2 从 0 起、r3 从 7 起——同一公式无相位分叉）→ token_indices = pos + 排号×16 把二维坐标编一维 → 一次 index_select 从 token_ids_cpu 扁平视图收齐 10 个 token。底部：query_start_loc=[0,2,7,10,10] 尾部 pad 到非递减；logits_indices=query_start_loc[1:]−1=[1,6,9] 是每请求的采样位（接上一章的采样段）。*
+> *图注：收集是 O(total) 的向量算子链，不是逐请求循环（`gpu_model_runner.py:L1743-L1767` + `L1977-L2024`，源码注释自带的 [2,5,3] 算例在此真跑）：np.repeat 展开排号 → cumsum+arange 折出请求内偏移 → positions = num_computed + 偏移（r1 从 4 起、r2 从 0 起、r3 从 7 起——同一公式无相位分叉）→ token_indices = pos + 排号×16 把二维坐标编一维 → 一次 index_select 从 token_ids_cpu 扁平视图收齐 10 个 token。底部：query_start_loc=[0,2,7,10,10] 尾部 pad 到非递减；logits_indices=query_start_loc[1:] - 1=[1,6,9] 是每请求的采样位（接上一章的采样段）。*
 
 这张表能证一条「不重不漏」：CU 偏移的相邻区间 `[query_start_loc[k], query_start_loc[k+1])` 把 `[0, total)` 精确划分给请求 k——cumsum 的定义保证每个区间宽恰为 `num_scheduled[k]`、彼此不交、并集为全段；而每格的 `position = num_computed + 请求内偏移` 落在 `[computed, computed+n)` 内，又⊆该行的已写前缀（prompt 在 `add_request` 写、output 在写回段写，`num_computed + n_scheduled = num_tokens` 正是[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)追赶公式的拍末账面）——所以 index_select 取到的必是真实 token，收集**永不读到未写的格子**。顺带从 `[0,2,7,10]` 里读出一个量：请求 k 的段末格 `query_start_loc[k+1] - 1`（本例即 [1,6,9]）是它本拍的**采样位**——采样要的 logits 就取自每请求段末这一格，前向按这列下标（`logits_indices`，非投机路径下正是 `query_start_loc[1:] - 1`，`gpu_model_runner.py:L2239`）取数进采样，接[第 17 章](../../ch17-executor-worker-model-runner/narrative/chapter.md)的采样段。整个收集的成本是 O(total) 的常数次向量算子：真实刻度下 total 上限就是 max_num_batched_tokens（API server 默认 2048、大卡 8192），一拍几千 token 的 gather 仍是几条向量化指令——对照 v0「逐请求 Python 循环组批」，这是结构性的替代，不是常数优化。
 
@@ -835,7 +837,7 @@ L2074-L2077 是**尾部 pad 惯例**的标本：真 CU 偏移只写到 `num_reqs
         )
 ```
 
-positions 在 CPU 上算过一份（`positions_np`），这里在 GPU 上又算一份（L2188，数据源换成已上载的 `num_computed_tokens` 镜像）——CPU 那份服务于收集的索引算术，GPU 这份是喂给前向的正式张量（在 GPU 端算，免得再搬一次大数组；取证环境里两份在 CPU device 上由同一源码行算出，数值一致）。`seq_lens` 的尾巴同样 pad 0（L2195，老规矩）。`compute_slot_mapping`（L2197）启动 Triton kernel 把每个 token 的 position 换算成 KV cache 物理槽位——那套乘加换算的数学[第 13 章](../../ch13-paged-kv/narrative/chapter.md)已经摊开过，block_table 的完整回收在更后面的章。最后的 `_prepare_input_ids`（L2204）把收集好的 `input_ids` 前缀上载——异步调度下它会直接消费上一拍留在 GPU 的采样 token（`prev_sampled_token_ids` 的三岔口：整段上载 / 单 slice 直拷 / 按索引 scatter，[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)实测过三条路），此处只要知道：不管走哪条，落点都是那块地址不变的 `input_ids.gpu`。
+positions 在 CPU 上算过一份（`positions_np`），这里在 GPU 上又算一份（L2188，数据源换成已上载的 `num_computed_tokens` 镜像）——CPU 那份服务于收集的索引算术，GPU 这份是喂给前向的正式张量（在 GPU 端算，免得再搬一次大数组；取证环境里没有 GPU，两份计算都落在 CPU 张量上、逐拍比对数值一致）。`seq_lens` 的尾巴同样 pad 0（L2195，老规矩）。`compute_slot_mapping`（L2197）启动 Triton kernel——Triton（写 GPU kernel 的语言与编译器，[第 13 章](../../ch13-paged-kv/narrative/chapter.md)槽位换算处正面介绍过）——把每个 token 的 position 换算成 KV cache 物理槽位，那套乘加换算的数学同一章已经摊开过，block_table 的完整回收在更后面的章。最后的 `_prepare_input_ids`（L2204）把收集好的 `input_ids` 前缀上载——异步调度下它会直接消费上一拍留在 GPU 的采样 token（`prev_sampled_token_ids` 的三岔口：整段上载 / 单 slice 直拷 / 按索引 scatter，[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)实测过三条路），此处只要知道：不管走哪条，落点都是那块地址不变的 `input_ids.gpu`。
 
 ## 前向与写回的闭环
 
@@ -870,7 +872,7 @@ L2 图 ④ 拍片，站 9：前向。到这里反而没什么新东西可讲—�
             }
 ```
 
-默认异步心跳下，采样 token **不落 CPU**（L3808 整张张量留在 GPU 缓存，避免一次 CPU 同步——[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)的主场）。片段里的 `invalid_req_indices_set` 是 `discard_request_mask` 的非零行号（`np.nonzero` 提取在 L3744-L3746，本异步分支在 L3799-L3800 物化成 list/set）——[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)立过的乐观纠错下游：盲调度按乐观假设排了 token、事后被纠出「本拍采样结果作废」的行，它决定下一片段里行的两种命运（不在集合里的写占位、在集合里的跳过）。同步模式下则走 D2H（device to host，GPU 搬回 CPU）拿到真 token 列表，进写回循环：
+默认异步心跳下，采样 token **不落 CPU**（L3808 整张张量留在 GPU 缓存，避免一次 CPU 同步——[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)的主场）。片段里的 `invalid_req_indices_set` 是 `discard_request_mask` 的非零行号（`np.nonzero` 提取在 L3744-L3746，本异步分支在 L3799-L3800 物化成 list/set）——[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)立过的乐观纠错下游：盲调度按乐观假设排了 token、事后被纠出「本拍采样结果作废」的行，它决定下一片段里行的两种命运（不在集合里的写占位、在集合里的跳过）。同片段开头的 `prev_req_id_to_index`（上一拍 req_id → 行号的快照）则是这套「采样 token 留 GPU」的配套检索表——下一拍 `_prepare_input_ids` 靠它把缓存的采样 token 对回行号（前面三岔口按索引 scatter 那条路用的就是它）。同步模式下则走 D2H（device to host，GPU 搬回 CPU）拿到真 token 列表，进写回循环：
 
 ```python
 # vllm/v1/worker/gpu_model_runner.py:L3815-L3846

@@ -85,7 +85,7 @@ WY = SY + SH_ + 76
 WX, WW = SX2 - 20, 560
 lc.parrow([(SX2 + SW / 2, SY + SH_), (SX2 + SW / 2, WY)], RED, 1.8, 'ab', dash=True)
 lc.text(SX2 + SW / 2 + 12, (SY + SH_ + WY) / 2 + 4,
-        '抢占期间池被抽干（8 块小池）：块被取走复用、惰性驱逐摘光哈希（map 4 → 0）', 8.6, RED,
+        '抢占期间池被抽干（8 块小池）：块被取走复用、惰性驱逐摘光哈希（map → 0）', 8.6, RED,
         'start', maxw=560, tag='t24')
 lc.rect(WX, WY, WW, 104, '#fef2f2', RED, rx=9, sw=1.6)
 lc.text(WX + 16, WY + 24, '④ 最坏分支：重排回来 · 命中 0', 11, RED, 'start', True, maxw=WW - 32,
