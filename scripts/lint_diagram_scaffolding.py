@@ -48,6 +48,14 @@ LEAK = re.compile(
     # lint 判绿=假阴,独立盲审才抓出——原正则只认带斜杠前缀的中间数据)。全语料 SVG oracle 0 假阳。
     r'|\bfixture_checks\b'
     r'|\bm\d{2}-[a-z][\w-]*'
+    # ↓ L2-spec 内部锚点 ID 的裸用法(exp-2026-08-29,ch16 盲审带出)。l2-spec 的
+    # l0_region.anchors 词汇(kv_column/gpu_column/…)是 gen_L2.anchor_regions 的
+    # 机器字段名,属 spec↔渲染器对账用——若被渲染进 <text> 即零脚手架泄漏。
+    # 刻意只列**复合专名**(全词汇表见 gen_L2.py anchor_regions;full/boot 等单词
+    # 过泛、上图有正常语义,不列——零假阳纪律)。本轮实查 ch16 L2 图面并无此泄漏
+    # (盲审误报,详见交付注),但该类泄漏无确定性门禁、只靠人眼,先立此碑防再漏。
+    r'|\b(?:api_band|zmq_band|engine_band|loop_box|lifeline'
+    r'|kv_column|gpu_column|sample_column)\b'
 )
 TEXTNODE = re.compile(r'<text[^>]*>(.*?)</text>', re.S)
 TAG = re.compile(r'<[^>]+>')

@@ -1,0 +1,325 @@
+{
+  "chapter_id": "ch16",
+  "note": "素材真相源：全部 run trace 在 explainer/traces/（共享替身 _harness.py + 驱动脚本 run_mN.py + 原始输出 mN.json），数字全部来自精简版真源码路径的运行（vLLM v0.27.1 行号基线；ScriptConnector 是契约的可编程测试替身，经 factory 的 kv_connector_module_path 真实装配）。取证环境=host 纯 CPU（本章机制全部是纯 CPU 元数据/控制流路径，不涉 GPU 行为差异字段）。四点口径注记（writer 就近挑明）：① m8 的时间账是虚拟拍教学模型——调用序（start_load_kv→逐层 wait/save→wait_for_save→get_finished）来自真实运行，每层传输/计算时长是模型参数非 GPU 实测，真实收益取决于传输/计算比；② m3 的子块尾场景用 ch15 m15/m16 已立的 partial-hit 粒度配置（full(16)+mamba-align(16) 两组、hash 8）驱动——块内边界命中只在此形态出生；mamba 组的命中长度 32 是 hit_diverged 判定的输入（调度器可观测行为与钉版一致），但其内部块表形态在精简版有 impl≠pin 边界（implementation/impl-notes.md），写作勿展开讲 mamba 组内部；③ m10 场景 2 的补登记清零在本场景单组 fp16 下开关关着（needs_kv_cache_zeroing=False，空清单是真实行为），开关打开的形态由场景 2b 直接驱动 record_blocks_for_zeroing（pin 对混合组的 invalid 扫描是 TODO，scheduler.py:L2781）；④ m11 的 finish_answer 编程为 True 模拟 producer 接管（consumer 场景默认 False=立即放块）。⑤ 覆盖口径（review R3 补录）：m6（core）无独立数值素材——纯契约纪律机制，已补登记卡（无数值 trace，quantified=false）；m12/m13/m15/m16/m17（supporting）无素材卡——正文凭 dossier 锚点+pin 源码直讲（defer_block_free 步序栅栏 / requires_kv_delivery 抢占护栏 / partial-tail 钉住 / kv_role 三态 / connector_prefix_cache_stats 命中率统计），dossier 对这六条均未要求 worked example 或配图——回修审计勿以『explainer 无条目』为由误退正文。",
+  "mechanisms": [
+    {
+      "mechanism_id": "m1",
+      "intuition": "同一个人在两个城市各开一间办公室：总部的秘书（调度器侧）只管查目录、记账、下搬运单；分部的搬运工（worker 侧）只认单子上的门牌号搬东西——两间办公室零通话零共享，唯一的往来是『一张不透明的搬运单』寄过去、『一张签收回执』寄回来。",
+      "figure_specs": [
+        {
+          "figure_id": "ch16-fig-role-split",
+          "template": "swimlane",
+          "l0_anchor": "L0 kv_column（KV 账本列）与 gpu_column（GPU 列）之间的那条进程边界——本章 l0_zoom「KV 账本+边界」所指：放大『账本列与 GPU 列之间，同一个类在两个进程各建一份』。",
+          "claim": "同一个 KVConnectorBase_V1 类按 KVConnectorRole 分居调度器进程与 worker 进程、分开构建零共享——调度器侧实例只产『搬运计划』（不透明 KVConnectorMetadata 随 SchedulerOutput 过线、不许改 scheduler_output），worker 侧实例只认 block_ids+注册的池张量搬运，回程只有 KVConnectorOutput。",
+          "numbers": [
+            {"value": "SCHEDULER=0 / WORKER=1", "provenance": "vllm/distributed/kv_transfer/kv_connector/v1/base.py:L124-L130（枚举值——role-split 的根）"},
+            {"value": "调度器侧原语 5 条（get_num_new_matched_tokens / update_state_after_alloc / update_connector_output / request_finished / take_events）", "provenance": "vllm/distributed/kv_transfer/kv_connector/v1/base.py:L3-L41（docstring 两半清单的上半）"},
+            {"value": "worker 侧原语 7 条（handle_preemptions / start_load_kv / wait_for_layer_load / save_kv_layer / wait_for_save / get_finished / build_connector_worker_meta）", "provenance": "vllm/distributed/kv_transfer/kv_connector/v1/base.py:L3-L41（docstring 两半清单的下半）"},
+            {"value": "NOTE 原话『We build separately to enforce strict separation』", "provenance": "vllm/distributed/kv_transfer/kv_connector/factory.py:L85-L94"}
+          ],
+          "caption_draft": "L0 位置：KV 账本列 × GPU 列之间的进程边界。同一个类 KVConnectorBase_V1 被工厂按角色建了两份：左泳道=调度器进程（查外部命中/记账/终局交接，bind_gpu_block_pool 直读块池元数据但绝不碰 GPU），右泳道=worker 进程（register_kv_caches 拿到池张量、逐层收发）。两份实例零共享状态，跨线的只有两封信：下行的 KVConnectorMetadata（只读计划）与上行的 KVConnectorOutput（完成/失败回执）——决策与搬运分离，正是这份契约能同时伺候 P/D、offload 多个后端的全部原因（后端本体 → ch36/37）。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m2",
+      "intuition": "图书馆除了馆内编目（本地前缀缓存）还能查馆际互借目录（外部缓存）：查不到别急着拒——『稍后再问』把书先放到旁边的等候架（skipped 队列），不挡后面排队的人；等目录有了答案，外馆藏书直接当已还的书用。",
+      "worked_example": {
+        "params": {
+          "block_size": 16,
+          "prompt_tokens": 64,
+          "pool_blocks": 64,
+          "kv_role": "kv_consumer",
+          "剧本": "步1 connector 答 None；步2 答 (32, False) 同步命中；幕3 ExampleConnector 磁盘版（40-token prompt）"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/m2.json",
+        "table": {
+          "columns": ["轮次", "connector 答复", "裁决", "本拍新算 token", "可观测面"],
+          "rows": [
+            ["步 1", "None（稍后再问）", "r1 移入 skipped_waiting、状态仍 WAITING——不堵 waiting 队头", "0", "本拍零调度、零占块"],
+            ["步 2", "(32, False) 同步命中", "本地 0 + 外部 32 = 已算 32", "32", "r1 本拍算 64−32=32、转 RUNNING；update_state_after_alloc 收到 32"],
+            ["幕 3（ExampleConnector 磁盘版）", "(32, False) 磁盘命中", "40-token prompt 块对齐取 32（留最后 1 token 要 logits）", "—", "worker 先存 2 块到磁盘；调度器侧查同一 prompt 命中 32——文件系统就是外部缓存"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "None 语义不损失活性：被退避的请求每步都有一拍重试且重试免费，主队列吞吐不受它拖累。",
+        "argument": "每轮 schedule() 先选 skipped 队头（FCFS skipped 优先，scheduler.py:L694-L695）→ 退避请求必被重新查询；查询本身按契约要求 side-effect free（base.py:L465-L498 docstring『Might be called multiple times … should be side-effect free』），故重复询问无代价，答案一旦可得立即被采纳。单调量=调度步数：外部世界（远端索引/连接）只会把答案从 None 推进到具体数，每个退避请求的等待被系统外的进展单调消解；系统内它不占 waiting 队头、不占块（步 1 零占块），其后请求照常调度。"
+      },
+      "quantified": "本例 64-token prompt、外部命中 32：本拍只算 64−32=32 token——一半的 prefill 计算被外部缓存吸收。对照磁盘版参考实现：40-token prompt 命中 32（块对齐，最后 1 token 必须本地重算要 logits——与本地前缀缓存同一条契约）。",
+      "figure_specs": [
+        {
+          "figure_id": "ch16-fig-none-means-later",
+          "template": "state-machine",
+          "l0_anchor": "L0 kv_column 的调度查询格——放大「账本列」上 waiting 循环里『查外部缓存』那一拍的三条出边（命中/零/None）。",
+          "claim": "None ≠ 0：『还没查到』和『查到为零』是两种答案——前者把请求移入 skipped 退避队列稍后再问（不堵 waiting 队头），后者立即按零外部命中排入计算；有数字则外部 token 与本地命中同一拍合成 num_computed_tokens。",
+          "numbers": [
+            {"value": "None → skipped_waiting（状态仍 WAITING、零占块、本拍零调度）", "provenance": "traces/m2.json steps[0]（r1_in_skipped_waiting=true / r1_blocks_held=0）"},
+            {"value": "下一拍 (32, False) → 本地 0+外部 32、本拍算 64−32=32、RUNNING", "provenance": "traces/m2.json steps[1]"},
+            {"value": "查询入参 = block_aligned_local（本地命中砍尾后的块对齐值）", "provenance": "traces/m2.json steps[*].query_seen_by_connector + scheduler.py:L773-L781"}
+          ],
+          "caption_draft": "L0 位置：KV 账本列·调度查询格。get_num_new_matched_tokens 把外部缓存当第二个前缀缓存查，返回三态：数字（命中，直接并入已算）、0（未命中，立即排入计算）、None（『稍后再问』——请求搬进 skipped 退避队列，waiting 队头不被堵住）。步 1/步 2 的实测：None 一拍零调度零占块，答案到达的那一拍 32 个外部 token 直接抵掉一半 prefill。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m3",
+      "intuition": "两本账打架时听更全的那本：本地缓存馆只登记到半页（块内 8 token 的子块尾），远端馆有整块的——那就把本地那半页剪掉（免得对半满块做 Copy-on-Write），让远端的整块加载盖过来；远端不比半页长，就留着半页、什么都不搬。",
+      "worked_example": {
+        "params": {
+          "block_size": 16,
+          "hash_block_size": 8,
+          "groups": "full(16) + mamba-align(16)，partial-hit 粒度配置（ch15 m15/m16）",
+          "seed_prompt_tokens": 40,
+          "probe_prompt_tokens": 56
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/m3.json",
+        "table": {
+          "columns": ["场景", "本地命中 / 子块尾", "远端答复", "仲裁裁决", "可观测面"],
+          "rows": [
+            ["逐组探测（仲裁前）", "full 组 40（含 8-token 子块尾）；mamba-align 组 32", "—", "hit_diverged：两组命中长度不同", "调度器把 block_aligned_local=32（砍尾后）呈给 connector，不呈 40"],
+            ["A：远端 16（严格更长）", "本地 40 → 砍尾到 32", "16 > 8", "truncate 砍本地尾 + 外部采用 16：32+16=48", "本拍只算 56−48=8；子块尾块引用数 0、仍在哈希表（免 CoW）"],
+            ["B：远端 8（不严格更长）", "本地 40 保尾", "8 不> 8", "外部 0；hit_diverged 且无外部撑腰 → 回退全组一致边界 32", "本拍算 56−32=24；update_state_after_alloc 收到 0"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "『有远端写 ⇒ 本地截到块对齐』：呈给 connector 的本地值恒为 block_aligned_local（砍过尾），凡走 truncate 路径采用的本地前缀长度必是 block_size 的整数倍——远端加载永远按整块落位，不与本地半块混写。",
+        "argument": "构造一：block_aligned_local = num_local − num_local%block_size 按定义对齐（scheduler.py:L773-L776）——connector 看到的本地命中永远隔着一条块对齐边界。构造二：两条出边必居其一——ext > partial_tail 时走 truncate_computed_blocks(new_computed_blocks, block_aligned_local)，其断言 num_computed_tokens % block_size == 0（kv_cache_manager.py:L777-L794）守护采用值=块对齐本地命中，远端数据覆盖从块边界起；否则外部采用 0、没有任何远端写（保尾路径的本地命中长度可以是块内边界——partial prefix cache 的细粒度命中，ch15 m15/m16，但那条路不发生跨进程写）。因此『远端覆盖本地尾』⇒『半满块整体让位』——既是免 CoW（半满共享块无人引用，实测 ref_cnt=0 留在自由队列），也是不混写的结构保证。"
+      },
+      "quantified": "本例 b=56 token：场景 A 仲裁后准入值 48 = 本地 32 + 外部 16，本拍只算 8——56 个 token 里 48 个不用算；被砍的 8-token 子块尾若不砍，采用半满共享块就得 CoW（一次整块拷贝带宽 + 一个新块），砍掉后该块引用数 0 留在自由队列。场景 B 的回退把本地命中从 40 收到 32：深命中的恢复边界处没有合法的 Mamba 状态，宁可少用 8 token 也不在非法边界恢复。",
+      "figure_specs": [
+        {
+          "figure_id": "ch16-fig-subtail-arbitration",
+          "template": "before-after",
+          "l0_anchor": "L0 kv_column 的缓存命中格——放大「账本列」上『本地命中与外部命中合并』的那一次仲裁（ch15 第 9 站留下的『→ ch16』路标在此接上）。",
+          "claim": "远端严格超过本地整块命中时，truncate_computed_blocks 把本地子块尾砍掉、让远端加载整块覆盖——免掉对半满共享块的 CoW；不严格更长则保尾、外部加载为零。",
+          "numbers": [
+            {"value": "本地命中 40 = 整块 32 + 子块尾 8（full 组）；mamba-align 组只命中 32 → hit_diverged", "provenance": "traces/m3.json caseA.probe_before_schedule（per_group_hits [40, 32]）"},
+            {"value": "场景 A：呈 connector 32、远端 16>8 → 砍尾：32+16=48、本拍 8、子块尾块 ref_cnt=0", "provenance": "traces/m3.json caseA"},
+            {"value": "场景 B：远端 8 不>8 → 保尾、外部 0 → 回退全组一致边界 32、本拍 24", "provenance": "traces/m3.json caseB"}
+          ],
+          "caption_draft": "L0 位置：KV 账本列·缓存命中格。仲裁前：本地链式哈希命中到 40（第 3 块只满了 8/16——hash 8 粒度的块内边界条目），mamba 组只到 32。仲裁 A：远端能供 16 个 token、严格盖过 8-token 的本地尾——调度器把呈给 connector 的本地值先砍成块对齐 32，远端加载按整块落位，被剪掉的半满块引用数归零、无需 CoW。仲裁 B：远端只及 8、不严格更长——保住本地尾、什么都不搬；发散的深命中（full 40 vs mamba 32）没有外部 KV 撑腰，回退到两组都认的 32——恢复边界处必须有合法的 Mamba 状态。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m4",
+      "intuition": "酒店预扣房费不开发票：房间（块）已经从 available 名单划走、客人的名字（哈希条目）却还没登记——等传输完成再补登记；中途退房（失败）就按已入住的天数结账、剩余房间重新打扫（清零）。",
+      "figure_specs": [
+        {
+          "figure_id": "ch16-fig-allocated-not-cached",
+          "template": "layout",
+          "l0_anchor": "L0 kv_column 的块账格——放大「账本列」上五段布局注释图（kv_cache_manager.py:L390-L446）里 ext_comp 那一段：『not cached by vLLM, but cached by connector』。",
+          "claim": "异步加载期请求处在『已分配未缓存』窗口：ext_comp 段的块已挂上块表（物理占用、对外不可见），但缓存账为零、哈希表没登记——传输完成才补缓存（m9），失败按第一个坏块截断（m10）。",
+          "numbers": [
+            {"value": "ext 32 token → 块表挂 2 块（block_ids [1,2]）", "provenance": "traces/m4.json observations.blocks_on_table / block_ids"},
+            {"value": "num_cached_block=0、块哈希 None（未缓存的可观测面）", "provenance": "traces/m4.json observations.num_cached_block / first_block_hash_is_none"},
+            {"value": "num_computed_tokens 先行设置 32、本拍零前向", "provenance": "traces/m4.json observations.num_computed_tokens_set_ahead / scheduled_tokens_this_step"},
+            {"value": "free 61/63：2 块被划走", "provenance": "traces/m4.json observations.free_blocks / pool_free_baseline"}
+          ],
+          "caption_draft": "L0 位置：KV 账本列·块账格。allocate_slots 的五段布局 <comp|new_comp|ext_comp|new|lookahead> 里，ext_comp 段是本章新开的口子：延迟入缓存（delay_cache_blocks=True）让块『先占位、后登记』。实测：64-token 请求外部可加载 32 → 2 块划入块表、缓存账 0、free 从 63 掉到 61；请求停在 WAITING_FOR_REMOTE_KVS、num_computed_tokens 已先行写成 32 但没有一拍前向消费它——账实分离的窗口态，补缓存在传输完成的提升拍（m9），截断在失败拍（m10）。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m5",
+      "intuition": "电梯装修（async load 占着轿厢、不可中断、不出成果）时物业只放一台装修、其余照常载客——两台一起装修，整栋楼就瘫了。『其余在途者的预约』就是那道『只放一台』的门。",
+      "worked_example": {
+        "params": {
+          "pool_blocks": 16,
+          "free_baseline": 15,
+          "r1": "128 token，ext 64 异步",
+          "r2": "144 token，ext 128 异步",
+          "watermark": 0.0,
+          "门序注": "full-ISL 门先查（全程块数 ≤ free，不扣预约），护轨门后查（本拍块数 ≤ free − reserved）——两门同用 get_num_blocks_to_allocate 预测器"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/m5.json",
+        "table": {
+          "columns": ["轮次", "事件", "free / 预约", "full-ISL 门（全程 ≤ free）", "护轨门（本拍 ≤ free−预约）", "裁决"],
+          "rows": [
+            ["步 1", "r1 求入（ext 64）", "free 15、预约 0", "8 ≤ 15 ✓", "4 ≤ 15 ✓", "准入：占 4 块 ext → free 11、预约 4（r1 尚需的余量）"],
+            ["步 2", "r2 求入（ext 128）", "free 11、预约 4", "9 ≤ 11 ✓（过）", "8 > 11−4=7 ✗", "拒：r2 留 WAITING、不进 skipped、零占块"],
+            ["步 3", "r1 完成→提升→同拍续算 64", "free 7、预约 0", "9 > 7 ✗", "（前门已拒）", "拒：容量真不够（非预约之锅）；r1 转 RUNNING"],
+            ["步 4", "r1 结束→释放 8 块；r2 再问", "free 15、预约 0", "9 ≤ 15 ✓", "8 ≤ 15 ✓", "准入：占 8 块 ext → free 7、预约 1（r2 的尾 16 token）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "护轨排除『互相等对方』的死锁环：任何时刻，在途 async 集合里的每个成员都不依赖其他成员让路才能完成。",
+        "argument": "死锁需要等待环。归纳证明护轨下不构成环：基例——集合为空时第一个 async 无预约约束、自足。归纳步——新成员 c 准入时必满足 need(c) ≤ free − Σ_{r∈在途} remaining(r)：即扣除全部在途者的剩余需求后仍有富余，c 拿到的资源不侵占任何 r 的完成余量；r 们此前同理。因此在途成员两两之间不存在『我等你释放』的边，无环。活性收尾：每个在途 async 必有终点——worker 侧 get_finished 契约保证传输完成（成功或失败）终将被上报（base.py:L369-L405），_try_promote 把它提走；集合单调排空（步 3→步 4 实测：r1 完成释放 8 块，r2 立刻放行）。"
+      },
+      "quantified": "16 块池（free 15）：r1 准入后 free=11、r1 预约 4——r2 的本拍 8 块只有 7 可用，被护轨拦下。若无护轨放 r2 进来：free 掉到 3，两个零前向、不可抢占的请求互相等对方释放 = 死锁；或退一步挤进来，也会把在途 prefill 挤成可预期抢占。代价侧：步 2 的拒绝让 r2 晚 2 步才进来（活性换吞吐的税）。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m6",
+      "intuition": "一封不透明的搬运单：调度器侧把『本步要搬什么』的全部决策打包成一份后端自定义的 KVConnectorMetadata，随 SchedulerOutput 过线——装什么、怎么解释完全是后端自己的事，调度器只负责透传。不透明是刻意的：调度器代码从头到尾不依赖任何后端数据结构，换后端（NIXL/LMCache/Mooncake/ExampleConnector）不改调度器一行。",
+      "invariant": {
+        "claim": "下行信对调度器完全不透明且不可变：build_connector_meta 不许改 scheduler_output、调用即重置连接器内部状态——一拍一清账，状态不跨拍残留。",
+        "argument": "两条纪律写在 base.py:L500-L539 的 docstring：『This function should NOT modify fields in the scheduler_output』（L533）与『calling this function will reset the state of the connector』（L534）；调用点 scheduler.py:L1233-L1237 只做 scheduler_output.kv_connector_metadata = meta 一行透传、不窥其内部。回程对称：worker 一拍干完把 KVConnectorOutput（finished_sending/finished_recving/invalid_block_ids）塞回来——两封信是两个世界之间仅有的往来。"
+      },
+      "coverage_note": "登记卡（review R3 补录）：m6 为 core 但无数值素材——纯契约纪律机制、非量化路径（quantified=false，无数值 trace）；三层叙事与不变量由正文『一封不透明的搬运单』一节凭本卡+dossier 锚点承载，图面由 m1 的 ch16-fig-role-split（两封信）承接。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m7",
+      "intuition": "装卸队围着流水线干活：开工前先统一收单、统一发车（bind/start_load_kv）；流水线上每站干自己的活（前向逐层）；下班前必须等最后一车货装完、交完回执才散场（wait_for_save/get_finished）——哪怕今天线上没活，收单发车和交回执也照走。",
+      "figure_specs": [
+        {
+          "figure_id": "ch16-fig-worker-tick",
+          "template": "flow",
+          "l0_anchor": "L0 gpu_column（GPU 列）的执行格——放大「GPU 列」上前向一拍里 KV 收发的包裹结构：_get_kv_connector_output 上下文把 _model_forward 包在中间。",
+          "claim": "worker 一拍的生命周期 = 上下文管理器包住前向：bind 计划 → start_load_kv 异步发起 → 前向内逐层 wait_for_layer_load/save_kv_layer → finally wait_for_save 强制同步 + get_finished + 清计划；无 token 步（no_forward）也走收发，但跳过 wait_for_save。",
+          "numbers": [
+            {"value": "2 层真实事件序 7 条：start_load_kv → (wait_for_layer_load→save_kv_layer)×2 → wait_for_save → get_finished", "provenance": "traces/m7.json event_sequence / sequence_len"},
+            {"value": "get_finished 收到 finished_req_ids={dead} 并上报", "provenance": "traces/m7.json get_finished_ids"},
+            {"value": "no_forward 变体：事件仅 start_load_kv+get_finished 2 条、wait_for_save 缺席", "provenance": "traces/m7.json no_forward_variant"}
+          ],
+          "caption_draft": "L0 位置：GPU 列·执行格。execute_model 的一拍：入口先 handle_preemptions（覆写前抢救，本例无抢占未触发），随后 maybe_get_kv_connector_output 上下文展开——bind 把不透明计划交给 worker 侧 connector，start_load_kv 在第一层注意力之前把全部层的加载异步发起；前向在 yield 处跑，层装饰器逐层等本层/存本层；finally 里 wait_for_save 是强制同步点（不出这个栅栏，paged buffer 可能被下一步覆写）、get_finished 带着本拍 finished_req_ids 询问收发完成、get_block_ids_with_load_errors 收失败块、clear 清计划。无 token 的空拍也走收发——异步传输与本拍 running 可以完全不相交。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m8",
+      "intuition": "自助餐传菜带：后厨（传输）按道次序出菜、你（计算）吃完一道接一道——不用等全桌菜上齐才动筷，只在拿到第 i 道之前等它一下。",
+      "worked_example": {
+        "params": {
+          "num_layers": 4,
+          "transfer_ticks_per_layer": 2,
+          "compute_ticks_per_layer": 3,
+          "时间单位注": "虚拟拍教学模型——调用序来自真实运行，时长是模型参数（非 GPU 实测）；真实收益取决于传输/计算比"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/m8.json",
+        "table": {
+          "columns": ["方案", "层 0", "层 1", "层 2", "层 3", "端到端"],
+          "rows": [
+            ["朴素：等全部到齐再算", "等到第 8 拍才开算：8..11", "11..14", "14..17", "17..20", "20 拍 = Σ传输 8 + Σ计算 12"],
+            ["契约形态：逐层重叠", "等 2 拍→算 2..5", "5..8（零等待）", "8..11（零等待）", "11..14（零等待）", "14 拍 = max(8,12)+首层等待 2"],
+            ["真实调用序（4 层真跑）", "start_load_kv 一次发起全部层", "wait_for_layer_load 层前 / save_kv_layer 层后 ×4", "wait_for_save", "get_finished", "11 个事件"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "逐层重叠下端到端 ≤ Σ传输 + Σ计算，且每层等待严格有界（只等本层就绪与上一层算完）；有限层数有限步必出栅栏。",
+        "argument": "单调量=已完成层数 i：处理第 i 层时钟推进到 max(t_{i-1}, ready_i)+C（ready_i=(i+1)T 为本层就绪时刻，t_{i-1} 为上一层算完时刻），i 严格递增、层数有限 → 前向有限步终止；随后 wait_for_save 栅栏保证所有异步 save 完成先于 paged buffer 的任何下一步复用（base.py:L359-L367 docstring『This prevents overwrites of paged KV buffer before saving done』）——正确性边界先于重叠极限。数值上：端到端 = max(ΣT, ΣC) + T（传输串行链路时），本例 max(8,12)+2=14 < 8+12=20。"
+      },
+      "quantified": "4 层 ×（传输 2 拍 + 计算 3 拍）：朴素 20 拍 → 重叠 14 拍，省 6 拍（30%）；层 1..3 全程零等待（实测 only_layer0_waits=true）——只有第一层付了一次传输等待。层数越多、传输/计算比越接近 1:1，sum→max 的结构收益越大；代价是 wait_for_save 强制同步点——正确性优先于把重叠压到极限。",
+      "figure_specs": [
+        {
+          "figure_id": "ch16-fig-layer-overlap",
+          "template": "swimlane",
+          "l0_anchor": "L0 gpu_column 的层执行格——放大「GPU 列」上前向内部：注意力层前后的两个钩子（maybe_transfer_kv_layer 装饰器）把传输与计算编织在一起。",
+          "claim": "wait_for_layer_load 把『等全部 KV 到齐再开算』拆成『每层只等本层』——传输与计算在第 i 层重叠，端到端从 Σ传输+Σ计算（sum）降到 ≈max(Σ传输, Σ计算)。",
+          "numbers": [
+            {"value": "4 层、每层传输 2 拍/计算 3 拍（模型参数）；就绪时刻 2/4/6/8", "provenance": "traces/m8.json transfer_ready_ticks / params"},
+            {"value": "重叠档期：层 0 算 2-5、层 1 算 5-8、层 2 算 8-11、层 3 算 11-14", "provenance": "traces/m8.json overlap_schedule"},
+            {"value": "朴素 20 拍（先等 8 拍、再串行算 12 拍）vs 重叠 14 拍、省 6 拍", "provenance": "traces/m8.json naive_total_ticks / overlap_total_ticks / saved_ticks"},
+            {"value": "真实调用序 11 事件：start_load_kv → (wait_for_layer_load→save_kv_layer)×4 → wait_for_save → get_finished", "provenance": "traces/m8.json real_call_sequence / real_sequence_len"}
+          ],
+          "caption_draft": "L0 位置：GPU 列·层执行格。上泳道=传输（start_load_kv 一次发起、按层序就绪于第 2/4/6/8 拍），下泳道=计算（每层 3 拍）。朴素编排要先等第 8 拍全部就绪再串行算，端到端 20；契约编排里每层注意力执行前的 wait_for_layer_load 只等本层——层 0 等 2 拍后开算，其后三层全部零等待接力，端到端 14 = max(8,12)+2。注意时长是教学模型的虚拟拍（真实收益取决于传输/计算比），调用序（层前 wait/层后 save）是 4 层真跑的实测。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m9",
+      "intuition": "快递到站不是直接扔门口：先签收上架（补缓存——让后面的请求能命中），整箱都到齐的还要拆最后一格重验（全命中退一 token——要 logits 必须亲手算最后一个 token），然后才按原路放回队列重新排队。",
+      "figure_specs": [
+        {
+          "figure_id": "ch16-fig-recv-promote",
+          "template": "state-machine",
+          "l0_anchor": "L0 kv_column 的请求状态格——放大「账本列」上 WAITING_FOR_REMOTE_KVS 状态的闭环（入口在护轨分配、出口在提升拍）。",
+          "claim": "传输完成的提升不是直接放行：_update_waiting_for_remote_kv 先补缓存（『已分配未缓存』窗口的块此刻才入哈希表），全命中还要退一个 token 重算（要 logits），再按 num_preemptions 分流回 WAITING/PREEMPTED 重入调度。",
+          "numbers": [
+            {"value": "部分命中：先行 48 → 提升拍补缓存后块账 4（3 补缓存+1 新算）、同拍续算 16", "provenance": "traces/m9.json case1_partial_hit"},
+            {"value": "全命中：先行 64 → 提升时退一 64→63、本拍补算 1", "provenance": "traces/m9.json case2_full_hit promote_log / scheduled_tokens_after_promote"},
+            {"value": "状态闭环：WAITING --异步命中--> WAITING_FOR_REMOTE_KVS --finished_recving--> 提升补缓存 --> WAITING（或 PREEMPTED）", "provenance": "traces/m9.json case1 status 变迁 + scheduler.py:L2635-L2693"}
+          ],
+          "caption_draft": "L0 位置：KV 账本列·请求状态格。worker 的 get_finished 报 finished_recving 只是入场券：下一拍 schedule 里 _try_promote 才真正结算——先把窗口期欠的缓存账补上（3 块 ext 此刻入哈希表，同拍续算的第 4 块直接正常入表），再查是不是全命中：外部缓存覆盖整个 prompt 时 num_computed_tokens 从 64 退到 63、本拍重算最后 1 个 token——远端缓存不豁免『要 logits 必须亲手算最后一个 token』的采样必要性（与本地前缀缓存同一条契约）。被抢占过的（num_preemptions>0）回 PREEMPTED 队列、否则回 WAITING，重新走正常准入。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m10",
+      "intuition": "搬家搬到一半车抛锚：不是整车货扔掉重买（fail），而是从第一个坏箱子处截断——已经搬进屋的留下、坏箱子之后的重新搬（recompute）；室友共用的箱子只重搬一次，不能各搬各的。",
+      "worked_example": {
+        "params": {
+          "block_size": 16,
+          "场景1": "fail 策略（默认）：ext 48 同步、坏块 idx 2",
+          "场景2": "recompute + 异步：ext 48、坏块 idx 2",
+          "场景3": "共享坏块（sync recompute）",
+          "场景2b": "补登记清零（needs_kv_cache_zeroing=True）"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/m10.json",
+        "table": {
+          "columns": ["场景", "失败块", "处置", "num_computed_tokens", "可观测面"],
+          "rows": [
+            ["fail 策略（默认）", "第 3 块（idx 2）", "整请求 FINISHED_ERROR", "—", "块全归还：free 63/63、请求出册"],
+            ["recompute（异步）", "第 3 块（idx 2）", "截断到第一个坏块前：32", "先行 48 → 32", "进失败重试账本；补缓存 2 块有效前缀、本拍重算 32 token"],
+            ["共享坏块（同步）", "中间块（seed 与 b 共享）", "第一个扫到者截断：seed→16；b 回退 48", "seed 48→16；b 48", "同一块只重算一次（marked_invalid 去重）"],
+            ["补登记清零（开关开）", "截断区 token 32..63", "record_blocks_for_zeroing 从块对齐 32 起补登记", "—", "非块对齐 17 被断言拒；块 3、4 进清零账"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "截断保持最长有效前缀且总重算量不翻倍：num_computed_tokens 单调降到第一个坏块的块对齐起点，每个坏块的重算责任唯一归属。",
+        "argument": "单调性：_update_requests_with_invalid_blocks 只把 num_computed_tokens 从当前值降到 idx×block_size（第一个坏块的块对齐起点，idx 为其在块表中的序号）——不回升、不越界（截断值 ≤ 原值），重算区恰好是 (截断值, 原值] 的块区间。唯一归属：共享坏块经 marked_invalid_block_ids 集合去重——第一个扫到的请求认领截断与重算，后来者发现自己 affected 但无未认领坏块时，回退到自己的 cached 计数（把坏块当『将被别人重算』）——同一块的全网重算次数恰为 1，总重算 token 数 ≤ 各请求失效 token 之和（不翻倍）。本例实测：seed 16 + b 0 = 16 token 的重算责任，落在 seed 一家。"
+      },
+      "quantified": "64-token、ext 48、坏第 3 块：recompute 截断到 32 → 只重算 32 token（fail 策略则整单作废 64）；共享场景 seed 截到 16、b 保住 48——坏 1 块（16 token）全网只重算 16 token。清零护栏的块对齐断言：17 被拒、32 放行——半有效块清零会抹掉自己的有效前缀，所以补登记的起点必须是块边界。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m11",
+      "intuition": "卖家已发货、买家未确认收货：账面上订单完成了（请求 finish），仓库却不能把货架腾给别人（块不释放）——等物流签收（get_finished 报 finished_sending）才真正归架；店铺打烊时间也因此要等最后一单签收（has_finished_requests）。",
+      "figure_specs": [
+        {
+          "figure_id": "ch16-fig-delayed-free",
+          "template": "before-after",
+          "l0_anchor": "L0 kv_column 与 gpu_column 交界的回收格——放大「账本列」上请求终局的那一格：free 的决定权被 request_finished 的返回值接走。",
+          "claim": "request_finished→True 后块进入『已交接未送达』挂起态——不释放、请求留账（self.requests 不删），直到 worker 的 get_finished 报 finished_sending 才 _free_blocks；has_finished_requests 让引擎在全部活请求结束后继续步进等这笔账。",
+          "numbers": [
+            {"value": "接管瞬间：块仍挂 2 块、free 61 不变、请求留册、has_finished_requests=true", "provenance": "traces/m11.json steps[1]"},
+            {"value": "finished_sending 到达：请求出册、free 回 63（全部归还）", "provenance": "traces/m11.json steps[2]"},
+            {"value": "交接内容=整块表（SupportsHMA 走 request_finished_all_groups 逐组块表）", "provenance": "traces/m11.json hma_variant"}
+          ],
+          "caption_draft": "L0 位置：KV 账本列 × GPU 列交界的回收格。producer 的请求完成不是块生涯的终点而是交接点：_connector_finished 先做窗外回收、按 num_computed_tokens 裁出整块表递给 connector；request_finished 返回 True 的那一刻起，块的所有权归 connector——调度器账本上请求还在（has_finished_requests=true，引擎不会提前收工）、free 停在 61 不动；直到 worker 报 finished_sending，_free_blocks 才把 2 块还回池子（free 回 63）。best-effort 缓存（offload）返回 False：块立即释放，丢一次 save 只是未来一次 miss——这正是 requires_kv_delivery 语义的另一面（m13）。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m14",
+      "intuition": "拿到房间号牌（block_id）和楼层平面图（register_kv_caches 注册的池张量）的搬运工：不过前台（vLLM 调度器）、不走大堂（中间层），直接按『门牌号×每层户数+户内偏移』找到房间搬进搬出。",
+      "worked_example": {
+        "params": {
+          "block_size": 16,
+          "paged_buffer_shape": [4, 2, 16, 8],
+          "prompt_tokens": 40,
+          "addressed_tokens": 32,
+          "block_ids": [1, 2],
+          "对齐注": "ExampleConnector 只寻址 align_to_block_size(len−1)=32 个 token——最后 1 token 留给重算要 logits"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/m14.json",
+        "table": {
+          "columns": ["方向", "动作", "寻址", "可观测面"],
+          "rows": [
+            ["寻址（元数据装配时）", "ReqMeta 按 (block_ids, block_size) 展平 slot_mapping", "slot = block_id×16+offset", "块 1：16..31；块 2：32..47；共 32 槽、户内偏移 0..15"],
+            ["save（worker→外部缓存）", "extract：layer[block_idxs, :, offsets] 抽出落盘", "同一 slot 集合", "落盘形状 32×2×8；逐槽值=slot 指纹逐一相等"],
+            ["load（外部缓存→池）", "inject：dst[block_idxs, :, offsets]=src 直写", "同一 slot 集合", "清零池后 32 槽逐一复原；未触及槽（块 0 槽 5）保持零"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "slot 寻址是确定性的双射：同一份 (block_ids, block_size) 元数据展开出的槽集合，save 抽走的与 load 写回的逐槽相等，集合外的槽不被触碰。",
+        "argument": "构造：slot_mapping = [block_id×bs+offset]，由元数据唯一确定（无随机、无环境依赖）——save 的 extract 与 load 的 inject 用同一公式取同一集合，往返 bijective。归纳面：每个槽 s 在 save 时读 layer[s//bs, :, s%bs]、在 load 时写同一位置——值经外部缓存文件中转逐槽相等（实测指纹=slot 编号逐一复原）；不在集合内的槽两次都不触碰（实测块 0 槽 5 在整池清零后仍为零）。这继承 ch13 的槽位恒等式：GPU 侧只认 block_id，块表间接寻址到物理槽的换算是唯一的共享真理。"
+      },
+      "quantified": "40-token prompt 按 ExampleConnector 的块对齐取 32 token（留最后 1 token）→ 块表 2 块、32 个槽：save 每层落 1 个磁盘文件（形状 32×2×8）、load 按 slot 直写 32 槽零中转——connector 拿到计划里的 block_ids 加注册的池张量，就能在 worker 进程直写 GPU 内存，不经过 vLLM 任何中间层（F7 路标：block_table 间接寻址在 ch13 埋、ch22 收）。",
+      "figure_specs": []
+    }
+  ]
+}

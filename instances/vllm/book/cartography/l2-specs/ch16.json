@@ -1,0 +1,399 @@
+{
+ "schema": "l2-spec/1",
+ "chapter": 16,
+ "part": "IV",
+ "title": "KVConnector",
+ "hook": "prefill 算力密集、decode 带宽密集，同卡混跑互相拖累——把两段拆到两个引擎，KV 必须跟着过户；可账本在调度器进程、GPU 张量在 worker 进程：谁有权搬、何时搬？等远端 KV 的请求占着池块却零前向进度，怎么不挤死在途 prefill？搬一半断了，凭什么按第一个坏块截断重算而非整单作废？",
+ "l0_zoom": "KV 账本+边界",
+ "l0_region": {
+  "anchors": [
+   "kv_column",
+   "gpu_column"
+  ]
+ },
+ "depends_on": [
+  15
+ ],
+ "reading": "读图：上排 = 装配与配置门（role-split：同一个类两个进程各建一份、零共享）；中排 ①-⑦ = 一个请求的异步 KV 一生（双查 → 仲裁 → 护轨分配 → 等待 → 计划过线 → worker 逐层收发 → 回收）；下排 = 失败回滚、producer 终局、边界三例外 + why 注；站号 = 请求流经顺序（1-2 装配 · 3-9 消费者一生 · 10 失败 · 11-12 producer 边界），正文按讲解需要编排；框内方法与 file:line 均为 v0.27.1 已核锚点。",
+ "frame": {
+  "title": "调度器进程 ↔ worker 进程 · KVConnectorBase_V1 双面契约（同一类两种角色，分开构建、不共享状态）",
+  "file": "vllm/distributed/kv_transfer/kv_connector/v1/base.py + factory.py"
+ },
+ "center": {
+  "name": "async_kv_cycle",
+  "title": "异步 KV 一生：双查 → 护轨分配 → 等待 → 过线 → worker 逐层收发 → 回收",
+  "where": "scheduler.py:L744-L821"
+ },
+ "components": [
+  {
+   "name": "装配 · role-split（两进程各一份）",
+   "role": "kv",
+   "zone": "north",
+   "stations": [
+    1,
+    2
+   ],
+   "file": "vllm/distributed/kv_transfer/kv_connector/factory.py + kv_transfer_state.py",
+   "methods": [
+    "· KVConnectorFactory.create_connector（factory.py:L43-L75）",
+    "· NOTE 原话：explicitly separated into two roles",
+    "  … build separately to enforce strict separation",
+    "· 调度器进程：SCHEDULER role（scheduler.py:L140-L144）",
+    "· worker 进程：ensure_kv_transfer_initialized 建 WORKER role",
+    "（kv_transfer_state.py:L90-L94 ← gpu_worker.py:L662）",
+    "· register_kv_caches：池张量按层名注册（base.py:L263-L271）",
+    "· bind_gpu_block_pool：调度器侧直读块池（L291-L294）"
+   ]
+  },
+  {
+   "name": "配置门 · KVTransferConfig",
+   "role": "plain",
+   "zone": "north",
+   "file": "vllm/config/kv_transfer.py",
+   "methods": [
+    "· kv_role 三态：kv_producer / kv_consumer / kv_both（L41-L43）",
+    "· is_kv_producer / consumer / transfer_instance（L108-L118）",
+    "· kv_load_failure_policy：recompute | fail（默认，L69-L72）",
+    "· 既设 kv_connector 则 kv_role 必设（L102-L106）",
+    "· encoder-decoder 构造期拒绝（scheduler.py:L137-L139）"
+   ]
+  },
+  {
+   "name": "① 双查 · 外部=第二个前缀缓存",
+   "role": "beat",
+   "zone": "center",
+   "stations": [
+    3
+   ],
+   "methods": [
+    "get_num_new_matched_tokens(request,",
+    "  block_aligned_local)",
+    "scheduler.py:L777-L781 · base.py:L465-L498",
+    "返回 (ext_tokens, load_kv_async)",
+    "None = 稍后再问 → 进 skipped 队列",
+    "（L783-L789，不堵 waiting 队头）"
+   ]
+  },
+  {
+   "name": "② 双命中仲裁",
+   "role": "beat",
+   "zone": "center",
+   "stations": [
+    4
+   ],
+   "methods": [
+    "本地 get_computed_blocks_for_connector",
+    "（kv_cache_manager.py:L297-L342 混合调和）",
+    "远端严格更长 → truncate 砍本地子块尾",
+    "（L791-L802：no CoW needed, load covers it）",
+    "否则保尾不加载（L803-L809）",
+    "hit_diverged 且无外部 → 回退全组一致边界",
+    "（L813-L821：深命中无合法 Mamba 状态）"
+   ]
+  },
+  {
+   "name": "③ 护轨分配 · delay_cache_blocks",
+   "role": "beat",
+   "zone": "center",
+   "stations": [
+    5
+   ],
+   "methods": [
+    "reserved_blocks = 其余在途 prefill 预约",
+    "（L965-L971 + L2628-L2633）",
+    "allocate_slots(",
+    "  num_external_computed_tokens,",
+    "  delay_cache_blocks=True)",
+    "（kv_cache_manager.py:L549-L552 已分配未缓存）",
+    "update_state_after_alloc（L1000-L1005）"
+   ]
+  },
+  {
+   "name": "④ WAITING_FOR_REMOTE_KVS",
+   "role": "beat",
+   "zone": "center",
+   "stations": [
+    6
+   ],
+   "methods": [
+    "request.status = WAITING_FOR_REMOTE_KVS",
+    "（scheduler.py:L1023-L1027 → request.py:L353）",
+    "num_computed_tokens 先行设置但闲置（L1041）",
+    "跳过新块清零：防清零与远端写入竞争",
+    "（_skip_zero_block_ids L1043-L1052）"
+   ]
+  },
+  {
+   "name": "⑤ 元数据过线",
+   "role": "beat",
+   "zone": "center",
+   "stations": [
+    7
+   ],
+   "methods": [
+    "build_connector_meta（base.py:L526-L539）",
+    "→ SchedulerOutput.kv_connector_metadata",
+    "（scheduler.py:L1234-L1237）",
+    "不透明 KVConnectorMetadata：决策侧只产计划",
+    "不改 scheduler_output · 调用即重置"
+   ]
+  },
+  {
+   "name": "⑥ worker 一拍 · 逐层收发",
+   "role": "beat",
+   "zone": "center",
+   "stations": [
+    8
+   ],
+   "methods": [
+    "handle_preemptions（gpu_model_runner:L4197-L4200）",
+    "bind → start_load_kv 异步发起（mixin L89-L95）",
+    "每层：wait_for_layer_load → 层计算 → save_kv_layer",
+    "（kv_transfer_utils.py:L37-L59 装饰器）",
+    "finally：wait_for_save + get_finished +",
+    "get_block_ids_with_load_errors（L99-L109）",
+    "无 token 步也走收发（no_forward L36-L48）"
+   ]
+  },
+  {
+   "name": "⑦ 完成回收 · 退一 token",
+   "role": "beat",
+   "zone": "center",
+   "stations": [
+    9
+   ],
+   "methods": [
+    "_update_from_kv_xfer_finished（L2714-L2741）",
+    "finished_recving → _update_waiting_for_remote_kv",
+    "（L2635-L2676：cache_blocks 补缓存）",
+    "全命中退一 token 要 logits（L2671-L2674）",
+    "→ 回 WAITING / PREEMPTED 重入调度",
+    "（_try_promote L2678-L2693）"
+   ]
+  },
+  {
+   "name": "失败回滚 · invalid_block_ids",
+   "role": "kv",
+   "zone": "south",
+   "stations": [
+    10
+   ],
+   "file": "vllm/v1/core/sched/scheduler.py + kv_cache_manager.py",
+   "methods": [
+    "· worker 报 get_block_ids_with_load_errors →",
+    "  KVConnectorOutput.invalid_block_ids（mixin L105）",
+    "· _handle_invalid_blocks（L2846-L2914）双策：",
+    "  fail（默认）FINISHED_ERROR / recompute 截断重算",
+    "· 按第一个坏块截断 num_computed_tokens（L2774-L2844）",
+    "· 重算区补登记清零 record_blocks_for_zeroing",
+    "（kv_cache_manager.py:L817-L829，必须块对齐）"
+   ]
+  },
+  {
+   "name": "producer 终局 · 接管释放",
+   "role": "kv",
+   "zone": "south",
+   "stations": [
+    11
+   ],
+   "file": "vllm/v1/core/sched/scheduler.py + v1/base.py",
+   "methods": [
+    "· _free_request → _connector_finished（L2577-L2612）：",
+    "  窗外回收 + get_block_ids_for_computed_tokens 整块表",
+    "· request_finished → True = connector 接管块",
+    "（base.py:L559-L578；混合走 SupportsHMA 逐组",
+    "  request_finished_all_groups base.py:L93-L114）",
+    "· get_finished 报 finished_sending 才 _free_blocks",
+    "（L2738-L2741）——异步送的块绝不提前放"
+   ]
+  },
+  {
+   "name": "边界三例外",
+   "role": "kv",
+   "zone": "south",
+   "stations": [
+    12
+   ],
+   "file": "vllm/v1/core/sched/scheduler.py",
+   "methods": [
+    "· defer_block_free 步序栅栏：异步调度+consumer，",
+    "  在途步可能还在写已释放块 → deferred_frees 栅栏",
+    "（L150-L156 + L2341-L2380，过栅栏才逆序归还）",
+    "· 抢占 drop_stale_output=self.requires_kv_delivery",
+    "（L617-L621：交接未决 → 产出无有效 KV，丢弃）",
+    "· partial-tail offload：钉住块内边界块交 connector",
+    "（L1165-L1179 + kv_cache_manager.py:L848-L874）"
+   ]
+  },
+  {
+   "name": "why · 决策与搬运分离",
+   "role": "plain",
+   "zone": "south",
+   "kind": "note",
+   "methods": [
+    "· 元数据账本在调度器进程（纯 CPU），GPU 张量在 worker",
+    "· 调度器侧只产不透明计划（KVConnectorMetadata），",
+    "  worker 侧只认 block_ids + 注册的 kv_caches 张量",
+    "· 同 class 两 role 分建——零共享是硬约束不是习惯",
+    "· v0 各后端各写一套调度钩子 = 不可组合 → 契约根治"
+   ]
+  },
+  {
+   "name": "why · 异步空转窗口",
+   "role": "plain",
+   "zone": "south",
+   "kind": "note",
+   "methods": [
+    "· async load 占着池块却零前向进度、又不可抢占",
+    "· 两个 async load 可互相吃掉对方完成余量 → 死锁",
+    "· 护轨：fits in free − 在途预约 − 水位（活性优先）",
+    "· 全命中也退一 token：要 logits（与本地缓存同契约）"
+   ]
+  },
+  {
+   "name": "邻章分界 · F8 埋点",
+   "role": "plain",
+   "zone": "south",
+   "kind": "note",
+   "methods": [
+    "· 池/块表/引用计数 → ch13 · 账本/准入门/水位 → ch14",
+    "· 链式哈希/CoW/子块尾 → ch15（本章消费其接口）",
+    "· NIXL/Mooncake/LMCache 后端与 P/D 拓扑 → ch36",
+    "· KV 池化回收 → ch37 —— F8 双面契约在此两章回收"
+   ]
+  }
+ ],
+ "flows": [
+  {
+   "from": "配置门 · KVTransferConfig",
+   "to": "装配 · role-split（两进程各一份）",
+   "label": "kv_transfer_config 既设才建 connector（kv_role 必填）"
+  },
+  {
+   "from": "装配 · role-split（两进程各一份）",
+   "to": "① 双查 · 外部=第二个前缀缓存",
+   "label": "connector 在场才查外部命中（L749/L769）"
+  },
+  {
+   "from": "① 双查 · 外部=第二个前缀缓存",
+   "to": "② 双命中仲裁",
+   "label": "本地命中 + ext_tokens"
+  },
+  {
+   "from": "② 双命中仲裁",
+   "to": "③ 护轨分配 · delay_cache_blocks",
+   "label": "num_external_computed_tokens 进分配"
+  },
+  {
+   "from": "③ 护轨分配 · delay_cache_blocks",
+   "to": "④ WAITING_FOR_REMOTE_KVS",
+   "label": "load_kv_async=True"
+  },
+  {
+   "from": "④ WAITING_FOR_REMOTE_KVS",
+   "to": "⑤ 元数据过线",
+   "label": "本步 SchedulerOutput 带搬运计划"
+  },
+  {
+   "from": "⑤ 元数据过线",
+   "to": "⑥ worker 一拍 · 逐层收发",
+   "label": "kv_connector_metadata 过线（跨进程）",
+   "dash": true
+  },
+  {
+   "from": "⑥ worker 一拍 · 逐层收发",
+   "to": "⑦ 完成回收 · 退一 token",
+   "label": "回程：finished_recving / invalid_block_ids"
+  },
+  {
+   "from": "⑦ 完成回收 · 退一 token",
+   "to": "失败回滚 · invalid_block_ids",
+   "label": "invalid_block_ids 分支",
+   "dash": true
+  },
+  {
+   "from": "失败回滚 · invalid_block_ids",
+   "to": "① 双查 · 外部=第二个前缀缓存",
+   "label": "recompute 截断后重入调度（退化为本地重算）",
+   "up": true,
+   "dash": true
+  },
+  {
+   "from": "⑥ worker 一拍 · 逐层收发",
+   "to": "producer 终局 · 接管释放",
+   "label": "finished_sending → 放块（producer 侧）",
+   "dash": true
+  },
+  {
+   "from": "producer 终局 · 接管释放",
+   "to": "边界三例外",
+   "label": "异步调度栅栏 / 抢占护栏 / partial-tail 钉住"
+  }
+ ],
+ "loop": {
+  "label": "传输完成：请求回 WAITING/PREEMPTED 重入 ①-③ 正常调度——『第二个前缀缓存』的一生闭环；producer 侧送完才放块"
+ },
+ "rail_header": "站号 = 异步 KV 一生（1-2 装配 · 3-6 查等待 · 7-9 收发回收 · 10-12 边界）",
+ "stations": [
+  {
+   "n": 1,
+   "where": "scheduler.py:L125-L158",
+   "what": "装配·调度器侧：create_connector(role=SCHEDULER)（factory.py:L43-L75，NOTE 原话『We build separately to enforce strict separation』）+ 四旗标：recompute_kv_load_failures / defer_block_free（异步调度+consumer）/ requires_kv_delivery / connector_prefix_cache_stats；建完 KVCacheManager 再 bind_gpu_block_pool（L291-L294）——调度器侧直读块池元数据"
+  },
+  {
+   "n": 2,
+   "where": "kv_transfer_state.py:L72-L94",
+   "what": "装配·worker 侧：ensure_kv_transfer_initialized（gpu_worker.py:L662）以 role=WORKER 再建一份挂全局 _KV_CONNECTOR_AGENT；register_kv_caches（base.py:L263-L271）把池张量按层名注册——worker 从此能按 block_ids+张量直写 GPU 内存；encoder-decoder 构造期被拒（scheduler.py:L137-L139）"
+  },
+  {
+   "n": 3,
+   "where": "scheduler.py:L744-L789",
+   "what": "双查：connector 在场先 get_computed_blocks_for_connector（kv_cache_manager.py:L297-L342，混合 per-group 调和+hit_diverged）再 get_num_new_matched_tokens(request, block_aligned_local)（base.py:L465-L498：外部缓存当第二个前缀缓存查）；None=『稍后再问』→ 进 step_skipped_waiting（L783-L789）不堵 waiting 队头"
+  },
+  {
+   "n": 4,
+   "where": "scheduler.py:L791-L821",
+   "what": "双命中仲裁：partial_tail=本地命中%block_size——远端严格更长 → truncate_computed_blocks 砍本地子块尾（『no CoW needed, and let the load cover it』）；否则保尾不加载；混合 hit_diverged 且无外部命中 → 回退 get_computed_blocks 全组一致边界（深命中无合法 Mamba 状态）"
+  },
+  {
+   "n": 5,
+   "where": "scheduler.py:L965-L1005",
+   "what": "护轨分配：async load 占块零前向进度又不可抢占 → 只许 fits in (free − 在途 prefill 预约 − 水位)：reserved_blocks=_inflight_prefill_reserved_blocks()（L2614-L2633）→ allocate_slots(num_external_computed_tokens, delay_cache_blocks=True)（kv_cache_manager.py:L549-L552『已分配未缓存』）→ update_state_after_alloc 告知 connector"
+  },
+  {
+   "n": 6,
+   "where": "scheduler.py:L1023-L1053",
+   "what": "等待态：status=WAITING_FOR_REMOTE_KVS（request.py:L353）、prepend 进 skipped 队列；num_computed_tokens 先行设置（L1041：传输完成前无人消费）；needs_kv_cache_zeroing 时把加载将覆写的块登记 _skip_zero_block_ids（L1043-L1052）——防清零与远端写入竞争"
+  },
+  {
+   "n": 7,
+   "where": "scheduler.py:L1234-L1258",
+   "what": "元数据过线：build_connector_meta → SchedulerOutput.kv_connector_metadata（base.py:L526-L539：不透明 KVConnectorMetadata、不改 scheduler_output、调用即重置）——决策侧只产搬运计划不搬数据；外部命中同时记 connector_prefix_cache_stats（L1006-L1014）"
+  },
+  {
+   "n": 8,
+   "where": "gpu_model_runner.py:L4197-L4200",
+   "what": "worker 逐层收发：execute_model 入口 handle_preemptions（覆写前抢救）→ _get_kv_connector_output（mixin L76-L112）包住 _model_forward：bind → start_load_kv 异步发起 → 每层 maybe_transfer_kv_layer 装饰器（kv_transfer_utils.py:L37-L59）层前 wait_for_layer_load、层后 save_kv_layer——逐层重叠 → finally：wait_for_save（防 paged buffer 被覆写）+ get_finished + get_block_ids_with_load_errors；无 token 步 no_forward（mixin L36-L48）"
+  },
+  {
+   "n": 9,
+   "where": "scheduler.py:L2714-L2741",
+   "what": "完成回收：update_from_output（L1974-L1976）→ _update_from_kv_xfer_finished：finished_recving 入集（已 finish 者直接放块）、finished_sending 放块；下步 _try_promote（L2678-L2693）调 _update_waiting_for_remote_kv（L2635-L2676）：cache_blocks 补缓存 + 全命中退一 token（要 logits）→ 按 num_preemptions 回 PREEMPTED/WAITING 重入调度"
+  },
+  {
+   "n": 10,
+   "where": "scheduler.py:L2846-L2914",
+   "what": "失败回滚：invalid_block_ids → _handle_invalid_blocks 双策：fail（默认）FINISHED_ERROR；recompute 则按第一个坏块截断 num_computed_tokens 到最长有效前缀（L2743-L2844，共享坏块只重算一次）。异步失败标 failed_recving_kv_req_ids：_update_waiting_for_remote_kv 失败分支（L2645-L2665）补缓存有效前缀 + record_blocks_for_zeroing（kv_cache_manager.py:L817-L829，块对齐）重算区补登记清零"
+  },
+  {
+   "n": 11,
+   "where": "scheduler.py:L2300-L2327",
+   "what": "producer 终局：_free_request → _connector_finished（L2577-L2612：窗外回收+整块表交接）→ request_finished→True = connector 接管：块不释放、请求留在 self.requests（has_finished_requests L2394-L2404 知道还有账），直到 get_finished 报 finished_sending 才 _free_blocks（L2738-L2741）；混合走 SupportsHMA.request_finished_all_groups（base.py:L93-L114）逐组交接"
+  },
+  {
+   "n": 12,
+   "where": "scheduler.py:L150-L156",
+   "what": "边界三例外：①defer_block_free 步序栅栏（L150-L156+L2341-L2380）：在途步还在写已释放块 → deferred_frees 等 processed_step_seq 过栅栏才逆序归还；②抢占 drop_stale_output=self.requires_kv_delivery（L617-L621：交接未决被抢，产出无有效 KV，丢弃）；③producer partial-tail offload（L1165-L1179 + kv_cache_manager.py:L848-L874：钉住块内边界块交 connector 卸载）"
+  }
+ ]
+}

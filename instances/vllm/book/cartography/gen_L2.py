@@ -490,7 +490,8 @@ def _contains(outer, inner):
             and inner['y'] + inner['h'] <= outer['y'] + outer['h'] + 0.5)
 
 
-def _elbow_flow(f, a, b, lane_y, R, badges, note_names, vsegs=None, label_adj=None):
+def _elbow_flow(f, a, b, lane_y, R, badges, note_names, vsegs=None, label_adj=None,
+                ns_snap=None):
     """x 区不重叠的跨行流 → 肘形路由（ch6 盲审立的规矩）。
 
     旧的「重叠中点垂直直落」在两框 x 区不重叠时，x 落在两框之间的空档——线从
@@ -504,6 +505,15 @@ def _elbow_flow(f, a, b, lane_y, R, badges, note_names, vsegs=None, label_adj=No
     dash = bool(f.get('dash'))
     ex = a['x'] + a['w'] / 2                    # 源框（下探方向的）边中心出线
     tx = b['x'] + b['w'] / 2                    # 目标框对边中心入线
+    # ns 肘形流竖段穿拍片让位（exp-2026-08-29 ch22，见 build 的 ns_snap 预算块）：
+    # 跨中排那条竖段（up=入场 / down=出线）若按框中心 x 正穿拍片，挪进预算选定的
+    # 拍片缝（缝在所属框边线内，箭头仍落框边——贴边纪律不破）。
+    if ns_snap and id(f) in ns_snap:
+        which_, gx_ = ns_snap[id(f)]
+        if which_ == 'from':
+            ex = gx_
+        else:
+            tx = gx_
     if down:
         y0, y1 = a['y'] + a['h'], b['y']
         # 入点避让目标框顶的站号徽标（骑框顶 y-8..y+9 tab 式，build 侧 badges 同口径）
@@ -551,7 +561,8 @@ def _elbow_flow(f, a, b, lane_y, R, badges, note_names, vsegs=None, label_adj=No
 
 
 def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vsegs=None,
-              label_adj=None, chip_geom=None, lane_obs=None, cf_hdr=None, nf_bands=()):
+              label_adj=None, chip_geom=None, lane_obs=None, cf_hdr=None, nf_bands=(),
+              ns_snap=None):
     a, b = R[f['from']], R[f['to']]
     color = ROLE.get(f.get('color_role') or 'plain', lc.C_MUTE)
     dash = bool(f.get('dash'))
@@ -613,7 +624,8 @@ def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vse
         # 两框 x 区不重叠 → 落点必在框外空档，直落=偷换 from/to（见 _elbow_flow 头注）→ 肘形
         if lanes and id(f) in lanes and not (
                 a['x'] <= x <= a['x'] + a['w'] and b['x'] <= x <= b['x'] + b['w']):
-            _elbow_flow(f, a, b, lanes[id(f)], R, badges, note_names, vsegs, label_adj)
+            _elbow_flow(f, a, b, lanes[id(f)], R, badges, note_names, vsegs, label_adj,
+                        ns_snap)
             return
         # north↔south 直落穿中排拍片（叶子框）→ 让位到两框 x 重叠区内的拍片间空档。
         # exp-2026-08-27（ch11）：EngineCore.step→update_from_output 直落 x=630 正穿 ①
@@ -1055,6 +1067,43 @@ def build(spec_path):
             zone_of.get(f['from']), zone_of.get(f['to'])) for f in flows):
         cap_band = (chips_bottom + 14 - 8.8, chips_bottom + 14 + 3.7)
     cf_bottom = cfy + cf_h if ccfg.get('name') else -1e9
+    # ---- ns 肘形流竖段穿拍片让位（exp-2026-08-29 ch22） ----
+    # 病灶：ns 肘形（exp-ch17 立的车道方案）只把车道压进 center↔south 行间带，跨中排的
+    # 那条竖段仍按**所属框中心 x** 直上/直下——中心 x 落进拍片缝是布局彩票：ch22『写腿→
+    # 出·KV 落池』up 流入场竖段 x=1849.8 正穿 ⑥ 拍片（1726.9–1925.4，199×178）整框，
+    # geometry linter arrow-crossed 红。同直落 ns 分支（draw_flow 的 chip_geom 块）的方：
+    # 竖段挪进**最近拍片缝**，且钳在所属框边线内（up=目标框 / down=源框；箭头仍落框边，
+    # 贴边纪律不破）；框内无可用缝才告警保持原位。预算一致性：snap 在 lane_obs/标签防撞/
+    # halo 之前算好、经 ns_snap 传入 draw_flow/_elbow_flow——车道墨迹检查、_yield_target
+    # 目标端让位、下沉说明行避让（vsegs）、白 halo 兜底全部对**最终**竖段 x。
+    # 触发式：无 ns 肘形流、或竖段本就不穿片的章 ns_snap 为空、输出逐字节不变。
+    chip_xr = sorted((x, x + w) for x, w in chip_pos.values())
+    grs_ = ([(chip_xr[i][1], chip_xr[i + 1][0]) for i in range(len(chip_xr) - 1)]
+            if chip_xr else [])
+    ns_snap = {}
+    for f in flows:
+        if (id(f) not in lanes
+                or {zone_of.get(f['from']), zone_of.get(f['to'])} != {'north', 'south'}):
+            continue
+        a_, b_ = R[f['from']], R[f['to']]
+        if b_['y'] > a_['y']:                       # down：出线竖段（源框底→车道）跨中排
+            v_y0, v_y1 = a_['y'] + a_['h'], lanes[id(f)]
+            box_, which_ = a_, 'from'
+        else:                                       # up：入场竖段（车道→目标框底）跨中排
+            v_y0, v_y1 = lanes[id(f)], b_['y'] + b_['h']
+            box_, which_ = b_, 'to'
+        if min(v_y0, v_y1) >= chips_bottom - 1 or max(v_y0, v_y1) <= chips_y + 1:
+            continue                                # 竖段不进拍片带（nc/cs 肘形均止于带边）
+        xc = box_['x'] + box_['w'] / 2
+        if not any(c0 <= xc <= c1 for c0, c1 in chip_xr):
+            continue                                # 中心 x 本就不在拍片上
+        cands = [(g0 + g1) / 2 for g0, g1 in grs_
+                 if box_['x'] + 2 <= (g0 + g1) / 2 <= box_['x'] + box_['w'] - 2]
+        if not cands:
+            print(f'  [warn] L2 ns 肘形流『{f.get("label", f["from"])[:14]}』竖段穿拍片、'
+                  f'所属框内无拍片缝，保持原位——需人工核图')
+            continue
+        ns_snap[id(f)] = (which_, min(cands, key=lambda t: abs(t - xc)))
     # 走廊静态障碍：肘形流全体（含**别家**流）的车道横线（按真实 x 跨距）+ 出线/入场
     # 竖段——目标端近框位（B）会被「目标更远的车道横线」跨过头顶（ch7：put 让位到
     # why 注框顶时，→同步面 车道（x 682.7–1721.9）横穿其上 0.8px，只查自车道漏网）
@@ -1066,6 +1115,12 @@ def build(spec_path):
         gdown = gb['y'] > ga['y']
         gy0 = (ga['y'] + ga['h']) if gdown else ga['y']
         gex, gtx = ga['x'] + ga['w'] / 2, gb['x'] + gb['w'] / 2
+        if id(gf) in ns_snap:                       # ns 竖段用让位后的最终 x（见上块）
+            _wh_, _gx_ = ns_snap[id(gf)]
+            if _wh_ == 'from':
+                gex = _gx_
+            else:
+                gtx = _gx_
         gly = lanes[id(gf)]
         lane_obs.append(('h', min(gex, gtx), max(gex, gtx), gly))
         lane_obs.append(('v', gex, min(gy0, gly), max(gy0, gly)))
@@ -1106,6 +1161,8 @@ def build(spec_path):
         a_, b_ = R[f['from']], R[f['to']]
         wlab = lc.tw(f['label'], 8.5)
         tx_ = b_['x'] + b_['w'] / 2
+        if id(f) in ns_snap and ns_snap[id(f)][0] == 'to':   # ns 入场竖段让位后的最终 x
+            tx_ = ns_snap[id(f)][1]
         for bd in badges:
             if b_['y'] - 12 < bd[3] and bd[1] < b_['y'] + 12 and bd[0] - 6 <= tx_ <= bd[2] + 6:
                 if bd[0] - 8 >= b_['x'] + 10:
@@ -1263,12 +1320,11 @@ def build(spec_path):
     # （badges / note_names 已上移至「肘形流标签防撞预算」之前——预算的防撞判定要用）
     vsegs = []      # 跨行流竖段 (x, y0, y1)——直落竖段/肘形两竖段/上下向容器刺，供下沉说明行避让
     # 拍片 x 区/拍片缝（ns 直落穿片让位用，见 draw_flow 的 R1 块）：无 center 拍片则 None
-    chip_xr = sorted((x, x + w) for x, w in chip_pos.values())
-    chip_geom = (chip_xr, [(chip_xr[i][1], chip_xr[i + 1][0])
-                           for i in range(len(chip_xr) - 1)]) if chip_xr else None
+    # （chip_xr/grs_ 已在上方 ns_snap 预算块算好，此处复用）
+    chip_geom = (chip_xr, grs_) if chip_xr else None
     for f in flows:
         draw_flow(f, R, zone_of, captions, badges, note_names, lanes, vsegs, label_adj,
-                  chip_geom, lane_obs, cf_hdr, nf_bands)
+                  chip_geom, lane_obs, cf_hdr, nf_bands, ns_snap)
     loop_vs = []          # 回环两竖段 (x, y0, y1)——下沉说明行避让用（下方 captions 块）
     if nb > 1 and spec.get('loop'):
         # 回环两端锚到首/末拍片的**实际**底边（R 里是真实 rect）——此前统一用 chips_bottom
