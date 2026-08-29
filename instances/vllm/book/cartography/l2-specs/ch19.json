@@ -1,0 +1,383 @@
+{
+  "schema": "l2-spec/1",
+  "chapter": 19,
+  "part": "V",
+  "title": "编译与捕获",
+  "hook": "模型的 forward 是 Python 写的，GPU 却不等 Python：vLLM 把模型编译成图、再把图捕成 CUDA graph 一次回放整段 kernel——可 attention 会写 KV cache（副作用）、batch 每拍都在变形，凭什么一张捕好的图能反复命中？「形状全等才能回放」这八个字背后是整条设计链。",
+  "l0_zoom": "执行臂中层",
+  "l0_region": {
+    "anchors": [
+      "gpu_column"
+    ]
+  },
+  "depends_on": [
+    17
+  ],
+  "reading": "读图：①-⑥ = 启动期（配置账本 → 构造期算子层 → keys → warmup/编译 → 捕获，全部发生在第一个请求之前），⑦-⑧ = 运行期一拍（裁决 → 查表 → padding → 喂图 → 回放）；下排 = BatchDescriptor / why 注 / 三代路线图 / F10 苗；站号 = 请求流经顺序（启动期 1-9 + 运行期 10-15），正文按讲解需要编排；框内方法与 file:line 均为 v0.27.1 已核锚点，灰字 = 规范源码路径。",
+  "rail_header": "站号 = 编译捕获生命周期（启动期 1-9 只走一次 · 运行期 10-15 每拍）· 15 站",
+  "frame": {
+    "title": "worker 进程 · 编译与捕获层（ch18 固定地址缓冲之上的执行形态）",
+    "file": "vllm/compilation/ + vllm/v1/cudagraph_dispatcher.py + custom_op.py"
+  },
+  "center": {
+    "name": "compile_capture",
+    "title": "启动期把 Python 变成图（①-⑥ 无请求在场）→ 运行期一拍查表回放（⑦-⑧）",
+    "where": "backends.py:L553 · cuda_graph.py:L233 · dispatcher:L235"
+  },
+  "components": [
+    {
+      "name": "入 · 启动序列（无请求在场）",
+      "role": "plain",
+      "zone": "north",
+      "file": "vllm/v1/engine/core.py",
+      "methods": [
+        "EngineCore 启动 → load_model → compile_or_warm_up_model（gpu_worker.py:L679，ch17 站 6 锚点）",
+        "编译/捕获全部前移到第一个请求之前——运行期零惊喜的代价是启动 This usually takes 5~20 seconds（gpu_model_runner.py:L6912）",
+        "运行期每拍入口 = ch18 站 9 的 execute_model（本章站 10 接续）"
+      ]
+    },
+    {
+      "name": "出 · 每拍 hidden_states",
+      "role": "plain",
+      "zone": "north",
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "methods": [
+        "postprocess：hidden_states[logits_indices] 取每请求末 token → compute_logits（L4458-L4485，ch17 站 10 已立）",
+        "回放产出与 eager 同址同形——ExecuteModelState 暂存 → sample_tokens（两段式，ch17 已立）"
+      ]
+    },
+    {
+      "name": "① 档位表与切点账本",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        1,
+        2
+      ],
+      "file": "vllm/config/vllm.py + config/compilation.py",
+      "methods": [
+        "-O0..-O3：O0 无编译无图 / O1 +PIECEWISE /",
+        "O2（默认）= FULL_AND_PIECEWISE + 融合 pass（vllm.py:L104-L327）",
+        "custom_ops 基础档：Inductor → 'none' 否则 'all'（L1285-L1292）",
+        "切点清单 = _attention_ops 13 算子 + kv update 两算子",
+        "（L764-L778, L1133-L1184）；kv update 字符串参数阻止图复用（issue #33267）"
+      ]
+    },
+    {
+      "name": "② 构造期算子层",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        3,
+        4
+      ],
+      "file": "vllm/model_executor/custom_op.py + attention.py",
+      "methods": [
+        "CustomOp：forward_native / cuda / hip / cpu / xpu / tpu 多实现（L138-L172）",
+        "构造期 dispatch_forward 一次绑定 _forward_method（L130-L136）——运行期零分支",
+        "default_on：Inductor 时 'none'（编译器融合）否则 'all'（L295-L311）",
+        "RMSNorm 三实现（layernorm.py:L36-L122）",
+        "Attention 自注册 static_forward_context（attention.py:L443-L446，重名 raise）",
+        "forward 签名从此不见 attn_metadata"
+      ]
+    },
+    {
+      "name": "③ dispatcher keys 预生成",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        5
+      ],
+      "file": "vllm/v1/cudagraph_dispatcher.py",
+      "methods": [
+        "initialize_cudagraph_keys：capture_sizes × lora 生成全部 key（L166-L233）",
+        "FULL 档 num_reqs 精确——FA3 scheduler_metadata 依赖（L199-L202）",
+        "bs→padded 尺寸表：段内上取整（L72-L91）",
+        "上游最弱链降级 min_cg_support（runner L7161-L7202，→ ch21）"
+      ]
+    },
+    {
+      "name": "④ 启动编排",
+      "role": "gpu",
+      "zone": "center",
+      "stations": [
+        6
+      ],
+      "file": "vllm/v1/worker/gpu_worker.py",
+      "methods": [
+        "compile_or_warm_up_model（L679-L853）",
+        "warmup 逐尺寸 dummy run（L706-L708）→ kernel_warmup（L713）",
+        "→ capture_model（L715-L717）",
+        "sampler 预热：刻意在 capture 后防 empty_cache（L796-L816）",
+        "三纠察：JIT monitor / freeze GC / sync check（L822-L848）"
+      ]
+    },
+    {
+      "name": "⑤ 切图与逐片编译",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        7,
+        8
+      ],
+      "file": "vllm/compilation/backends.py",
+      "methods": [
+        "dummy 前向触发 Dynamo → VllmBackend.__call__（L1020，只调一次 L1168）",
+        "split_graph：should_split 命中即切",
+        "+ keep_original_order 保突变（L553-L627）",
+        "逐片 PiecewiseBackend(Inductor)（L687-L776）",
+        "每片包 CUDAGraphWrapper(PIECEWISE)（L633-L684）",
+        "丢 guard 一次编译（wrapper.py:L47-L154）"
+      ]
+    },
+    {
+      "name": "⑥ 捕获 · 从大到小",
+      "role": "gpu",
+      "zone": "center",
+      "stations": [
+        9
+      ],
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "methods": [
+        "capture_model：大图先捕、小图复用图池（L6829-L6831）",
+        "每形状先 eager 热身 → is_graph_capturing=True 捕一次（L6920-L6966）",
+        "捕后关捕获窗口：意外捕获即 RuntimeError（L6900 + monitor.py:L90-L99）"
+      ]
+    },
+    {
+      "name": "⑦ 一拍裁决 · 查表 · padding",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        10,
+        11,
+        12
+      ],
+      "file": "vllm/v1/cudagraph_dispatcher.py",
+      "methods": [
+        "一拍裁决（runner L4265 → L3932-L4044）：cascade / encoder 禁 FULL、DP 对齐",
+        "查表 dispatch：先 FULL 精确 key（L307-L311）→ 再 PIECEWISE relaxed",
+        "（L313-L318）→ miss 落 NONE（L320-L324）",
+        "padding 四件套：qsl 尾部非递减（L2073-L2078）/",
+        "block_table 尾行 NULL_BLOCK_ID（L2338-L2341）/",
+        "slot_mapping 尾部 -1（L4128-L4130）/ positions 清零（L3663-L3664）"
+      ]
+    },
+    {
+      "name": "⑧ 喂图 · 算子与回放",
+      "role": "gpu",
+      "zone": "center",
+      "stations": [
+        13,
+        14,
+        15
+      ],
+      "file": "vllm/compilation/cuda_graph.py",
+      "methods": [
+        "set_forward_context 注入 mode+descriptor（runner L4432-L4456）",
+        "——wrapper 盲信 context",
+        "统一算子 unified_attention_with_output（attention.py:L574-L581）",
+        "KV 写独立算子 dummy 依赖保序（L775-L798）；op 内 get_attention_context 按 layer_name 取（L732-L772）",
+        "回放命中：DEBUG data_ptr 断言 → replay()（L346-L361）",
+        "全图 wrapper：load_model 尾部 CUDAGraphWrapper(FULL)（runner L5467-L5469）"
+      ]
+    },
+    {
+      "name": "BatchDescriptor · 回放命中的 key",
+      "role": "gpu",
+      "zone": "south",
+      "file": "vllm/forward_context.py",
+      "methods": [
+        "frozen dataclass：num_tokens / num_reqs(可 None) / uniform / has_lora / num_active_loras（L29-L58）",
+        "「形状全等」的形式化；wrapper 以它为 dict key 查 concrete_cudagraph_entries（cuda_graph.py:L207）",
+        "ForwardContext 每拍携带 mode+descriptor（L131-L159）——thread-local 载体"
+      ]
+    },
+    {
+      "name": "why · 形状全等才能回放",
+      "role": "plain",
+      "zone": "south",
+      "kind": "note",
+      "methods": [
+        "CUDA graph 录的是参数快照：kernel 指针 / grid/block / 宿主端分支产出（FA3 scheduler_metadata）全烤死图内，replay 不重读 shape/地址元数据",
+        "命中 = BatchDescriptor 全等 AND 地址不变——前半由 dispatcher padding 供给，后半由 ch18 固定地址供给",
+        "运行期体检：DEBUG 逐 data_ptr 断言（cuda_graph.py:L346-L355）"
+      ]
+    },
+    {
+      "name": "三代切图方案并存（路线图）",
+      "role": "plain",
+      "zone": "south",
+      "kind": "note",
+      "methods": [
+        "正典 = Dynamo FX 预切图（本章 ⑥）；另两条默认关、作展望脚注",
+        "use_inductor_graph_partition（config/compilation.py:L669-L687）：Inductor codegen 后按 tag 分区——RoPE+KV cache 融合只在此模式",
+        "BreakableCUDAGraph（breakable_cudagraph.py:L3-L21）：运行期断点捕获，env VLLM_USE_BREAKABLE_CUDAGRAPH 默认 0（envs.py:L170）"
+      ]
+    },
+    {
+      "name": "F10 苗 · 量化与 kernel 的耦合 → ch27",
+      "role": "plain",
+      "zone": "south",
+      "kind": "note",
+      "methods": [
+        "blocked weights → custom_ops 强制 '+quant_fp8'（config/vllm.py:L1261-L1268，注释：On H100 the CUDA kernel is faster than native）",
+        "query_quant：simple torch operation 让 torch.compile 融合进前序算子（attention.py:L514-L524）",
+        "PassConfig fuse_norm_quant / fuse_act_quant / fuse_attn_quant（config/compilation.py:L121-L126）——量化算子贴着 norm/attention 长出来"
+      ]
+    }
+  ],
+  "flows": [
+    {
+      "from": "入 · 启动序列（无请求在场）",
+      "to": "① 档位表与切点账本",
+      "label": "配置期先于一切"
+    },
+    {
+      "from": "① 档位表与切点账本",
+      "to": "② 构造期算子层",
+      "label": "load_model 构造期"
+    },
+    {
+      "from": "② 构造期算子层",
+      "to": "③ dispatcher keys 预生成",
+      "label": "initialize_kv_cache 期"
+    },
+    {
+      "from": "③ dispatcher keys 预生成",
+      "to": "④ 启动编排",
+      "label": "启动序列"
+    },
+    {
+      "from": "④ 启动编排",
+      "to": "⑤ 切图与逐片编译",
+      "label": "首个 dummy 前向"
+    },
+    {
+      "from": "⑤ 切图与逐片编译",
+      "to": "⑥ 捕获 · 从大到小",
+      "label": "capture_model"
+    },
+    {
+      "from": "⑥ 捕获 · 从大到小",
+      "to": "⑦ 一拍裁决 · 查表 · padding",
+      "label": "第一个请求到来"
+    },
+    {
+      "from": "⑦ 一拍裁决 · 查表 · padding",
+      "to": "⑧ 喂图 · 算子与回放",
+      "label": "固定地址喂图（ch18 接口）"
+    },
+    {
+      "from": "⑧ 喂图 · 算子与回放",
+      "to": "出 · 每拍 hidden_states",
+      "label": "replay 产出",
+      "up": true,
+      "color_role": "engine"
+    },
+    {
+      "from": "⑦ 一拍裁决 · 查表 · padding",
+      "to": "BatchDescriptor · 回放命中的 key",
+      "label": "查表用 key",
+      "dash": true
+    },
+    {
+      "from": "⑧ 喂图 · 算子与回放",
+      "to": "why · 形状全等才能回放",
+      "label": "断言即体检",
+      "dash": true
+    },
+    {
+      "from": "⑤ 切图与逐片编译",
+      "to": "三代切图方案并存（路线图）",
+      "label": "正典是其一",
+      "dash": true
+    },
+    {
+      "from": "② 构造期算子层",
+      "to": "F10 苗 · 量化与 kernel 的耦合 → ch27",
+      "label": "同算子换 kernel",
+      "dash": true
+    }
+  ],
+  "loop": {
+    "label": "每拍循环 ⑦→⑧（下一拍回到 ⑦ 重新裁决）——①-⑥ 启动期只走一次：①配置期、②load_model、③KV 初始化、④-⑥warmup/编译/捕获窗口"
+  },
+  "stations": [
+    {
+      "n": 1,
+      "where": "vllm/config/vllm.py:L229-L327",
+      "what": "档位表：-O0..-O3 预设（OptimizationLevel L104-L116）——O0 无编译无图、O1 Dynamo+Inductor+PIECEWISE、O2（默认，L409）= FULL_AND_PIECEWISE + 按硬件谓词的融合 pass。落账在 VllmConfig post_init（L1272-L1300：optimization_level>O0 → mode=VLLM_COMPILE；custom_ops 基础档 Inductor→'none' 否则 'all'，L1285-L1292）。量化侧伏笔：blocked weights → 强制 '+quant_fp8'（L1261-L1268 注释自述 On H100 the CUDA kernel is faster than native）【F10 苗】"
+    },
+    {
+      "n": 2,
+      "where": "vllm/config/compilation.py:L1133-L1184",
+      "what": "切图点清单 set_splitting_ops_for_v1：splitting_ops = _attention_ops 13 个算子（L764-L778）+ unified_kv_cache_update/unified_mla_kv_cache_update（L1183-L1184——其字符串参数阻止 Inductor 复用 piecewise 图，issue #33267 注释原话，故移出编译图）；注释：full cudagraph 也保留 piecewise fx 图结构、在全图外捕（PR #20059）"
+    },
+    {
+      "n": 3,
+      "where": "vllm/model_executor/custom_op.py:L174-L207",
+      "what": "CustomOp 构造期 dispatch：每个算子（如 RMSNorm，layernorm.py:L36-L122 的 register(\"rms_norm\")+forward_native/forward_cuda/forward_xpu）在 __init__ 一次性把 _forward_method 绑定为当前平台/开关的具名方法（L130-L133）；enabled()（±name 开关，L271-L293）→ disabled 走 maybe_compile(forward_native)（L209-L269：op 内调用的算子对模型级 torch.compile 不可见，故单独编译）；default_on()：Inductor 时 'none'（让编译器融合）否则 'all'（L295-L311）。运行期 forward 只一次属性转发零分支（L135-L136）——『kernel 融合』与『手工 fused kernel』二选一的解法"
+    },
+    {
+      "n": 4,
+      "where": "vllm/model_executor/layers/attention/attention.py:L443-L446",
+      "what": "Attention 构造自注册：prefix 重名即 raise（L444-L445）、注册进 compilation_config.static_forward_context[prefix]（L446）——『模型定义域在构造期产出层注册表，本域在运行期消费』；use_direct_call = not current_platform.opaque_attention_op()（L437-L441）平台决定走 torch op 还是直调。forward 签名从此不见 attn_metadata（metadata 透传旧设计的终结）"
+    },
+    {
+      "n": 5,
+      "where": "vllm/v1/cudagraph_dispatcher.py:L166-L233",
+      "what": "keys 预生成：initialize_cudagraph_keys 按 cudagraph_capture_sizes × lora_cases 笛卡尔积生成全部合法 BatchDescriptor key（cudagraph_keys 是『运行期合法图的唯一真相源』docstring L20-L24）；FULL 档要求 num_reqs 精确——注释原话 FULL mode needs exact num_reqs because FA3's scheduler_metadata computation depends on it（L199-L202），PIECEWISE 放宽 num_reqs=None（L201-L203）；bs→padded 尺寸表 L72-L109（段内上取整、compile_sizes 不得被 padding 改写）。上游：_check_and_update_cudagraph_mode 最弱链降级（gpu_model_runner.py:L7161-L7202 → resolve_cudagraph_mode_and_sizes，config/compilation.py:L1368-L1472）"
+    },
+    {
+      "n": 6,
+      "where": "vllm/v1/worker/gpu_worker.py:L679-L853",
+      "what": "启动编排 compile_or_warm_up_model：warmup_sizes 逐个 _dummy_run（L706-L708，首个 dummy 前向触发站 7-8 的编译）→ kernel_warmup 调优（L713）→ capture_model（L715-L717，站 9）→ 末 PP 段 sampler 预热（L796-L816，NOTE 刻意在 capture 后防 empty_cache 清缓冲）→ trigger_inductor_lazy_init（L822-L830，注释 rather than on a later compile cache-miss at runtime）→ activate_jit_monitor（L832-L839）→ freeze_gc_heap（L841-L844）→ enable_gpu_sync_check（L846-L848）——编译/捕获/warmup/防退化全部前移，运行期零惊喜"
+    },
+    {
+      "n": 7,
+      "where": "vllm/compilation/backends.py:L1020-L1179",
+      "what": "首次前向切图：warmup 的 dummy run 触发 Dynamo trace → VllmBackend.__call__（L1020；can only be called once，L1168）→ split_graph(graph, fx_split_ops)（L1179 调用 → L553-L627 算法：遍历 FX 节点按 should_split（partition_rules.py:L14-L38）编 subgraph_id，连续切点合并 L583-L589、空子图回并 L593、keep_original_order=True 保突变语义 L595-L608——注释原话 otherwise pytorch might reorder the nodes and the semantics of the graph will change when we have mutations）"
+    },
+    {
+      "n": 8,
+      "where": "vllm/compilation/backends.py:L687-L776",
+      "what": "逐片编译：PiecewiseCompileInterpreter.call_module 把非切分子图建 PiecewiseBackend（Inductor 编译，L755-L764）→ wrap_with_cudagraph_if_needed 挂回（L766-L772 ← L633-L684：每片包 CUDAGraphWrapper(PIECEWISE)，首片 debug 日志/非首片 gc_disable/末片 weak_ref_output）。防重编译由 TorchCompileWithNoGuardsWrapper 丢全部 guard + fullgraph=True + dynamic=False 一次编译永不回看（wrapper.py:L47-L154）。接缝（每层 attention+KV update）仍 eager——flash_attn.py:L880-L888 NOTE 原话：view/slice surprisingly slow even when they do not invoke any GPU ops"
+    },
+    {
+      "n": 9,
+      "where": "vllm/v1/worker/gpu_model_runner.py:L6814-L6918",
+      "what": "捕获：capture_model 先 set_cudagraph_capturing_enabled(True)（L6832）；从大到小（L6829-L6831 注释原话 Capture the large shapes first so that the smaller shapes can reuse the memory pool；get_capture_descs 降序 cudagraph_dispatcher.py:L326-L350）；逐形状 _warmup_and_capture（L6920-L6966：先 num_warmups 次 eager dummy（mode=NONE）→ is_graph_capturing=True 捕一次）；捕完 set_cudagraph_capturing_enabled(False)（L6900）——意外捕获直接 RuntimeError（monitor.py:L90-L99）；This usually takes 5~20 seconds（L6912）"
+    },
+    {
+      "n": 10,
+      "where": "vllm/v1/worker/gpu_model_runner.py:L4265-L4278",
+      "what": "一拍①裁决：execute_model 内 _determine_batch_execution_and_padding（L3932-L4044：dispatch_cudagraph 闭包 L3977-L3985；cascade attention / encoder 输入禁 FULL（L3987-L3989）；DP 各 rank coordinate_batch_across_dp 对齐后 re-dispatch（L4004-L4027——cudagraph key 不一致会让集合通信挂死）；CUDAGraphStat num_paddings 观测 L4029-L4036）"
+    },
+    {
+      "n": 11,
+      "where": "vllm/v1/cudagraph_dispatcher.py:L235-L324",
+      "what": "一拍②查表 dispatch：越界/未初始化/超 max_size 落 NONE（L274-L281）→ 构造 padded batch_desc（_create_padded_batch_descriptor L132-L156）→ 先查 FULL 精确 key（L307-L311）→ 再查 PIECEWISE relaxed key（num_reqs=None，L313-L318）→ 都 miss 落 NONE eager（L320-L324）。invalid_modes 供 cascade 等场景禁 FULL"
+    },
+    {
+      "n": 12,
+      "where": "vllm/v1/worker/gpu_model_runner.py:L2073-L2078",
+      "what": "一拍③padding 四件套（主锚 query_start_loc 尾部填非递减——注释原话 kernels like FlashAttention requires that）：block_table 尾行填 NULL_BLOCK_ID（L2338-L2341，Block 0 is reserved for padding）、slot_mapping 尾部填 -1（L4128-L4130，KV 写 kernel 跳过 pad 槽）、positions 尾部清零（L3663-L3664）——把每拍变形的 batch 塞进捕获时的固定形状"
+    },
+    {
+      "n": 13,
+      "where": "vllm/v1/worker/gpu_model_runner.py:L4432-L4456",
+      "what": "一拍④注入：set_forward_context(attn_metadata, num_tokens_padded, cudagraph_runtime_mode=cudagraph_mode, batch_descriptor=batch_desc, slot_mapping) 内 _model_forward（L3879-L3909）——mode+descriptor 经 thread-local（vllm/forward_context.py:L259-L344）传给图内的 wrapper；判责在 dispatcher、wrapper 盲信（cuda_graph.py:L240-L254）。上方注释 Run the model. Use persistent buffers for CUDA graphs.——ch18 固定地址的接口"
+    },
+    {
+      "n": 14,
+      "where": "vllm/model_executor/layers/attention/attention.py:L488-L582",
+      "what": "一拍⑤算子化前向：每个 Attention 层 forward 预分配 output（L531）、QKV reshape 刻意在 op 外（NOTE L534-L535 minimize the CPU overheads）→ torch.ops.vllm.unified_attention_with_output（L574-L581）；KV 写拆成独立算子 unified_kv_cache_update（L775-L798，返回 key.new_empty(0) 作 dummy 数据依赖传入保序——L829-L832 注释原话 accepting it creates a data dependency that ensures torch.compile preserves ordering）；op 内 get_attention_context（L732-L772）按 layer_name 从 ForwardContext 取 metadata/kv_cache/slot_mapping——不设 context 直接 assert 崩（forward_context.py:L199-L205）"
+    },
+    {
+      "n": 15,
+      "where": "vllm/compilation/cuda_graph.py:L233-L361",
+      "what": "一拍⑥回放：CUDAGraphWrapper.__call__ 从 forward_context 取 mode+descriptor（盲信，L240-L254）→ key 命中：DEBUG 模式逐 data_ptr 断言与捕获时一致（L346-L355 错误信息原话 Input addresses for cudagraphs are different during replay）→ cudagraph.replay()（L360）；未命中即捕（L265-L337：validate_cudagraph_capturing_enabled 先验、共享图池、输出弱引用）。全图 wrapper 挂载点：load_model 尾部 CUDAGraphWrapper(FULL)（gpu_model_runner.py:L5467-L5469）——FULL 在模型外、PIECEWISE 在编译器内的每片上，各认领自己的 mode"
+    }
+  ]
+}

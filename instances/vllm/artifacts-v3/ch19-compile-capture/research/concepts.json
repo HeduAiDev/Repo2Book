@@ -1,0 +1,331 @@
+{
+  "chapter_id": "ch19",
+  "chapter_title": "编译与捕获",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "generated_by": "researcher",
+  "generated_date": "2026-08-29",
+  "note": "立项裁决:本章 introduces 四件套(CustomOp/piecewise 编译/CUDA Graph/forward context)全部产卡,且按「CUDA Graph 全量首讲」展开(ch18 的 cuda-graph-replay-fixed-address 只埋『地址固定』前提,明确把首讲让给本章;ch12 已有 cuda-streams-events-pinned-memory,ch13 已有 triton-gpu-language——流与 Triton 语言不重复产卡,只补「JIT 首次调用才编译+磁盘缓存」增量)。全书 pedagogy-plan 中 torch.compile/Dynamo/Inductor 仅本章出现——本章是整套编译栈的门,故产 torch-compile 管线/守卫/fx/算子库四张外部卡。从 v2 ch23 存量复用 5 张(torch-compile-dynamo-inductor-pipeline / fx-graphmodule-split-module / op-qualified-name-notation / torch-library-custom-op-fake-impl / rmsnorm-paper),sources/writer_note 保留并按 2026-08-29 新抓取补强;新增 12 张(guards/piecewise/cuda-graph 首讲/图池共享/launch 开销/融合/CustomOp 模式/forward context 线程局部/gc.freeze/GCC -O 记法/Triton 缓存/weakref)。不产 competing_set:本章无真正的外部竞争项目集(CUDAGraphMode 三态是 vLLM 内部策略集,属正文内容而非外部生态)。skipped:v2 的 inductor-pre-post-grad-passes(ch19 不走 Inductor pass 清单)、frozen-dataclass(ch18 dataclasses 卡已覆盖)、contextvars(vLLM 用的是 threading.local 级别的线程局部,不需要 async 任务上下文)。版本敏感处:PyTorch 文档按 2.13(2026-08-29 抓取)、vLLM 设计文档 cuda_graphs 页标注日期 2026-06-23、custom_op/torch_compile 页 2026-08-29 抓取,均与 pin v0.27.1 口径互恰;Triton 缓存细节(~/.triton/cache、TRITON_CACHE_DIR)官方 API 页过薄,靠 PyTorch 官方缓存教程+红帽技术博客补,整卡标 medium。无需 Lead 决断项。",
+  "concepts": [
+    {
+      "id": "torch-compile-dynamo-inductor-pipeline",
+      "term": "torch.compile / Dynamo / Inductor 编译管线",
+      "kind": "external_project",
+      "one_line": "PyTorch 官方的「把 Python 模型编译成优化代码」工具链:Dynamo 负责『读懂』Python 代码抓成计算图,Inductor 负责『优化』这张图并生成快代码。",
+      "what_it_is": "eager(急切)模式下,PyTorch 逐行执行你写的每个算子:每来一个 op,过一遍 Python 解释、参数检查、dispatch,再启动一个 GPU kernel——灵活但开销大。torch.compile 换一条路:先用 Dynamo 把 Python 函数追踪(trace)成一张 FX 计算图(官方教程原话:『torch.compile accomplishes this by tracing through your Python code, looking for PyTorch operations』),交给后端编译器(默认 Inductor)优化——融合算子、减少内存读写——再生成新代码(Triton kernel)替换原函数。官方教程一句话总结收益来源:『Speedup mainly comes from reducing Python overhead and GPU read/writes』。pipeline 三段:Dynamo(抓图,遇不支持的 Python 特性就 graph break 退回 eager)→ FX Graph(算子级中间表示)→ Inductor(把图编成 Triton/C++ 代码)。vLLM 的 -O 系列编译等级正是控制这条管线开到哪一段。",
+      "background": "PyTorch 起家靠 eager 的易用性(对比 TF1 的先建图后执行),代价是执行期开销;2022 年 PyTorch 2.0 推出 torch.compile,用「运行时追踪 + 编译」折中:第一次跑的时候抓图编译,之后跑编译产物。Inductor 生成 GPU 代码的语言正是 Triton(ch13 已讲)。vLLM 从 V1 架构起把 torch.compile 纳入执行臂:默认 -O2(全模型编译 + 分段),把 transformer 层里的常规算子交给编译器融合,注意力单独切出。",
+      "links": [
+        "https://docs.pytorch.org/docs/stable/torch.compiler.html",
+        "https://pytorch.org/tutorials/intermediate/torch_compile_tutorial.html",
+        "https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747"
+      ],
+      "sources": [
+        "https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html — 2026-08-29 抓取:『Speedup mainly comes from reducing Python overhead and GPU read/writes』、tracing 定义",
+        "https://docs.pytorch.org/docs/stable/torch.compiler.html — torch.compiler 总文档(链接门)",
+        "v2 ch23 存量(2026-07-24 抓取):pytorch.org Dynamo 概览/graph breaks 索引/uwplse 博客——Dynamo→FX→backend 三段与 graph break 机制(复用)"
+      ],
+      "confidence": "high",
+      "writer_note": "本章是全书唯一讲编译栈的章(pedagogy-plan 核过,别章不出现)——值得花半节把三段管线讲实:trace 发生在第一次调用、编译产物有守卫(下一卡)、Inductor 产物是 Triton kernel(呼应 ch13)。深度留给链接。"
+    },
+    {
+      "id": "torch-compile-guards-recompile",
+      "term": "守卫(guards)与重编译(recompilation)",
+      "kind": "external_concept",
+      "one_line": "torch.compile 的每次产物都附带一组『入场检查』——形状变了、常量变了就不许复用,必须重编译;检查太多次后干脆放弃、退回 eager。",
+      "what_it_is": "编译产物只对『抓图时的那些条件』成立:输入张量的形状、dtype、Python 常量的值……Dynamo 把这些条件做成一组轻量检查(guards),每次调用先跑检查、通过才用编译产物,不通过就叫一次『guard failure』触发重编译(官方 API 文档:『A single frame may be compiled multiple times if previous compiled results are not applicable for subsequent calls — this is called a \"guard failure\"』,可用 TORCH_LOGS=guards 观察)。重编译有上限:『Multiple compiled results can be associated with a frame up to torch._dynamo.config.recompile_limit, which defaults to 8, at which point we will fall back to eager』(recompilation 指南同义表述:超过默认 8 次后『all future compilation attempts will result in the function being skipped (run eagerly)』)。形状为什么会变:vLLM 的 torch_compile 设计文档点破——『torch.compile is designed to guard on dynamic shapes with no hesitation when needed』,动态形状天然带来形状守卫,而推理的 batch/seq 恰恰每步都在变。两个关键开关:dynamic=False 时『we will NEVER generate dynamic kernels, we will always specialize』(全部特化、锁死形状);fullgraph=True 时『we require that the entire function be capturable into a single graph』『if there are graph breaks, then this will raise an error』(不许中途逃回 eager)。",
+      "background": "guards 是「编译产物可复用」与「Python 太灵活」之间的折中:Python 函数可以对任何输入做任何事,编译器只能对满足假设的输入负责,于是把假设写成检查挂在产物门口。对 vLLM 这类形状每步都变的服务,这是一把双刃剑:好处是形状检查兜住正确性,坏处是变一次形状重编一次、8 次封顶退 eager——所以 vLLM 在捕获(capture)路径上干脆把守卫整个丢掉(TorchCompileWithNoGuardsWrapper):捕获时形状是喂进去的精确形状、之后永远按形状全等回放,守卫已无事可查,留着只会在每步重放前白跑一遍。",
+      "example": "```python\nf = torch.compile(model, fullgraph=True, dynamic=False)\nf(x_b8)   # 第 1 次调用:追踪 + 编译;产物门口挂上 guards,如「x.shape == (8, 4096)」\nf(x_b8)   # guards 通过 → 直接跑编译产物\nf(x_b16)  # 形状守卫失败 → guard failure → 重编译出第二个产物(门口挂 (16, 4096) 检查)\n# ……累计 8 个产物后:recompile_limit 到顶,之后的形状直接退回 eager 执行\n```\n逐行要点:第 1 行的两个参数正是 vLLM 捕获路径的取法——fullgraph=True 禁止 graph break(图必须完整可捕获),dynamic=False 强制全特化(形状钉死,配合 CUDA Graph 的形状全等前提)。守卫丢弃的安全性由「回放形状恒等于捕获形状」保证,而非由守卫保证。",
+      "links": [
+        "https://docs.pytorch.org/docs/stable/generated/torch.compile.html",
+        "https://docs.pytorch.org/docs/stable/user_guide/torch_compiler/compile/programming_model.recompilation.html",
+        "https://docs.vllm.ai/en/latest/design/torch_compile/"
+      ],
+      "sources": [
+        "https://docs.pytorch.org/docs/2.13/generated/torch.compile.html — 2026-08-29 抓取:guard failure 定义、recompile_limit 默认 8 回退 eager、dynamic=False『we will always specialize』、fullgraph=True 语义",
+        "https://docs.pytorch.org/docs/2.13/user_guide/torch_compiler/compile/programming_model.recompilation.html — 2026-08-29 抓取:cache_size_limit 默认 8、超限 skipped (run eagerly)、『if the guards pass』、int/float 按精确值被守卫",
+        "https://docs.vllm.ai/en/latest/design/torch_compile/ — 2026-08-29 抓取:『torch.compile is designed to guard on dynamic shapes with no hesitation when needed』、backed/unbacked 动态形状守卫"
+      ],
+      "confidence": "high",
+      "writer_note": "这是理解 TorchCompileWithNoGuardsWrapper 的前置卡:先讲清「守卫=产物门口的形状检查、失败=重编译、8 次退 eager」,再讲 vLLM 丢守卫就不突兀。dynamic=False / fullgraph=True 两个取值要在正文点名——它们分别对应「形状钉死」和「图必须完整」。"
+    },
+    {
+      "id": "fx-graphmodule-split-module",
+      "term": "FX / GraphModule 与 split_module(计算图中间表示与切图工具)",
+      "kind": "external_concept",
+      "one_line": "torch.fx 是 PyTorch 的「计算图中间表示」层:把模型表示成一张可以程序化查看、改写、切块的图;split_module 就是官方提供的『按规则把一张图切成多块』的刀具。",
+      "what_it_is": "FX 用 Graph(节点列表,每个节点是一次 op 调用)+ GraphModule(把图包回一个可像 nn.Module 一样调用的对象)表示模型。节点可以逐个解释执行——fx 文档把这套叫 interpreter pattern:『loop over all the Nodes in a Graph and execute them』,而 Interpreter 类『encompasses the above logic in a way that certain aspects of the interpreter's execution can be overridden via method overrides』(通过覆写方法挂钩每个节点的执行)。torch.fx.passes.split_module.split_module 则按回调规则把一张 GraphModule 拆成若干子模块:回调对每个节点返回一个分组标签,同标签的节点归入同一子模块;keep_original_order=True 时子模块间的调用顺序保持与原图一致(拆完不重排)。vLLM 两个用法都在本章:split_graph 用 split_module 按『注意力算子处切开』把整图拆段;PiecewiseCompileInterpreter 继承 fx.Interpreter、逐节点解释执行编译后的段。",
+      "background": "PyTorch 历来缺一张「显式的图」:eager 模式下模型就是 Python 代码,没有可整体优化的中间表示。FX(2021)补上这一层:符号追踪(symbolic trace)跑一遍模型录下 op 序列成图。它是 Dynamo 之前的图捕获方案,至今仍是「拿到一张可改写的图」的标准工具——vLLM 的分段编译正是拿 Dynamo 抓出的图(FX 格式)再加工,而不是自己解析 Python。",
+      "example": "```python\nimport torch\nimport torch.fx as fx\n\ndef f(x, w):\n    return (x * w).sigmoid().sum()\n\ngm = fx.symbolic_trace(f)          # 追踪成图\nprint(gm.graph)                    # 逐节点: %x, %w, call_function[mul], call_function[sigmoid], call_function[sum], return\n# split_module(gm, module_root, split_callback, keep_original_order=True)\n# split_callback(node) 对每个节点返回标签,如「mul→段0, sigmoid→段0, sum→段1」\n# → 产出 gm.submod_0(mul+sigmoid) / gm.submod_1(sum),调用顺序与原图一致\n```\n逐行要点:symbolic_trace 后,原来写死在 Python 里的执行顺序变成了显式的节点链——这是「能切图」的前提;split_callback 是唯一的切图规则入口,vLLM 把它写成「碰到注意力算子就换段」。",
+      "links": [
+        "https://docs.pytorch.org/docs/stable/fx.html",
+        "https://docs.pytorch.org/docs/stable/generated/torch.fx.passes.split_module.split_module.html"
+      ],
+      "sources": [
+        "https://docs.pytorch.org/docs/2.13/fx.html — 2026-08-29 抓取:interpreter pattern『loop over all the Nodes in a Graph and execute them』、Interpreter 可覆写挂钩",
+        "v2 ch23 存量(2026-07-24 抓取):fx.html / split_module API 页——split_callback 分组语义与 keep_original_order 保序语义(复用)"
+      ],
+      "confidence": "high",
+      "writer_note": "split_module 的「回调打标签 + keep_original_order 保序」语义要讲准——这正是 vllm VllmBackend.split_graph 的刀具;fx.Interpreter 一句话带过即可(PiecewiseCompileInterpreter 只继承它逐节点跑,不是新魔法)。"
+    },
+    {
+      "id": "op-qualified-name-notation",
+      "term": "算子限定名记法 namespace::name",
+      "kind": "notation",
+      "one_line": "PyTorch 里每个算子的正式身份证是「命名空间::名字」——aten::add 是老核心库的加法,vllm::unified_attention_with_output 是 vLLM 注册的新算子;看到 :: 就知道这是注册进算子体系、可被 dispatch 的正式算子名。",
+      "what_it_is": "PyTorch 的算子(op)按「命名空间::名字」登记:aten(老核心,add/mul/matmul 全在这)、prims、以及各项目自建命名空间(vLLM 用 vllm)。这不是字符串装饰——限定名是 dispatcher 的索引键:torch.library 注册、按 dispatch key 找 kernel、错误信息里指认算子,用的全是这个名。配套还有两层对象要分清:torch.ops.aten.add 是 OpOverloadPacket(「一族重载」的包),torch.ops.aten.add.Tensor 才是 OpOverload(具体到某个签名的重载);给 torch.library.register_fake 之类 API 传名字时,要的是能唯一定位的那一层。torch.library 文档原话:『A class to create libraries that can be used to register new operators or override operators in existing libraries』,Library 的 kind 就有 DEF/IMPL/FRAGMENT 三种注册姿势。",
+      "background": "PyTorch 早期算子散落 C++ 各处、没有统一命名;引入 dispatcher 与算子注册体系(aten:: 命名空间)后,「一个名字、多个后端实现」才有了落点:名字挂在命名空间下,实现按 dispatch key(CUDA/CPU/Meta……)各注册一份。vLLM 把注意力包装成 vllm::unified_attention_with_output 这样的正式算子,正是为了登上这套体系——只有正式算子才能出现在 FX 图里被 Dynamo 追踪、被编译器当「一个节点」对待。",
+      "example": "```python\nimport torch\n\ntorch.ops.aten.add          # OpOverloadPacket:add 的「重载包」\ntorch.ops.aten.add.Tensor   # OpOverload:具体签名 add.Tensor(Tensor self, Tensor other) -> Tensor\n\n# vLLM 侧(示意,据 vLLM 编译设计文档的算子名):\n# torch.library 注册后,图里这个节点显示为调用目标 vllm::unified_attention_with_output\n#   —— 切图规则(splitting_ops)认的就是这类限定名\n```\n逐行要点:包(add)与重载(add.Tensor)差一层精度——注册 fake 实现等 API 需要精确到重载;vllm:: 前缀说明注意力已被抬升为「PyTorch 正式算子」,不是普通 Python 函数。",
+      "links": [
+        "https://docs.pytorch.org/docs/stable/library.html",
+        "https://docs.pytorch.org/docs/stable/ops.html"
+      ],
+      "sources": [
+        "https://docs.pytorch.org/docs/2.13/library.html — 2026-08-29 抓取:Library『register new operators or override operators in existing libraries』、DEF/IMPL/FRAGMENT kind、dispatch key 注册",
+        "v2 ch23 存量(2026-07-24 抓取): aten::add / vllm::unified_attention_with_output 的限定名与 OpOverloadPacket/OpOverload 区分(复用)"
+      ],
+      "confidence": "high",
+      "writer_note": "第一次出现 aten::/vllm:: 限定名时用这张卡解释「为什么名字里有 ::」;OpOverloadPacket vs OpOverload 点一句即可,深挖留链接。"
+    },
+    {
+      "id": "torch-library-custom-op-fake-impl",
+      "term": "torch.library 自定义算子(与 fake 实现/mutates_args)",
+      "kind": "external_concept",
+      "one_line": "把一个普通 Python 函数注册成 PyTorch 正式算子的官方 API:注册时声明「它改不改输入」(mutates_args)、补一个「只算形状不碰数据」的 fake 实现,编译器就能把它当图里的一个不透明节点正确处理。",
+      "what_it_is": "官方教程定位:自定义算子让你『treat an arbitrary Python function as an opaque callable with respect to torch.compile and/or torch.export』,一句话点透本质——给编译器一个显式边界:『A custom operator gives PyTorch an explicit boundary. Use it when tracing into the implementation is impossible or undesirable.』(实现里有 Triton kernel、C++ 扩展、或不希望被追踪时)。三个关键件:① mutates_args——可变算子『must list every mutated argument in mutates_args』,没列的参数不许改;② register_fake(fake kernel)——『must return tensors with the same metadata as the real kernel: shape, dtype, device, layout, strides』且『may inspect metadata, but must not read tensor data』;文档直言『The FakeTensor kernel is necessary (but not sufficient) for the operator to work with PyTorch compilation APIs』——没有它,追踪(需要推出输出形状)直接卡住;③ 按设备注册实现:torch.library 文档『Register an implementation for a device type for this operator』,『Some valid device_types are: \"cpu\", \"cuda\", \"xla\", \"mps\", \"ipu\", \"xpu\"』——同一个算子名,CUDA 一份 kernel、CPU 一份 kernel,由 dispatcher 按输入所在设备挑(dispatch key:『dispatch key that the input function should be registered for』)。这套「一个名字 × 多后端实现 × 编译期 fake」正是 vLLM 把注意力注册成 vllm::unified_attention_with_output 时踩的官方轨道。",
+      "background": "PyTorch 1.x 时代扩展算子要写 C++/pybind,门槛高;torch.library(2.4 起把 register_fake 定名,文档注明『This API was renamed to torch.library.register_fake() in PyTorch 2.4』)让纯 Python 注册成为一等公民。它解决三件事:让第三方 kernel 进得了计算图(编译器看得见)、按设备自动选实现(dispatcher)、追踪时不真正跑 kernel(fake 实现)。vLLM 的 unified_attention_with_output 带 out 变体(把输出写进给定 buffer)正需要 mutates_args 声明,F10 埋点(ch27 量化的 +quant_fp8 过滤器)也走同一条注册轨道。",
+      "example": "```python\nimport torch\n\n# 说明性骨架(据 PyTorch 官方教程的模式,2026-08-29 抓取):\nmy_op = torch.library.custom_op(\"mylib::my_kernel\", mutates_args={\"out\"})(\n    def my_kernel(x: torch.Tensor, out: torch.Tensor) -> None:\n        out.copy_(x * 2)            # 真实实现:改写 out —— 所以 out 必须列进 mutates_args\n)\n\n@my_op.register_fake\ndef _(x, out):                     # fake 实现:不碰数据,只保证元数据(shape/dtype)正确\n    return None\n\nx = torch.randn(4, device=\"cuda\")\nout = torch.empty(4, device=\"cuda\")\nwith torch.compile(fullgraph=True):  # 有 fake 实现,追踪时不需要真跑 kernel\n    my_op(x, out)\n```\n逐行要点:mutates_args={\"out\"} 是对编译器的「副作用申报」——不申报就改输入,编译器优化时会把改写当没发生;register_fake 让 Dynamo 追踪阶段拿到输出形状而不执行 kernel;若在 CUDA 上注册过实现而没注册 CPU 实现,CPU 调用会报 no kernel 错——这就是「一名字多实现」的分发本质。",
+      "links": [
+        "https://docs.pytorch.org/tutorials/advanced/python_custom_ops.html",
+        "https://docs.pytorch.org/docs/stable/library.html"
+      ],
+      "sources": [
+        "https://docs.pytorch.org/tutorials/advanced/python_custom_ops.html — 2026-08-29 抓取:opaque 边界两句原话、mutates_args『must list every mutated argument』、fake kernel 元数据/不碰数据、opcheck 校验",
+        "https://docs.pytorch.org/docs/2.13/library.html — 2026-08-29 抓取:impl 按设备注册(device_types cpu/cuda/xla/…)、dispatch key、register_fake 2.4 定名",
+        "v2 ch23 存量(2026-07-24 抓取):direct_register_custom_op 作为薄包装的定位(复用)"
+      ],
+      "confidence": "high",
+      "writer_note": "unified_attention_with_output 出场前必须先讲这张卡:opaque 边界(编译器不试图看穿注意力内部)、mutates_args(out 变体改写输出 buffer)、register_fake(追踪不真跑)。PyTorch dispatcher 的「一名字多实现」天然是 vLLM CustomOp 的对照系——放下一张卡。"
+    },
+    {
+      "id": "vllm-custom-op-multi-backend",
+      "term": "vLLM CustomOp 多后端分发模式",
+      "kind": "custom_pattern",
+      "one_line": "vLLM 自己的一套「一个算子、多份实现、启动时一次选好」模式:子类同时提供 forward_native/forward_cuda/forward_hip/… 若干份实现,构造时按当前平台把其中一份钉死为该实例的 forward。",
+      "what_it_is": "官方设计文档定义:CustomOp 是『an abstract class used for dispatching the forward method of various operations to the appropriate backend』,同时是 vLLM 与 OOT(Out-Of-Tree,树外设备插件)『register their custom operations』的机制。分发规则(按 current_platform):CPU→forward_cpu、CUDA→forward_cuda、ROCm→forward_hip(『If forward_hip() is not implemented, it will use forward_cuda() as a fallback』)、XPU→forward_xpu、TPU→forward_tpu、OOT 平台→forward_oot,一律兜底到 forward_native(纯 PyTorch 实现)。注册:@CustomOp.register(\"op_name\") 进 op_registry;树外设备(vllm-ascend/vllm-spyre/vllm-musa)用 @CustomOp.register_oot 同名覆盖,『without directly modify vLLM』。与编译的联动由 compilation_config.custom_ops 控制:没被点名的算子,配置里有 all 就启用、有 none 就禁用(两者互斥);默认规则——backend 是 inductor 且模式非 NONE 时追加 none,理由文档写得很直白:『Inductor generates (fused) Triton kernels for those disabled custom ops』(禁用后 Inductor 会为这些算子生成融合的 Triton kernel,常能更快);否则追加 all。命令行还支持点名单:'[\"all,-op1\"]'(全开但关掉 op1)/'[\"none,+op1,+op2\"]'(全关但只开这两个)。关键工程细节:这份分发是在**构造时**完成的——按平台把选中的实现绑定成实例的 forward,之后每次调用零分发开销(不再是每次调用都问一遍「我在哪个平台」);这区别于 PyTorch dispatcher「每次调用过 dispatch key」的路线,是用户层自己实现的一次性分发。",
+      "background": "动机:同一个算子(RMSNorm、RoPE、激活函数……)在不同硬件上最优实现不同——CUDA 有手写/第三方 kernel,冷门硬件只有纯 PyTorch 兜底;而 vLLM 的算子还要能整体被编译。CustomOp 是 vLLM 在 torch.library 之外维护的用户层多后端体系:前者(dispatcher)管「算子进图、编译器可见」,后者(CustomOp)管「vLLM 代码库内部一份代码跑遍所有硬件」。两者在注意力处会师:注意力走 torch.library 注册成正式算子,普通算子走 CustomOp。enabled()/default_on() 协议决定算子默认开不开,编译配置再按上面规则收口。",
+      "example": "```python\n# 说明性骨架:据 vLLM CustomOp 设计文档(2026-08-29 抓取)的模式,非原码:\nclass RMSNorm(CustomOp):\n    def forward_native(self, x, weight, residual=None): ...  # 纯 PyTorch——一切平台的最终兜底\n    def forward_cuda(self, x, weight, residual=None): ...    # CUDA 专用 kernel 路径\n    def forward_xpu(self, x, weight, residual=None): ...     # Intel GPU 路径\n\n@CustomOp.register(\"rms_norm\")        # 进 op_registry;\"rms_norm\" 即开关粒度名\nclass RMSNorm(CustomOp): ...\n\n# 启动时:构造 RMSNorm 实例 → 按平台把 forward_cuda 钉死为该实例的 forward\n# 编译配置:--compilation-config '{\"custom_ops\": [\"all,-rms_norm\"]}'\n#   → rms_norm 被禁用 → Inductor 为它生成融合 Triton kernel(文档原话)\n```\n逐行要点:三份 forward_xxx 是「同语义、不同硬件」的三胞胎;register 的字符串名是编译配置里 +/- 操作的把手;禁用一个 CustomOp 不是删功能,而是把这段计算还给编译器去融合。",
+      "links": [
+        "https://docs.vllm.ai/en/stable/design/custom_op/",
+        "https://docs.pytorch.org/docs/stable/library.html"
+      ],
+      "sources": [
+        "https://docs.vllm.ai/en/stable/design/custom_op/ — 2026-08-29 抓取:抽象类定义、全部 forward_xxx 分发规则、hip→cuda 回退、native 兜底、register/register_oot、custom_ops all/none + inductor 追加 none 及『(fused) Triton kernels』理由、'+op/-op' 语法、OOT 插件列表(vllm-ascend/spyre/musa)",
+        "https://docs.pytorch.org/docs/2.13/library.html — 2026-08-29 抓取:PyTorch dispatcher 按 dispatch key 分发的官方路线(对照系)"
+      ],
+      "confidence": "high",
+      "writer_note": "introduces 清单主卡之一。两个层次要讲实:①多后端三胞胎+构造时钉死(与 dispatcher 每次分发对照);②与编译的交互——inductor 默认 none 让编译器接手融合。RMSNorm 是最好的一号例子(又连着 rmsnorm-paper 卡)。构造时绑定的实现细节(_forward_method 层面)属 pin 源码,由 dossier 承担,卡内点到「构造时一次钉死」即可。"
+    },
+    {
+      "id": "piecewise-compilation",
+      "term": "分段编译(piecewise compilation)",
+      "kind": "custom_pattern",
+      "one_line": "vLLM 的折中术:把整图在注意力处切成若干段,段内交给 torch.compile 编译+捕获 CUDA Graph,注意力本身留在图外走 eager——编译的好处拿到手,CUDA Graph 啃不动的注意力也不用改写。",
+      "what_it_is": "vLLM 官方设计文档的定位句:『Initial piecewise compilation was built to allow piecewise cudagraph capture, excluding cudagraph-unsupported operations (mainly attention). This allowed some speedup from cudagraphs while maintaining compatibility with all attention backends.』——分段编译从第一天起就是为 CUDA Graph 服务的:注意力(动态形状、依赖元数据、各家后端实现各异)进不了图,那就把它当「切口」。torch_compile 设计文档补了机制:整图『further split into pieces, by the splitting_ops (usually this is the attention operation)』,而『we only capture the cudagraph for the piece of graph between attention operations』(只对注意力之间的段捕获 CUDA Graph,注意力自身 eager)。切图由 split_module 按 splitting_ops 清单执行(13 个注意力相关算子+KV cache 更新算子);切出的每段用 PiecewiseCompileInterpreter 执行、被单独编译并捕获成图。后续演进(设计文档,2026-06-23):full cudagraphs 模式可以不分段整图捕获——但早期『this tight coupling between compilation and cudagraph capture led to an all-or-nothing experience』,于是有了统一的分发协议(CUDAGraphDispatcher:FULL→PIECEWISE→NONE 逐级回退)与按注意力后端能力(AttentionCGSupport)选择;更新的实验方向 use_inductor_graph_partition(『partition the graph in Inductor instead of right after Dynamo』,需 torch>=2.9)与 BreakableCUDAGraph(env VLLM_USE_BREAKABLE_CUDAGRAPH,默认关)继续解耦编译与捕获。",
+      "background": "三代史:①最初为了「既要 CUDA Graph 又要兼容所有注意力后端」发明分段(注意力留 eager);②full cudagraphs(配可捕获的注意力后端如 FA3)整图捕获,与分段并存但早期体验「全有或全无」;③2025-08 的分发协议(#20059,官方设计文档 2026-06-23 定稿)把 NONE/PIECEWISE/FULL 统一成一张查表:注意力后端支持就 FULL、不支持退 PIECEWISE、都不行退 NONE。分段始终是兼容性兜底那条腿。",
+      "example": "```\n一层 transformer 的计算序列(示意):\n  RMSNorm → Linear → [Attention] → Linear → RMSNorm → [Attention] → ...\n                         ↑切点                ↑切点\n切成段后:\n  段A = RMSNorm+Linear          → torch.compile 编译 + CUDA Graph 捕获(形状固定)\n  Attention                     → eager 执行(动态形状/元数据依赖,不进图)\n  段B = Linear+RMSNorm          → 编译 + 捕获\n  Attention                     → eager\n  …推理一步 = 「回放段A → 跑注意力 → 回放段B → 跑注意力 → …」\n```\n逐行要点:切点(splitting_ops 命中的算子)本身**不进任何一段**——它是段与段之间的「图外缝隙」;段内算子全是形状可固定的常规算子,这是编译+捕获的前提;注意力在缝隙里拿 forward context 提供的元数据自由变形状。",
+      "links": [
+        "https://docs.vllm.ai/en/stable/design/cuda_graphs/",
+        "https://docs.vllm.ai/en/latest/design/torch_compile/"
+      ],
+      "sources": [
+        "https://docs.vllm.ai/en/stable/design/cuda_graphs/ — 2026-08-29 抓取(文档标注日期 2026-06-23):分段编译动机原话、full cudagraphs、all-or-nothing 耦合史、CUDAGraphMode 三态表、CUDAGraphDispatcher 信任链、use_inductor_graph_partition(torch>=2.9)、AttentionCGSupport",
+        "https://docs.vllm.ai/en/latest/design/torch_compile/ — 2026-08-29 抓取:『further split into pieces, by the splitting_ops (usually this is the attention operation)』、『we only capture the cudagraph for the piece of graph between attention operations』、『vLLM's V1 architecture uses piecewise cudagraph that aligns with the piecewise compilation』"
+      ],
+      "confidence": "high",
+      "writer_note": "introduces 主卡之一。叙事骨架建议:动机(注意力进不了图)→ 三代史(分段→full→统一分发)→ 机制(切点=splitting_ops,注意力=图外缝隙)。切图代码(split_module 调用)与 splitting_ops 清单本身是 pin 源码,交给 dossier 的 embed;卡提供的是「为什么会有分段」的外部叙事与官方定位句。"
+    },
+    {
+      "id": "cuda-graph-capture-replay",
+      "term": "CUDA Graph 捕获与回放(stream capture / replay)",
+      "kind": "external_concept",
+      "one_line": "把一串 GPU kernel 的启动参数整个录制成一张「图」,之后一次 CPU 调用就能整串重放——录制时用过的内存地址、形状、kernel 配置原样复用,这就是「形状全等才能回放」的根源。",
+      "what_it_is": "CUDA Graph(CUDA 10 引入,PyTorch 博客:『CUDA Graphs, which made its debut in CUDA 10, let a series of CUDA kernels to be defined and encapsulated as a single unit』)。PyTorch 侧的构建方式是流捕获:『PyTorch supports the construction of CUDA graphs using stream capture, which puts a CUDA stream in capture mode. CUDA work issued to a capturing stream doesn't actually run on the GPU. Instead, the work is recorded in a graph.』——捕获期间 kernel 不执行,只把「启动什么 kernel、什么参数、读写哪块内存」记下来;回放则是一次调用整串提交:『Under the hood, a replay submits the entire graph's work to the GPU with a single call to cudaGraphLaunch』。回放语义是形状全等的一切根源:『Each replay runs the same kernels with the same arguments. For pointer arguments this means the same memory addresses are used... By filling input memory with new data (e.g., from a new batch) before each replay, you can rerun the same work on new data.』——换数据靠往同一块输入内存拷贝新值,不是换 tensor。代价(官方 constraints 列表):『Capture must occur on a non-default stream』『Ops that synchronize the CPU with the GPU (e.g., .item() calls) are prohibited』『Dynamic control flow (based on CPU or GPU data) is prohibited』『CPU work is not captured. If the captured ops include CPU work, that work will be elided during replay』『Dynamic shapes are prohibited. The graph assumes every tensor in the captured op sequence has the same size and layout in every replay』;好处一栏也有:『Once captured, the graph may be replayed on any stream』。收益经济学见 kernel-launch-overhead 卡。",
+      "background": "来自 PyTorch 官方博客(NVIDIA 与 PyTorch 团队合写,2021):『Modern DL frameworks have complicated software stacks that incur significant overheads associated with the submission of each operation to the GPU』。CUDA Graph 在 CUDA 10(2018)引入,PyTorch v1.10(2021)原生支持,首战 MLPerf:Mask R-CNN 图内部分 31ms→6ms(~5x,整体 1.70x)、4096 卡 BERT 1.12x。LLM 推理把这套用到极致:decode 步 batch 小、kernel 短,CPU 提交开销占比最高,vLLM 的整条捕获管线(多尺寸图、padding、地址固定)都建立在这组官方语义上。ch18 已埋「回放地址固定」前提(其卡引用过同一段语义),本章负责首讲全貌:捕获机制、约束清单、回放语义、多尺寸图、图池。",
+      "example": "```python\nimport torch\n\nstatic_in  = torch.randn(8, 512, device=\"cuda\")   # 长寿输入占位:回放永远读写这块地址\nstatic_out = torch.empty_like(static_in)\n\ns = torch.cuda.Stream()                            # 约束:捕获必须在非默认流\ns.wait_stream(torch.cuda.current_stream())\nwith torch.cuda.stream(s):                         # 先在同侧流上热身(官方模式)\n    for _ in range(3):\n        static_out.copy_(static_in * 2)\ntorch.cuda.current_stream().wait_stream(s)\n\ng = torch.cuda.CUDAGraph()\nwith torch.cuda.graph(g):                          # 进入捕获模式:kernel 不执行,只被记录\n    static_out.copy_(static_in * 2)\n\nstatic_in.copy_(new_data)                          # 新数据 → 拷进同一块内存\n# (此处若有 .item()/动态分支 → 捕获直接报错或行为未定义)\ng.replay()                                         # 一次 cudaGraphLaunch,整串 kernel 照录制的参数重放\n```\n逐行要点:static_in/static_out 必须长寿——回放读写的地址在捕获时就定死了;热身让 lazy init/JIT 不进图;capture 块里录下的「mul + copy」带固定 grid/block 与指针;replay 换数据不换地址。这五行就是 vLLM CUDAGraphWrapper 的官方最小原型。",
+      "links": [
+        "https://docs.pytorch.org/docs/stable/notes/cuda.html",
+        "https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/",
+        "https://docs.vllm.ai/en/stable/design/cuda_graphs/"
+      ],
+      "sources": [
+        "https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/ — 2026-08-29 抓取(页面标注更新 2024-11-15):stream capture 定义段、replay 语义段(同 kernel 同参数同地址/填输入内存换数据)、单次 cudaGraphLaunch、CUDA 10 出身、MLPerf 数字(Mask R-CNN 图内 31ms→6ms 整体 1.70x、BERT 1.12x)、小 batch CPU 开销压倒 GPU 的机制段",
+        "https://docs.pytorch.org/docs/2.13/notes/cuda.html — 2026-08-29 抓取:constraints 清单逐条(非默认流/禁 .item()/禁动态控制流/CPU 工作被略去/禁动态形状/回放可任意流)",
+        "https://docs.vllm.ai/en/stable/design/cuda_graphs/ — 2026-08-29 抓取:vLLM 侧的图模式三态与分发协议(正文衔接)"
+      ],
+      "confidence": "high",
+      "writer_note": "introduces 主卡、本章理论核心「形状全等才能回放的本质」的外部依据。上面五行最小例子值得正文化(标注「说明性,据 PyTorch 官方模式」):static 张量长寿→地址固定→填数据→replay。约束清单挑四条最常踩的讲(非默认流/.item()/CPU 被略/动态形状禁)。与 ch18 的衔接要一句点名:ch18 已讲地址固定的代价,本章讲捕获回放全貌。"
+    },
+    {
+      "id": "cuda-graph-pool-sharing",
+      "term": "CUDA Graph 私有内存池与共享(pool sharing)",
+      "kind": "external_concept",
+      "one_line": "每张捕获的图自带一块「私有内存池」(中间张量从这分配);多张图共享一个池能省大量显存——前提是你保证它们永远按捕获顺序回放、绝不并发,这正是 vLLM「从大到小捕获+共享一个池」的依据。",
+      "what_it_is": "捕获期间分配的中间张量来自图专属的私有池,回放时原址复用。官方 notes 说明池可共享:『torch.cuda.graph's pool argument is a hint to use a particular private pool, and can be used to share memory across graphs』;并解释为什么默认各用各的池:『If you capture multiple graphs, this conservative approach ensures graph replays never corrupt each other's values, but sometimes needlessly wastes memory』(各持一池保险但浪费)。共享的安全条件被写得一清二楚:『It's safe for a set of graphs to share a private pool if you know they'll always be replayed in the same order they were captured, and never be replayed concurrently.』;附带警告:『replaying one graph can clobber another graph's outputs when they share a pool, unless clone() is called on the outputs beforehand.』。vLLM 的用法正踩在这条安全线上:同 batch 档位的多张图(以及不同档位的图)共享图池,靠「捕获从最大 batch 到最小、每档只回放自己那张」的纪律满足「不乱序、不并发」。",
+      "background": "CUDA Graph 的中间显存若每张图独占,捕获 N 个 batch 档位就 N 份峰值显存,推理服务根本吃不消;PyTorch 因此给了 pool 参数让多图共池。共池的本质是「同一块显存在不同图的回放间复用」——既然不同档位的图永远不会同时回放(vLLM 每步只回放一张),让它们互相覆盖中间缓冲完全安全。这也解释了捕获顺序的讲究:从大到小捕获,让大图先占住高位地址/池空间,小图复用剩余;捕获窗口的 tripwire(回放时若输出张量已被释放,weakref 变 None)是同一条纪律的运行时防线。",
+      "example": "```\n# 官方模式(PyTorch notes,2026-08-29 抓取)改写成 vLLM 场景示意:\npool = torch.cuda.graph_pool_handle()      # 取一个可共享的私有池句柄\ng1 = torch.cuda.CUDAGraph()                 # 图1:batch=32(先捕获大的)\nwith torch.cuda.graph(g1, pool=pool):\n    out_big = model_run(static_in_32)\ng2 = torch.cuda.CUDAGraph()                 # 图2:batch=8(后捕获小的,共享同一池)\nwith torch.cuda.graph(g2, pool=pool):\n    out_small = model_run(static_in_8)\n# 安全承诺:运行期 g1/g2 只按捕获时确立的纪律单独回放、绝不并发\n#           → 两图的中间张量互相覆盖也无害;若破坏纪律(并发回放),输出会被另一张图 clobber\n```\n逐行要点:pool 句柄是「共池」的全部 API;后捕获的图复用先捕获图已占的池空间——显存只记一份峰值;安全靠使用纪律保证,API 不替你检查。",
+      "links": [
+        "https://docs.pytorch.org/docs/stable/notes/cuda.html",
+        "https://docs.pytorch.org/docs/stable/generated/torch.cuda.graph_pool_handle.html"
+      ],
+      "sources": [
+        "https://docs.pytorch.org/docs/2.13/notes/cuda.html — 2026-08-29 抓取:pool 参数『hint to use a particular private pool... share memory across graphs』、保守各池的浪费、共池安全条件原句、clobber 警告"
+      ],
+      "confidence": "high",
+      "writer_note": "对应「图池共享与从大到小捕获」机制。正文要点:①私有池是什么(中间张量的图专属分配器);②共享省显存的量级直觉;③安全条件两句话(按捕获顺序、绝不并发)——vLLM 的捕获纪律正是兑现这两句。与 weakref 卡连用讲 tripwire。"
+    },
+    {
+      "id": "kernel-launch-overhead-eager-dispatch",
+      "term": "kernel 启动开销与 eager 分发链(Part V「GPU 不等 Python」的底座)",
+      "kind": "external_concept",
+      "one_line": "eager 模式下每个算子都要走完「Python 解释→参数处理→选 kernel→提交 GPU」整条 CPU 链,一次几个微秒;kernel 本身只有几微秒时,CPU 追不上 GPU,显卡就在两个 kernel 之间饿着——这是编译与捕获共同要杀的敌人。",
+      "what_it_is": "PyTorch 官方博客的原话:『the time taken by each GPU operation diminishes to just a few microseconds and, in these cases, the high work submission latencies of frameworks often lead to low utilization of the GPU』;机制展开:『CPU cores process meta-data like tensor shapes in order to prepare arguments needed to launch GPU kernels. Processing meta-data is a fixed cost... at small batch sizes CPU overhead can become larger than GPU run time. When that happens, GPUs go idle between kernel calls.』。LLM decode 正是极端场景:batch 小、每步几十上百个短 kernel,固定 CPU 开销占比最高。两类解药各切一刀:torch.compile 砍「算子粒度」——融合把多个 op 变一个 kernel(官方教程:『Speedup mainly comes from reducing Python overhead and GPU read/writes』);CUDA Graph 砍「提交粒度」——回放时『a replay submits the entire graph's work to the GPU with a single call to cudaGraphLaunch』,『A graph's arguments and kernels are fixed, so a graph replay skips all layers of argument setup and kernel dispatch, including Python, C++, and CUDA driver overheads』。实证:MLPerf Mask R-CNN 图内部分 31ms→6ms(~5x),『The graphed portion now runs in 6 ms instead of 31ms』;BERT 4096 卡 1.12x;DLRM 推理『The effect is particularly visible when using very small batch sizes, where CPU overheads are more pronounced』。",
+      "background": "这是 Part V「GPU 不等 Python」的总纲外部依据。GPU 算力增速快于单 kernel 提交开销下降,强扩展(多卡切小 batch)把矛盾推到极限——2021 年 MLPerf 竞赛中 NVIDIA/PyTorch 为此把 CUDA Graph 原生化。LLM 推理的 decode 阶段复现了同样条件,还叠加了 Python 层(采样、调度)的开销,于是 vLLM 同时上两刀:编译(融合,减少 kernel 数)+捕获(单次提交,消灭逐 kernel 分发)。",
+      "example": "```\n一个 eager 步(示意,数字为量级感):\n  kernel1[5us GPU] --CPU 链 ~10us--> kernel2[4us GPU] --~10us--> kernel3[5us GPU]\n  GPU 有效时间 14us,GPU 却等了 ~20us —— 利用率 <50%\n同一串算子:\n  编译后:融合成 1 个 kernel[8us]        → kernel 数 3→1,分发链 3→1\n  捕获后:replay 一次 cudaGraphLaunch     → 分发链整条消失,提交开销 ≈ 常数(与 kernel 数无关)\n  → 小 batch 下两者叠加,GPU 侧几乎背靠背执行\n```\n逐行要点:eager 的开销按「每个 kernel」计费;融合减少计费次数;捕获把计费方式改成「每次回放」计一次——这两刀互补,正是 -O2(编译)+CUDA Graph(捕获)同时存在的原因。",
+      "links": [
+        "https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/",
+        "https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html"
+      ],
+      "sources": [
+        "https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/ — 2026-08-29 抓取:提交延迟/几微秒论述、shape 元数据固定成本、小 batch CPU>GPU 时间与 GPU idle、Mask R-CNN 6ms/31ms、BERT 1.12x、DLRM 小 batch 论述、replay 跳过全部参数准备与分发层原句",
+        "https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html — 2026-08-29 抓取:『Speedup mainly comes from reducing Python overhead and GPU read/writes』"
+      ],
+      "confidence": "high",
+      "writer_note": "Part V 开篇底座卡:把「GPU 不等 Python」从口号落到「每个 kernel 一条 CPU 链」的机制与官方数字(31ms→6ms)。建议在本章前部给出,后文编译/捕获两刀各自回指它。量级示意数字标注「说明性」。"
+    },
+    {
+      "id": "operator-fusion",
+      "term": "算子融合(kernel fusion)",
+      "kind": "external_concept",
+      "one_line": "把相邻的几个算子合并进一个 GPU kernel:中间结果不再写回显存再读出来,而是留在寄存器里直接喂给下一步——kernel 数和内存流量同时下降。",
+      "what_it_is": "PyTorch 官方博客(2026-06-02):『Without compilation, the GPU runs a kernel, a function on the GPU, for each torch operation in your code. This creates two big slowdowns: the time spent moving data in memory, and the overhead of starting each new kernel.』;解法:『PyTorch's Inductor compiler automatically groups dependent operations together into single, efficient Triton kernels. This keeps data in faster memory close to the register and cuts down on kernel overhead.』。具体例子(官方博宾示例 x*w → +b → sigmoid):不融合 3 个 kernel 共 8 次显存读写(读输入×2、读积+偏置、读和、写三个结果);融合成 1 个 kernel 后『we load all inputs once, do all three operations in a row, and store only the final result. The intermediate values (tmp2 and tmp4) stay in registers – the fastest memory on the GPU』,内存流量 8→4 次(『a 50% reduction in memory traffic』)、kernel 启动 3→1、中间缓冲 2→0。融合家族:垂直融合(链式依赖,最常见——神经网络本来就是链)、归约融合(sum/max 连前后处理)、GEMM+epilogue(矩阵乘把偏置/激活捎带在尾上)、水平融合(『computing both sin(x) and cos(x) in a single kernel, loading x only once』)。与本章的扣合:融合是编译收益的主力,而 CustomOp 对编译器是不透明边界——这正是 vLLM 在 inductor 后端默认把 custom_ops 设为 none 的原因:让算子「摊开」还给编译器,融合才走得通(官方 CustomOp 文档:『Inductor generates (fused) Triton kernels for those disabled custom ops』)。",
+      "background": "eager 模式下每个 op 独立成 kernel、中间结果一律经显存中转——算得越碎、显存带宽浪费越大;融合需要「看见整段计算」才能做,所以它天然是编译器的活(人手写融合 kernel 又难又不可移植)。Triton(ch13)让 Inductor 能自动生成融合 kernel,融合从手艺变成了自动化的编译 pass。",
+      "example": "```python\n# 官方博客原例(2026-08-29 抓取,torch.compile 前后对比):\ndef pointwise_example(x, w, b):\n    tmp = x * w\n    tmp = tmp + b\n    tmp = tmp.sigmoid()\n    return tmp\n\n# eager / 未融合:3 个 Triton kernel(mul_kernel, add_kernel, sigmoid_kernel)\n#   每个都「load 输入 → 一个运算 → store 结果」:8 次显存读写、3 次启动\n# torch.compile 后:1 个 kernel triton_poi_fused_add_mul_sigmoid_0\n#   load 三个输入一次 → 乘、加、sigmoid 连着做 → 只 store 最终结果\n#   中间量 tmp2/tmp4 全程留在寄存器,不落显存\n```\n逐行要点:函数一字不改,编译器靠「看见三步连着」把它们焊进一个 kernel;名字 triton_poi_fused_* 里的 fused 与被融合的算子名,可用 TORCH_LOGS=output_code 亲眼看(官方博客给出的验证方法)。",
+      "links": [
+        "https://pytorch.org/blog/why-is-pytorch-compile-so-fast-kernel-fusion/",
+        "https://docs.vllm.ai/en/stable/design/custom_op/"
+      ],
+      "sources": [
+        "https://pytorch.org/blog/why-is-pytorch-compile-so-fast-kernel-fusion/ — 2026-08-29 抓取(页面标注 2026-06-02):两大慢因论述、融合定义句、pointwise 三合一完整例子(8→4 次内存流量、寄存器留中间量)、垂直/归约/GEMM-epilogue/水平融合分类、TORCH_LOGS=output_code 验证法",
+        "https://docs.vllm.ai/en/stable/design/custom_op/ — 2026-08-29 抓取:『Inductor generates (fused) Triton kernels for those disabled custom ops』(与 CustomOp none 的扣合)"
+      ],
+      "confidence": "high",
+      "writer_note": "编译为什么快的答案卡。官方三合一例子(x*w→+b→sigmoid)非常适合正文内嵌(标注外部示例);再点一句「CustomOp 不透明=融合边界」,与 vllm-custom-op 卡的 none/all 逻辑互为因果。"
+    },
+    {
+      "id": "forward-context-thread-local",
+      "term": "forward context 与线程局部存储(thread-local)模式",
+      "kind": "custom_pattern",
+      "one_line": "vLLM 用「线程局部变量 + 上下文管理器」把本步的注意力元数据挂在当前线程上:注意力后端在图外的缝隙里随手可取,而不用把这些参数穿透每一层函数签名。",
+      "what_it_is": "外部底座:Python 的 threading.local——官方文档:『Thread-local data is data whose values are thread specific. If you have data that you want to be local to a thread, create a local object and use its attributes』;跨线程互不可见(文档示例:主线程 mydata.number=42,另一线程读到空、写下 11,主线程再读仍是 42),且『values you get from a local object... are for whatever thread was current at the time the attribute was read』。vLLM 的 forward context 建在这上面:每个注意力层实例启动时把自己注册进一张按层前缀索引的静态注册表(static_forward_context),让「层 → 注意力实例」全局可查;每次前向开始,一个上下文管理器(set_forward_context)把本步的运行时信息(注意力元数据、批描述、当前图模式等)装进线程局部的当前 context,层与层之间的代码、甚至图外的注意力实现都能经 get_attention_context 取到,不需要层层传参。官方 CUDA Graph 设计文档还点出这套 context 在捕获协议里的地位:『CUDAGraphWrapper instances can blindly trust the forward context』——CUDAGraphDispatcher 是唯一真相源,把本步该用哪张图写进 forward context,图包装器直接信它,不再自查。",
+      "background": "为什么不用函数参数传?注意力需要的元数据(batch 结构、KV cache 布局)每步都变、且只有注意力关心——若走参数,所有中间层的 forward 签名都要带上一包与己无关的数据(「参数穿透」)。线程局部是经典解法:数据挂在「当前执行流」上,谁需要谁取。CUDA 生态也有先例(每线程默认流);Python 侧 threading.local 提供同构语义。为什么切图之后更需要它:分段编译把注意力留在图外,图外代码恰恰是「拿不到图内传参」的那段——context 成了图内段与图外注意力之间的唯一活线。",
+      "example": "```python\n# 说明性骨架:线程局部 + 上下文管理器的组合(据 Python 官方 threading.local 语义,非 vLLM 原码):\nimport threading\n\n_current = threading.local()            # 每个线程看到各自独立的属性空间\n\nclass Ctx:\n    def __init__(self, attn_meta, batch_desc):\n        self.attn_meta = attn_meta      # 本步的注意力元数据\n        self.batch_desc = batch_desc\n\nclass set_context:                      # 上下文管理器:进入装、退出卸(支持嵌套)\n    def __init__(self, ctx): self.ctx = ctx\n    def __enter__(self):\n        self._prev = getattr(_current, \"v\", None)\n        _current.v = self.ctx           # 只影响当前线程\n        return self.ctx\n    def __exit__(self, *exc):\n        _current.v = self._prev         # 恢复上一层\n        return False\n\n# 前向一步:set_context(Ctx(meta, desc)) 之内,任何深处直接:\n#     ctx = _current.v            ← 不经参数穿透,拿到的就是本步的 meta/desc\n# 线程 A 装的 ctx,线程 B 读不到(threading.local 语义)——多 worker 各自隔离\n```\n逐行要点:_current 一处定义全局,但每个线程的 .v 各自独立(Python 文档 42/11 示例的行为);上下文管理器保证「出作用域就还原」,嵌套前向不串味;get 侧(注意力后端)对获取方式完全无感——它只知道「当前 context 里有我要的元数据」。",
+      "links": [
+        "https://docs.python.org/3/library/threading.html#thread-local-data",
+        "https://docs.vllm.ai/en/stable/design/cuda_graphs/"
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/threading.html — 2026-08-29 抓取:『Thread-local data is data whose values are thread specific』、mydata.number 42/11 跨线程示例、『values... are for whatever thread was current at the time the attribute was read』",
+        "https://docs.vllm.ai/en/stable/design/cuda_graphs/ — 2026-08-29 抓取:『CUDAGraphWrapper instances can blindly trust the forward context』、CUDAGraphDispatcher 唯一真相源定位"
+      ],
+      "confidence": "high",
+      "writer_note": "introduces 主卡之一。两层讲:先 Python threading.local 的「各线程各自一份」语义(42/11 例子一句话即可),再 vLLM 的用法动机(元数据不穿透签名、图外注意力的活线)。pin 源码里的具体字段(attn_metadata/slot_mapping 等)归 dossier;卡提供模式与动机。"
+    },
+    {
+      "id": "gc-freeze-python-gc",
+      "term": "Python 垃圾回收与 gc.freeze()",
+      "kind": "external_concept",
+      "one_line": "Python 靠引用计数即时释放对象,另有一条后台「循环垃圾回收器」定期扫描全堆找循环引用——对象多了扫描就是停顿;gc.freeze() 把已有对象全部搬进「永久代」,让之后的回收再也别碰它们。",
+      "what_it_is": "官方文档:gc 模块『provides an interface to the optional garbage collector』,其存在前提是『the collector supplements the reference counting already used by Python』——引用计数管不了循环引用,gc 来补。分代策略(官方原话):『The GC classifies objects into three generations depending on how many collection sweeps they have survived. New objects are placed in the youngest generation (generation 0). If an object survives a collection it is moved to the next older generation...』,按分配/释放差额超阈值触发(『When the number of allocations minus the number of deallocations exceeds threshold0, collection starts』)。freeze 的精确定义:『Freeze all the objects tracked by the garbage collector; move them to a permanent generation and ignore them in all the future collections.』。vLLM 的用法逻辑:启动期(编译、捕获、热身)过后,进程里的长命对象(模型、图、缓存)已经稳定,而 steady-state 的每步生成最怕毛刺——freeze 一次,把这一大摊搬进永久代,后续 gc 触发时扫描范围只剩新分配的小对象,停顿从「扫全堆」缩到「扫增量」。",
+      "background": "gc.freeze 生于 CPython 多进程部署场景:官方文档给的原始用例是 fork 前 freeze——『If a process will fork() without exec()... call gc.disable() early in the parent process, gc.freeze() right before fork(), and gc.enable() early in child processes』,避免子进程 GC 触碰父进程对象的 gc_refs 引发写时复制。长寿命服务的用法是同一机制的自然延伸:与其每代都被扫,不如整体豁免。vLLM 把它与「启动期前移」哲学配套:所有贵的事(编译/JIT/捕获/GC 大扫)都在服务开始前做完或冻结。",
+      "example": "```python\nimport gc\n\n# 启动尾声(示意):\ngc.collect()          # 先做一次完整回收,把垃圾清干净\ngc.freeze()           # 幸存对象(模型/图/缓存)全部搬进永久代——「future collections」不再扫它们\n# 之后服务运行中:gc 触发时只扫 generation0/1 的新对象,停顿从全堆量级缩到增量量级\n```\n逐行要点:freeze 不关闭 gc(那是 gc.disable),也不释放任何东西——它只改「扫描范围」;先 collect 再 freeze 是干净做法(freeze 会把当时还挂着的垃圾也一并「钉」进永久代)。",
+      "links": [
+        "https://docs.python.org/3/library/gc.html"
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/gc.html — 2026-08-29 抓取:gc 与引用计数关系原句、三代划分与阈值触发机制、gc.freeze 定义句『move them to a permanent generation and ignore them in all the future collections』、fork 用例原文、gc.disable 语义"
+      ],
+      "confidence": "high",
+      "writer_note": "对应启动期前移机制里的「freeze GC」一步。正文先补一句底座(引用计数 vs 循环 gc、分代扫描),再点 freeze 的「搬永久代」语义;别写成「关闭 gc」。与「启动期前移」哲学连讲。"
+    },
+    {
+      "id": "gcc-opt-levels-notation",
+      "term": "GCC -O0..-O3 优化等级记法(vLLM -O 系列的记法渊源)",
+      "kind": "notation",
+      "one_line": "C 编译器世界的老记法:-O0 不优化(调试用)、-O3 最激进;vLLM 把它借来表示「torch.compile 开到哪一档」,连「-O2=不做空间换时间的大多数优化」这条注释风格都一并致敬。",
+      "what_it_is": "GCC 手册定义:-O0『Reduce compilation time and make debugging produce the expected results. This is the default.』;-O1『tries to reduce code size and execution time, without performing any optimizations that take a great deal of compilation time』;-O2『performs nearly all supported optimizations that do not involve a space-speed tradeoff』(几乎所有不涉及空间换时间的优化);-O3『Optimize yet more』(再加循环交换/展开/更激进向量化等)。vLLM 的 CompilationLevel/OptimizationLevel(-O0 无编译、-O1 只 Dynamo、-O2 全图+分段+融合 pass、-O3 更激进)借的正是这套「旗标记法 + 档位递进」的心智模型:一个字母 O 加数字,数字越大编译越多、启动越慢、运行越快。注意是借记法不借语义:vLLM 的档位切的是「编译管线开到哪段、切不切图」,不是 GCC 那组具体的 pass。",
+      "background": "-O 系列是 Unix 编译器几十年的通用词汇(gcc/clang 通用),程序员看到 -O2 会自动预编译「合理的高优化档、默认或接近默认」;-O0 则是「调试模式」的代名词。vLLM 把编译开关命名成 -O0..-O3,让有系统背景的读者零成本迁移心智模型;连 vLLM 源码给 -O2 写的注释风格都与 GCC 手册那句「不做空间换时间的优化」同构。",
+      "example": "```\nGCC 侧(GCC 手册,2026-08-29 抓取):\n  gcc -O0 -g app.c   # 不优化+调试信息:变量一动不动,断点行为符合直觉(GCC 默认就是 -O0)\n  gcc -O2 app.c      # 「nearly all supported optimizations that do not involve a space-speed tradeoff」\n  gcc -O3 app.c      # 「Optimize yet more」:再上激进的循环变换/向量化\n\nvLLM 侧(记法借用,语义另定义;档位含义以 pin 源码 vllm/config 为准,归 dossier):\n  -O0 → 不编译(纯 eager)\n  -O1 → 只开 Dynamo 一段\n  -O2 → 全图编译+分段(+融合 pass;默认档)\n  -O3 → 在 -O2 上再叠更激进的优化\n```\n逐行要点:GCC 的 -O2 注释句与 vLLM -O2 的语义注释是「同一种口吻」——这就是记法渊源的直接物证;但两边数字对应的内容物完全不同,只借「字母 O + 递进档位」的形状。",
+      "links": [
+        "https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html"
+      ],
+      "sources": [
+        "https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html — 2026-08-29 抓取:-O0/-O1/-O2/-O3 各自定义原句(-O2『nearly all supported optimizations that do not involve a space-speed tradeoff』、-O3『Optimize yet more』、-O0 默认且利于调试)"
+      ],
+      "confidence": "high",
+      "writer_note": "开头讲 OptimizationLevel 时用这张卡点一句「-O 记法是向 GCC 编译器致敬」即可,档位具体含义由正文/dossier 承担;提醒 writer 别把 GCC 语义与 vLLM 语义写成等同。"
+    },
+    {
+      "id": "triton-jit-compile-cache",
+      "term": "Triton JIT 编译与磁盘缓存",
+      "kind": "external_concept",
+      "one_line": "Triton kernel 不是预先编译好的——第一次用某个「形状/常量特化」调用它时才现场编译,产物落磁盘缓存;同一特化第二次出现直接命中,不再付编译时间。",
+      "what_it_is": "Triton 官方 API 文档对 @triton.jit 的定位就一句:『JIT-compiling a function using the Triton compiler』——装饰器把 Python 函数变成「用时才编译」的 kernel;同页的 do_not_specialize 参数侧证了特化机制的存在(某些参数默认会参与特化,可显式排除)。编译产物带缓存:PyTorch 官方缓存教程(面向 Inductor/Triton):『PyTorch Compiler implements several caches to reduce compilation latency』『These caches allow Inductor to avoid recompilation across process boundaries』『The default implementation stores compiled artifacts in the system temp directory』(默认在系统临时目录的 torchinductor_<username> 下),且『if TRITON_CACHE_DIR is not set in the environment, Inductor sets the Triton cache directory to this same [location]... under the Triton sub-directory』——Inductor 会把 Triton 缓存重定向到自己管的位置。第三方(红帽技术博客,2025-05-16)补充默认路径 ~/.triton/cache 与 TRITON_CACHE_DIR 覆盖。与本章扣合:Inductor 编译出的段就是 Triton kernel 集,「第一次真跑」才会触发 JIT——vLLM 启动编排里的 inductor lazy init 与 JIT 监控正是把这笔首次编译成本从「第一个请求」前移到「启动期」。",
+      "background": "Triton 语言本身 ch13 已讲(写 kernel 像 NumPy);这里的增量是它的「时间维」:kernel 按特化缓存,冷启动第一次调用要付编译秒级成本,缓存命中后近乎零成本。这也是所有 JIT 系统(PyTorch Inductor、numba 同理)的共同形态——vLLM 的 JIT 监控对 numba @njit(parallel) 的处理是同一件事的另一个实例。",
+      "example": "```python\nimport triton\nimport triton.language as tl\n\n@triton.jit\ndef add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask) + tl.load(y_ptr + offs, mask), mask)\n\nadd_kernel[(grid,)](x, y, out, n, BLOCK=1024)\n# 第 1 次调用该特化(n 值类、BLOCK=1024):现场编译 → 产物落磁盘缓存\n# 之后同特化调用:直接载缓存 kernel,零编译\n# 换一个 BLOCK(如 512):新的特化 → 又要编译一次\n```\n逐行要点:JIT 的粒度是「特化」不是「函数」——constexpr 与被特化的标量参与缓存键;首次调用的编译成本在服务场景必须被挪走,这正是启动期「lazy init + 预热」存在的原因。",
+      "links": [
+        "https://triton-lang.org/main/python-api/generated/triton.jit.html",
+        "https://docs.pytorch.org/tutorials/recipes/torch_compile_caching_configuration_tutorial.html",
+        "https://next.redhat.com/2025/05/16/understanding-triton-cache-optimizing-gpu-kernel-compilation/"
+      ],
+      "sources": [
+        "https://triton-lang.org/main/python-api/generated/triton.jit.html — 2026-08-29 抓取:『JIT-compiling a function using the Triton compiler』、do_not_specialize 参数(特化机制侧证)——官方页对缓存细节无展开",
+        "https://docs.pytorch.org/tutorials/recipes/torch_compile_caching_configuration_tutorial.html — 2026-08-29 抓取:缓存降延迟原句、默认存系统临时目录(torchinductor_<username>)、TRITON_CACHE_DIR 未设时 Inductor 重定向 Triton 缓存",
+        "https://next.redhat.com/2025/05/16/understanding-triton-cache-optimizing-gpu-kernel-compilation/ — 2026-08-29 抓取(红帽技术博客,非一手官方):~/.triton/cache 默认路径、TRITON_CACHE_DIR/TRITON_ALWAYS_COMPILE 环境变量"
+      ],
+      "confidence": "medium",
+      "writer_note": "为「启动期前移/JIT 监控」提供外部依据的小卡。JIT=首次调用才编译+特化缓存讲清即可;~/.triton/cache 具体路径是厂商博客口径(标 medium),正文别把路径写死成官方承诺。Triton 语言细节回指 ch13。"
+    },
+    {
+      "id": "python-weakref",
+      "term": "Python 弱引用(weakref)",
+      "kind": "external_concept",
+      "one_line": "一种「不阻止对象被回收」的引用:对象只剩弱引用指着时,垃圾回收随时可以回收它,之后弱引用调用出来就是 None——vLLM 用它做「图输出还活着吗」的探针。",
+      "what_it_is": "官方文档定义:『A weak reference to an object is not enough to keep the object alive: when the only remaining references to a referent are weak references, garbage collection is free to destroy the referent and reuse its memory for something else.』;取值协议:『The original object can be retrieved by calling the reference object if the referent is still alive; if the referent is no longer alive, calling the reference object will cause None to be returned.』,存活判断的标准写法是『ref() is not None』。vLLM 捕获管线里的用法逻辑:图的输出张量若被外部正常持有,张量活着(其显存/地址稳定);若外部早已放手、只剩图自己记着,那这些输出随时可能被回收——而回放要求「输出地址与捕获时一致」,输出张量被回收再分配就是地址漂移事故。于是对输出持弱引用而非强引用(不替用户延长寿命),并在回放时检查:弱引用变 None = 捕获窗口纪律被破坏,触发 tripwire。",
+      "background": "弱引用是 Python 处理「想引用但不想拥有」的标准工具:缓存(对象死了缓存项自动失效)、观察者列表、避免循环引用的经典手段。CUDA Graph 场景用的是它的「探针」面:弱引用的生死就是对象生死的实时指示器,不需要轮询对象本身。",
+      "example": "```python\nimport weakref\n\nclass Output: ...\n\no = Output()\nr = weakref.ref(o)     # 弱引用:不增加「保活」的引用计数份额\nprint(r() is o)        # True —— 对象还活着,调用弱引用拿回原对象\n\ndel o                  # 强引用没了,只剩弱引用 → 对象可被回收\nprint(r())             # None —— 官方判定写法:ref() is not None 为假即已回收\n```\n逐行要点:弱引用调用像开盲盒——活着拿回对象、死了拿回 None;这个二元结果正是「tripwire 探针」的全部所需。",
+      "links": [
+        "https://docs.python.org/3/library/weakref.html"
+      ],
+      "sources": [
+        "https://docs.python.org/3/library/weakref.html — 2026-08-29 抓取:弱引用不保活定义句、r() 活则对象/死则 None 协议、『ref() is not None』存活判定、基础示例(o is r(); del 后 r() 为 None)"
+      ],
+      "confidence": "high",
+      "writer_note": "对应 weak_ref 输出与捕获窗口 tripwire 机制的小卡。一句底座(弱引用不保活、调用判生死)+ 一句 vLLM 用法(输出不强行保活,回放前用弱引用验活,变 None 即报警)。"
+    },
+    {
+      "id": "rmsnorm-paper",
+      "term": "RMSNorm(论文:Root Mean Square Layer Normalization)",
+      "kind": "external_concept",
+      "one_line": "LayerNorm 的极简版:不减均值、只按均方根缩放——少一次统计、少一次减法,换来效果基本持平、速度更快,成了 LLaMA 系等主流 LLM 的标配归一化。",
+      "what_it_is": "(v2 ch23 存量复用)RMSNorm 把 LayerNorm 简化为「只用均方根做尺度归一化」,去掉了 re-centering(减均值)项。论文(arXiv 1910.07467)在多个任务上验证:效果与 LayerNorm 相当或更好,同时获得可观的加速(论文报告最高 ~7-64% 不等的提速,视任务)。对 vLLM:transformer 每层前后都要归一化,RMSNorm 是高频算子,也是 CustomOp 多后端模式的教科书样本(纯 PyTorch 的 forward_native 兜底 + 各平台的专用 kernel)。",
+      "background": "(v2 存量)2019 年 Zhang & Sennrich 提出;此前 LayerNorm(2016)是 Transformer 的标配,RMSNorm 证明「减均值」那半个统计是可砍的冗余,此后 LLaMA 及绝大多数开源 LLM 采纳,归一化从「两统计量」时代进入「一统计量」时代。",
+      "links": [
+        "https://arxiv.org/abs/1910.07467"
+      ],
+      "sources": [
+        "https://arxiv.org/abs/1910.07467 — v2 ch23 存量(2026-07-24 抓取):RMSNorm 定义(去 re-centering)与效果/加速结论(复用,未重新抓取全文;摘要与结论口径在 v2 已核)"
+      ],
+      "confidence": "high",
+      "writer_note": "RMSNorm 作为本章 CustomOp 一号例子时顺带给一句来历(论文+为何快),一段即可,公式细节留 ch(若前文已讲归一化则只回指)。"
+    }
+  ]
+}

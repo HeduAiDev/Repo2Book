@@ -1,0 +1,1152 @@
+{
+ "chapter_id": "ch19",
+ "part": "V",
+ "title": "编译与捕获",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "chapter_kind": "code",
+ "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。本章把 L0 的 GPU 执行臂中层（与 ch18 同一 zoom）再往『执行形态』维度打开：ch18 讲同一块 GPU 每拍被怎么喂（持久批次+固定地址），本章讲喂进去之后前向到底以什么形态执行——被 Inductor 逐片编译、再被 CUDA graph 整段捕获回放。Part V hook『Python 写的 attention 变成 CUDA graph 重播的 kernel』在本章完成兑现。",
+ "hook_suggestion": "「模型的 forward 是 Python 写的，GPU 却不等 Python：vLLM 把模型编译成图、再把图捕成 CUDA graph 一次回放整层 kernel——可 attention 会写 KV cache（副作用）、batch 每拍都在变形，凭什么一张捕好的图能反复命中？形状全等才能回放，这八个字背后是整条设计链。」（从 Part V hook『Python 写的 attention 变成 CUDA graph 重播的 kernel』+ 本章 notes『形状全等才能回放的本质』+ deepread/gpu-exec why_chains[10] 的 pain 段『CUDA graph 录的是对固定地址显存执行这串 kernel launch』提炼为真问题）",
+ "scope_note": "本章解读执行臂中层的『执行形态』：前向以 piecewise 编译图 + CUDA graph 回放的形态运行。主线一（启动期·把 Python 变成图，站 1-9，无请求在场）= -O0..-O3 档位解析（一个参数展开为 mode+cudagraph_mode+融合 pass）→ 切图点清单 set_splitting_ops_for_v1（splitting_ops = _attention_ops + kv update 算子）→ 模型构造期两层注册（CustomOp 每算子构造期一次性 dispatch；Attention 层自注册 static_forward_context）→ KV 初始化期（后端最弱链降级 → initialize_cudagraph_keys 预生成全部 BatchDescriptor key）→ compile_or_warm_up_model 编排（warmup dummy 前向触发 Dynamo trace → VllmBackend.split_graph 切图 → PiecewiseCompileInterpreter 逐片 Inductor 编译 + PIECEWISE wrapper + 丢 guard → capture_model 从大到小逐形状捕获）→ 运行期纠察三件套（JIT monitor / freeze GC / sync check）。主线二（运行期·一拍查表回放，站 10-15，每拍心跳）= _determine_batch_execution_and_padding 裁决（cascade attn/encoder 输入禁 FULL、DP 对齐）→ CudagraphDispatcher.dispatch 查表（FULL 精确 key → PIECEWISE relaxed key → NONE）→ padding 四件套把可变 batch 塞进固定形状 → set_forward_context 注入 mode+descriptor（判责在 dispatcher、wrapper 盲信）→ Attention.forward 调统一算子（op 内 get_attention_context 按 layer_name 取执行环境；KV 写拆独立算子 dummy 依赖保序）→ CUDAGraphWrapper 命中即 replay（DEBUG data_ptr 断言）。边界：FlashAttention 数学归 ch20（primer）；注意力后端选择/优先级表/逐 KV 组混布归 ch21（本章只消费 min_cg_support 最弱链这个接口）；slot_mapping 的 Triton 数学归 ch22（本章只讲尾部 -1 pad 的图捕获语义）；CpuGpuBuffer/持久批次细节归 ch18（本章消费其固定地址——回放命中的后半条件）；异步调度归 ch12；模型 V2 runner（vllm/v1/worker/gpu/）实验性，全书锚定 V1，只作展望脚注；DBO/ubatching、EPLB、encoder cudagraph 属扩展态不进首读。",
+ "one_line": "vLLM 把模型前向变成两种『预制形态』：torch.compile 在 splitting_ops（注意力等不可融合算子）处切图、片内 Inductor 编译、片间接缝 eager（piecewise）；CUDA graph 再按 BatchDescriptor（num_tokens/num_reqs/uniform/lora 计数）为 key 逐形状捕获整段 kernel launch——运行期每拍查表命中即回放，而『形状全等 AND 地址不变』两个命中条件分别由 dispatcher 的 padding 尺寸表与 ch18 的固定地址缓冲供给，编译/捕获/warmup/防退化全部前移启动期，运行期零惊喜。",
+ "code_spine": [
+  "vllm/config/vllm.py:L104-L116  OptimizationLevel：-O0 无编译无图 / O1 PIECEWISE / O2(默认) FULL_AND_PIECEWISE+融合 pass / O3 暂同 O2——读者入口",
+  "vllm/config/vllm.py:L229-L327  四档预设表 OPTIMIZATION_LEVEL_00..03 + OPTIMIZATION_LEVEL_TO_CONFIG；L1272-L1300 档位落账（mode→VLLM_COMPILE、custom_ops 基础档）",
+  "vllm/config/compilation.py:L53-L103  CUDAGraphMode：NONE/PIECEWISE/FULL 运行期模式 + FULL_DECODE_ONLY/FULL_AND_PIECEWISE 组合档",
+  "vllm/config/compilation.py:L764-L778  _attention_ops 13 算子切点清单",
+  "vllm/config/compilation.py:L1133-L1184  set_splitting_ops_for_v1：splitting_ops 组装 + kv update 算子移出编译图（issue #33267）",
+  "vllm/model_executor/custom_op.py:L103-L207  CustomOp：forward_* 多实现 + 构造期 dispatch_forward 一次性绑定 _forward_method；L271-L311 enabled/default_on 开关协议",
+  "vllm/model_executor/layers/layernorm.py:L35-L122  RMSNorm：@CustomOp.register(\"rms_norm\") + forward_native/forward_cuda/forward_xpu 三实现",
+  "vllm/model_executor/layers/attention/attention.py:L437-L446  Attention 构造自注册 static_forward_context + use_direct_call 平台分叉",
+  "vllm/model_executor/layers/attention/attention.py:L488-L582  Attention.forward：预分配 output、reshape 在 op 外、调 torch.ops.vllm.unified_attention_with_output",
+  "vllm/model_executor/layers/attention/attention.py:L732-L846  算子实现三件：get_attention_context（按 layer_name 取 context）/ unified_kv_cache_update（dummy 依赖保序）/ unified_attention_with_output（转调 backend impl）",
+  "vllm/forward_context.py:L30-L58  BatchDescriptor（frozen key）；L131-L194 ForwardContext；L259-L344 set_forward_context（每拍注入）",
+  "vllm/compilation/backends.py:L553-L627  split_graph：在 splitting_ops 的 FX 节点处切图（连续切点合并、keep_original_order 保突变语义）",
+  "vllm/compilation/backends.py:L633-L684  wrap_with_cudagraph_if_needed：每片包 CUDAGraphWrapper(PIECEWISE)（首片 debug/非首片禁 GC/末片 weak_ref）",
+  "vllm/compilation/backends.py:L687-L776  PiecewiseCompileInterpreter：逐片 PiecewiseBackend（Inductor）+ 挂回 interpreter，接缝 eager",
+  "vllm/compilation/wrapper.py:L47-L154  TorchCompileWithNoGuardsWrapper：丢全部 guard + fullgraph=True + dynamic=False 一次编译永不回看",
+  "vllm/v1/cudagraph_dispatcher.py:L72-L109  bs→padded 尺寸表；L166-L233 initialize_cudagraph_keys 生成全部 key；L235-L324 dispatch 查表（FULL 精确→PIECEWISE relaxed→NONE）；L326-L350 get_capture_descs 降序",
+  "vllm/compilation/cuda_graph.py:L145-L361  CUDAGraphWrapper：盲信 forward context 的 mode/descriptor、按 key 捕获（共享图池/弱引用输出）/回放（DEBUG data_ptr 断言）",
+  "vllm/v1/worker/gpu_model_runner.py:L7161-L7202  _check_and_update_cudagraph_mode：最弱链降级 → initialize_cudagraph_keys",
+  "vllm/v1/worker/gpu_worker.py:L679-L853  compile_or_warm_up_model：warmup→kernel 调优→capture→sampler 预热→inductor lazy init→JIT 纠察→freeze GC→sync 纠察",
+  "vllm/v1/worker/gpu_model_runner.py:L6814-L6966  capture_model（大到小、捕获窗口开关）+ _warmup_and_capture（先热身后捕获）",
+  "vllm/v1/worker/gpu_model_runner.py:L3932-L4044  _determine_batch_execution_and_padding：一拍裁决（cascade/encoder 禁 FULL、DP 对齐、CUDAGraphStat）",
+  "vllm/v1/worker/gpu_model_runner.py:L2073-L2078,L2338-L2341,L4128-L4130,L3663-L3664  padding 四件套：query_start_loc 非递减 / block_table NULL_BLOCK_ID / slot_mapping -1 / positions 清零",
+  "vllm/v1/worker/gpu_model_runner.py:L4432-L4456  set_forward_context 内 _model_forward：mode+descriptor 经 thread-local 进图"
+ ],
+ "stations": [
+  {
+   "n": 1,
+   "where": "vllm/config/vllm.py:L229-L327",
+   "what": "档位表：-O0..-O3 预设（OptimizationLevel L104-L116）——O0 无编译无图、O1 Dynamo+Inductor+PIECEWISE、O2（默认，L409）= FULL_AND_PIECEWISE + 按硬件谓词的融合 pass。落账在 VllmConfig post_init（L1272-L1300：optimization_level>O0 → mode=VLLM_COMPILE；custom_ops 基础档 Inductor→'none' 否则 'all'，L1285-L1292）。量化侧伏笔：blocked weights → 强制 '+quant_fp8'（L1261-L1268 注释自述 On H100 the CUDA kernel is faster than native）【F10 苗】"
+  },
+  {
+   "n": 2,
+   "where": "vllm/config/compilation.py:L1133-L1184",
+   "what": "切图点清单 set_splitting_ops_for_v1：splitting_ops = _attention_ops 13 个算子（L764-L778）+ unified_kv_cache_update/unified_mla_kv_cache_update（L1183-L1184——其字符串参数阻止 Inductor 复用 piecewise 图，issue #33267 注释原话，故移出编译图）；注释：full cudagraph 也保留 piecewise fx 图结构、在全图外捕（PR #20059）"
+  },
+  {
+   "n": 3,
+   "where": "vllm/model_executor/custom_op.py:L174-L207",
+   "what": "CustomOp 构造期 dispatch：每个算子（如 RMSNorm，layernorm.py:L36-L122 的 register(\"rms_norm\")+forward_native/forward_cuda/forward_xpu）在 __init__ 一次性把 _forward_method 绑定为当前平台/开关的具名方法（L130-L133）；enabled()（±name 开关，L271-L293）→ disabled 走 maybe_compile(forward_native)（L209-L269：op 内调用的算子对模型级 torch.compile 不可见，故单独编译）；default_on()：Inductor 时 'none'（让编译器融合）否则 'all'（L295-L311）。运行期 forward 只一次属性转发零分支（L135-L136）——『kernel 融合』与『手工 fused kernel』二选一的解法"
+  },
+  {
+   "n": 4,
+   "where": "vllm/model_executor/layers/attention/attention.py:L443-L446",
+   "what": "Attention 构造自注册：prefix 重名即 raise（L444-L445）、注册进 compilation_config.static_forward_context[prefix]（L446）——『模型定义域在构造期产出层注册表，本域在运行期消费』；use_direct_call = not current_platform.opaque_attention_op()（L437-L441）平台决定走 torch op 还是直调。forward 签名从此不见 attn_metadata（metadata 透传旧设计的终结）"
+  },
+  {
+   "n": 5,
+   "where": "vllm/v1/cudagraph_dispatcher.py:L166-L233",
+   "what": "keys 预生成：initialize_cudagraph_keys 按 cudagraph_capture_sizes × lora_cases 笛卡尔积生成全部合法 BatchDescriptor key（cudagraph_keys 是『运行期合法图的唯一真相源』docstring L20-L24）；FULL 档要求 num_reqs 精确——注释原话 FULL mode needs exact num_reqs because FA3's scheduler_metadata computation depends on it（L199-L202），PIECEWISE 放宽 num_reqs=None（L201-L203）；bs→padded 尺寸表 L72-L109（段内上取整、compile_sizes 不得被 padding 改写）。上游：_check_and_update_cudagraph_mode 最弱链降级（gpu_model_runner.py:L7161-L7202 → resolve_cudagraph_mode_and_sizes，config/compilation.py:L1368-L1472）"
+  },
+  {
+   "n": 6,
+   "where": "vllm/v1/worker/gpu_worker.py:L679-L853",
+   "what": "启动编排 compile_or_warm_up_model：warmup_sizes 逐个 _dummy_run（L706-L708，首个 dummy 前向触发站 7-8 的编译）→ kernel_warmup 调优（L713）→ capture_model（L715-L717，站 9）→ 末 PP 段 sampler 预热（L796-L816，NOTE 刻意在 capture 后防 empty_cache 清缓冲）→ trigger_inductor_lazy_init（L822-L830，注释 rather than on a later compile cache-miss at runtime）→ activate_jit_monitor（L832-L839）→ freeze_gc_heap（L841-L844）→ enable_gpu_sync_check（L846-L848）——编译/捕获/warmup/防退化全部前移，运行期零惊喜"
+  },
+  {
+   "n": 7,
+   "where": "vllm/compilation/backends.py:L1020-L1179",
+   "what": "首次前向切图：warmup 的 dummy run 触发 Dynamo trace → VllmBackend.__call__（L1020；can only be called once，L1168）→ split_graph(graph, fx_split_ops)（L1179 调用 → L553-L627 算法：遍历 FX 节点按 should_split（partition_rules.py:L14-L38）编 subgraph_id，连续切点合并 L583-L589、空子图回并 L593、keep_original_order=True 保突变语义 L595-L608——注释原话 otherwise pytorch might reorder the nodes and the semantics of the graph will change when we have mutations）"
+  },
+  {
+   "n": 8,
+   "where": "vllm/compilation/backends.py:L687-L776",
+   "what": "逐片编译：PiecewiseCompileInterpreter.call_module 把非切分子图建 PiecewiseBackend（Inductor 编译，L755-L764）→ wrap_with_cudagraph_if_needed 挂回（L766-L772 ← L633-L684：每片包 CUDAGraphWrapper(PIECEWISE)，首片 debug 日志/非首片 gc_disable/末片 weak_ref_output）。防重编译由 TorchCompileWithNoGuardsWrapper 丢全部 guard + fullgraph=True + dynamic=False 一次编译永不回看（wrapper.py:L47-L154）。接缝（每层 attention+KV update）仍 eager——flash_attn.py:L880-L888 NOTE 原话：view/slice surprisingly slow even when they do not invoke any GPU ops"
+  },
+  {
+   "n": 9,
+   "where": "vllm/v1/worker/gpu_model_runner.py:L6814-L6918",
+   "what": "捕获：capture_model 先 set_cudagraph_capturing_enabled(True)（L6832）；从大到小（L6829-L6831 注释原话 Capture the large shapes first so that the smaller shapes can reuse the memory pool；get_capture_descs 降序 cudagraph_dispatcher.py:L326-L350）；逐形状 _warmup_and_capture（L6920-L6966：先 num_warmups 次 eager dummy（mode=NONE）→ is_graph_capturing=True 捕一次）；捕完 set_cudagraph_capturing_enabled(False)（L6900）——意外捕获直接 RuntimeError（monitor.py:L90-L99）；This usually takes 5~20 seconds（L6912）"
+  },
+  {
+   "n": 10,
+   "where": "vllm/v1/worker/gpu_model_runner.py:L4265-L4278",
+   "what": "一拍①裁决：execute_model 内 _determine_batch_execution_and_padding（L3932-L4044：dispatch_cudagraph 闭包 L3977-L3985；cascade attention / encoder 输入禁 FULL（L3987-L3989）；DP 各 rank coordinate_batch_across_dp 对齐后 re-dispatch（L4004-L4027——cudagraph key 不一致会让集合通信挂死）；CUDAGraphStat num_paddings 观测 L4029-L4036）"
+  },
+  {
+   "n": 11,
+   "where": "vllm/v1/cudagraph_dispatcher.py:L235-L324",
+   "what": "一拍②查表 dispatch：越界/未初始化/超 max_size 落 NONE（L274-L281）→ 构造 padded batch_desc（_create_padded_batch_descriptor L132-L156）→ 先查 FULL 精确 key（L307-L311）→ 再查 PIECEWISE relaxed key（num_reqs=None，L313-L318）→ 都 miss 落 NONE eager（L320-L324）。invalid_modes 供 cascade 等场景禁 FULL"
+  },
+  {
+   "n": 12,
+   "where": "vllm/v1/worker/gpu_model_runner.py:L2073-L2078",
+   "what": "一拍③padding 四件套（主锚 query_start_loc 尾部填非递减——注释原话 kernels like FlashAttention requires that）：block_table 尾行填 NULL_BLOCK_ID（L2338-L2341，Block 0 is reserved for padding）、slot_mapping 尾部填 -1（L4128-L4130，KV 写 kernel 跳过 pad 槽）、positions 尾部清零（L3663-L3664）——把每拍变形的 batch 塞进捕获时的固定形状"
+  },
+  {
+   "n": 13,
+   "where": "vllm/v1/worker/gpu_model_runner.py:L4432-L4456",
+   "what": "一拍④注入：set_forward_context(attn_metadata, num_tokens_padded, cudagraph_runtime_mode=cudagraph_mode, batch_descriptor=batch_desc, slot_mapping) 内 _model_forward（L3879-L3909）——mode+descriptor 经 thread-local（vllm/forward_context.py:L259-L344）传给图内的 wrapper；判责在 dispatcher、wrapper 盲信（cuda_graph.py:L240-L254）。上方注释 Run the model. Use persistent buffers for CUDA graphs.——ch18 固定地址的接口"
+  },
+  {
+   "n": 14,
+   "where": "vllm/model_executor/layers/attention/attention.py:L488-L582",
+   "what": "一拍⑤算子化前向：每个 Attention 层 forward 预分配 output（L531）、QKV reshape 刻意在 op 外（NOTE L534-L535 minimize the CPU overheads）→ torch.ops.vllm.unified_attention_with_output（L574-L581）；KV 写拆成独立算子 unified_kv_cache_update（L775-L798，返回 key.new_empty(0) 作 dummy 数据依赖传入保序——L829-L832 注释原话 accepting it creates a data dependency that ensures torch.compile preserves ordering）；op 内 get_attention_context（L732-L772）按 layer_name 从 ForwardContext 取 metadata/kv_cache/slot_mapping——不设 context 直接 assert 崩（forward_context.py:L199-L205）"
+  },
+  {
+   "n": 15,
+   "where": "vllm/compilation/cuda_graph.py:L233-L361",
+   "what": "一拍⑥回放：CUDAGraphWrapper.__call__ 从 forward_context 取 mode+descriptor（盲信，L240-L254）→ key 命中：DEBUG 模式逐 data_ptr 断言与捕获时一致（L346-L355 错误信息原话 Input addresses for cudagraphs are different during replay）→ cudagraph.replay()（L360）；未命中即捕（L265-L337：validate_cudagraph_capturing_enabled 先验、共享图池、输出弱引用）。全图 wrapper 挂载点：load_model 尾部 CUDAGraphWrapper(FULL)（gpu_model_runner.py:L5467-L5469）——FULL 在模型外、PIECEWISE 在编译器内的每片上，各认领自己的 mode"
+  }
+ ],
+ "stations_note": "站号 = 编译与捕获生命周期：配置与构造期（1-4，无请求在场）→ keys 与启动编排（5-6）→ 编译与捕获（7-9，站 6 编排的内部展开，仍无请求）→ 运行期一拍（10-15，每拍心跳）。与 ch17/18 衔接：ch17 站 10 的『execute_model 前向黑盒』与 ch18 站 9 的『固定地址喂图（编译与捕获全章 → ch19）』在本章打开——站 13 的调用点即 ch18 站 9 同一处。与 ch20/21 衔接：op 内转调的 backend.impl.forward（flash_attn.py:L880 起）的数学归 ch20、后端选择归 ch21（本章只消费 min_cg_support 接口，站 5）。与 ch22 衔接：slot_mapping 尾部 -1 只讲图捕获语义，position→物理 slot 的 Triton 数学归 ch22。与 ch12 衔接：异步调度下本拍 dispatch 用乐观 seq_lens、纠偏在 GPU 端（深讲已立）。与 ch27 衔接：站 1 的 '+quant_fp8' 强制与站 14 的 query_quant 融合注释是 F10『量化与 kernel 的耦合』的苗。与 ch34 衔接：DP 对齐 coordinate_batch_across_dp 只讲到『key 不一致通信挂死』一层，分布式全貌归 ch34。",
+ "key_classes": [
+  {
+   "name": "CustomOp",
+   "file": "vllm/model_executor/custom_op.py",
+   "responsibility": "多平台算子基类：forward_native/cuda/hip/cpu/xpu/tpu 多实现 + op_registry 全局注册 + 构造期 dispatch_forward 一次性绑定 _forward_method（L103-L207）；enabled/default_on 开关协议（L271-L311）；maybe_compile 给被不透明算子包住的调用单独编译 forward_native（L209-L269）。姊妹机制 PluggableLayer（L32-L100）：模块级组装抽象、不做 per-platform dispatch，供 OOT 整层替换。"
+  },
+  {
+   "name": "CudagraphDispatcher",
+   "file": "vllm/v1/cudagraph_dispatcher.py",
+   "responsibility": "运行期查表器：预计算 bs→padded 尺寸表（L72-L109）、initialize_cudagraph_keys 生成全部合法 BatchDescriptor key（L166-L233，cudagraph_keys 是唯一真相源）、dispatch 每拍返回 (mode, batch_desc)（L235-L324）、get_capture_descs 给捕获器降序形状（L326-L350）。判责在上游、wrapper 盲信下游。"
+  },
+  {
+   "name": "CUDAGraphWrapper",
+   "file": "vllm/compilation/cuda_graph.py",
+   "responsibility": "捕获/回放包装（L145）：按 BatchDescriptor 建 concrete_cudagraph_entries 表项；捕获走共享图池 + 输出弱引用（L265-L337）；回放前 DEBUG 逐 data_ptr 断言（L346-L355）；不存持久缓冲、不拷输入——固定地址是 runner 的职责（docstring L161-L167）。"
+  },
+  {
+   "name": "BatchDescriptor",
+   "file": "vllm/forward_context.py",
+   "responsibility": "frozen dataclass（L29-L58）：num_tokens/num_reqs/uniform/has_lora/num_active_loras——CUDA graph 查表的 key，『形状全等』的形式化。"
+  },
+  {
+   "name": "ForwardContext",
+   "file": "vllm/forward_context.py",
+   "responsibility": "每拍执行环境的 thread-local 载体（L131-L194）：no_compile_layers（static_forward_context 拷贝）/attn_metadata/slot_mapping/cudagraph_runtime_mode/batch_descriptor；set_forward_context（L259-L344）由 runner 每拍注入。"
+  },
+  {
+   "name": "Attention",
+   "file": "vllm/model_executor/layers/attention/attention.py",
+   "responsibility": "算子化的注意力层：构造期自注册 static_forward_context（L443-L446）；forward 只做 reshape + 调统一算子（L488-L582）；KV 写拆 unified_kv_cache_update 用 dummy 依赖保序（L775-L814）；unified_attention_with_output 经 get_attention_context 取执行环境转调 backend impl（L817-L846）。本章只讲其算子化与注册面，后端选择归 ch21。"
+  },
+  {
+   "name": "VllmBackend",
+   "file": "vllm/compilation/backends.py",
+   "responsibility": "torch.compile 的 vLLM 定制后端（L805）：__call__ 在 Dynamo trace 完成后 split_graph 切图（L1020-L1179）+ 缓存目录管理；『The major work of this backend is to split the graph into piecewise graphs, and pass them to the piecewise backend.』（docstring L810-L811）。"
+  },
+  {
+   "name": "PiecewiseCompileInterpreter",
+   "file": "vllm/compilation/backends.py",
+   "responsibility": "片间拼跑（L687 起）：fx.Interpreter 按序执行 split_gm，命中编译名单的子图建 PiecewiseBackend（Inductor）并包 cudagraph wrapper，其余（切点算子）eager 直调——piecewise 的运行形态。"
+  },
+  {
+   "name": "TorchCompileWithNoGuardsWrapper",
+   "file": "vllm/compilation/wrapper.py",
+   "responsibility": "防重编译包装（L47）：丢全部 guard（guard_filter_fn L105-L125）+ torch.compile(fullgraph=True, dynamic=False)（L147-L154）——一次编译永不回看；@support_torch_compile（decorators.py:L118 起）把它注入模型类基类。"
+  },
+  {
+   "name": "RMSNorm",
+   "file": "vllm/model_executor/layers/layernorm.py",
+   "responsibility": "CustomOp 的代表实例（L36-L122）：@CustomOp.register(\"rms_norm\") + forward_native/forward_cuda/forward_xpu 三实现——『一个算子多份身体』的最小样本。"
+  },
+  {
+   "name": "GPUModelRunner",
+   "file": "vllm/v1/worker/gpu_model_runner.py",
+   "responsibility": "本章运行期编排者：_determine_batch_execution_and_padding 每拍裁决（L3932-L4044）、padding 四件套（L2073-L2078 等）、set_forward_context 注入（L4432-L4449）、capture_model/_warmup_and_capture 捕获（L6814-L6966）、load_model 尾部套 FULL wrapper（L5435-L5479）、_check_and_update_cudagraph_mode 最弱链降级（L7161-L7202）。"
+  },
+  {
+   "name": "Worker",
+   "file": "vllm/v1/worker/gpu_worker.py",
+   "responsibility": "compile_or_warm_up_model 启动编排（L679-L853）：warmup→kernel 调优→capture→sampler 预热→inductor lazy init→JIT 纠察→freeze GC→sync 纠察——ch17 站 6 生命周期锚点的深讲落点。"
+  },
+  {
+   "name": "OptimizationLevel / CompilationConfig",
+   "file": "vllm/config/vllm.py + vllm/config/compilation.py",
+   "responsibility": "-O0..-O3 预设（vllm.py:L104-L116、L229-L327，默认 O2）与编译配置持有者（compilation.py）：mode/splitting_ops/cudagraph_mode/custom_ops/cudagraph_capture_sizes/static_forward_context 全在此。"
+  },
+  {
+   "name": "LayerName",
+   "file": "vllm/utils/torch_utils.py",
+   "responsibility": "opaque 层名类型（L845-L870）：torch.compile 把它 lift 成图输入而非烤成常量，避免逐层重编译——根治 splitting_ops 曾因字符串参数被迫加切点的问题（issue #33267）的下一代方案。"
+  },
+  {
+   "name": "BreakableCUDAGraphWrapper",
+   "file": "vllm/compilation/breakable_cudagraph.py",
+   "responsibility": "第三代切图方案（实验，env VLLM_USE_BREAKABLE_CUDAGRAPH 默认 0，envs.py:L170）：运行期在算子 dispatcher 处断点捕获；@eager_break_during_capture 挂在正典算子上（attention.py:L817）——路线图脚注。"
+  }
+ ],
+ "data_flow": [
+  "【启动期·编译流（本章站 6-8）】compile_or_warm_up_model（gpu_worker.py:L679）→ warmup_sizes 逐个 _dummy_run（L706-L708）→ 首个 dummy 前向穿 TorchCompileWithNoGuardsWrapper.__call__（wrapper.py:L171 起）触发 Dynamo trace → VllmBackend.__call__（backends.py:L1020，断言只调一次 L1168）→ split_graph 按 splitting_ops 切图（L1179 → L553-L627）→ PiecewiseCompileInterpreter.call_module 逐片建 PiecewiseBackend 并包 CUDAGraphWrapper(PIECEWISE)（L730-L776 + L633-L684）→ 此后每次前向 = interpreter 按序拼跑：片内走编译产物/图、切点算子（unified_attention_with_output、unified_kv_cache_update）eager。",
+  "【启动期·捕获流（本章站 9）】capture_model（gpu_model_runner.py:L6814）→ set_cudagraph_capturing_enabled(True)（L6832）→ get_capture_descs 降序（cudagraph_dispatcher.py:L326-L350）→ 逐形状 _warmup_and_capture（L6920-L6966：eager 热身 → is_graph_capturing=True 再跑一次）→ wrapper 首遇 key 即捕（cuda_graph.py:L265-L337：记 data_ptr、共享图池、弱引用输出）→ 捕完 set_cudagraph_capturing_enabled(False)（L6900）→ 图池显存差计入日志（L6911-L6917，5~20 秒）。",
+  "【引用 deepread/gpu-exec.json data_flow §4c】_determine_batch_execution_and_padding（L4265-L4278 → L3932）：CudagraphDispatcher.dispatch 决定 PIECEWISE/FULL/NONE 与 padding 后的 BatchDescriptor（cudagraph_dispatcher.py:L235-L324；DP 各 rank 先 coordinate_batch_across_dp 对齐 L4004-L4027）。",
+  "【引用 deepread/gpu-exec.json data_flow §5】set_forward_context(attn_metadata, cudagraph_runtime_mode, batch_descriptor, slot_mapping)（L4432-L4449）内 _model_forward（L4450-L4456 → L3879）：model(...)——编译图执行；每个 Attention 层调 torch.ops.vllm.unified_attention_with_output（attention.py:L574-L581），op 内 get_attention_context 取 metadata → backend.impl.forward（flash_attn.py:L880 起，paged KV gather + attention kernel）；片间由 PiecewiseCompileInterpreter 拼接（backends.py:L687 起），CUDAGraphWrapper 命中 BatchDescriptor 即 replay（cuda_graph.py:L233-L361）。",
+  "【本章补充·padding 配套（deepread why_chains[10] solution (d)）】dispatch 命中 padded 形状后，runner 四件套把活跃数据对齐捕获形状：query_start_loc 尾部填非递减值（L2073-L2078，FlashAttention 要求）、block_table 尾行填 NULL_BLOCK_ID（L2338-L2341，Block 0 保留 padding）、slot_mapping 尾部填 -1（L4128-L4130，KV 写 kernel 跳过）、positions 尾部清零（L3663-L3664）。"
+ ],
+ "why_chains": [
+  {
+   "decision": "CustomOp：每个算子多平台实现（forward_cuda/forward_native/...）+ 全局注册表，构造期一次性 dispatch",
+   "old_design": "算子层直接调 fused CUDA kernel。快，但对 torch.compile 完全不透明——Inductor 无法融合穿过 opaque kernel；每个硬件平台用 if-else 分支；eager 模式下 native 实现又太慢。",
+   "pain": "『kernel 融合』与『手工 fused kernel』二选一：Inductor 编译模式下手工 fused op 反而挡路（挡住相邻算子融合），eager 模式下没有它又太慢。",
+   "solution": "vllm/model_executor/custom_op.py:L103-L311 CustomOp 基类：forward_cuda/forward_hip/forward_cpu/forward_xpu/forward_tpu/forward_native 多实现（L138-L172）；__init__ 时 dispatch_forward 一次性把 _forward_method 绑定为当前平台/编译模式的具名函数（L174-L207：先查 enabled()，disabled 走 maybe_compile(forward_native)，enabled 按 current_platform 分支返回各平台方法），运行期 forward 只一次属性转发零分支（L135-L136）。开关规则 default_on()：Inductor 后端时 custom_ops 默认 'none'（走 forward_native 让编译器融合），否则 'all'（L295-L311）。op_registry 全局注册（register L313-L327）+ OOT 类替换（__new__ L109-L128、register_oot L338-L360）。disabled 时 forward_native 可被 maybe_compile 单独编译（L209-L269——\"Compile forward_native to avoid eager torch ops if inside opaque torch custom op\"，dynamic=True 防重编译，_dynamic_arg_dims 显式标动态维 L238-L261）。v0.27 新增姊妹机制 PluggableLayer（L32-L100）：模块级组装抽象，不做 per-platform dispatch，供 OOT 整层替换。",
+   "cost": "每个 CustomOp 要维护并测试多份实现、保证数值一致；dispatch 在构造时冻结——运行期不可切换；op_registry/op_registry_oot 是全局可变状态（enabled/disabled_custom_ops 计数进 compilation_config L741-L745）。",
+   "source_card": "deepread/gpu-exec.json why_chains[7]"
+  },
+  {
+   "decision": "注意力=不透明自定义算子：layer_name 进图、metadata 走 thread-local forward context",
+   "old_design": "v0/v1 早期：attention 层 forward 直接调 kernel，attn_metadata 作为参数从 model.forward 一路透传（污染所有模型 forward 签名）；torch.compile 遇动态控制流+外部副作用（写 KV cache）无法全图捕获。forward context 机制 2024-10-03 才引入（9aaf14c62 \"[misc] add forward context for attention (#9029)\"，git diff-filter=A 实证 forward_context.py 生日）。",
+   "pain": "(1) metadata 透传把『执行环境』泄漏进『模型定义』——每个模型文件的 forward 签名都被引擎内部结构绑架；(2) 想用 torch.compile 就必须让 attention 变成图里的一个节点。",
+   "solution": "0f8cafe2d \"[Kernel] unified_attention for Attention.forward (#11967)\"（2025-01-13）确立算子化。Attention.__init__ 把自己注册进 compilation_config.static_forward_context[prefix]（vllm/model_executor/layers/attention/attention.py:L443-L446，重名即 raise L444-L445）；forward（L488-L582）只调 out-variant 算子：预分配 output（L531）、QKV reshape 在 op 外做以省 op 内 CPU 开销（L533-L541 NOTE(woosuk) \"We do this outside the custom op to minimize the CPU overheads\"）；CUDA 系平台走 torch.ops.vllm.unified_attention_with_output（L574-L581），非 opaque 平台直调 Python 函数（L543-L561；分叉开关 use_direct_call = not current_platform.opaque_attention_op() L437-L441）。算子实现 unified_attention_with_output（L817-L846）经 get_attention_context（L732-L772）从 ForwardContext 按 layer_name 取 attn_metadata/kv_cache/slot_mapping（ForwardContext 由 execute_model 的 set_forward_context 每拍设置：forward_context.py:L259-L344，执行期锚 gpu_model_runner.py:L4432-L4449；no_compile_layers 字段即 static_forward_context 的拷贝 forward_context.py:L229-L231）。KV 写拆成独立算子 unified_kv_cache_update（L775-L814），其返回的空张量作为 dummy 数据依赖传入 attention 算子保序（L829-L832 \"accepting it creates a data dependency that ensures torch.compile preserves ordering\"）。fake_impl 让 Dynamo 可 trace（L801-L806、L849-L859）。v0.27 演进：layer_name 字符串用 LayerName opaque 类型包一层（vllm/utils/torch_utils.py:L845-L870——\"torch.compile lifts it as a graph input instead of baking it as a constant. This avoids per-layer recompilation for custom ops that accept layer name strings\"，_encode/_resolve L881-L888），旧方案 fast_moe_cold_start 的 ForwardContext 列表弹出法仍并存（forward_context.py:L160-L186）。",
+   "cost": "隐式全局状态：不设 forward context 直接调 attention 即 assert 崩（forward_context.py:L199-L205）；调用栈只见 op 名不见层名，profiler 需专门映射；forward_includes_kv_cache_update 语义分叉（vllm/v1/attention/backend.py:L67 默认 True，FlashAttentionBackend 改 False flash_attn.py:L86）——即 CUDA 上 KV 写与 attention 是两个 op 各多一次 dispatch，且 v0.27 起 execute_model 要按 has_separate_kv_update 决定 slot_mapping 用 padded 维度（gpu_model_runner.py:L4307-L4317）。",
+   "source_card": "deepread/gpu-exec.json why_chains[8]"
+  },
+  {
+   "decision": "piecewise 分片编译：在注意力等『不可融合算子』处切图，片内编译、片间接缝 eager（同一问题的三代解法并存）",
+   "old_design": "全图 torch.compile 或全 eager 二选一。全 eager：每层几十次 kernel launch 走 Python dispatch，decode 小 batch 时 CPU 是瓶颈；全图 compile：attention 的外部副作用/动态分支进不了图，且动态 batch 触发反复重编译（guard 检查+recompile 抖动）。",
+   "pain": "同异步调度链的 CPU overhead 战线——『编译单元』必须从整模型降到层间连续段，否则要么 CPU 喂不上、要么图捕不进。",
+   "solution": "ff5ed6e1b \"[torch.compile] rework compile control with piecewise cudagraph (#9715)\"（2024-10-29）确立正典方案：splitting_ops 列表 = _attention_ops（\"vllm::unified_attention_with_output\"、unified_mla、mamba_mixer2/mixer、short_conv、linear_attention、qwen_gdn、sparse_attn_indexer、deepseek_v4_attention 等 13 个，vllm/config/compilation.py:L764-L778）+ \"vllm::unified_kv_cache_update\"/\"unified_mla_kv_cache_update\"（set_splitting_ops_for_v1 L1155-L1184；注释：KV update 算子的字符串参数阻止 Inductor 复用 piecewise 图故移出编译图——LayerName opaque 正是根治此问题的下一代方案）。VllmBackend.split_graph 在命中 splitting_ops 的 FX 节点处切图（vllm/compilation/backends.py:L553-L627；连续切点合并 L583-L589、空子图回并 _merge_empty_only_subgraphs L437-L478、keep_original_order 保语义 L595-L608），每片独立送 Inductor 编译并包 CUDAGraphWrapper(PIECEWISE)（wrap_with_cudagraph_if_needed L633-L684：首片开 debug 日志、非首片禁 GC、末片 weak_ref output），运行期 PiecewiseCompileInterpreter 按序拼跑（L687 起）。防重编译：TorchCompileWithNoGuardsWrapper fullgraph=True + dynamic=False + 丢全部 guard 一次编译永不回看（vllm/compilation/wrapper.py:L47-L54、L105-L125、L147-L154）。v0.27 两条新路线并存（都默认关）：(a) use_inductor_graph_partition=True（config/compilation.py:L669-L687）——不在 Dynamo FX 层切而在 Inductor codegen 完成全部融合 pass 之后按 cudagraph_unsafe tag 分区，RoPE+KV cache 融合等 pass 只在此模式可用（L1162-L1184 的 warning 链证明依赖关系）；(b) BreakableCUDAGraph（8a56da384 \"[Experimental] Breakable CUDA graph (#42304)\" 2026-05-16、27fa5aa3b \"(#44050)\" MRV2 支持实验；vllm/compilation/breakable_cudagraph.py:L5-L25）——干脆不预切图：单个 capture context 驱动整个 forward，在 attention/kv-cache 算子 dispatcher 处『结束当前段捕获→eager 执行→恢复捕获』（@eager_break_during_capture 装饰器 L52-L80，要求被装饰算子写调用方预分配的 output，否则地址漂移炸下游图段）；灵感自 sglang#19102；env 门 VLLM_USE_BREAKABLE_CUDAGRAPH 默认 0（envs.py:L170）。",
+   "cost": "接缝（每层 attention+KV update）仍在 eager Python 跑——flash_attn.py:L880-L888 NOTE(woosuk) 明示：piecewise 模式下 forward 是 eager，\"view and slice ... are surprisingly slow even in the case they do not invoke any GPU ops. Whenever making a change in this method, please benchmark the performance\"；三代方案并存 = 配置矩阵与测试矩阵膨胀（fuse_attn_quant 与 inductor partition 互斥 L1143、SP 要求全图 L1213-L1219）；编译产物/缓存/AOT 管理（compilation_time 从 worker 汇回主进程：CompilationTimes NamedTuple vllm/v1/worker/worker_base.py:L34-L36 → gpu_worker.py:L850-L853 回填 → executor 汇回主进程取 max 落 compilation_config.compilation_time（vllm/v1/executor/abstract.py:L124-L137，字段定义 vllm/config/compilation.py:L748/L750）→ 主进程消费/日志 vllm/v1/engine/core.py:L332-L336）。",
+   "source_card": "deepread/gpu-exec.json why_chains[9]"
+  },
+  {
+   "decision": "CUDA Graph 捕获回放：按 BatchDescriptor 查表命中，实际 batch padding 到捕获形状",
+   "old_design": "eager 每拍重新 launch 全部 kernel（Python dispatch + cudaLaunchKernel × 每层数十次）。v0 已有按 batch size 捕获的 cudagraph；v1 的重做核心是显式 dispatch 协议（74f441f4b \"Allow full cudagraph with separate attention routines (#20059)\" 2025-08-15 引入 cudagraph_dispatcher.py，git diff-filter=A 实证），2025-09-23 24fab45d9 \"Change default CUDAGraphMode from PIECEWISE to FULL_AND_PIECEWISE (#25444)\" 把默认档位升到混合模式。",
+   "pain": "为什么形状必须精确匹配（本质）：CUDA graph 录的是『对这块固定地址的显存执行这串 kernel launch』——kernel 的 grid/block 配置、指针、乃至宿主端分支（如 FA3 的 scheduler_metadata 计算）都在捕获时烤死在图里；replay 不会重新读取张量的 shape 元数据。形状或地址变了，图执行的就是错误的工作量/错误的数据。所以回放命中条件 = BatchDescriptor 全等 AND 输入张量地址不变。",
+   "solution": "(a) key 与查表：frozen dataclass BatchDescriptor(num_tokens/num_reqs/uniform/has_lora/num_active_loras)（vllm/forward_context.py:L29-L58）；CudagraphDispatcher（vllm/v1/cudagraph_dispatcher.py:L15）预计算 bs→padded 尺寸表（L72-L91，并对 compile_sizes 做『不得被 padding 改写』校验 L93-L109）、initialize_cudagraph_keys 生成全部合法 key（L166-L233；FULL 档要求 num_reqs 精确——注释 \"FULL mode needs exact num_reqs because FA3's scheduler_metadata computation depends on it\" L199-L202；PIECEWISE 放宽 num_reqs=None L201-L203）、dispatch 每拍查表返回 (mode, batch_desc)（L235-L324：先查 FULL 精确 key、再查 PIECEWISE relaxed key、都 miss 落 NONE）。(b) 捕获/回放：CUDAGraphWrapper（vllm/compilation/cuda_graph.py:L145）以 BatchDescriptor 为 key；捕获走共享 graph pool（L200、L303-L317 set_graph_pool_id），输出弱引用省显存（L325-L336）；回放前 DEBUG 模式逐 data_ptr 断言与捕获时一致（L346-L355 \"Input addresses for cudagraphs are different during replay\"）；wrapper 盲信 forward context 传来的 runtime_mode/descriptor（L240-L254 \"blindly trust them for cudagraph dispatching\"——判责在上游 dispatcher）。(c) 运行期 dispatch：_determine_batch_execution_and_padding（gpu_model_runner.py:L3932-L4044）每拍算 (cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, cudagraph_stats)（dispatch_cudagraph 内联闭包 L3977-L3989，cascade attn / encoder 输入时禁 FULL L3987-L3989），经 set_forward_context 传给 wrapper（L4432-L4449）。(d) padding 配套四件套全在 runner：query_start_loc 尾部填非递减值（L2073-L2078，注释 \"kernels like FlashAttention requires that\"）、block_table 尾行填 NULL_BLOCK_ID（L2338-L2341，注释 \"Block 0 is reserved for padding\"）、slot_mapping 尾部填 -1（L4128-L4130，让 KV 写 kernel 跳过写）、positions 尾部清零（L3663-L3664）。(e) 捕获编排：capture_model（L6813-L6918）从大到小捕（get_capture_descs 降序 L6876-L6884；dispatcher 侧同序 L326-L350 \"sorted largest-first for memory efficiency\"）；_warmup_and_capture 先 warmup 数次 eager（mode=NONE）再 is_graph_capturing=True 捕一次（L6920-L6966）；捕获后 set_cudagraph_capturing_enabled(False) 让任何意外捕获直接报错（L6895-L6900）。(f) DP 一致性：coordinate_batch_across_dp 让各 DP rank 对 padded 尺寸达成一致后 re-dispatch（L4004-L4027——DP rank 的 cudagraph key 不一致会让集合通信挂死）。(g) 观测：CUDAGraphStat num_paddings（L4029-L4036）+ CUDAGraphLogging 汇总表（cuda_graph.py:L40-L124）。(h) 顶层档位：v0.27 新增 -O0..-O3 optimization_level 预设（vllm/config/vllm.py:L230-L327，默认 O2 = FULL_AND_PIECEWISE + 各融合 pass 按硬件启用 L292-L315），读者入口被大幅简化。",
+   "cost": "(1) 启动：\"This usually takes 5~20 seconds\"（gpu_model_runner.py:L6912-L6913 官方自述）；(2) 显存：图池独占，capture 前后 mem_get_info 差值即代价（L6911），默认经 profile_cudagraph_memory（L6645 起，用临时池预捕全部形状估显存）计入 KV cache 预算——VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS 默认 1（envs.py:L2018-L2020），等价 util 提示日志 gpu_worker.py:L568-L605；(3) 算力浪费：bs=9 pad 到 16 白算 7 行 decode（decode 便宜所以可接受，CUDAGraphStat 的 num_paddings 可观测）；(4) 一切输入必须写回捕获时的固定 buffer——这是 CpuGpuBuffer/持久批次整条设计链的下游约束，设计间环环相扣。",
+   "source_card": "deepread/gpu-exec.json why_chains[10]"
+  },
+  {
+   "decision": "编译/捕获/warmup/防退化全部前移启动期，运行期零惊喜",
+   "old_design": "惰性编译/首次触发捕获：第一个真实请求承受 JIT 编译与图捕获的长尾延迟（首 token 延迟尖刺数百 ms～秒级）。",
+   "pain": "Triton JIT / inductor 编译 / 意外 cudagraph 捕获 / GC 暂停 / CPU-GPU sync，任何一样在服务期触发 = 单拍延迟尖刺，对 SLO 是事故。",
+   "solution": "Worker.compile_or_warm_up_model 编排启动流水（vllm/v1/worker/gpu_worker.py:L678-L853）：warmup_sizes 逐个 _dummy_run（L680-L709，compile_ranges 补边界尺寸 L695-L703）→ kernel_warmup 调优 kernel（L713）→ capture_model 逐形状捕获（L715-L717；实际 vs 估计图池对比日志 L719-L733）→ V1 路径：末 PP 段 _dummy_sampler_run 预分配 logits/采样缓冲（L796-L816，NOTE \"This is called after capture_model on purpose to prevent memory buffers from being cleared by empty_cache\"）→ trigger_inductor_lazy_init 预热 inductor 进程级惰性初始化（L822-L830，注释 \"rather than on a later compile cache-miss at runtime\"）→ activate_jit_monitor 任何意外 JIT 编译直接暴露（L832-L839）→ freeze_gc_heap 冻结堆停止 GC 扫描静态对象（L841-L844）→ enable_gpu_sync_check 开同步纠察（L846-L848）。显存侧对偶：determine_available_memory 用 profile_run + profile_cudagraph_memory 把激活峰值与图池都计入 KV cache 预算（L459-L611）。v0.27 新增 startup_plan（import L76-L79、maybe_apply_startup_plan L472、maybe_save_startup_plan L791）：把测得的 KV 内存建议落盘，复跑时提示直接用 --kv-cache-memory 跳过 profiling 漂移。",
+   "cost": "启动时间显著拉长（warmup+编译+捕获 5~20s+，CompileTimes 专门回传并落 compilation_config.compilation_time：定义 vllm/v1/worker/worker_base.py:L34-L36、回填 gpu_worker.py:L850-L853、汇回主进程取 max vllm/v1/executor/abstract.py:L124-L137（字段 vllm/config/compilation.py:L748/L750）、主进程日志 vllm/v1/engine/core.py:L332-L336）；启动期 dummy 数据的形状假设若与真实流量不符，运行期踩到未捕获形状（回退 eager，性能突降）；profile 的显存估计偏保守会吃掉 KV cache 空间（150MiB 冗余缓冲 gpu_worker.py:L749）。",
+   "source_card": "deepread/gpu-exec.json why_chains[13]"
+  }
+ ],
+ "embed_excerpts": [
+  {
+   "path": "vllm/config/vllm.py",
+   "lines": "L104-L116",
+   "what": "OptimizationLevel 枚举：-O0 无编译无图 / -O1 Dynamo+Inductor+PIECEWISE / -O2 再加 FULL / -O3 暂同 O2——四档 docstring 即本章地图。",
+   "code": "class OptimizationLevel(IntEnum):\n    \"\"\"Optimization level enum.\"\"\"\n\n    O0 = 0\n    \"\"\"O0 : No optimization. no compilation, no cudagraphs, no other\n    optimization, just starting up immediately\"\"\"\n    O1 = 1\n    \"\"\"O1: Quick optimizations. Dynamo+Inductor compilation and Piecewise\n    cudagraphs\"\"\"\n    O2 = 2\n    \"\"\"O2: Full optimizations. -O1 as well as Full and Piecewise cudagraphs.\"\"\"\n    O3 = 3\n    \"\"\"O3: Currently the same as -O2s.\"\"\"",
+   "elide": []
+  },
+  {
+   "path": "vllm/config/vllm.py",
+   "lines": "L275-L297",
+   "what": "O2 预设（默认档）：cudagraph_mode=FULL_AND_PIECEWISE + 按硬件谓词启用的融合 pass（fuse_norm_quant/fuse_attn_quant=IS_QUANTIZED/enable_sp=IS_DENSE...）——读者一个参数背后展开为整章。",
+   "code": "OPTIMIZATION_LEVEL_02 = {\n    \"compilation_config\": {\n        \"pass_config\": {\n            \"fuse_norm_quant\": enable_norm_fusion,\n            \"fuse_act_quant\": enable_act_fusion,\n            \"fuse_allreduce_rms\": enable_allreduce_rms_fusion,\n            \"fuse_attn_quant\": IS_QUANTIZED,\n            \"enable_sp\": IS_DENSE,\n            \"fuse_gemm_comms\": IS_DENSE,\n            \"fuse_act_padding\": enable_norm_pad_fusion,\n            \"fuse_mla_dual_rms_norm\": enable_mla_dual_rms_norm_fusion,\n            \"fuse_rope_kvcache\": enable_rope_kvcache_fusion,\n            \"fuse_qk_norm_rope_kvcache\": enable_qk_norm_rope_kvcache,\n            \"enable_qk_norm_rope_fusion\": False,\n            \"fuse_rope_kvcache_cat_mla\": enable_rope_kvcache_mla_fusion,\n        },\n        \"cudagraph_mode\": CUDAGraphMode.FULL_AND_PIECEWISE,\n        \"use_inductor_graph_partition\": False,\n    },\n    \"kernel_config\": {\n        \"enable_flashinfer_autotune\": True,\n    },\n}",
+   "elide": [
+    "L278-L290 pass_config 的 12 个融合 pass 字典项（fuse_norm_quant→enable_norm_fusion、fuse_attn_quant→IS_QUANTIZED 等谓词引用；谓词函数体定义在文件上方 L121 起、不在本段）正文按需点名即可"
+   ]
+  },
+  {
+   "path": "vllm/config/vllm.py",
+   "lines": "L1261-L1292",
+   "what": "F10 苗·量化与 kernel 的耦合：blocked weights → custom_ops 强制 '+quant_fp8'（注释自述 On H100 the CUDA kernel is faster than native implementation）；以及 custom_ops 基础档落账：Inductor 编译时 'none'（走 forward_native 让编译器融合）、否则 'all'——default_on() 规则的配置侧对偶。",
+   "code": "        # Enable quant_fp8 CUDA ops (TODO disable in follow up)\n        # On H100 the CUDA kernel is faster than\n        # native implementation\n        # https://github.com/vllm-project/vllm/issues/25094\n        if has_blocked_weights():\n            custom_ops = self.compilation_config.custom_ops\n            if \"-quant_fp8\" not in custom_ops:\n                custom_ops.append(\"+quant_fp8\")\n\n        current_platform.apply_config_platform_defaults(self)\n\n        if self.compilation_config.mode is None:\n            if self.optimization_level > OptimizationLevel.O0:\n                self.compilation_config.mode = CompilationMode.VLLM_COMPILE\n            else:\n                self.compilation_config.mode = CompilationMode.NONE\n\n        # By default, enable torch wrapping only when using custom Inductor lowering\n        if self.compilation_config.ir_enable_torch_wrap is None:\n            self.compilation_config.ir_enable_torch_wrap = (\n                self.compilation_config.mode == CompilationMode.VLLM_COMPILE\n                and self.compilation_config.backend == \"inductor\"\n            )\n\n        if all(s not in self.compilation_config.custom_ops for s in (\"all\", \"none\")):\n            if (\n                self.compilation_config.backend == \"inductor\"\n                and self.compilation_config.mode != CompilationMode.NONE\n            ):\n                self.compilation_config.custom_ops.append(\"none\")\n            else:\n                self.compilation_config.custom_ops.append(\"all\")",
+   "elide": [
+    "L1253-L1259 has_blocked_weights 的两个 hasattr 分支"
+   ]
+  },
+  {
+   "path": "vllm/config/compilation.py",
+   "lines": "L53-L103",
+   "what": "CUDAGraphMode 枚举：NONE/PIECEWISE/FULL 三个运行期模式 + FULL_DECODE_ONLY/FULL_AND_PIECEWISE 两个组合档（tuple 值）；decode_mode/mixed_mode/separate_routine 拆解组合档——『三 runtime 模式一个 dispatch 协议』的词汇表。",
+   "code": "class CUDAGraphMode(enum.Enum):\n    \"\"\"Constants for the cudagraph mode in CompilationConfig.\n    Meanwhile, the subset enum `NONE`, `PIECEWISE` and `FULL` are also\n    treated as concrete runtime mode for cudagraph runtime dispatching.\n    \"\"\"\n\n    NONE = 0\n    PIECEWISE = 1\n    FULL = 2\n    FULL_DECODE_ONLY = (FULL, NONE)\n    FULL_AND_PIECEWISE = (FULL, PIECEWISE)\n\n    def decode_mode(self) -> \"CUDAGraphMode\":\n        return CUDAGraphMode(self.value[0]) if self.separate_routine() else self\n\n    def mixed_mode(self) -> \"CUDAGraphMode\":\n        return CUDAGraphMode(self.value[1]) if self.separate_routine() else self\n\n    def has_mode(self, mode: \"CUDAGraphMode\") -> bool:\n        assert not mode.separate_routine()\n        if self.separate_routine():\n            return mode.value in self.value\n        return self == mode\n\n    def requires_piecewise_compilation(self) -> bool:\n        return self.has_mode(CUDAGraphMode.PIECEWISE)\n\n    def max_cudagraph_mode(self) -> \"CUDAGraphMode\":\n        return CUDAGraphMode(max(self.value)) if self.separate_routine() else self\n\n    def has_full_cudagraphs(self) -> bool:\n        return self.max_cudagraph_mode() == CUDAGraphMode.FULL\n\n    def has_piecewise_cudagraphs(self) -> bool:\n        return self.requires_piecewise_compilation()\n\n    def separate_routine(self) -> bool:\n        return isinstance(self.value, tuple)\n\n    @classmethod\n    def valid_runtime_modes(cls) -> frozenset[\"CUDAGraphMode\"]:\n        return frozenset({cls.NONE, cls.PIECEWISE, cls.FULL})\n\n    def is_valid_runtime_mode(self) -> bool:\n        return self in CUDAGraphMode.valid_runtime_modes()\n\n    def __str__(self) -> str:\n        return self.name\n\n    def __bool__(self) -> bool:\n        return self != CUDAGraphMode.NONE",
+   "elide": []
+  },
+  {
+   "path": "vllm/config/compilation.py",
+   "lines": "L762-L778",
+   "what": "_attention_ops：默认切图点清单（13 个算子，PyTorch namespace::name 格式）——『在哪切』的账本。",
+   "code": "    # Attention ops; used for piecewise cudagraphs\n    # Use PyTorch operator format: \"namespace::name\"\n    _attention_ops: ClassVar[list[str]] = [\n        \"vllm::unified_attention_with_output\",\n        \"vllm::unified_mla_attention_with_output\",\n        \"vllm::mamba_mixer2\",\n        \"vllm::mamba_mixer\",\n        \"vllm::short_conv\",\n        \"vllm::linear_attention\",\n        \"vllm::qwen_gdn_attention_core\",\n        \"vllm::gdn_attention_core_xpu\",\n        \"vllm::olmo_hybrid_gdn_full_forward\",\n        \"vllm::sparse_attn_indexer\",\n        \"vllm::rocm_aiter_sparse_attn_indexer\",\n        \"vllm::deepseek_v4_attention\",\n        \"vllm::hpc_rope_norm_forward\",\n    ]",
+   "elide": [
+    "L765-L777 其余 11 个非 unified_attention_with_output 的算子（mamba/short_conv/linear_attention/...）正文点名 unified_attention_with_output 与 unified_mla 即可"
+   ]
+  },
+  {
+   "path": "vllm/config/compilation.py",
+   "lines": "L1143-L1184",
+   "what": "set_splitting_ops_for_v1 主支：①注释原话——full cudagraph 模式仍保留 piecewise fx 图结构、在全图外捕（PR #20059）；②splitting_ops=list(_attention_ops)；③unified_kv_cache_update 的字符串参数阻止 Inductor 复用 piecewise 图，故追加为切点移出编译图（issue #33267）。",
+   "code": "        if self.pass_config.fuse_attn_quant and not self.use_inductor_graph_partition:\n            self.set_splitting_ops_for_attn_fusion()\n        else:\n            if self.splitting_ops is None:\n                # NOTE: When using full cudagraph, instead of setting an empty\n                # list and capture the full cudagraph inside the flattened fx\n                # graph, we keep the piecewise fx graph structure but capture\n                # the full cudagraph outside the fx graph. This reduces some\n                # cpu overhead when the runtime batch_size is not cudagraph\n                # captured. see https://github.com/vllm-project/vllm/pull/20059\n                # for details. Make a copy to avoid mutating the class-level\n                # list via reference.\n                self.splitting_ops = list(self._attention_ops)\n\n                # unified_kv_cache_update has a string param that prevents Inductor\n                # from reusing piecewise graphs. Remove it from the compiled graph.\n                # This has the side-effect of excluding cache from cudagraphs but\n                # that doesn't seem to affect performance.\n                # https://github.com/vllm-project/vllm/issues/33267\n                if not self.use_inductor_graph_partition:\n                    if self.pass_config.fuse_rope_kvcache:\n                        logger.warning_once(\n                            \"fuse_rope_kvcache is enabled, but splitting_ops is None \"\n                            \"and Inductor graph partition is not enabled.\"\n                            \"Disabling fuse_rope_kvcache.\"\n                            \"Please either set splitting_ops to an empty list []\"\n                            \"or set use_inductor_graph_partition to True \"\n                            \"to enable RoPE+KV cache fusion.\"\n                        )\n                        self.pass_config.fuse_rope_kvcache = False\n                    if self.pass_config.fuse_qk_norm_rope_kvcache:\n                        logger.warning_once(\n                            \"fuse_qk_norm_rope_kvcache is enabled, but \"\n                            \"splitting_ops is None and Inductor graph partition \"\n                            \"is not enabled. Disabling fuse_qk_norm_rope_kvcache. \"\n                            \"Please either set splitting_ops to an empty list [] \"\n                            \"or set use_inductor_graph_partition to True \"\n                            \"to enable QK-Norm+RoPE+KV cache fusion.\"\n                        )\n                        self.pass_config.fuse_qk_norm_rope_kvcache = False\n                    self.splitting_ops.append(\"vllm::unified_kv_cache_update\")\n                    self.splitting_ops.append(\"vllm::unified_mla_kv_cache_update\")",
+   "elide": [
+    "L1162-L1182 fuse_rope_kvcache/fuse_qk_norm_rope_kvcache 与 inductor partition 互斥的两个 warning 降级块（正文一句话带过）"
+   ]
+  },
+  {
+   "path": "vllm/model_executor/custom_op.py",
+   "lines": "L103-L136",
+   "what": "CustomOp 基类头：__new__ 查 op_registry_oot 允许整类替换；__init__ 构造期一次性 dispatch_forward 绑 _forward_method；运行期 forward 只一次属性转发零分支。",
+   "code": "class CustomOp(nn.Module):\n    \"\"\"\n    Base class for custom ops.\n    Dispatches the forward method to the appropriate backend.\n    \"\"\"\n\n    def __new__(cls, *args, **kwargs):\n        try:\n            op_name = cls.__name__\n        except AttributeError:\n            raise TypeError(\n                f\"Cannot instantiate '{cls.__name__}': its 'name' attribute \"\n                f\"was not set, possibly because it was not decorated with \"\n                f\"@CustomOp.register, or it's the CustomOp base class itself.\"\n            ) from None\n\n        if op_name not in op_registry_oot:\n            op_cls_to_instantiate = cls\n        else:\n            op_cls_to_instantiate = op_registry_oot[op_name]\n            logger.debug(\n                \"Instantiating custom op: %s using %s\",\n                op_name,\n                str(op_cls_to_instantiate),\n            )\n        return super().__new__(op_cls_to_instantiate)\n\n    def __init__(self, *, enforce_enable: bool = False, compile_native: bool = False):\n        super().__init__()\n        self._enforce_enable = enforce_enable\n        self._forward_method = self.dispatch_forward(compile_native=compile_native)\n\n    def forward(self, *args, **kwargs):\n        return self._forward_method(*args, **kwargs)",
+   "elide": [
+    "L109-L128 __new__ 的 OOT 替换分支（OOT 插件机制，正文作边界注）"
+   ]
+  },
+  {
+   "path": "vllm/model_executor/custom_op.py",
+   "lines": "L174-L207",
+   "what": "dispatch_forward：先查 enabled()（enforce_enable 或 ±name 开关），disabled 走 maybe_compile(forward_native)；enabled 按 current_platform 分支返回各平台具名方法——构造期冻结、运行期不可切换。",
+   "code": "    def dispatch_forward(self, compile_native: bool):\n        # NOTE(woosuk): Here we assume that vLLM was built for only one\n        # specific backend. Currently, we do not support dynamic dispatching.\n        compilation_config = get_cached_compilation_config()\n\n        # NOTE(shen-shanshan): CustomOp object can be enforce enabled, e.g.,\n        # enable device-specific kernels in ViT models when enabling graph\n        # mode. By default, it will follow the compilation_config to determine\n        # whether enable itself.\n        # This enforce_enable mechanism will be removed after we adding a\n        # separate compilation_config for multi-modal part.\n        enabled = self._enforce_enable or self.enabled()\n        if enabled:\n            compilation_config.enabled_custom_ops.update([self.__class__.name])\n        else:\n            compilation_config.disabled_custom_ops.update([self.__class__.name])\n\n        if not enabled:\n            # Compile forward_native to avoid eager torch ops if inside\n            # opaque torch custom op (e.g. fused_moe, unified_attention, etc.)\n            return self.maybe_compile(self.forward_native, enable=compile_native)\n\n        if current_platform.is_rocm():\n            return self.forward_hip\n        elif current_platform.is_cpu():\n            return self.forward_cpu\n        elif current_platform.is_tpu():\n            return self.forward_tpu\n        elif current_platform.is_xpu():\n            return self.forward_xpu\n        elif current_platform.is_out_of_tree():\n            return self.forward_oot\n        else:\n            return self.forward_cuda",
+   "elide": [
+    "L179-L184 enforce_enable 的 NOTE(shen-shanshan) 注释块（ViT 特例，一句话带过）"
+   ]
+  },
+  {
+   "path": "vllm/model_executor/custom_op.py",
+   "lines": "L209-L231",
+   "what": "maybe_compile 头部：『CustomOp 实例若在不透明算子内部被调用，其 forward 对模型级 torch.compile 不可见——此时单独编译 forward_native』+ 三道不编译闸（enable 开关/全局 NONE/eager backend）。注释自认 does not enable fusion across ops。",
+   "code": "    def maybe_compile(self, fn, *, enable: bool = True):\n        \"\"\"\n        Compile fn if compilation enabled.\n        Useful for CustomOp instances called from within a torch custom op,\n        meaning the forward call is hidden from the model-level torch.compile.\n\n        NOTE: this does not enable fusion across ops, so opaque custom ops\n        should still be unwrapped wherever possible.\n        \"\"\"\n        from vllm.config.compilation import CompilationMode\n\n        # Do not compile if compilation disabled\n        if not enable:\n            return fn\n\n        # Do not compile if global compilation disabled\n        compilation_config = get_cached_compilation_config()\n        if compilation_config.mode == CompilationMode.NONE:\n            return fn\n\n        # If eager backend is used, do not compile either\n        if compilation_config.backend == \"eager\":\n            return fn",
+   "elide": [
+    "L233-L269 dynamic_arg_dims 包装分支与 dynamic=True 的 torch.compile 尾部（正则点到 mark_dynamic 即可）"
+   ]
+  },
+  {
+   "path": "vllm/model_executor/custom_op.py",
+   "lines": "L271-L311",
+   "what": "enabled()（±name 精确开关、两者同设即 raise）与 default_on()（custom_ops 须恰含一个基础档 all/none；Inductor 时默认 none 否则 all）——开关协议的全部规则。",
+   "code": "    @classmethod\n    def enabled(cls) -> bool:\n        # if no name, then it was not registered\n        compilation_config = get_cached_compilation_config()\n        custom_ops = compilation_config.custom_ops\n        if not hasattr(cls, \"name\"):\n            logger.warning_once(\n                \"Custom op %s was not registered, which means it won't appear \"\n                \"in the op registry. It will be enabled/disabled based on the \"\n                \"global settings.\",\n                cls.__name__,\n            )\n            return CustomOp.default_on()\n\n        enabled = f\"+{cls.name}\" in custom_ops\n        disabled = f\"-{cls.name}\" in custom_ops\n        if enabled and disabled:\n            raise ValueError(\n                \"custom_ops cannot both enable and disable the same operation: \"\n                f\"{cls.name}. Remove either the '+' or '-' directive\"\n            )\n\n        return (CustomOp.default_on() or enabled) and not disabled\n\n    @staticmethod\n    def default_on() -> bool:\n        \"\"\"\n        Behavior controlled by `CompilationConfig.custom_ops`: On by default if\n        'all', off by default if 'none'.\n        When PyTorch Inductor is used, 'none' is the default value,\n        otherwise 'all'.\n        \"\"\"\n        compilation_config = get_cached_compilation_config()\n        count_none = compilation_config.custom_ops.count(\"none\")\n        count_all = compilation_config.custom_ops.count(\"all\")\n        if count_none + count_all != 1:\n            raise ValueError(\n                \"custom_ops must contain exactly one base mode: 'all' or 'none'\"\n            )\n\n        return not count_none > 0 or count_all > 0",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/layers/layernorm.py",
+   "lines": "L35-L42",
+   "what": "RMSNorm 注册头：@CustomOp.register(\"rms_norm\") 把类挂进 op_registry——CustomOp 的具体实例。",
+   "code": "# --8<-- [start:rms_norm]\n@CustomOp.register(\"rms_norm\")\nclass RMSNorm(CustomOp):\n    \"\"\"Root mean square normalization.\n\n    Computes x -> w * x / sqrt(E[x^2] + eps) where w is the learned weight.\n    Refer to https://arxiv.org/abs/1910.07467\n    \"\"\"",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/layers/layernorm.py",
+   "lines": "L74-L122",
+   "what": "RMSNorm 三实现：forward_native（PyTorch 原生，编译器可融合）/ forward_cuda（VLLM_BATCH_INVARIANT 分支 + 回落 native）/ forward_xpu（直接转发 cuda）——一个算子、多份身体。",
+   "code": "    def forward_native(\n        self,\n        x: torch.Tensor,\n        residual: torch.Tensor | None = None,\n    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:\n        \"\"\"PyTorch-native implementation equivalent to forward().\"\"\"\n        if residual is None:\n            return ir.ops.rms_norm(\n                x,\n                self.weight.data if self.pass_weight else None,\n                self.variance_epsilon,\n                self.variance_size_override,\n            )\n        else:\n            return ir.ops.fused_add_rms_norm.maybe_inplace(\n                x,\n                residual,\n                self.weight.data if self.pass_weight_add else None,\n                self.variance_epsilon,\n                self.variance_size_override,\n            )\n\n    def forward_cuda(\n        self,\n        x: torch.Tensor,\n        residual: torch.Tensor | None = None,\n    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:\n        if envs.VLLM_BATCH_INVARIANT:\n            assert self.variance_size_override is None, (\n                \"Batch invariance is not supported for variance_size_override\"\n            )\n            pass_weight = (\n                self.pass_weight_add if residual is not None else self.pass_weight\n            )\n            return rms_norm_batch_invariant(\n                x,\n                self.weight.data if pass_weight else None,\n                self.variance_epsilon,\n                residual=residual,\n            )\n\n        return self.forward_native(x, residual)\n\n    def forward_xpu(\n        self,\n        x: torch.Tensor,\n        residual: torch.Tensor | None = None,\n    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:\n        return self.forward_cuda(x, residual)",
+   "elide": [
+    "L101-L113 VLLM_BATCH_INVARIANT 断言分支（batch 不变性实验路径）"
+   ]
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/attention.py",
+   "lines": "L437-L446",
+   "what": "Attention 构造期双注册面：use_direct_call = not current_platform.opaque_attention_op()（平台决定走 torch op 还是直调）；prefix 重名即 raise、注册进 compilation_config.static_forward_context——『模型定义域在构造期产出层注册表，本域在运行期消费』。",
+   "code": "        # For cuda-alike (CUDA and ROCM) and cpu platforms, we control how\n        # torch.compile works by registering the attention as one giant\n        # opaque custom op. For other platforms, we directly call them\n        # and let torch.compile handle them.\n        self.use_direct_call = not current_platform.opaque_attention_op()\n\n        compilation_config = vllm_config.compilation_config\n        if prefix in compilation_config.static_forward_context:\n            raise ValueError(f\"Duplicate layer name: {prefix}\")\n        compilation_config.static_forward_context[prefix] = self",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/attention.py",
+   "lines": "L512-L582",
+   "what": "Attention.forward 主体：query_quant 前置分支（F10 苗、保留）——kv_cache_dtype 为 fp8/nvfp4 时用 simple torch operation 量化 query，注释自述 enables torch.compile to fuse this into previous ops；预分配 output（L531）→ QKV reshape 刻意在 custom op 外做（NOTE(woosuk)：minimize the CPU overheads from the non-CUDA-graph regions）→ CUDA 系平台走 torch.ops.vllm.unified_attention_with_output（out-variant）；KV 写拆成独立算子 unified_kv_cache_update，其返回的空张量作 dummy 数据依赖传入保序。",
+   "code": "        if output_dtype is None:\n            output_dtype = query.dtype\n        if self.query_quant is not None:\n            # quantizing with a simple torch operation enables\n            # torch.compile to fuse this into previous ops\n            # which reduces overheads during decoding.\n            # Otherwise queries are quantized using custom ops\n            # which causes decoding overheads\n            assert self.kv_cache_dtype in {\"fp8\", \"fp8_e4m3\", \"nvfp4\"}\n\n            # check if query quantization is supported\n            if self.impl.supports_quant_query_input:\n                query, _ = self.query_quant(query, self._q_scale)\n\n        if output_shape is None:\n            # Handle both 2D [num_tokens, hidden] and\n            # 3D [num_tokens, heads, head_dim] query\n            num_tokens = query.shape[0]\n            output_shape = torch.Size((num_tokens, self.num_heads * self.head_size_v))\n        output = torch.empty(output_shape, dtype=output_dtype, device=query.device)\n        hidden_size = output_shape[-1]\n        # Reshape the query, key, and value tensors.\n        # NOTE(woosuk): We do this outside the custom op to minimize the\n        # CPU overheads from the non-CUDA-graph regions.\n        query = query.view(-1, self.num_heads, self.head_size)\n        output = output.view(-1, self.num_heads, self.head_size_v)\n        if key is not None:\n            key = key.view(-1, self.num_kv_heads, self.head_size)\n        if value is not None:\n            value = value.view(-1, self.num_kv_heads, self.head_size_v)\n        kv_cache_dummy_dep = None\n        if self.use_direct_call:\n            # Skip this if sharing KV cache with an earlier attention layer.\n            if (\n                not self.attn_backend.forward_includes_kv_cache_update\n                and self.kv_sharing_target_layer_name is None\n                and key is not None\n                and value is not None\n            ):\n                kv_cache_dummy_dep = unified_kv_cache_update(\n                    key, value, self.layer_name\n                )\n            unified_attention_with_output(\n                query,\n                key,\n                value,\n                output,\n                self.layer_name,\n                kv_cache_dummy_dep=kv_cache_dummy_dep,\n            )\n        else:\n            # Skip this if sharing KV cache with an earlier attention layer.\n            encoded = _encode_layer_name(self.layer_name)\n            if (\n                not self.attn_backend.forward_includes_kv_cache_update\n                and self.kv_sharing_target_layer_name is None\n                and key is not None\n                and value is not None\n            ):\n                kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(\n                    key, value, encoded\n                )\n            torch.ops.vllm.unified_attention_with_output(\n                query,\n                key,\n                value,\n                output,\n                encoded,\n                kv_cache_dummy_dep=kv_cache_dummy_dep,\n            )\n        return output.view(-1, hidden_size)",
+   "elide": [
+    "L508-L511 calculate_kv_scales 前置分支（fp8 KV 首拍标定，delete 清单已批删——可省；query_quant L514-L524 为 F10 苗须保留，故本 excerpt 自 L512 起）"
+   ]
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/attention.py",
+   "lines": "L732-L772",
+   "what": "get_attention_context：算子实现内按 layer_name 从 ForwardContext 取 attn_metadata（dict 按 layer / list 按 spec decode）/ 层实例（no_compile_layers）/ kv_cache / slot_mapping——thread-local 执行环境的消费口。",
+   "code": "def get_attention_context(\n    layer_name: str,\n) -> tuple[Any, \"Attention | MLAAttention\", torch.Tensor, torch.Tensor]:\n    \"\"\"Extract attention context for a given layer.\n\n    This helper function extracts the attention metadata, attention layer\n    instance, KV cache tensor, and slot mapping for a specific layer.\n\n    Args:\n        layer_name: The name/identifier of the attention layer.\n\n    Returns:\n        A tuple containing:\n        - attn_metadata: Attention metadata for this specific layer, or None if\n            no metadata available\n        - attn_layer: The attention layer instance (Attention or MLAAttention)\n        - kv_cache: The KV cache tensor for current forward pass\n        - slot_mapping: The slot mapping for this specific layer\n\n        Note: attn_metadata may be None, but attn_layer and kv_cache are always\n        extracted from the forward context.\n    \"\"\"\n    forward_context: ForwardContext = get_forward_context()\n    attn_metadata_raw = forward_context.attn_metadata\n    attn_metadata: AttentionMetadata\n    if isinstance(attn_metadata_raw, dict):\n        attn_metadata = attn_metadata_raw[layer_name]\n    elif isinstance(attn_metadata_raw, list):\n        # list[dict[str, AttentionMetadata]]: used in speculative decoding\n        # where [0] is the base-model (non-speculative) metadata dict.\n        attn_metadata = attn_metadata_raw[0][layer_name]\n    else:\n        attn_metadata = attn_metadata_raw\n    attn_layer: Attention | MLAAttention = forward_context.no_compile_layers[layer_name]\n    kv_cache = attn_layer.kv_cache\n    slot_mapping = forward_context.slot_mapping\n    assert isinstance(slot_mapping, dict), (\n        f\"Expected slot_mapping to be a dict, got {type(slot_mapping)}. \"\n    )\n    layer_slot_mapping = slot_mapping.get(layer_name)\n    return attn_metadata, attn_layer, kv_cache, layer_slot_mapping",
+   "elide": [
+    "L757-L764 list 分支（spec decode DBO 双微批，回指 ch33）"
+   ]
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/attention.py",
+   "lines": "L775-L814",
+   "what": "unified_kv_cache_update：docstring 原话——返回 dummy 以向 unified_attention 声明副作用与数据依赖、确保 torch.compile 保序；实现经 get_attention_context 拿 kv_cache/slot_mapping 调 impl.do_kv_cache_update，返回 key.new_empty(0)；direct_register_custom_op 注册（mutates_args=[]）。",
+   "code": "def unified_kv_cache_update(\n    key: torch.Tensor,\n    value: torch.Tensor,\n    layer_name: LayerNameType,\n) -> torch.Tensor:\n    \"\"\"\n    Returns a dummy that is passed to unified_attention to signal a side effect and\n    the data dependency between them to ensure torch.compile preserves ordering.\n    \"\"\"\n    layer_name = _resolve_layer_name(layer_name)\n    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)\n    if layer_slot_mapping is not None:\n        assert hasattr(attn_layer.impl, \"do_kv_cache_update\"), (\n            f\"{attn_layer.impl.__class__.__name__} does not support kv cache update\"\n        )\n        attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]\n            attn_layer,\n            key,\n            value,\n            kv_cache,\n            layer_slot_mapping,\n        )\n\n    return key.new_empty(0)\n\n\ndef unified_kv_cache_update_fake(\n    key: torch.Tensor,\n    value: torch.Tensor,\n    layer_name: LayerNameType,\n) -> torch.Tensor:\n    return torch.empty(0, device=key.device, dtype=key.dtype)\n\n\ndirect_register_custom_op(\n    op_name=\"unified_kv_cache_update\",\n    op_func=unified_kv_cache_update,\n    fake_impl=unified_kv_cache_update_fake,\n    mutates_args=[],\n)",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/attention.py",
+   "lines": "L817-L846",
+   "what": "unified_attention_with_output（@eager_break_during_capture + @maybe_transfer_kv_layer 装饰——第三代方案的断点钩子挂在正典算子上）：del kv_cache_dummy_dep 后经 get_attention_context 取上下文转调 self.impl.forward——attention 的全部执行环境都从 forward context 来，签名里只有一个 layer 名。",
+   "code": "@eager_break_during_capture\n@maybe_transfer_kv_layer\ndef unified_attention_with_output(\n    query: torch.Tensor,\n    key: torch.Tensor,\n    value: torch.Tensor,\n    output: torch.Tensor,\n    layer_name: LayerNameType,\n    output_scale: torch.Tensor | None = None,\n    output_block_scale: torch.Tensor | None = None,\n    kv_cache_dummy_dep: torch.Tensor | None = None,\n) -> None:\n    # kv_cache_dummy_dep is not used but accepting it creates a data dependency\n    # that ensures torch.compile preserves ordering between KV cache update and\n    # attention forward.\n    del kv_cache_dummy_dep\n    layer_name = _resolve_layer_name(layer_name)\n    attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)\n\n    self.impl.forward(\n        self,\n        query,\n        key,\n        value,\n        kv_cache,\n        attn_metadata,\n        output=output,\n        output_scale=output_scale,\n        output_block_scale=output_block_scale,\n    )",
+   "elide": []
+  },
+  {
+   "path": "vllm/forward_context.py",
+   "lines": "L29-L58",
+   "what": "BatchDescriptor（frozen dataclass）：num_tokens / num_reqs(可 None) / uniform / has_lora / num_active_loras——docstring 自述 keep the num of items as minimal as possible to properly and uniquely describe the padded batch；它是 CUDA graph 查表的 key。",
+   "code": "@dataclass(frozen=True)\nclass BatchDescriptor:\n    \"\"\"\n    Batch descriptor for cudagraph dispatching. We should keep the num of\n    items as minimal as possible to properly and uniquely describe the padded\n    batch for cudagraph.\n    \"\"\"\n\n    num_tokens: int\n    num_reqs: int | None = None\n    \"\"\"\n    Number of requests in the batch. Can be None for PIECEWISE cudagraphs where\n    the cudagraphs can handle any number of requests.\n    \"\"\"\n    uniform: bool = False\n    \"\"\"\n    True if all the requests in the batch have the same number of tokens.\n    \"\"\"\n    has_lora: bool = False\n    \"\"\"\n    Whether this batch has active LoRA adapters.\n    \"\"\"\n    num_active_loras: int = 0\n    \"\"\"\n    Number of distinct active LoRA adapters in this batch.\n    When cudagraph_specialize_lora_count is enabled, separate CUDA graphs\n    are captured for each num_active_loras value. This allows kernels\n    (like fused_moe_lora) whose grid size depends on num_active_loras\n    to be properly captured.\n    \"\"\"",
+   "elide": []
+  },
+  {
+   "path": "vllm/forward_context.py",
+   "lines": "L131-L159",
+   "what": "ForwardContext 字段：no_compile_layers（static_forward_context 的拷贝）/ attn_metadata / slot_mapping / cudagraph_runtime_mode（默认 NONE）/ batch_descriptor / is_padding / skip_compiled——每拍执行环境的 thread-local 载体。",
+   "code": "@dataclass\nclass ForwardContext:\n    # copy from vllm_config.compilation_config.static_forward_context\n    no_compile_layers: dict[str, Any]\n    attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]]\n    slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]]\n    \"\"\"\n    Type Dict[str, AttentionMetadata] for v1, map from layer_name of each\n    attention layer to its attention metadata\n    Type List[Dict[str, AttentionMetadata]] for DBO. List of size two, one\n    for each microbatch.\n    Set dynamically for each forward pass\n    \"\"\"\n    # set dynamically for each forward pass\n    dp_metadata: DPMetadata | None = None\n    # determine the cudagraph style at runtime to be FULL, PIECEWISE, or NONE.\n    # by default NONE, no cudagraph is used.\n    cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE\n    batch_descriptor: BatchDescriptor | None = None\n\n    ubatch_slices: UBatchSlices | None = None\n\n    # Boolean mask over the token axis: True for padding rows that are not real\n    # tokens. Consumers can use it to skip work for padded tokens. None when\n    # the producer does not set it.\n    is_padding: torch.Tensor | None = None\n\n    # If True, bypass the compiled model call, e.g. by using .forward() directly\n    skip_compiled: bool = False",
+   "elide": [
+    "L151-L156 ubatch_slices/is_padding（DBO 扩展态，一句话带过）；L161-L186 all_moe_layers/moe_layer_index 的 fast_moe_cold_start 旧方案注释块"
+   ]
+  },
+  {
+   "path": "vllm/forward_context.py",
+   "lines": "L259-L344",
+   "what": "set_forward_context：上下文管理器——DP 元数据协调、cudagraph 用时顺手补建 batch_descriptor（there's no harm since if it doesn't match in the wrapper it'll fall through）、平台注入 additional_kwargs、构造 ForwardContext 后 override 全局 _forward_context 包住 yield。",
+   "code": "@contextmanager\ndef set_forward_context(\n    attn_metadata: Any,\n    vllm_config: VllmConfig,\n    num_tokens: int | None = None,\n    num_tokens_across_dp: torch.Tensor | None = None,\n    cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,\n    batch_descriptor: BatchDescriptor | None = None,\n    ubatch_slices: UBatchSlices | None = None,\n    slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,\n    skip_compiled: bool = False,\n    is_padding: torch.Tensor | None = None,\n):\n    \"\"\"A context manager that stores the current forward context,\n    can be attention metadata, etc.\n    Here we can inject common logic for every model forward pass.\n    \"\"\"\n    global forward_start_time\n    need_to_track_batchsize = track_batchsize and attn_metadata is not None\n    if need_to_track_batchsize:\n        forward_start_time = time.perf_counter()\n\n    dp_metadata: DPMetadata | None = None\n    if (\n        (\n            vllm_config.parallel_config.data_parallel_size > 1\n            or vllm_config.parallel_config.use_sequence_parallel_moe\n        )\n        and vllm_config.parallel_config.is_moe_model is not False\n        and (attn_metadata is not None or num_tokens is not None)\n    ):\n        # If num_tokens_across_dp hasn't already been initialized, then\n        # initialize it here. Both DP padding and Microbatching will be\n        # disabled.\n        if (\n            num_tokens_across_dp is None\n            and vllm_config.parallel_config.data_parallel_size > 1\n        ):\n            assert ubatch_slices is None\n            assert num_tokens is not None\n            _, num_tokens_across_dp, _ = coordinate_batch_across_dp(\n                num_tokens_unpadded=num_tokens,\n                parallel_config=vllm_config.parallel_config,\n                allow_microbatching=False,\n            )\n            assert num_tokens_across_dp is not None\n        elif num_tokens_across_dp is None:\n            assert num_tokens is not None\n            num_tokens_across_dp = torch.tensor([num_tokens], dtype=torch.int32)\n        dp_metadata = DPMetadata.make(\n            vllm_config.parallel_config, num_tokens or 0, num_tokens_across_dp\n        )\n\n    # Convenience: if cudagraph is used and num_tokens is given, we can just\n    # create a batch descriptor here if not given (there's no harm since if it\n    # doesn't match in the wrapper it'll fall through).\n    if cudagraph_runtime_mode != CUDAGraphMode.NONE and num_tokens is not None:\n        batch_descriptor = batch_descriptor or BatchDescriptor(num_tokens=num_tokens)\n\n    additional_kwargs = current_platform.set_additional_forward_context(\n        attn_metadata=attn_metadata,\n        vllm_config=vllm_config,\n        dp_metadata=dp_metadata,\n        num_tokens=num_tokens,\n        num_tokens_across_dp=num_tokens_across_dp,\n        cudagraph_runtime_mode=cudagraph_runtime_mode,\n        batch_descriptor=batch_descriptor,\n        ubatch_slices=ubatch_slices,\n    )\n\n    forward_context = create_forward_context(\n        attn_metadata,\n        vllm_config,\n        dp_metadata,\n        cudagraph_runtime_mode,\n        batch_descriptor,\n        ubatch_slices,\n        slot_mapping,\n        additional_kwargs,\n        skip_compiled,\n        is_padding=is_padding,\n    )\n\n    try:\n        with override_forward_context(forward_context):\n            yield",
+   "elide": [
+    "L345-L376 finally 尾部的 batchsize 统计日志段（观测，整段略）"
+   ]
+  },
+  {
+   "path": "vllm/compilation/partition_rules.py",
+   "lines": "L14-L38",
+   "what": "should_split：node.target 是 OpOverload(Packet) 且限定名在 splitting_ops 中——切点判定的全部逻辑，仅 24 行。",
+   "code": "def should_split(node: torch.fx.Node, splitting_ops: list[str]) -> bool:\n    \"\"\"\n    Check if a node should be split for dynamo graph partition.\n    It operates on dynamo graph, so the node.target can be anything.\n    We need to check and split only on OpOverload and OpOverloadPacket.\n    \"\"\"\n\n    if node.op != \"call_function\":\n        return False\n\n    target = node.target\n\n    if isinstance(target, torch._ops.OpOverloadPacket):\n        # Example: \"aten::add\"\n        return target._qualified_op_name in splitting_ops\n\n    if isinstance(target, torch._ops.OpOverload):\n        # Example: \"aten::add\"\n        packet_name = target.name()\n\n        # Example: \"aten::add.default\"\n        op_overload_name = f\"{packet_name}.{target._overloadname}\"\n        return op_overload_name in splitting_ops or packet_name in splitting_ops\n\n    return False",
+   "elide": []
+  },
+  {
+   "path": "vllm/compilation/backends.py",
+   "lines": "L553-L627",
+   "what": "split_graph 算法：遍历 FX 节点按 should_split 编 subgraph_id（连续切点合并 L583-L589）、空子图回并（_merge_empty_only_subgraphs）、keep_original_order=True 保突变语义（L595-L608 注释原话：otherwise pytorch might reorder the nodes and the semantics of the graph will change when we have mutations）、split_module 切成子模块序列。",
+   "code": "def split_graph(\n    graph: fx.GraphModule, splitting_ops: list[str]\n) -> tuple[fx.GraphModule, list[SplitItem]]:\n    _decompose_size_nodes(graph)\n\n    # split graph by ops\n    subgraph_id = 0\n    node_to_subgraph_id: dict[fx.Node, int] = {}\n    split_op_graphs: list[int] = []\n    for node in graph.graph.nodes:\n        if node.op in (\"output\", \"placeholder\"):\n            continue\n\n        # Check if this is a getitem operation on a node from an earlier subgraph.\n        # If so, assign it to the same subgraph as its input to avoid passing entire\n        # tuple as input to submodules, which is against standalone_compile and\n        # AoTAutograd input requirement.\n        if node.op == \"call_function\" and node.target == operator.getitem:\n            # Assign this getitem to the same subgraph as its input\n            input_node = node.args[0]\n            if input_node.op != \"placeholder\":\n                assert input_node in node_to_subgraph_id\n                node_to_subgraph_id[node] = node_to_subgraph_id[input_node]\n                continue\n\n        if should_split(node, splitting_ops):\n            subgraph_id += 1\n            node_to_subgraph_id[node] = subgraph_id\n            split_op_graphs.append(subgraph_id)\n\n            # keep consecutive splitting ops together\n            # (we know node.next exists because node isn't the last (output) node)\n            if should_split(node.next, splitting_ops):\n                # this will get incremented by the next node\n                subgraph_id -= 1\n            else:\n                subgraph_id += 1\n        else:\n            node_to_subgraph_id[node] = subgraph_id\n\n    _merge_empty_only_subgraphs(node_to_subgraph_id, split_op_graphs)\n\n    # `keep_original_order` is important!\n    # otherwise pytorch might reorder the nodes and\n    # the semantics of the graph will change when we\n    # have mutations in the graph\n    with _use_lazy_graph_module(True):\n        has_tuple_return = is_torch_equal_or_newer(\"2.12.0.dev\")\n        tuple_return_kwarg = {\"tuple_return\": True} if has_tuple_return else {}\n        split_gm = torch.fx.passes.split_module.split_module(\n            graph,\n            None,\n            lambda node: node_to_subgraph_id[node],\n            keep_original_order=True,\n            **tuple_return_kwarg,\n        )\n\n    outputs = []\n\n    names = [name for (name, module) in split_gm.named_modules()]\n\n    for name in names:\n        if \".\" in name or name == \"\":\n            # recursive child module or the root module\n            continue\n\n        module = getattr(split_gm, name)\n\n        graph_id = int(name.replace(\"submod_\", \"\"))\n        outputs.append(SplitItem(name, graph_id, (graph_id in split_op_graphs), module))\n\n    # sort by integer graph_id, rather than string name\n    outputs.sort(key=lambda x: x.graph_id)\n\n    return split_gm, outputs",
+   "elide": [
+    "L566-L576 getitem 归并优化；L593 _merge_empty_only_subgraphs 调用行"
+   ]
+  },
+  {
+   "path": "vllm/compilation/backends.py",
+   "lines": "L633-L684",
+   "what": "wrap_with_cudagraph_if_needed：Dynamo 切片路线下每片包 CUDAGraphWrapper(PIECEWISE)——首片 debug_log_enable、非首片 gc_disable（跨层反复 gc.collect 让捕获极慢的注释）、末片 weak_ref_output；平台可换静态图包装类。use_inductor_graph_partition 时整段跳过（另条路线不在此包装）。",
+   "code": "def wrap_with_cudagraph_if_needed(\n    piecewise_backend: Any,\n    vllm_config: VllmConfig,\n    compilation_config: CompilationConfig,\n    is_first_graph: bool,\n    is_last_graph: bool,\n) -> Any:\n    \"\"\"\n    Wrap a piecewise backend with CUDA graph wrapper if needed.\n    This function is shared between VllmBackend and\n    construct_serializable_fn_from_inductor_cache.\n\n    Args:\n        piecewise_backend: The backend to wrap\n        vllm_config: The vLLM configuration\n        compilation_config: The compilation configuration\n        is_first_graph: Whether this is the first graph in the sequence\n        is_last_graph: Whether this is the last graph in the sequence\n\n    Returns:\n        The wrapped backend if CUDA graphs are enabled, otherwise the original backend\n    \"\"\"\n    if (\n        not compilation_config.cudagraph_mode.has_piecewise_cudagraphs()\n        or compilation_config.use_inductor_graph_partition\n    ):\n        return piecewise_backend\n\n    # We're using Dynamo-based piecewise splitting, so we wrap\n    # the whole subgraph with a static graph wrapper.\n    from .cuda_graph import CUDAGraphOptions\n\n    # resolve the static graph wrapper class (e.g. CUDAGraphWrapper\n    # class) as platform dependent.\n    static_graph_wrapper_class = resolve_obj_by_qualname(\n        current_platform.get_static_graph_wrapper_cls()\n    )\n\n    # Always assign PIECEWISE runtime mode to the\n    # CUDAGraphWrapper for piecewise_backend, to distinguish\n    # it from the FULL cudagraph runtime mode, no matter it\n    # is wrapped on a full or piecewise fx graph.\n    return static_graph_wrapper_class(\n        runnable=piecewise_backend,\n        vllm_config=vllm_config,\n        runtime_mode=CUDAGraphMode.PIECEWISE,\n        cudagraph_options=CUDAGraphOptions(\n            debug_log_enable=is_first_graph,\n            gc_disable=not is_first_graph,\n            weak_ref_output=is_last_graph,\n        ),\n    )",
+   "elide": [
+    "L640-L654 docstring 与参数说明"
+   ]
+  },
+  {
+   "path": "vllm/compilation/backends.py",
+   "lines": "L730-L776",
+   "what": "PiecewiseCompileInterpreter.call_module：命中 compile_submod_names 的子图建 PiecewiseBackend（送 Inductor 编译）并经 wrap_with_cudagraph_if_needed 挂回 self.module.__dict__[target]——片间接缝仍是 interpreter 的普通调用（eager）。",
+   "code": "    def call_module(\n        self,\n        target: torch.fx.node.Target,\n        args: tuple[torch.fx.node.Argument, ...],\n        kwargs: dict[str, Any],\n    ) -> Any:\n        assert isinstance(target, str)\n\n        gm = getattr(self.module, target)\n        outputs = gm.graph.output_node().args[0]\n        output = fx.map_arg(outputs, lambda node: node.meta[\"example_value\"])\n\n        if target in self.compile_submod_names:\n            index = self.compile_submod_names.index(target)\n            submod = self.fetch_attr(target)\n\n            sym_shape_indices = [\n                i for i, x in enumerate(args) if isinstance(x, torch.SymInt)\n            ]\n\n            # Lazy import here to avoid circular import\n            from torch._inductor.compile_fx import graph_returns_tuple\n\n            from .piecewise_backend import PiecewiseBackend\n\n            piecewise_backend = PiecewiseBackend(\n                submod,\n                self.vllm_config,\n                index,\n                len(self.compile_submod_names),\n                sym_shape_indices,\n                self.vllm_backend,\n                graph_returns_tuple(submod),\n                submod_name=target,\n            )\n\n            self.module.__dict__[target] = wrap_with_cudagraph_if_needed(\n                piecewise_backend,\n                self.vllm_config,\n                self.compilation_config,\n                piecewise_backend.is_first_graph,\n                piecewise_backend.is_last_graph,\n            )\n\n            compilation_counter.num_piecewise_capturable_graphs_seen += 1\n\n        return output",
+   "elide": [
+    "L738-L748 example_value 推导与 sym_shape_indices 收集行"
+   ]
+  },
+  {
+   "path": "vllm/compilation/wrapper.py",
+   "lines": "L47-L54",
+   "what": "TorchCompileWithNoGuardsWrapper docstring：丢全部 guard → 首次 __call__ 触发一次编译、此后 Dynamo 永不再 trace——防重编译的契约原文。",
+   "code": "class TorchCompileWithNoGuardsWrapper:\n    \"\"\"\n    A wrapper class for torch.compile, it ensures that all guards are dropped\n    when CompilationMode is not CompilationMode.STOCK_TORCH_COMPILE.\n    When guards are dropped, the first time __call__ is invoked, a single\n    compilation is triggered. Dynamo should never be traced again after that\n    since we drop all guards.\n    \"\"\"",
+   "elide": []
+  },
+  {
+   "path": "vllm/compilation/wrapper.py",
+   "lines": "L105-L154",
+   "what": "丢 guard 与一次编译：非 STOCK 模式下 guard_filter_fn 把 guard 表清空（skip_all_guards_unsafe 或全 False 回落）；torch.compile(fullgraph=True, dynamic=False, backend=VllmBackend, options) ——『一次编译永不回看』的落地。",
+   "code": "        if mode != CompilationMode.STOCK_TORCH_COMPILE:\n            # Drop all the guards.\n            if self.evaluate_guards:\n                assert not envs.VLLM_USE_BYTECODE_HOOK, (\n                    \"compilation_config.dynamic_shapes_config.evaluate_guards \"\n                    \"requires VLLM_USE_BYTECODE_HOOK=0. \"\n                )\n                assert ds_type != DynamicShapesType.UNBACKED, (\n                    \"UNBACKED dynamic shapes do not add guards\"\n                )\n\n                options[\"guard_filter_fn\"] = lambda x: [\n                    entry.guard_type == \"SHAPE_ENV\" for entry in x\n                ]\n            else:\n                if hasattr(torch.compiler, \"skip_all_guards_unsafe\"):\n                    # Torch 2.10+ provides skip_all_guards_unsafe\n                    options[\"guard_filter_fn\"] = torch.compiler.skip_all_guards_unsafe\n                else:\n                    # Equivalent fallback for older PyTorch: skip all guards\n                    options[\"guard_filter_fn\"] = lambda x: [False for _ in x]\n\n        compiled_ptr: Any = self.forward\n        # Validate that unbacked dynamic shapes require VLLM_USE_BYTECODE_HOOK=False\n\n        # Apply the constrain_to_fx_strides patch before first compilation.\n        # This covers STOCK_TORCH_COMPILE and DYNAMO_ONCE paths. The VLLM\n        # compile paths call this from their own compile() methods too.\n        from vllm.env_override import _apply_constrain_to_fx_strides_patch\n\n        _apply_constrain_to_fx_strides_patch()\n\n        aot_context = nullcontext()\n        if envs.VLLM_USE_AOT_COMPILE:\n            if hasattr(torch._dynamo.config, \"enable_aot_compile\"):\n                aot_context = torch._dynamo.config.patch(enable_aot_compile=True)\n            else:\n                msg = \"torch._dynamo.config.enable_aot_compile is not \"\n                msg += \"available. AOT compile is disabled and please \"\n                msg += \"upgrade PyTorch version to use AOT compile.\"\n                logger.warning(msg)\n\n        with aot_context:\n            self._compiled_callable = torch.compile(\n                compiled_ptr,\n                fullgraph=True,\n                dynamic=False,\n                backend=backend,\n                options=options,\n            )",
+   "elide": [
+    "L107-L114 evaluate_guards 与 unbacked 断言分支（动态形状新路线）；L127-L160 aot/bytecode_hook 尾部"
+   ]
+  },
+  {
+   "path": "vllm/v1/cudagraph_dispatcher.py",
+   "lines": "L72-L109",
+   "what": "_compute_bs_to_padded_graph_size：按 capture_sizes 分段预计算 bs→padded 尺寸表（段首保形、段内上取整到段尾）；并校验 compile_sizes 不得被 padding 改写（否则 raise）。",
+   "code": "    def _compute_bs_to_padded_graph_size(self) -> None:\n        \"\"\"Pre-compute the mapping from batch size to padded graph size.\"\"\"\n        max_size = self.compilation_config.max_cudagraph_capture_size\n        capture_sizes = self.compilation_config.cudagraph_capture_sizes\n        assert max_size is not None, (\n            \"Maximum cudagraph capture size must be set when cudagraphs are enabled.\"\n        )\n        assert capture_sizes is not None, (\n            \"Cudagraph capture sizes must be set when cudagraphs are enabled.\"\n        )\n        self._bs_to_padded_graph_size: list[int] = [0] * (max_size + 1)\n        for end, start in zip(\n            capture_sizes + [max_size + 1],\n            [0] + capture_sizes,\n        ):\n            for bs in range(start, end):\n                if bs == start:\n                    self._bs_to_padded_graph_size[bs] = start\n                else:\n                    self._bs_to_padded_graph_size[bs] = end\n\n        # Validate that compile_sizes won't be changed by padding.\n        # Only validate when cudagraphs are actually being used.\n        if (\n            self.compilation_config.compile_sizes\n            and self.cudagraph_mode != CUDAGraphMode.NONE\n        ):\n            for size in self.compilation_config.compile_sizes:\n                size = int(size)\n                if size <= max_size:\n                    padded = self._bs_to_padded_graph_size[size]\n                    if padded != size:\n                        raise ValueError(\n                            f\"compile_sizes contains {size} which would be \"\n                            f\"padded to {padded}. All compile_sizes must be \"\n                            \"values that won't be changed by cudagraph padding. \"\n                            \"Use values from cudagraph_capture_sizes.\"\n                        )",
+   "elide": [
+    "L93-L109 compile_sizes 校验块（正文一句话）"
+   ]
+  },
+  {
+   "path": "vllm/v1/cudagraph_dispatcher.py",
+   "lines": "L132-L156",
+   "what": "_create_padded_batch_descriptor：num_tokens 查表取 padded；uniform_decode 且 FULL 档时 num_reqs = padded/query_len（否则放宽 num_reqs=padded 并取消 uniform 标记）——key 的构造现场。",
+   "code": "    def _create_padded_batch_descriptor(\n        self,\n        num_tokens: int,\n        uniform_decode: bool,\n        has_lora: bool,\n        num_active_loras: int = 0,\n    ) -> BatchDescriptor:\n        max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs\n        uniform_decode_query_len = self.uniform_decode_query_len\n        num_tokens_padded = self._bs_to_padded_graph_size[num_tokens]\n\n        if uniform_decode and self.cudagraph_mode.has_mode(CUDAGraphMode.FULL):\n            num_reqs = min(num_tokens_padded // uniform_decode_query_len, max_num_seqs)\n            assert num_tokens_padded % uniform_decode_query_len == 0\n        else:\n            uniform_decode = False\n            num_reqs = min(num_tokens_padded, max_num_seqs)\n\n        return BatchDescriptor(\n            num_tokens=num_tokens_padded,\n            num_reqs=num_reqs,\n            uniform=uniform_decode,\n            has_lora=has_lora,\n            num_active_loras=num_active_loras,\n        )",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/cudagraph_dispatcher.py",
+   "lines": "L186-L233",
+   "what": "initialize_cudagraph_keys：按 cudagraph_capture_sizes × lora_cases 笛卡尔积生成全部合法 key；注释原话——FULL mode needs exact num_reqs because FA3's scheduler_metadata computation depends on it，PIECEWISE 放宽 num_reqs=None/uniform=False；decode FULL 档再补一组精确 key。『keys 是运行期合法图的唯一真相源』。",
+   "code": "        # Note: we create all valid keys for cudagraph here but do not\n        # guarantee all keys would be used. For example, if we allow lazy\n        # capturing in future PR, some keys may never be triggered.\n        if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:\n            assert self.compilation_config.cudagraph_capture_sizes is not None, (\n                \"Cudagraph capture sizes must be set when mixed mode is enabled.\"\n            )\n            for bs, num_active_loras in product(\n                self.compilation_config.cudagraph_capture_sizes, lora_cases\n            ):\n                batch_desc = self._create_padded_batch_descriptor(\n                    bs, False, num_active_loras > 0, num_active_loras\n                )\n                # Only relax for PIECEWISE mode. FULL mode needs exact num_reqs\n                # because FA3's scheduler_metadata computation depends on it.\n                if cudagraph_mode.mixed_mode() == CUDAGraphMode.PIECEWISE:\n                    batch_desc = replace(batch_desc, num_reqs=None, uniform=False)\n                self.add_cudagraph_key(cudagraph_mode.mixed_mode(), batch_desc)\n\n        # if decode cudagraph mode is FULL, and we don't already have mixed\n        # mode full cudagraphs then add them here.\n        if (\n            cudagraph_mode.decode_mode() == CUDAGraphMode.FULL\n            and cudagraph_mode.separate_routine()\n        ):\n            max_num_tokens = (\n                uniform_decode_query_len\n                * self.vllm_config.scheduler_config.max_num_seqs\n            )\n            assert self.compilation_config.cudagraph_capture_sizes is not None, (\n                \"Cudagraph capture sizes must be set when full mode is enabled.\"\n            )\n            cudagraph_capture_sizes_for_decode = [\n                x\n                for x in self.compilation_config.cudagraph_capture_sizes\n                if x <= max_num_tokens and x >= uniform_decode_query_len\n            ]\n            for bs, num_active_loras in product(\n                cudagraph_capture_sizes_for_decode, lora_cases\n            ):\n                self.add_cudagraph_key(\n                    CUDAGraphMode.FULL,\n                    self._create_padded_batch_descriptor(\n                        bs, True, num_active_loras > 0, num_active_loras\n                    ),\n                )\n\n        self.keys_initialized = True",
+   "elide": [
+    "L180-L184 lora_cases 收集；L207-L231 decode FULL 单独补 key 段"
+   ]
+  },
+  {
+   "path": "vllm/v1/cudagraph_dispatcher.py",
+   "lines": "L235-L324",
+   "what": "dispatch 查表：越界/未初始化/NONE 档/超 max_size 直接落 NONE（L274-L281）；构造 padded batch_desc → 先查 FULL 精确 key（L307-L311）→ 再查 PIECEWISE relaxed key（num_reqs=None，L313-L318）→ 都 miss 落 NONE（L320-L324）。invalid_modes 供 cascade attention 等禁 FULL（docstring 自述）。",
+   "code": "    def dispatch(\n        self,\n        num_tokens: int,\n        uniform_decode: bool = False,\n        has_lora: bool = False,\n        num_active_loras: int = 0,\n        valid_modes: AbstractSet[CUDAGraphMode] | None = None,\n        invalid_modes: AbstractSet[CUDAGraphMode] | None = None,\n    ) -> tuple[CUDAGraphMode, BatchDescriptor]:\n        \"\"\"\n        Given conditions(e.g.,batch descriptor and if using piecewise only),\n        dispatch to a cudagraph runtime mode and the valid batch descriptor.\n        A new batch descriptor is returned as we might dispatch a uniform batch\n        to a graph that supports a more general batch (uniform to non-uniform).\n\n        Args:\n            num_tokens: Number of tokens in the batch.\n            uniform_decode: Whether the batch is uniform decode (i.e. uniform and query\n                length is uniform_decode_query_len).\n            has_lora: Whether LoRA is active.\n            num_active_loras: Number of distinct active LoRA adapters.\n            valid_modes: Set of cudagraph modes that are allowed. None means\n                all modes are allowed.\n            invalid_modes: Set of cudagraph modes to exclude. Subtracted from\n                valid_modes to compute allowed modes. (e.g., {FULL} for\n                features like cascade attention not supported by full\n                cudagraphs). None means no modes are excluded.\n        \"\"\"\n        allowed_modes = valid_modes or CUDAGraphMode.valid_runtime_modes()\n\n        if invalid_modes:\n            allowed_modes -= invalid_modes\n\n        assert len(allowed_modes) >= 1, (\n            f\"No allowed cudagraph modes: valid_modes={valid_modes}, \"\n            f\"invalid_modes={invalid_modes}\"\n        )\n        max_size = self.compilation_config.max_cudagraph_capture_size\n\n        if (\n            not self.keys_initialized\n            or self.cudagraph_mode == CUDAGraphMode.NONE\n            or max_size is None\n            or num_tokens > max_size\n            or allowed_modes <= {CUDAGraphMode.NONE}\n        ):\n            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)\n\n        effective_num_active_loras = num_active_loras\n        if has_lora and num_active_loras > 0:\n            if self.specialize_lora_count:\n                # Find the smallest captured `num_active_loras` that is >= the current\n                # `num_active_loras`. This is because we only capture graphs for\n                # a subset of possible `num_active_loras` values (powers of 2).\n                import bisect\n\n                idx = bisect.bisect_left(self.captured_lora_counts, num_active_loras)\n                if idx < len(self.captured_lora_counts):\n                    effective_num_active_loras = self.captured_lora_counts[idx]\n            else:\n                # When not specializing, graphs are captured only with max_loras + 1,\n                # so we must use max_loras + 1 for dispatch to find a matching graph.\n                assert self.vllm_config.lora_config is not None, (\n                    \"LoRA config must be set when has_lora is True.\"\n                )\n                effective_num_active_loras = self.vllm_config.lora_config.max_loras + 1\n\n        normalized_uniform = uniform_decode and self.cudagraph_mode.separate_routine()\n        batch_desc = self._create_padded_batch_descriptor(\n            num_tokens, normalized_uniform, has_lora, effective_num_active_loras\n        )\n\n        if CUDAGraphMode.FULL in allowed_modes:\n            # check if key exists for full cudagraph\n            batch_desc_to_check = batch_desc\n            if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.FULL]:\n                return CUDAGraphMode.FULL, batch_desc_to_check\n\n        if CUDAGraphMode.PIECEWISE in allowed_modes:\n            # also check if the relaxed key exists for more \"general\"\n            # piecewise cudagraph\n            batch_desc_to_check = replace(batch_desc, num_reqs=None, uniform=False)\n            if batch_desc_to_check in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:\n                return CUDAGraphMode.PIECEWISE, batch_desc_to_check\n\n        assert CUDAGraphMode.NONE in allowed_modes, (\n            f\"No matching cudagraph found and NONE is not in \"\n            f\"allowed_modes={allowed_modes}\"\n        )\n        return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)",
+   "elide": [
+    "L244-L262 docstring 的参数说明段；L283-L300 LoRA specialize 的 bisect 分支（LoRA 专化，正文略）"
+   ]
+  },
+  {
+   "path": "vllm/compilation/cuda_graph.py",
+   "lines": "L146-L168",
+   "what": "CUDAGraphWrapper docstring：四步工作流（初始化定 mode → 运行期从 forward context 收 mode+descriptor 并 blindly trust → 不匹配直通 runnable → 匹配则按 key 捕获/回放）+ 关键边界声明：wrapper 不存持久缓冲、不拷输入——固定地址是外部（runner）的职责。",
+   "code": "    \"\"\"Wraps a runnable to add CUDA graph capturing and replaying ability. And\n    provide attribute access to the underlying `runnable` via `__getattr__`.\n\n    The workflow of this wrapper in the cudagraph dispatching is as follows:\n    1. At initialization, a runtime mode is assigned to the wrapper (FULL or\n    PIECEWISE).\n    2. At runtime, the wrapper receives a runtime_mode and a\n    batch_descriptor(key) from the forward context and blindly trust them\n    for cudagraph dispatching.\n    3. If runtime_mode is NONE or runtime_mode does not match the mode of the\n    wrapper, just call the runnable directly.\n    4. Otherwise, i.e., the runtime_mode matches the mode of the wrapper,\n    the wrapper will perform cudagraph capture(if key does not exist, create\n    a new entry and cache it) or replay (if key exists in the cache).\n\n    Note: CUDAGraphWrapper does not store persistent buffers or copy any\n    runtime inputs into that buffers for replay. We assume implementing them\n    is done outside of the wrapper. That is because we do not make any\n    assumption on the dynamic shape (batch size) of the runtime inputs, as a\n    trade-off for staying orthogonal to compilation logic. Nevertheless,\n    tracing and checking the input addresses to be consistent during replay is\n    guaranteed when VLLM_LOGGING_LEVEL == \"DEBUG\".\n    \"\"\"",
+   "elide": []
+  },
+  {
+   "path": "vllm/compilation/cuda_graph.py",
+   "lines": "L233-L261",
+   "what": "__call__ 头：无 forward context（视觉编码器等）直通；mode 不匹配直通（嵌套多 wrapper 各按 mode 认领）；匹配则取 batch_descriptor 建表项——wrapper 与 dispatcher 的分工：判责在上游、wrapper 盲信。",
+   "code": "    def __call__(self, *args: Any, **kwargs: Any) -> Any | None:\n        if not is_forward_context_available():\n            # No forward context means we are outside the normal\n            # inference path (e.g. a vision encoder forward pass).\n            # Just run the underlying function without cudagraphs.\n            return self.runnable(*args, **kwargs)\n\n        forward_context = get_forward_context()\n        batch_descriptor = forward_context.batch_descriptor\n        cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode\n\n        if (\n            cudagraph_runtime_mode == CUDAGraphMode.NONE\n            or cudagraph_runtime_mode != self.runtime_mode\n        ):\n            # CUDAGraphMode.NONE could mean the profile run, a warmup run, or\n            # running without cudagraphs.\n            # We do not trigger capture/replay if the runtime mode is not\n            # matches. This enables properly dispatching to the correct\n            # CUDAGraphWrapper when nesting multiple instances with different\n            # runtime modes.\n            return self.runnable(*args, **kwargs)\n\n        assert batch_descriptor is not None\n        if batch_descriptor not in self.concrete_cudagraph_entries:\n            # create a new entry for this batch descriptor\n            self.concrete_cudagraph_entries[batch_descriptor] = CUDAGraphEntry(\n                batch_descriptor=batch_descriptor\n            )",
+   "elide": []
+  },
+  {
+   "path": "vllm/compilation/cuda_graph.py",
+   "lines": "L265-L344",
+   "what": "捕获路径：validate_cudagraph_capturing_enabled() 先验捕获合法性 → 记录输入 data_ptr → 共享图池 set_graph_pool_id → torch.cuda.graph(cudagraph, pool=...) 内跑一遍 runnable → 输出 weak_ref_tensors 省显存（注释：只有末片安全，因为其输出不再被别的图用）。gc_disable 时连 gc.collect/empty_cache 都 patch 成 no-op。",
+   "code": "        if entry.cudagraph is None:\n            if self.cudagraph_options.debug_log_enable:\n                # Since we capture cudagraph for many different shapes and\n                # capturing is fast, we don't need to log it for every\n                # shape. E.g. we only log it for the first subgraph in\n                # piecewise mode.\n                logger.debug(\n                    \"Capturing a cudagraph on (%s,%s)\",\n                    self.runtime_mode.name,\n                    entry.batch_descriptor,\n                )\n            # validate that cudagraph capturing is legal at this point.\n            validate_cudagraph_capturing_enabled()\n\n            input_addresses = [\n                x.data_ptr() for x in args if isinstance(x, torch.Tensor)\n            ]\n            entry.input_addresses = input_addresses\n            cudagraph = torch.cuda.CUDAGraph()\n\n            with ExitStack() as stack:\n                if self.cudagraph_options.gc_disable:\n                    # during every model forward for piecewise cudagraph\n                    # mode, we will capture many pieces of cudagraphs\n                    # (roughly one per layer). running gc again and again\n                    # across layers will make the cudagraph capture very slow.\n                    # therefore, we only run gc for the first graph,\n                    # and disable gc for the rest of the graphs.\n                    stack.enter_context(\n                        patch(\"gc.collect\", lambda *args, **kwargs: None)\n                    )\n                    stack.enter_context(\n                        patch(\n                            \"torch.accelerator.empty_cache\",\n                            lambda *args, **kwargs: None,\n                        )\n                    )\n\n                if self.graph_pool is not None:\n                    set_graph_pool_id(self.graph_pool)\n                else:\n                    set_graph_pool_id(current_platform.graph_pool_handle())\n\n                # Sync offloader's copy stream before capture.\n                # Ensure any pre-capture prefetches from offloader are complete.\n                get_offloader().sync_prev_onload()\n\n                # mind-exploding: carefully manage the reference and memory.\n                with torch.cuda.graph(\n                    cudagraph,\n                    pool=self.graph_pool,\n                    stream=current_stream(),\n                ):\n                    # `output` is managed by pytorch's cudagraph pool\n                    output = self.runnable(*args, **kwargs)\n                    # Join offloader's copy stream after forward to avoid\n                    # unjoined stream error. The last layer's start_prefetch\n                    # forks copy_stream, but wait_prefetch only happens in\n                    # the next forward pass.\n                    get_offloader().join_after_forward()\n                    if self.cudagraph_options.weak_ref_output:\n                        # by converting it to weak ref,\n                        # the original `output` will immediately be released\n                        # to save memory. It is only safe to do this for\n                        # the last graph in piecewise cuadgraph mode, because\n                        # the output of the last graph will not be used by\n                        # any other cuda graph.\n                        output = weak_ref_tensors(output)\n\n            # here we always use weak ref for the output\n            # to save memory\n            entry.output = weak_ref_tensors(output)\n            entry.cudagraph = cudagraph\n\n            compilation_counter.num_cudagraph_captured += 1\n\n            # important: we need to return the output, rather than\n            # the weak ref of the output, so that pytorch can correctly\n            # manage the memory during cuda graph capture\n            return output",
+   "elide": [
+    "L286-L301 gc patch 块；L308-L310/L320-L324 offloader 同步调用行"
+   ]
+  },
+  {
+   "path": "vllm/compilation/cuda_graph.py",
+   "lines": "L346-L361",
+   "what": "回放路径：DEBUG 模式逐 data_ptr 断言与捕获时一致（错误信息原文：Input addresses for cudagraphs are different during replay）→ entry.cudagraph.replay() → 返回弱引用输出。『形状全等才能回放』的最终落点。",
+   "code": "        if self.is_debugging_mode:\n            # check if the input addresses are the same\n            new_input_addresses = [\n                x.data_ptr() for x in args if isinstance(x, torch.Tensor)\n            ]\n            assert new_input_addresses == entry.input_addresses, (\n                f\"Input addresses for cudagraphs are different \"\n                f\"during replay. Expected {entry.input_addresses}, \"\n                f\"got {new_input_addresses}\"\n            )\n\n        # Sync offloader before replay - ensures any external dependencies\n        # from pre-capture prefetches are satisfied.\n        get_offloader().sync_prev_onload()\n        entry.cudagraph.replay()\n        return entry.output",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L2073-L2078",
+   "what": "padding 四件套之一：query_start_loc 活跃前缀写 CU 偏移、尾部填非递减（注释原话：kernels like FlashAttention requires that）后 copy_to_gpu。",
+   "code": "        self.query_start_loc.np[0] = 0\n        self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens\n        # Note: pad query_start_loc to be non-decreasing, as kernels\n        # like FlashAttention requires that\n        self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])\n        self.query_start_loc.copy_to_gpu()",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L2338-L2341",
+   "what": "padding 四件套之二：block_table 尾行填 NULL_BLOCK_ID（注释：Block 0 is reserved for padding）。",
+   "code": "            # Fill unused block table entries with NULL_BLOCK_ID (null block)\n            # for CUDAGraph padding. Block 0 is reserved for padding.\n            blk_table_tensor[num_reqs:num_reqs_padded].fill_(NULL_BLOCK_ID)\n            return blk_table_tensor",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L4128-L4130",
+   "what": "padding 四件套之三：slot_mapping 尾部填 -1（注释：Needed for reshape_and_cache in full cuda graph mode）——KV 写 kernel 跳过 pad 槽。",
+   "code": "            # Fill unused with -1. Needed for reshape_and_cache in full cuda\n            # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID\n            slot_mapping[num_tokens_unpadded:num_tokens_padded].fill_(-1)",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L3663-L3664",
+   "what": "padding 四件套之四：positions 尾部清零（_preprocess 内）。",
+   "code": "            if num_input_tokens > num_scheduled_tokens:\n                self.positions[num_scheduled_tokens:num_input_tokens].zero_()",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L4265-L4278",
+   "what": "一拍裁决调用点：execute_model 内 _determine_batch_execution_and_padding（cascade 前缀_lens 已算好作为入参）——随后 num_tokens_padded = batch_desc.num_tokens、pad_attn = (mode==FULL) 决定下游全部 padded 维度。",
+   "code": "            (\n                cudagraph_mode,\n                batch_desc,\n                should_ubatch,\n                num_tokens_across_dp,\n                cudagraph_stats,\n            ) = self._determine_batch_execution_and_padding(\n                num_tokens=num_tokens_unpadded,\n                num_reqs=num_reqs,\n                num_scheduled_tokens_np=num_scheduled_tokens_np,\n                max_num_scheduled_tokens=max_num_scheduled_tokens,\n                use_cascade_attn=cascade_attn_prefix_lens is not None,\n                num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),\n            )",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L4432-L4456",
+   "what": "set_forward_context + _model_forward：mode 与 batch_descriptor 经 thread-local 传进图内的 wrapper；上方注释 Run the model. Use persistent buffers for CUDA graphs.——ch18 固定地址与本章回放的接缝。",
+   "code": "        with (\n            set_forward_context(\n                attn_metadata,\n                self.vllm_config,\n                num_tokens=num_tokens_padded,\n                num_tokens_across_dp=num_tokens_across_dp,\n                cudagraph_runtime_mode=cudagraph_mode,\n                batch_descriptor=batch_desc,\n                ubatch_slices=ubatch_slices_padded,\n                slot_mapping=slot_mappings,\n                skip_compiled=has_encoder_input,\n            ),\n            record_function_or_nullcontext(\"gpu_model_runner: forward\"),\n            self.maybe_get_kv_connector_output(\n                scheduler_output,\n                defer_finalize=defer_kv_connector_finalize,\n            ) as kv_connector_output,\n        ):\n            model_output = self._model_forward(\n                input_ids=input_ids,\n                positions=positions,\n                intermediate_tensors=intermediate_tensors,\n                inputs_embeds=inputs_embeds,\n                **model_kwargs,\n            )",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L6814-L6918",
+   "what": "capture_model：先 set_cudagraph_capturing_enabled(True)；注释原话 Capture the large shapes first so that the smaller shapes can reuse the memory pool；按 get_capture_descs()（降序）逐形状 _capture_cudagraphs；捕后 set_cudagraph_capturing_enabled(False)（任何意外捕获直接 RuntimeError）；统计图池显存差并打日志 This usually takes 5~20 seconds。",
+   "code": "    def capture_model(self) -> int:\n        if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:\n            logger.warning(\n                \"Skipping CUDA graph capture. To turn on CUDA graph capture, \"\n                \"ensure `cudagraph_mode` was not manually set to `NONE`\"\n            )\n            return 0\n\n        # Initialize encoder CUDA graph manager if enabled.\n        self._maybe_init_encoder_cudagraph_manager()\n\n        compilation_counter.num_gpu_runner_capture_triggers += 1\n\n        start_time = time.perf_counter()\n\n        # Trigger CUDA graph capture for specific shapes.\n        # Capture the large shapes first so that the smaller shapes\n        # can reuse the memory pool allocated for the large shapes.\n        set_cudagraph_capturing_enabled(True)\n\n        # Setup torch profiler for graph capture traces (conditional)\n        from vllm.distributed.parallel_state import get_world_group\n\n        local_rank = get_world_group().local_rank\n        enable_profiler = (\n            local_rank == 0\n        ) and self.vllm_config.profiler_config.capture_torch_profiler\n        if enable_profiler:\n            trace_dir = (\n                self.vllm_config.profiler_config.torch_profiler_dir + \"/capture_traces\"\n            )\n            profiler = torch.profiler.profile(\n                activities=[\n                    torch.profiler.ProfilerActivity.CPU,\n                    torch.profiler.ProfilerActivity.CUDA,\n                ],\n                record_shapes=True,\n                profile_memory=True,\n                with_stack=True,\n                on_trace_ready=torch.profiler.tensorboard_trace_handler(\n                    trace_dir,\n                    worker_name=f\"graph_capture_rank_{local_rank}\",\n                    use_gzip=True,\n                ),\n            )\n            logger.info_once(\n                \"Rank %d: Torch profiler enabled for CUDA graph capture, \"\n                \"traces will be saved to: %s\",\n                local_rank,\n                trace_dir,\n            )\n        else:\n            profiler = nullcontext()\n            logger.info_once(\n                \"Rank %d: Torch profiler disabled for CUDA graph capture\", local_rank\n            )\n\n        with self._freeze_gc(), graph_capture(device=self.device):\n            torch.accelerator.synchronize()\n            torch.accelerator.empty_cache()\n            start_free_gpu_memory = torch.accelerator.get_memory_info()[0]\n\n            for (\n                runtime_mode,\n                batch_descs,\n            ) in self.cudagraph_dispatcher.get_capture_descs():\n                self._capture_cudagraphs(\n                    batch_descriptors=batch_descs,\n                    cudagraph_runtime_mode=runtime_mode,\n                    profiler=profiler,\n                )\n                torch.accelerator.synchronize()\n\n            # Capture encoder CUDA graphs if enabled\n            if self.encoder_cudagraph_manager is not None:\n                encoder_graph_pool = current_platform.graph_pool_handle()\n                self.encoder_cudagraph_manager.capture(graph_pool=encoder_graph_pool)\n\n            torch.accelerator.synchronize()\n            end_free_gpu_memory = torch.accelerator.get_memory_info()[0]\n\n        # Disable cudagraph capturing globally, so any unexpected cudagraph\n        # capturing will be detected and raise an error after here.\n        # Note: We don't put it into graph_capture context manager because\n        # we may do lazy capturing in future that still allows capturing\n        # after here.\n        set_cudagraph_capturing_enabled(False)\n\n        torch.accelerator.synchronize()\n        torch.accelerator.empty_cache()\n\n        # Lock workspace to prevent resizing during execution.\n        # Max workspace sizes should have been captured during warmup/profiling.\n        lock_workspace()\n\n        end_time = time.perf_counter()\n        elapsed_time = end_time - start_time\n        cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory\n        # This usually takes 5~20 seconds.\n        logger.info_once(\n            \"Graph capturing finished in %.0f secs, took %.2f GiB\",\n            elapsed_time,\n            cuda_graph_size / (1 << 30),\n        )\n        return cuda_graph_size",
+   "elide": [
+    "L6822-L6823/L6887-L6890 encoder cudagraph 段；L6834-L6869 torch profiler 装配；L6871-L6873 freeze_gc/graph_capture 头"
+   ]
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L6920-L6966",
+   "what": "_warmup_and_capture：每形状先 num_warmups 次 eager dummy run（mode=NONE，让 JIT/内存分配稳定）→ synchronize → is_graph_capturing=True 再跑一次（wrapper 内首遇即捕）——『先热身再进捕获窗口』的编排。",
+   "code": "    def _warmup_and_capture(\n        self,\n        desc: BatchDescriptor,\n        cudagraph_runtime_mode: CUDAGraphMode,\n        profile_seq_lens: int | None = None,\n        allow_microbatching: bool = False,\n        num_warmups: int | None = None,\n        profiler: AbstractContextManager[Any] | None = None,\n    ):\n        if profiler is None:\n            profiler = nullcontext()\n        if num_warmups is None:\n            num_warmups = self.compilation_config.cudagraph_num_of_warmups\n        force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL\n        for _ in range(num_warmups):\n            self._dummy_run(\n                desc.num_tokens,\n                cudagraph_runtime_mode=CUDAGraphMode.NONE,\n                force_attention=force_attention,\n                uniform_decode=desc.uniform,\n                allow_microbatching=allow_microbatching,\n                skip_eplb=True,\n                remove_lora=False,\n                num_active_loras=desc.num_active_loras,\n                profile_seq_lens=profile_seq_lens,\n            )\n        if num_warmups > 0:\n            # Warmups may use auxiliary streams. Ensure all of their work has\n            # completed before beginning CUDA graph capture.\n            torch.accelerator.synchronize()\n        with (\n            profiler,\n            torch.profiler.record_function(\n                f\"capture_{desc.num_tokens}_{cudagraph_runtime_mode.name}\"\n            ),\n        ):\n            self._dummy_run(\n                desc.num_tokens,\n                cudagraph_runtime_mode=cudagraph_runtime_mode,\n                uniform_decode=desc.uniform,\n                allow_microbatching=allow_microbatching,\n                skip_eplb=True,\n                remove_lora=False,\n                num_active_loras=desc.num_active_loras,\n                is_graph_capturing=True,\n                profile_seq_lens=profile_seq_lens,\n            )",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L5435-L5479",
+   "what": "load_model 尾部包装：STOCK_TORCH_COMPILE 分支直接 model.compile；否则按档位给整个 model 套 CUDAGraphWrapper(FULL)（或 BreakableCUDAGraphWrapper / UBatchWrapper）——FULL 图挂在模型外、PIECEWISE 图挂在编译器内的每片上，两层各认领自己的 mode。",
+   "code": "        if (\n            self.vllm_config.compilation_config.mode\n            == CompilationMode.STOCK_TORCH_COMPILE\n        ):\n            from vllm.env_override import _apply_constrain_to_fx_strides_patch\n\n            _apply_constrain_to_fx_strides_patch()\n            backend = self.vllm_config.compilation_config.init_backend(self.vllm_config)\n            compilation_counter.stock_torch_compile_count += 1\n            self.model.compile(fullgraph=True, backend=backend)\n            return\n        # for other compilation modes, cudagraph behavior is controlled by\n        # CudagraphWrapper and CudagraphDispatcher of vllm.\n\n        # wrap the model with full cudagraph wrapper if needed.\n        cudagraph_mode = self.compilation_config.cudagraph_mode\n        assert cudagraph_mode is not None\n        if (\n            is_breakable_cudagraph_enabled()\n            and cudagraph_mode != CUDAGraphMode.NONE\n            and not self.parallel_config.use_ubatching\n        ):\n            self.model = BreakableCUDAGraphWrapper(self.model, self.vllm_config)\n            drafter = getattr(self, \"drafter\", None)\n            if drafter is not None and hasattr(drafter, \"model\"):\n                drafter.model = BreakableCUDAGraphWrapper(\n                    drafter.model, self.vllm_config\n                )\n        elif (\n            cudagraph_mode.has_full_cudagraphs()\n            and not self.parallel_config.use_ubatching\n        ):\n            self.model = CUDAGraphWrapper(\n                self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL\n            )\n        elif self.parallel_config.use_ubatching:\n            if cudagraph_mode.has_full_cudagraphs():\n                self.model = UBatchWrapper(\n                    self.model, self.vllm_config, CUDAGraphMode.FULL, self.device\n                )\n            else:\n                self.model = UBatchWrapper(\n                    self.model, self.vllm_config, CUDAGraphMode.NONE, self.device\n                )\n",
+   "elide": [
+    "L5452-L5462 breakable 分支；L5470-L5478 ubatching 分支"
+   ]
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L7161-L7202",
+   "what": "_check_and_update_cudagraph_mode：遍历全部注意力组取最弱 CG 支持（min_cg_support）→ resolve_cudagraph_mode_and_sizes 降级 → initialize_cudagraph_keys——后端能力向上传染：一个后端拖累全模型档位（接口归 ch21）。",
+   "code": "    def _check_and_update_cudagraph_mode(\n        self,\n        attention_backends: list[set[type[AttentionBackend]]],\n        kv_cache_groups: list[KVCacheGroupSpec],\n        is_profiling: bool = False,\n    ) -> None:\n        \"\"\"\n        Resolve the cudagraph_mode when there are multiple attention\n        groups with potential conflicting CUDA graph support.\n        Then initialize the cudagraph_dispatcher based on the resolved\n        cudagraph_mode.\n        \"\"\"\n        min_cg_support = AttentionCGSupport.ALWAYS\n        min_cg_attn_backend = None\n\n        for attn_backend_set, kv_cache_group in zip(\n            attention_backends, kv_cache_groups\n        ):\n            for attn_backend in attn_backend_set:\n                builder_cls = attn_backend.get_builder_cls()\n\n                cg_support = builder_cls.get_cudagraph_support(\n                    self.vllm_config, kv_cache_group.kv_cache_spec\n                )\n                if cg_support.value < min_cg_support.value:\n                    min_cg_support = cg_support\n                    min_cg_attn_backend = attn_backend.__name__\n        cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(\n            min_cg_support,\n            min_cg_attn_backend,\n            self.uniform_decode_query_len,\n            use_v2_model_runner=False,\n            tensor_parallel_size=self.parallel_config.tensor_parallel_size,\n            kv_cache_config=self.kv_cache_config,\n            max_num_reqs=self.max_num_reqs,\n            is_profiling=is_profiling,\n        )\n        # Trigger cudagraph dispatching keys initialization after\n        # resolved cudagraph mode.\n        self.cudagraph_dispatcher.initialize_cudagraph_keys(\n            cudagraph_mode, self.uniform_decode_query_len\n        )",
+   "elide": [
+    "L7204-L7216 drafter 的 dispatcher 初始化尾段"
+   ]
+  },
+  {
+   "path": "vllm/v1/worker/gpu_worker.py",
+   "lines": "L679-L717",
+   "what": "compile_or_warm_up_model 前半：warmup_sizes（compile_sizes 减去 cg 尺寸 + compile_ranges 补边界）从大到小逐个 _dummy_run（首个 dummy 前向即触发 Dynamo trace 与切图编译）→ kernel_warmup 调优 → capture_model 捕图。",
+   "code": "    def compile_or_warm_up_model(self) -> CompilationTimes:\n        warmup_sizes: list[int] = []\n\n        if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:\n            # warm up sizes that are not in cudagraph capture sizes,\n            # but users still want to compile for better performance,\n            # e.g. for the max-num-batched token size in chunked prefill.\n            compile_sizes = self.vllm_config.compilation_config.compile_sizes\n            warmup_sizes = compile_sizes.copy() if compile_sizes is not None else []  # type: ignore[assignment]\n            cg_capture_sizes: list[int] = []\n\n            if self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:\n                cg_sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes\n                cg_capture_sizes = [] if cg_sizes is None else cg_sizes\n                warmup_sizes = [x for x in warmup_sizes if x not in cg_capture_sizes]\n\n            compile_ranges = self.vllm_config.compilation_config.get_compile_ranges()\n            # For each compile_range, if none of the batch sizes\n            # in warmup_sizes or cudagraph_capture_sizes are in the range,\n            # add the end of the range to ensure compilation/warmup.\n            all_sizes = set(cg_capture_sizes)\n            all_sizes.update([x for x in warmup_sizes if isinstance(x, int)])\n            for compile_range in compile_ranges:\n                if not any(x in compile_range for x in all_sizes):\n                    warmup_sizes.append(compile_range.end)\n\n        # We skip EPLB here since we don't want to record dummy metrics\n        for size in sorted(warmup_sizes, reverse=True):\n            logger.info(\"Compile and warming up model for size %d\", size)\n            self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)\n        self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)\n\n        # Warmup and tune the kernels used during model execution before\n        # cuda graph capture.\n        kernel_warmup(self)\n\n        cuda_graph_memory_bytes = 0\n        if not self.model_config.enforce_eager:\n            cuda_graph_memory_bytes = self.model_runner.capture_model()",
+   "elide": [
+    "L682-L703 warmup_sizes 推导细节"
+   ]
+  },
+  {
+   "path": "vllm/v1/worker/gpu_worker.py",
+   "lines": "L793-L848",
+   "what": "启动期收尾四连：末 PP 段 sampler 预热（NOTE：刻意在 capture_model 之后防 empty_cache 清掉缓冲）→ trigger_inductor_lazy_init（注释：rather than on a later compile cache-miss at runtime）→ activate_jit_monitor（意外 JIT 编译即暴露）→ freeze_gc_heap（GC 不再扫描静态对象）→ enable_gpu_sync_check——『运行期零惊喜』的全部落点。",
+   "code": "        if self.use_v2_model_runner:\n            # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.\n            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)\n        elif get_pp_group().is_last_rank:\n            # V1: Warm up sampler and preallocate memory buffer for logits and other\n            # sampling related tensors of max possible shape to avoid memory\n            # fragmentation issue.\n            # NOTE: This is called after `capture_model` on purpose to prevent\n            # memory buffers from being cleared by `torch.accelerator.empty_cache`.\n            max_num_reqs = min(\n                self.scheduler_config.max_num_seqs,\n                self.scheduler_config.max_num_batched_tokens,\n            )\n\n            # We skip EPLB here since we don't want to record dummy metrics\n            hidden_states, last_hidden_states = self.model_runner._dummy_run(\n                num_tokens=max_num_reqs,\n                skip_eplb=True,\n                cudagraph_runtime_mode=CUDAGraphMode.NONE,\n            )\n            if self.model_runner.is_pooling_model:\n                self.model_runner._dummy_pooler_run(hidden_states)\n            else:\n                self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)\n\n        # Reset the seed to ensure that the random state is not affected by\n        # the model initialization and profiling.\n        set_random_seed(self.model_config.seed)\n\n        # Eagerly trigger inductor's once-per-process lazy inits during\n        # warmup (rather than on a later compile cache-miss at runtime).\n        c_config = self.compilation_config\n        if c_config.mode != CompilationMode.NONE and c_config.backend == \"inductor\":\n            from vllm.compilation.compiler_interface import (\n                trigger_inductor_lazy_init,\n            )\n\n            trigger_inductor_lazy_init(self.device)\n\n        # All warmup is done — start monitoring for unexpected JIT\n        # compilations that would cause latency spikes during inference.\n        from vllm.utils.jit_monitor import activate as activate_jit_monitor\n\n        activate_jit_monitor(\n            mode=self.observability_config.jit_monitor_mode,\n            verbose=self.observability_config.jit_monitor_verbose,\n        )\n\n        # Freeze the worker heap so the GC won't scan static objects\n        # (model weights, KV caches, CUDA graphs) during inference.\n        freeze_gc_heap()\n        maybe_attach_gc_debug_callback()\n\n        # Warmup / first-compile is done — activate the `VLLM_GPU_SYNC_CHECK`\n        # gate so subsequent `execute_model` / `sample_tokens` calls enforce it.\n        enable_gpu_sync_check()",
+   "elide": [
+    "L793-L795 use_v2_model_runner 分支；L818-L820 重置随机种子"
+   ]
+  },
+  {
+   "path": "vllm/v1/attention/backends/flash_attn.py",
+   "lines": "L880-L888",
+   "what": "接缝成本的原话：NOTE(woosuk)——piecewise CUDA graphs 下本方法在 eager 跑，view/slice 即使不触发 GPU op 也 surprisingly slow，任何改动都要 benchmark。切图的代价写在被切出去的代码里。",
+   "code": "        # IMPORTANT!\n        # NOTE(woosuk): With piece-wise CUDA graphs, this method is executed in\n        # eager-mode PyTorch. Thus, we need to be careful about any CPU overhead\n        # in this method. For example, `view` and `slice` (or `[:n]`) operations\n        # are surprisingly slow even in the case they do not invoke any GPU ops.\n        # Minimize the PyTorch ops in this method as much as possible.\n        # Whenever making a change in this method, please benchmark the\n        # performance to make sure it does not introduce any overhead.\n",
+   "elide": []
+  },
+  {
+   "path": "vllm/utils/torch_utils.py",
+   "lines": "L845-L870",
+   "what": "LayerName opaque 类型（v0.27）：字符串包成 opaque value-type，torch.compile 把它 lift 成图输入而非烤成常量——避免逐层重编译；register_opaque_type(hoist=True)。对照：splitting_ops 曾因 unified_kv_cache_update 的字符串参数被迫加切点（issue #33267），LayerName 是根治此问题的下一代方案。",
+   "code": "class LayerName(OpaqueBase):  # type: ignore[misc]\n    \"\"\"Wraps a module name string for use as a torch opaque type.\n\n    When torch >= 2.11, this is registered as a hoisted value-type opaque\n    object so that torch.compile lifts it as a graph input instead of baking\n    it as a constant.  This avoids per-layer recompilation for custom ops\n    that accept layer name strings (attention, MOE, KV cache, etc.).\n    \"\"\"\n\n    def __init__(self, value: str):\n        self.value = value\n\n    def __eq__(self, other):\n        return isinstance(other, LayerName) and self.value == other.value\n\n    def __hash__(self):\n        return hash(self.value)\n\n    def __fx_repr__(self):\n        return (f\"LayerName({self.value!r})\", {\"LayerName\": LayerName})\n\n\nif HAS_OPAQUE_TYPE:\n    from torch._library.opaque_object import register_opaque_type\n\n    register_opaque_type(LayerName, typ=\"value\", hoist=True)",
+   "elide": [
+    "L872-L889 _USE_LAYERNAME 开关与 _resolve/_encode 尾部"
+   ]
+  },
+  {
+   "path": "vllm/compilation/breakable_cudagraph.py",
+   "lines": "L3-L21",
+   "what": "第三代方案（实验，env 默认关）：不预切图——单个捕获上下文驱动整个 forward，在 attention/kv-cache 算子 dispatcher 处结束当前段捕获→eager 执行→恢复捕获；灵感自 sglang#19102；eager 段必须写捕获时的同一批静态缓冲。作路线图脚注，不进首读正典。",
+   "code": "\"\"\"Breakable CUDA graph capture/replay.\n\nThis is an alternative to :class:`CUDAGraphWrapper` that replaces vLLM's\ntorch.compile-based FX graph splitting with runtime stream-capture\nbreaks.\n\nThe idea (inspired by sgl-project/sglang#19102): instead of pre-splitting\nthe model into many pieces at attention boundaries, a\nsingle capture context drives the whole forward and intercepts\nattention / kv-cache custom ops at the dispatcher to end the current\nstream capture, run the op eagerly, and resume capture.\n\nThe captured artifact is a list of zero-arg callables -- the bound\n``CUDAGraph.replay`` for graph segments, or the user fn for eager\nsegments -- replayed in order at inference time.\n\nEager segments must operate on the same static buffers used during\ncapture so subsequent graph segments read the same memory addresses.\n\"\"\"",
+   "elide": []
+  }
+ ],
+ "theory": [
+  {
+   "topic": "形状全等才能回放的本质（CUDA graph 录的到底是什么）",
+   "content": "CUDA graph 捕获的是『一次前向期间 CPU 向 GPU 提交的全部工作』的参数快照：每个 kernel launch 的 grid/block 配置、参数块里的张量指针、乃至宿主端分支的产出（如 FA3 的 scheduler_metadata 是 CPU 算好再传给 kernel 的——所以 FULL 档连 num_reqs 都必须精确，cudagraph_dispatcher.py:L199-L202）。replay 只是把这串提交原样重发，不会重读张量的 shape/地址元数据。由此推出命中条件的两条：(1) BatchDescriptor 全等——形状变了图执行的就是错误的工作量；(2) 输入地址不变——指针烤死在图里，换了地址图读写的就是错误的数据。前者由 dispatcher 的 padding 尺寸表保证（任意 bs 上取整到捕获形状），后者由 ch18 的固定地址持久缓冲保证——两个条件各有一条设计链供给，DEBUG 模式下的 data_ptr 断言（cuda_graph.py:L346-L355）是第二条的运行期体检。"
+  },
+  {
+   "topic": "bs→padded 尺寸表与 padding 浪费算术",
+   "content": "capture_sizes 是一组分段端点（如 1,2,4,8,16,24,32,...）：段首 bs 保形、段内 bs 上取整到段尾（_compute_bs_to_padded_graph_size，cudagraph_dispatcher.py:L72-L91——zip(capture_sizes+[max+1], [0]+capture_sizes) 的区间填充）。浪费 = padded - bs 行白算：bs=9 pad 到 16 即白算 7 行。decode 一行只有一个 token 的 forward，白算便宜；prefill 一行可达数千 token，贵得多——所以默认捕获尺寸表只到 max_num_seqs 附近的 decode 量级，大 prefill 落 NONE 走 eager/编译图（dispatch L278：num_tokens > max_size 即 NONE）。CUDAGraphStat.num_paddings 把这笔账暴露成可观测指标（L4029-L4036）。"
+  },
+  {
+   "topic": "piecewise 的收益模型：编译砍什么、图捕砍什么",
+   "content": "两个优化砍的是两种不同的开销：torch.compile（Inductor）砍的是『算子粒度』——把多个小算子融合成大 kernel、消除中间显存往返；CUDA graph 砍的是『提交粒度』——一次 replay 顶替整段 kernel launch 的 CPU→GPU 提交与 Python dispatch。全 eager 的 decode 小 batch：每层几十次 Python dispatch + cudaLaunchKernel，整拍被 CPU 支配（Part V 的靶子）。全图 compile 的死结：attention 有外部副作用（写 KV cache）、动态分支、且动态 batch 触发 guard 反复重编译。piecewise 把『编译单元』降到层间连续段：不可融合处切出去 eager（切点=splitting_ops），可融合段编译后整体捕图——接缝每层约两次（attention + KV update），flash_attn.py:L880-L888 的 NOTE 是接缝成本的官方自白（连 view/slice 都 surprisingly slow）。"
+  },
+  {
+   "topic": "丢 guard 为什么是安全的（一次编译永不回看的前提）",
+   "content": "torch.compile 的 guard 是『输入还满足编译时的假设吗』的每拍检查；丢掉 guard 意味着赌假设恒成立（wrapper.py:L47-L54）。赌注的抵押品是上游设计链：所有输入张量落在启动期一次分配的固定形状/固定地址缓冲（ch18 CpuGpuBuffer/持久批次）+ 有限个捕获形状经 padding 归一 + mark_dynamic 声明的动态维纪律（@support_torch_compile 从 forward 注解推断，decorators.py:L118-L199）。任何假设被破坏都不会静默——wrapper 的 fullgraph=True 会让 trace 失败直接报错，而不是生成带 guard 的多版本缓存。这是『防重编译』（dynamic shapes 下 guard 风暴）与『可预测性』的合流。"
+  },
+  {
+   "topic": "图池共享与从大到小捕获的显存原理",
+   "content": "torch.cuda.graph(pool=...) 让多张图共享同一块图私有内存池：后捕的图可以复用先捕图已分配但已死的中间张量显存。CUDA 的池按『捕获顺序 + 张量活性』做分段复用——先捕最大形状，其工作集显存最大；小形状后捕时大部分中间缓冲能落进大图已开的段里，净增显存趋近于输出张量。capture_model 的注释（gpu_model_runner.py:L6829-L6831）与 get_capture_descs 的降序（L326-L350 sorted largest-first for memory efficiency）即此原理的编排面。图池总代价 = capture 前后 mem_get_info 差值（L6911），启动期经 profile_cudagraph_memory 预捕全部形状计入 KV cache 预算（ch14/ch17 的账本接口）。"
+  }
+ ],
+ "mechanisms": [
+  {
+   "id": "ch19-m01",
+   "name": "CustomOp 多平台算子抽象：forward_* 多实现 + op_registry 注册 + 构造期一次性 dispatch（运行期零分支）",
+   "kind": "protocol",
+   "source_anchors": [
+    "vllm/model_executor/custom_op.py:L130-L207",
+    "vllm/model_executor/custom_op.py:L315-L327"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "difficulty": "core"
+  },
+  {
+   "id": "ch19-m02",
+   "name": "default_on/±name 开关协议与编译模式耦合：Inductor 时默认 'none' 走 forward_native 让编译器融合、否则 'all'；±name 精确开关；enabled/disabled 计数进 compilation_config",
+   "kind": "config",
+   "source_anchors": [
+    "vllm/model_executor/custom_op.py:L272-L311",
+    "vllm/config/vllm.py:L1285-L1292"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting"
+  },
+  {
+   "id": "ch19-m03",
+   "name": "maybe_compile：不透明算子内部的 CustomOp 调用对模型级 torch.compile 不可见，forward_native 可被单独编译（不跨算子融合）",
+   "kind": "config",
+   "source_anchors": [
+    "vllm/model_executor/custom_op.py:L209-L269"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting"
+  },
+  {
+   "id": "ch19-m04",
+   "name": "forward context 三段式：构造期 Attention 自注册 static_forward_context → 每拍 set_forward_context 注入 thread-local → 算子内 get_attention_context 按 layer_name 取——metadata 不进模型 forward 签名",
+   "kind": "protocol",
+   "source_anchors": [
+    "vllm/model_executor/layers/attention/attention.py:L443-L446",
+    "vllm/forward_context.py:L260-L344",
+    "vllm/model_executor/layers/attention/attention.py:L732-L772"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "difficulty": "core"
+  },
+  {
+   "id": "ch19-m05",
+   "name": "注意力算子化：out-variant 统一算子 unified_attention_with_output（output 预分配、reshape 在 op 外）+ KV 写拆 unified_kv_cache_update 返回空张量作 dummy 数据依赖保序 + fake_impl 让 Dynamo 可 trace",
+   "kind": "protocol",
+   "source_anchors": [
+    "vllm/model_executor/layers/attention/attention.py:L488-L582",
+    "vllm/model_executor/layers/attention/attention.py:L775-L814",
+    "vllm/model_executor/layers/attention/attention.py:L819-L846"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "difficulty": "core"
+  },
+  {
+   "id": "ch19-m06",
+   "name": "LayerName opaque 类型：层名字符串包成 opaque value-type 被 torch.compile lift 成图输入而非烤成常量——避免逐层重编译（v0.27；对照 splitting_ops 因字符串参数被迫加切点的 issue #33267）",
+   "kind": "config",
+   "source_anchors": [
+    "vllm/utils/torch_utils.py:L845-L870"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting"
+  },
+  {
+   "id": "ch19-m07",
+   "name": "splitting_ops 切图点账本：_attention_ops 13 算子 + kv update 两算子（字符串参数阻止 Inductor 复用 piecewise 图故移出编译图）；full cudagraph 仍保留 piecewise fx 结构在全图外捕（PR #20059）",
+   "kind": "config",
+   "source_anchors": [
+    "vllm/config/compilation.py:L764-L778",
+    "vllm/config/compilation.py:L1133-L1184"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "difficulty": "core"
+  },
+  {
+   "id": "ch19-m08",
+   "name": "split_graph 切图算法：should_split 命中即编新 subgraph_id（连续切点合并、getitem 归并、空子图回并）+ keep_original_order=True 保突变语义 + split_module 切成子模块序列",
+   "kind": "algorithm",
+   "source_anchors": [
+    "vllm/compilation/backends.py:L553-L627",
+    "vllm/compilation/partition_rules.py:L14-L38"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "difficulty": "core"
+  },
+  {
+   "id": "ch19-m09",
+   "name": "逐片编译与接缝：PiecewiseCompileInterpreter 按序拼跑、非切分子图 PiecewiseBackend 送 Inductor、切点算子 eager（接缝成本：flash_attn NOTE view/slice surprisingly slow）；每片包 CUDAGraphWrapper(PIECEWISE)（首片 debug/非首片禁 GC/末片 weak_ref）",
+   "kind": "dataflow",
+   "source_anchors": [
+    "vllm/compilation/backends.py:L687-L776",
+    "vllm/compilation/backends.py:L633-L684",
+    "vllm/v1/attention/backends/flash_attn.py:L880-L888"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "difficulty": "core"
+  },
+  {
+   "id": "ch19-m10",
+   "name": "防重编译：TorchCompileWithNoGuardsWrapper 丢全部 guard + fullgraph=True + dynamic=False 一次编译永不回看（@support_torch_compile 注入模型类基类、mark_dynamic 动态维纪律）",
+   "kind": "config",
+   "source_anchors": [
+    "vllm/compilation/wrapper.py:L47-L154",
+    "vllm/compilation/decorators.py:L118-L199"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting"
+  },
+  {
+   "id": "ch19-m11",
+   "name": "CUDAGraphMode 档位与 -O0..-O3 预设：三运行期模式（NONE/PIECEWISE/FULL）+ 组合档（FULL_DECODE_ONLY/FULL_AND_PIECEWISE 的 tuple 值与 decode_mode/mixed_mode 拆解）；-O 表把 mode+cudagraph+fuse pass 折成一个读者参数（默认 O2）",
+   "kind": "config",
+   "source_anchors": [
+    "vllm/config/compilation.py:L53-L103",
+    "vllm/config/vllm.py:L104-L116",
+    "vllm/config/vllm.py:L229-L327"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting"
+  },
+  {
+   "id": "ch19-m12",
+   "name": "BatchDescriptor key 与查表 dispatch：frozen 五字段 key；bs→padded 尺寸表（段内上取整、compile_sizes 不得被改写）；initialize_cudagraph_keys 预生成全 key（FULL 精确 num_reqs——FA3 scheduler_metadata 依赖；PIECEWISE 放宽 None）；dispatch 先 FULL 后 PIECEWISE 后 NONE；invalid_modes 禁档",
+   "kind": "algorithm",
+   "source_anchors": [
+    "vllm/forward_context.py:L30-L58",
+    "vllm/v1/cudagraph_dispatcher.py:L72-L109",
+    "vllm/v1/cudagraph_dispatcher.py:L166-L233",
+    "vllm/v1/cudagraph_dispatcher.py:L235-L324"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "difficulty": "core"
+  },
+  {
+   "id": "ch19-m13",
+   "name": "padding 四件套：query_start_loc 尾部非递减（FlashAttention 要求）/ block_table 尾行 NULL_BLOCK_ID（Block 0 保留）/ slot_mapping 尾部 -1（KV 写跳过）/ positions 尾部清零——把可变 batch 塞进捕获形状",
+   "kind": "algorithm",
+   "source_anchors": [
+    "vllm/v1/worker/gpu_model_runner.py:L2073-L2078",
+    "vllm/v1/worker/gpu_model_runner.py:L2338-L2341",
+    "vllm/v1/worker/gpu_model_runner.py:L4128-L4130",
+    "vllm/v1/worker/gpu_model_runner.py:L3663-L3664"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "difficulty": "core"
+  },
+  {
+   "id": "ch19-m14",
+   "name": "CUDAGraphWrapper 捕获与回放：盲信 forward context 的 mode/descriptor（判责在 dispatcher）；按 key 首遇即捕（validate 捕获合法性、共享图池、输出弱引用）；回放前 DEBUG 逐 data_ptr 断言；不存持久缓冲不拷输入（固定地址是 runner 的职责）",
+   "kind": "protocol",
+   "source_anchors": [
+    "vllm/compilation/cuda_graph.py:L233-L361",
+    "vllm/v1/worker/gpu_model_runner.py:L5435-L5479"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "difficulty": "core"
+  },
+  {
+   "id": "ch19-m15",
+   "name": "启动期捕获编排：capture_model 从大到小（大图先捕小图复用图池）+ 捕获窗口开关（捕完 set False，意外捕获即 RuntimeError）+ _warmup_and_capture 每形状先 eager 热身再捕；compile_or_warm_up_model 全链前移（warmup→kernel 调优→capture→sampler 预热→lazy init）",
+   "kind": "dataflow",
+   "source_anchors": [
+    "vllm/v1/worker/gpu_model_runner.py:L6814-L6918",
+    "vllm/v1/worker/gpu_model_runner.py:L6920-L6966",
+    "vllm/v1/worker/gpu_worker.py:L679-L717"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "difficulty": "core"
+  },
+  {
+   "id": "ch19-m16",
+   "name": "后端能力最弱链降级：min_cg_support 取全部注意力组最弱 CG 支持 → resolve_cudagraph_mode_and_sizes 降级链 → initialize_cudagraph_keys——一个后端拖累全模型 cudagraph 档位（接口归 ch21）",
+   "kind": "config",
+   "source_anchors": [
+    "vllm/v1/worker/gpu_model_runner.py:L7161-L7202",
+    "vllm/config/compilation.py:L1368-L1472"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting"
+  },
+  {
+   "id": "ch19-m17",
+   "name": "三代切图方案并存（路线图脚注）：FX 预切图（正典，本章）/ use_inductor_graph_partition（Inductor codegen 后按 cudagraph_unsafe tag 分区，RoPE+KV 融合只在此模式）/ BreakableCUDAGraph（运行期断点捕获，env 默认关；eager_break_during_capture 挂在正典算子上）",
+   "kind": "config",
+   "source_anchors": [
+    "vllm/config/compilation.py:L669-L687",
+    "vllm/compilation/breakable_cudagraph.py:L3-L21",
+    "vllm/envs.py:L170"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting"
+  },
+  {
+   "id": "ch19-m18",
+   "name": "运行期零惊喜三纠察：activate_jit_monitor（意外 JIT 编译即暴露）/ freeze_gc_heap（GC 不再扫静态对象）/ enable_gpu_sync_check（execute_model/sample_tokens 任何 CPU↔GPU sync 直接抛）——纪律从注释升级为运行期 tripwire",
+   "kind": "protocol",
+   "source_anchors": [
+    "vllm/v1/worker/gpu_worker.py:L822-L848"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting"
+  }
+ ],
+ "subtraction_plan": {
+  "delete": [
+   {
+    "what": "custom_op.py：PluggableLayer 整类（L32-L100）+ register_oot/maybe_get_oot_by_class + CustomOp.__new__ 的 OOT 替换分支（L109-L128）+ register_oot 方法（L329-L360）",
+    "why_safe": "OOT 整层替换机制本章只作边界注（正文一句话），非 LoRA/非插件部署路径不经过 op_registry_oot（空 dict 时 __new__ 直接走 cls）；删净后 op_registry 主流程完整。"
+   },
+   {
+    "what": "cudagraph_dispatcher.py：LoRA 专化路径——_get_lora_cases（L111-L130）、captured_lora_counts/specialize_lora_count 字段、dispatch 内 LoRA bisect 分支（L283-L300）、initialize_cudagraph_keys 内 LoRA 维——lora_cases/captured_lora_counts 收集行（L180-L184）与两处 product 的 lora_cases 第二迭代维（L193-L195、L223-L225），删后单层遍历 capture_sizes（num_active_loras 恒 0）",
+    "why_safe": "lora_config 默认 None 时 _get_lora_cases 恒返回 [0]，has_lora 恒 False——非 LoRA 部署的行为逐字节等价；删 bisect 分支后 dispatch 走 fast path。"
+   },
+   {
+    "what": "backends.py：VllmBackend.__call__ 的编译缓存/落盘巨块（L1021-L1101 的 import、hash/cache_dir/元数据 json、L1103-L1164 的计时与 instrument、L1181-L1192 的 split_gm 副本与 depyf 钩子）+ collect_standalone_compile_artifacts（L872-L932）+ configure_post_pass 的 pass 装配细节",
+    "why_safe": "全部是缓存/观测/序列化，不影响『trace→切图→逐片编译→拼跑』主链；精简版不落盘缓存，每次进程内重编译（行为与冷启动一致）。"
+   },
+   {
+    "what": "backends.py：_decompose_size_nodes（L479-L550）与 _merge_empty_only_subgraphs（L437-L476）两个优化 pass 及其调用行（L556、L593）",
+    "why_safe": "边界优化：前者处理 torch.Size 跨切点（仅多维 sym shape 模型需要），后者避免空子图；删后 split_module 语义不变，只是可能多出平凡子图——正文中标注为『删的是优化不是功能』，须在 tests 里保留一个多切点样例验证切图仍正确。"
+   },
+   {
+    "what": "cuda_graph.py：CUDAGraphStat/CUDAGraphLogging 观测类（L32-L124）、offloader 同步调用（L308-L310、L320-L324、L357-L359）、_runnable_str 调试字段（L192 定义 + L215-L219 __getattr__ 内引用它拼错误信息的 raise 分支——删字段须连同该分支删净、剩裸 raise AttributeError；is_debugging_mode 保留，回放断言 L346 在用）",
+    "why_safe": "统计表格与 offloader（权重卸载扩展态）不在本章路径；get_offloader() 默认返回 no-op 但删除调用更彻底——删后捕获/回放控制流不变（debug 断言必须保留）。"
+   },
+   {
+    "what": "gpu_model_runner.py 的 capture_model：torch profiler 装配段（L6834-L6869）、encoder cudagraph 段（L6822-L6823、L6887-L6890）、lock_workspace（L6905-L6907）",
+    "why_safe": "profiler 是观测、encoder cudagraph 是多模态扩展态、lock_workspace 是 workspace 池（kernel_warmup 引入）的锁——三者删后『大到小捕获+窗口开关』主链不变。"
+   },
+   {
+    "what": "gpu_worker.py 的 compile_or_warm_up_model：startup_plan 落盘与 KV 内存建议段（L719-L791）、use_v2_model_runner 分支（L793-L795）、VLLM_BATCH_INVARIANT 等实验开关分支",
+    "why_safe": "建议/落盘是观测与提示（maybe_save_startup_plan 属 ch17 已讲的启动计划），V2 分支本章锚定 V1 不走；删后启动编排顺序 warmup→kernel_warmup→capture→sampler 预热→lazy init→JIT monitor→freeze GC→sync check 完整。"
+   },
+   {
+    "what": "forward_context.py：set_forward_context 的 batchsize 统计（头部使用行 L276-L279 与 finally 尾段 L345-L376，连同包裹尾段的 try/finally 壳——内层 with override_forward_context(...): yield 去壳后保留）与模块级全局量 track_batchsize/last_logging_time/forward_start_time/batchsize_logging_interval/batchsize_forward_time（L22-L26）、DPMetadata 的 sp_local_sizes/cu_tokens_across_sp（L101-L128，SP 扩展态）",
+    "why_safe": "观测与 sequence-parallel 扩展；DP>1 主路径只经 DPMetadata.make。删后单 DP 路径 set_forward_context 行为不变（tests 须覆盖 DP=1 注入路径）。"
+   },
+   {
+    "what": "config/compilation.py set_splitting_ops_for_v1 的扩展分支：fuse_attn_quant 互斥降级（L1143-L1144→set_splitting_ops_for_attn_fusion L1250-L1264）、SP/fuse_gemm_comms 全图要求（L1213-L1230）、DeepEP 禁图（L1232-L1248）、empty splitting_ops 降级（L1186-L1211）",
+    "why_safe": "四种特殊配置的降级路径；默认 O2 下无一触发（正文各一句话带过）。删后主支『splitting_ops=_attention_ops+kv update 两算子』保留。注意：删除须连同调用点守卫一起删净，不留悬空引用。"
+   },
+   {
+    "what": "attention.py：maybe_calc_kv_scales 算子及其注册（L697-L729）与 forward 内调用（L508-L511）、mm_prefix_clamp_sliding_window/kv_sharing 相关分支（kv_sharing 校验+存储 L449-L455、mm_prefix_clamp_sliding_window 存储 L456-L458、forward 内两处 kv_sharing 守卫 L544-L547、L563-L570）、get_kv_cache_spec（L621-L694，归 KV 域章节）",
+    "why_safe": "kv scales 是 fp8 KV 首拍标定（正文略）、kv_sharing 是层间共享特例、get_kv_cache_spec 属 KV cache 域（ch13-16 已立其消费侧）；删后统一算子调用链（reshape→unified_kv_cache_update→unified_attention_with_output）完整保留。query_quant 分支（L514-L524）必须保留——F10 苗。"
+   }
+  ],
+  "must_keep": [
+   {
+    "symbol": "CustomOp",
+    "why": "本章主角基类：多平台算子抽象。"
+   },
+   {
+    "symbol": "dispatch_forward",
+    "why": "构造期一次性 dispatch 的实现——『构造期冻结、运行期零分支』的证据。"
+   },
+   {
+    "symbol": "forward_native",
+    "why": "编译器可融合的 PyTorch 原生实现——Inductor 档 'none' 的落点。"
+   },
+   {
+    "symbol": "forward_cuda",
+    "why": "手工 kernel 实现槽位（RMSNorm 展示）。"
+   },
+   {
+    "symbol": "enabled",
+    "why": "±name 开关协议。"
+   },
+   {
+    "symbol": "default_on",
+    "why": "Inductor→'none' 否则 'all' 的默认规则——『融合与手工 kernel 二选一』的开关面。"
+   },
+   {
+    "symbol": "maybe_compile",
+    "why": "不透明算子内部调用的单独编译机制。"
+   },
+   {
+    "symbol": "op_registry",
+    "why": "全局注册表——enabled() 按名查开关的底座。"
+   },
+   {
+    "symbol": "RMSNorm",
+    "why": "CustomOp 的代表实例（register+三实现）。"
+   },
+   {
+    "symbol": "BatchDescriptor",
+    "why": "回放命中 key 的形式化——frozen 五字段。"
+   },
+   {
+    "symbol": "ForwardContext",
+    "why": "每拍执行环境 thread-local 载体。"
+   },
+   {
+    "symbol": "set_forward_context",
+    "why": "runner 每拍注入 mode/descriptor/metadata 的入口。"
+   },
+   {
+    "symbol": "get_forward_context",
+    "why": "算子内取 context 的入口（未设即 assert 崩）。"
+   },
+   {
+    "symbol": "get_attention_context",
+    "why": "按 layer_name 取 attn_metadata/kv_cache/slot_mapping 的消费口。"
+   },
+   {
+    "symbol": "unified_attention_with_output",
+    "why": "统一注意力算子（out-variant）——attention 进图的形态。"
+   },
+   {
+    "symbol": "unified_kv_cache_update",
+    "why": "KV 写独立算子——dummy 依赖保序的主角。"
+   },
+   {
+    "symbol": "static_forward_context",
+    "why": "构造期层注册表（compilation_config 字段）。"
+   },
+   {
+    "symbol": "use_direct_call",
+    "why": "平台 opaque_attention_op 分叉。"
+   },
+   {
+    "symbol": "LayerName",
+    "why": "opaque 层名——字符串不烤进图。"
+   },
+   {
+    "symbol": "_encode_layer_name",
+    "why": "LayerName 编码入口。"
+   },
+   {
+    "symbol": "CUDAGraphMode",
+    "why": "档位枚举（NONE/PIECEWISE/FULL+组合档）。"
+   },
+   {
+    "symbol": "FULL_AND_PIECEWISE",
+    "why": "默认 O2 档的组合值。"
+   },
+   {
+    "symbol": "_attention_ops",
+    "why": "切图点清单。"
+   },
+   {
+    "symbol": "set_splitting_ops_for_v1",
+    "why": "splitting_ops 组装主支。"
+   },
+   {
+    "symbol": "splitting_ops",
+    "why": "『在哪切』的账本字段。"
+   },
+   {
+    "symbol": "VllmBackend",
+    "why": "torch.compile 定制后端。"
+   },
+   {
+    "symbol": "split_graph",
+    "why": "切图算法本体。"
+   },
+   {
+    "symbol": "should_split",
+    "why": "切点判定（partition_rules）。"
+   },
+   {
+    "symbol": "wrap_with_cudagraph_if_needed",
+    "why": "每片包 PIECEWISE wrapper。"
+   },
+   {
+    "symbol": "PiecewiseCompileInterpreter",
+    "why": "片间拼跑器。"
+   },
+   {
+    "symbol": "TorchCompileWithNoGuardsWrapper",
+    "why": "丢 guard 一次编译。"
+   },
+   {
+    "symbol": "CudagraphDispatcher",
+    "why": "运行期查表器。"
+   },
+   {
+    "symbol": "_compute_bs_to_padded_graph_size",
+    "why": "bs→padded 尺寸表。"
+   },
+   {
+    "symbol": "_create_padded_batch_descriptor",
+    "why": "key 构造现场。"
+   },
+   {
+    "symbol": "initialize_cudagraph_keys",
+    "why": "全 key 预生成（FULL 精确/PIECEWISE 放宽）。"
+   },
+   {
+    "symbol": "dispatch",
+    "why": "查表主入口（FULL→PIECEWISE→NONE）。"
+   },
+   {
+    "symbol": "get_capture_descs",
+    "why": "捕获形状降序清单。"
+   },
+   {
+    "symbol": "CUDAGraphWrapper",
+    "why": "捕获/回放包装。"
+   },
+   {
+    "symbol": "concrete_cudagraph_entries",
+    "why": "key→图 表项。"
+   },
+   {
+    "symbol": "CUDAGraphEntry",
+    "why": "key→图条目类（cuda_graph.py:L128）——捕获态 input_addresses/output/cudagraph 的载体。"
+   },
+   {
+    "symbol": "set_graph_pool_id",
+    "why": "共享图池注入调用（cuda_graph.py:L304/L306）——m14 共享图池叙事的符号锚。"
+   },
+   {
+    "symbol": "weak_ref_tensors",
+    "why": "输出弱引用调用（cuda_graph.py:L332/L336）——捕获产物省显存、末片才安全的机制。"
+   },
+   {
+    "symbol": "capture_model",
+    "why": "启动期捕获编排（大到小+窗口开关）。"
+   },
+   {
+    "symbol": "_warmup_and_capture",
+    "why": "每形状先热身后捕获。"
+   },
+   {
+    "symbol": "set_cudagraph_capturing_enabled",
+    "why": "捕获窗口开关。"
+   },
+   {
+    "symbol": "validate_cudagraph_capturing_enabled",
+    "why": "意外捕获 tripwire。"
+   },
+   {
+    "symbol": "_determine_batch_execution_and_padding",
+    "why": "一拍裁决（禁 FULL/DP 对齐/统计）。"
+   },
+   {
+    "symbol": "compile_or_warm_up_model",
+    "why": "启动编排主方法。"
+   },
+   {
+    "symbol": "OptimizationLevel",
+    "why": "-O0..-O3 枚举。"
+   },
+   {
+    "symbol": "OPTIMIZATION_LEVEL_TO_CONFIG",
+    "why": "档位→配置映射表。"
+   },
+   {
+    "symbol": "_check_and_update_cudagraph_mode",
+    "why": "最弱链降级→keys 初始化。"
+   },
+   {
+    "symbol": "min_cg_support",
+    "why": "后端能力最弱链变量（ch21 接口）。"
+   }
+  ]
+ },
+ "foreshadow_due": {
+  "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，不跑）",
+  "should_plant": [
+   {
+    "id": "F10",
+    "text": "量化与 kernel 的耦合",
+    "paid": 27,
+    "plant_guidance": "本章两处天然苗床，正文各点一句、不展开（深回收归 ch27 量化章）：(1) 站 1 档位落账处——vllm/config/vllm.py:L1261-L1268：blocked weights（块状量化权重）→ custom_ops 强制 '+quant_fp8'，注释原话 On H100 the CUDA kernel is faster than native implementation——量化格式改变『同一算子选哪个 kernel』；(2) 站 14 统一算子内——attention.py:L514-L524 query_quant 分支：kv_cache_dtype 为 fp8/nvfp4 时用 simple torch operation 量化 query，注释自述 quantizing with a simple torch operation enables torch.compile to fuse this into previous ops... Otherwise queries are quantized using custom ops which causes decoding overheads——量化与编译/融合的纠缠。另可点 PassConfig 的 fuse_norm_quant/fuse_act_quant/fuse_attn_quant（config/compilation.py:L121-L126：Fuse the custom RMSNorm + quant ops 等，O2 档 fuse_attn_quant=IS_QUANTIZED）作为『量化算子贴着 norm/attention 长出来、催生融合 pass』的第三证。"
+   }
+  ],
+  "should_payoff": [],
+  "note": "本章（no=19）只埋 F10、无应回收项。衔接注（非登记伏笔）：(1) ch17 站 6/站 9-10 与 ch18 站 9 都留下『编译与捕获 → ch19』前向指针，本章兑现；(2) ch18-m14『固定地址 → CUDA graph 回放前提』在本章站 13/15 收口（DEBUG data_ptr 断言是后半条件的运行期体检）；(3) 本章给 ch21 留接口：min_cg_support 最弱链降级 + unified_attention_with_output 转调的 backend impl（后端选择/优先级表归 ch21）；(4) 给 ch22 留接口：slot_mapping 尾部 -1 的 PAD 语义（position→slot 的 Triton 数学归 ch22）；(5) LayerName opaque 根治 issue #33267 的叙事与 ch27 量化 kernel 命名/注册面遥相呼应（F10 回收时可用）。"
+ },
+ "l2_spec": "book/cartography/l2-specs/ch19.json（同批产出；stations 与本档 stations 同一份账本）"
+}
