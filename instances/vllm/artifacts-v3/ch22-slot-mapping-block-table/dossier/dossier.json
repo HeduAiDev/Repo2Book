@@ -1,0 +1,904 @@
+{
+ "chapter_id": "ch22-slot-mapping-block-table",
+ "part": "V",
+ "title": "slot_mapping 与 block_table",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "chapter_kind": "code",
+ "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。Part V 收官章（l0_zoom=执行臂+KV 接缝）——ch17 立了执行三层、ch18 立了持久批次与固定地址、ch19 立了编译与捕获、ch20/ch21 立了注意力数学与后端选择；本章把执行臂最后一条线接到 KV 池上：调度器给的 block_id 如何在 GPU 上变成物理槽位、attention 如何穿着这张表读写 KV。F7 伏笔（block_table 间接寻址，ch13 埋、pedagogy-plan ledger paid=22）在本章正式回收（ch21 已从后端视角路过读侧消费，本章补全 kernel 内景与写读两腿的完整故事）。",
+ "hook_suggestion": "「CUDA graph 回放要求形状与捕获那一刻全等——可真实一拍常常只来十来个 token，图里录的却是 max 形状的活：多出来的八千多个槽位凭什么不把 KV 池写花？换个方向，把 position→slot 的换算搬回 CPU 用 numpy 算完再拷过去不行吗——vLLM 为什么宁肯写一个 Triton kernel 也绝不这么做？最后，同一个页表为什么长出两副面孔：写 KV 的 kernel 拿着每 token 一个的 slot_mapping 直进直出，读历史的 attention 却必须穿每请求一张的 block_table 间接寻址？」（从 Part V hook『Python 写的 attention 变成 CUDA graph 重播的 kernel』+ 本章 l0_zoom『执行臂+KV 接缝』+ deepread/gpu-exec.json why_chains[12]（D2H 斩断异步调度 / GPU 端换算）、why_chains[10]（CUDA graph 形状纪律与 padding 四件套）提炼；pedagogy-plan ch22 notes 原话『D2H 斩断异步调度之忌』，introduces=Triton GPU 端换算 + PAD 语义）",
+ "scope_note": "主线 = 块号→槽位的一条线 + 双腿消费 + PAD 语义：(A) 承接点：ch18 的 _prepare_inputs 在 L2188-L2201 停住的地方继续——positions 已是 GPU 张量、commit_block_table 先行已发车；(B) block_table 双镜像本体：[max_num_reqs, max_blocks_per_req] int32 的 CpuGpuBuffer 页表、append_row CPU 增量写、commit 只拷活跃行；(C) Triton GPU 端换算（introduces 之一）：_compute_slot_mapping_kernel grid=(num_reqs+1,)——每 program 一请求区间、恒等式 slot = 块号×block_size + pos%block_size、do_not_specialize 防逐拍重编译、CP(DCP) 分片烤在 kernel（单卡退化恒等，只讲分片数学不讲多 rank 部署）；(D) PAD 语义（introduces 之二）：PAD_SLOT_ID=-1（token 侧）与 NULL_BLOCK_ID=0（行侧）三处分工；CUDA graph 捕获 max 形状 → PAD 程序每拍重填尾部；padding 四件套的另两件（query_start_loc 非递减 L2073-L2078、positions 尾部清零 L3663-L3664）点名即收；(E) 双口径装配：_get_slot_mappings 的 padded/unpadded 由 has_separate_kv_update 裁决（forward_includes_kv_cache_update 分叉，FlashAttention=False）、尾段 fill_(-1)、按 layer_name 铺 dict；块表尾行 NULL_BLOCK_ID；CommonAttentionMetadata 收束；(F) 双腿消费（F7 回收）：写腿 unified_kv_cache_update → do_kv_cache_update → reshape_and_cache_flash（CUDA kernel slot<0 跳过、slot 逆分解 slot//bs 与 slot%bs）；读腿 flash_attn_varlen_func(block_table=) 穿表间接寻址；(G) 变体与边界：kernel 块细分（分配块≠kernel 块、prepare_kernel_block_sizes/select_common_block_size、FA [MultipleOf(16)]）、SlotMappingMode.NONE（Mamba/GDN 块表当状态索引）、多组块表与逐层铺设、块表宽度 128-token 对齐（#50302）、move_row 清空源行防 stale（#49757）。边界：注意力数学 → ch20；后端选择/validate/逐组混布 → ch21；编译与 CUDA graph 机制本体 → ch19；持久批次与 token 收集 → ch18；分页账本/混合组化 → ch13/ch14；KVConnector 直接读写池内块 → ch16；CP/DCP 多 rank 部署形态 → 分布式 Part（本章只讲 kernel 内的分片数学）。",
+ "code_spine": [
+  "vllm/v1/worker/gpu_model_runner.py:L1192-L1566 —— _update_states 差量调和（块表线在 L1441-L1474：new_block_ids extend / 恢复整表替换 → block_table.append_row 落 CPU 行）",
+  "vllm/v1/worker/block_table.py:L138-L180 —— CPU 侧行维护五原语 append_row/add_row/clear_row/move_row/swap_row（numpy 增量写、行长账 num_blocks_per_row；move_row 清空源行防 stale）",
+  "vllm/v1/worker/gpu_model_runner.py:L1977-L1979 —— _prepare_inputs 第一句 commit_block_table：先拷块表、与后续 CPU 计算重叠（OPTIMIZATION 注释原话）",
+  "vllm/v1/worker/gpu_model_runner.py:L2188-L2195 —— GPU 端组装：positions = num_computed_tokens[req_indices_gpu] + query_pos.gpu（换算的输入已是 GPU 张量）；seq_lens 同式",
+  "vllm/v1/worker/gpu_model_runner.py:L2197-L2201 —— compute_slot_mapping(num_reqs, query_start_loc.gpu, positions) 派发 Triton kernel",
+  "vllm/v1/worker/block_table.py:L182-L211 —— compute_slot_mapping 本体：SlotMappingMode.NONE 早退（Mamba/GDN）+ kernel 启动 grid=(num_reqs+1,)、全部 constexpr（含 PAD_ID=PAD_SLOT_ID、TOTAL_CP_* 喂 dcp 组）",
+  "vllm/v1/worker/block_table.py:L380-L442 —— _compute_slot_mapping_kernel：PAD 程序（L399-L408 尾部重填）+ 恒等式主体（L410-L442，CP 分片/非本秩 PAD 烤在 kernel；装饰器 L379 do_not_specialize 防逐拍重编译）",
+  "vllm/v1/worker/gpu_model_runner.py:L4307-L4318 + L4367-L4376 —— padded/unpadded 双口径：has_separate_kv_update（forward_includes_kv_cache_update 分叉）裁决 slot_mappings 用哪个维度",
+  "vllm/v1/worker/gpu_model_runner.py:L4082-L4154 —— _get_slot_mappings：切 blk_table.slot_mapping.gpu 前缀、尾段 fill_(-1)（reshape_and_cache in full cuda graph mode）、按 layer_name 铺 dict",
+  "vllm/v1/worker/gpu_model_runner.py:L2284-L2449 —— _build_attention_metadata：块表尾行填 NULL_BLOCK_ID（L2338-L2341，Block 0 is reserved for padding）→ CommonAttentionMetadata(block_table_tensor=, slot_mapping=)（L2430-L2449）",
+  "vllm/v1/worker/gpu_model_runner.py:L4432-L4449 —— set_forward_context(slot_mapping=slot_mappings)：逐层 slot_mapping 进 ForwardContext（forward_context.py:L136 dict[layer_name]）",
+  "vllm/model_executor/layers/attention/attention.py:L775-L798 —— 写腿：unified_kv_cache_update 算子（get_attention_context 按 layer_name 取 slot_mapping → impl.do_kv_cache_update）",
+  "vllm/v1/attention/backends/flash_attn.py:L1098-L1132 —— do_kv_cache_update → reshape_and_cache_flash（key/value 可 padded 而 slot_mapping 定 token 数——woosuk NOTE）",
+  "csrc/libtorch_stable/cache_kernels.cu:L315-L342 —— reshape_and_cache_flash_kernel：slot_idx<0 return（PAD 消费端）+ slot 逆分解 block_idx=slot//bs、offset=slot%bs",
+  "vllm/v1/attention/backends/flash_attn.py:L929-L934 + L1041-L1066 —— 读腿：block_table 进 flash_attn_varlen_func——attention kernel 穿表间接寻址读历史 KV（F7 回收点）"
+ ],
+ "stations": [
+  {
+   "n": 1,
+   "where": "gpu_model_runner.py:L1441-L1474",
+   "what": "块号过线落行：_update_states 的块表线——在跑请求逐组 block_ids.extend(new_ids)（差量）、被抢占恢复的整表替换（L1447-L1452），再 input_batch.block_table.append_row 把块 id 写进 CPU 页表行（L1473-L1474）。ch18 讲过整段调和，本章只跟块号这一条线"
+  },
+  {
+   "n": 2,
+   "where": "block_table.py:L138-L158",
+   "what": "append_row 本体：CPU numpy 增量写——start = num_blocks_per_row[row] 记行长度、新块 id 接着写；hybrid（分配块≠kernel 块）时先 map_to_kernel_blocks 拆块再写。add_row（L156-L158）重置行重写 = 新增/恢复请求用"
+  },
+  {
+   "n": 3,
+   "where": "gpu_model_runner.py:L1977-L1979",
+   "what": "先行拷贝：_prepare_inputs 第一句 commit_block_table——把块表活跃行 H2D 先发车，让 PCIe 拷贝与随后的 np.repeat/index_select 等 CPU 活重叠（注释原话 'OPTIMIZATION: Start copying the block table first … overlap the copy with the following CPU operations'）；commit = copy_to_gpu(num_reqs) 只拷活跃行"
+  },
+  {
+   "n": 4,
+   "where": "gpu_model_runner.py:L2188-L2195",
+   "what": "GPU 端组装输入：positions = num_computed_tokens[req_indices_gpu].to(int64) + query_pos.gpu（L2188-L2191）——换算 slot 的输入在 GPU 上算好、全程不落 CPU；seq_lens = num_computed + scheduled 同式（L2192-L2195）。把 positions D2H 拉回 CPU 换算 = 同步点斩断异步调度（本章 why 主线）"
+  },
+  {
+   "n": 5,
+   "where": "block_table.py:L182-L211",
+   "what": "派发：compute_slot_mapping——SlotMappingMode.NONE（Mamba/GDN 状态缓存组）直接早退：块表当状态索引用、不算 per-token slot；否则 _compute_slot_mapping_kernel[(num_reqs+1,)](…) 启动——grid 比 num_reqs 多一个 program，全部块尺寸/秩/PAD 值作 constexpr 烤进 kernel"
+  },
+  {
+   "n": 6,
+   "where": "block_table.py:L399-L408",
+   "what": "PAD 程序：第 num_reqs+1 个 program 专职把 [num_tokens, max_num_tokens) 填 PAD_SLOT_ID——CUDA graph 捕获的是 max 形状、slot_mapping 是持久 buffer，上一拍的真数据还躺在尾部，每拍必须重填。「PAD 语义」的出生地"
+  },
+  {
+   "n": 7,
+   "where": "block_table.py:L410-L442",
+   "what": "恒等式主体：每 program 处理一请求 token 区间 [start_idx, end_idx)（query_start_loc 圈定）——块号 = block_table[req][virtual_block_indices]、slot_ids = 块号 × block_size + 块内偏移（L430-L440）；CP 分片三件（virtual_block_size 放大 L413、is_local 本秩判定 L421-L423、local_block_offsets 重排 L424-L428）单卡全部退化为恒等、非本秩槽位打 PAD（L441）"
+  },
+  {
+   "n": 8,
+   "where": "gpu_model_runner.py:L4307-L4318",
+   "what": "padded/unpadded 裁决：has_separate_kv_update = 存在后端 forward_includes_kv_cache_update=False（FlashAttention 系：KV 写与 attention 是两个 op）——此时 slot_mappings 必须用 padded 维度匹配 key/value 张量；FULL cudagraph 时 pad_attn 亦为真（调用点 L4367-L4376 三元选择）"
+  },
+  {
+   "n": 9,
+   "where": "gpu_model_runner.py:L4082-L4154",
+   "what": "slot 双口径装配：_get_slot_mappings——按第 8 站裁决切 blk_table.slot_mapping.gpu 前缀；尾段 [num_tokens_unpadded, num_tokens_padded) fill_(-1)（注释：Needed for reshape_and_cache in full cuda graph mode）；再按 layer_name 铺成 dict 供 ForwardContext"
+  },
+  {
+   "n": 10,
+   "where": "gpu_model_runner.py:L2325-L2341",
+   "what": "行侧装配：_get_block_table——get_device_tensor(num_reqs_padded) 取 GPU 镜像，尾行 [num_reqs, num_reqs_padded) 填 NULL_BLOCK_ID=0（注释原话 'Block 0 is reserved for padding'——与 ch13 第 1 站 null_block 占 block_id=0 同源）；块表与 slot_mapping 一起进 CommonAttentionMetadata（L2430-L2449）"
+  },
+  {
+   "n": 11,
+   "where": "gpu_model_runner.py:L4432-L4449",
+   "what": "逐层铺设：set_forward_context(slot_mapping=slot_mappings, …)——slot_mapping 进 ForwardContext（dict[layer_name]，forward_context.py:L136）；模型前向里每个 Attention 层按自己的 layer_name 取表（不透传、不污染模型 forward 签名——ch19 已立的算子化纪律）"
+  },
+  {
+   "n": 12,
+   "where": "attention.py:L775-L798",
+   "what": "写腿入口：unified_kv_cache_update 算子——get_attention_context(layer_name) 从 ForwardContext 取该层 slot_mapping（L767-L771），交 impl.do_kv_cache_update；返回空张量作 dummy 数据依赖保 torch.compile 顺序"
+  },
+  {
+   "n": 13,
+   "where": "flash_attn.py:L1098-L1132",
+   "what": "写腿落地：do_kv_cache_update → reshape_and_cache_flash——CUDA kernel 逐 token（cache_kernels.cu:L326-L333）：slot_idx = slot_mapping[token]；slot_idx < 0 直接 return（注释原话 'slot_idx can be -1 if the token is padded'——第 6 站 PAD 的消费端）；否则 block_idx = slot//block_size、offset = slot%block_size 把 K/V 行写进页张量"
+  },
+  {
+   "n": 14,
+   "where": "flash_attn.py:L1041-L1066",
+   "what": "读腿：attention forward 从 metadata 取 block_table（L934），flash_attn_varlen_func(block_table=block_table, …)——历史 KV 的读全靠 kernel 穿表间接寻址（每个逻辑块号现场查物理块）。F7 回收：ch13 埋的「间接寻址代价」在此兑现——写是直寻址（slot 每 token 现算）、读是间接寻址（表随请求长大）"
+  }
+ ],
+ "stations_note": "站号 = 块号→槽位→KV 落池的一条线：第 1-2 站 CPU 侧行维护（差量 append）；第 3 站先行拷贝（H2D 与 CPU 重叠）；第 4-7 站 GPU 端换算（输入已是 GPU 张量 → 派发 → PAD 程序 → 恒等式）；第 8-10 站双口径装配（padded/unpadded 裁决 + slot 尾段 -1 + 块表尾行 0 + CommonAttentionMetadata）；第 11 站 forward context 逐层铺设；第 12-13 站写腿（slot_mapping 直寻址）；第 14 站读腿（block_table 间接寻址——F7 回收）。正文按讲解需要编排——建议先立『换算为什么必须在 GPU』（D2H 之忌），再进 kernel 拆恒等式与 PAD 程序，然后讲双口径装配与两腿消费，收在 F7 回收与下一拍回环。",
+ "key_classes": [
+  {
+   "name": "BlockTable",
+   "file": "vllm/v1/worker/block_table.py",
+   "responsibility": "worker 侧单组页表：block_table（[max_num_reqs, max_num_blocks_per_req] int32 的 CpuGpuBuffer 双镜像）+ num_blocks_per_row 行长账 + slot_mapping（[max_num_batched_tokens] int64 持久缓冲）；CPU 侧行维护五原语（append_row/add_row/clear_row/move_row/swap_row）、commit_block_table 拷活跃行、compute_slot_mapping 派发 Triton kernel；hybrid 时持 kernel 块细分（blocks_per_kv_block/map_to_kernel_blocks）；NONE 模式下块表退化为状态索引。"
+  },
+  {
+   "name": "MultiGroupBlockTable",
+   "file": "vllm/v1/worker/block_table.py",
+   "responsibility": "按 KV cache group 持多张 BlockTable，把行原语/commit/compute_slot_table 扇出到全部组（block_tables[idx] 取第 i 组）；构造时经 get_block_table_width 做 128-token 对齐与 kernel 块细分定宽。"
+  },
+  {
+   "name": "_compute_slot_mapping_kernel",
+   "file": "vllm/v1/worker/block_table.py",
+   "responsibility": "@triton.jit(do_not_specialize=[num_tokens, max_num_tokens])：grid=(num_reqs+1,)——前 num_reqs 个 program 各算一请求区间的槽位恒等式（含 CP 分片与非本秩 PAD），最后一个 program 专职把 [num_tokens, max) 填 PAD_SLOT_ID；do_not_specialize 让两个每拍变化的标量不触发重编译。"
+  },
+  {
+   "name": "CpuGpuBuffer",
+   "file": "vllm/v1/utils.py",
+   "responsibility": "cpu（pinned）+ gpu + np 三视图一体的固定形状缓冲；copy_to_gpu(n) 只传活跃前缀、non_blocking——块表双镜像与 slot_mapping 持久缓冲的共同基座（ch18 已立）。"
+  },
+  {
+   "name": "CommonAttentionMetadata",
+   "file": "vllm/v1/attention/backend.py",
+   "responsibility": "跨后端共享元数据：block_table_tensor（读腿的表）+ slot_mapping（写腿的索引）+ query_start_loc/seq_lens/num_reqs/positions 一起过桥给各注意力后端的 builder；两个 deprecated 属性（seq_lens_cpu/num_computed_tokens_cpu）的措辞就是 D2H 禁忌的成文纪律（L505-L533）。"
+  },
+  {
+   "name": "unified_kv_cache_update / unified_attention_with_output",
+   "file": "vllm/model_executor/layers/attention/attention.py",
+   "responsibility": "KV 写与 attention 各自的不透明算子（ch19 已立算子化框架）：前者经 get_attention_context 按 layer_name 取 slot_mapping 落 do_kv_cache_update、返回空张量作数据依赖保序（L775-L798）；后者走后端 forward（读腿）。"
+  },
+  {
+   "name": "FlashAttentionImpl",
+   "file": "vllm/v1/attention/backends/flash_attn.py",
+   "responsibility": "代表性消费端：forward_includes_kv_cache_update=False（KV 写独立成 op，故 slot_mappings 要 padded 维度）；do_kv_cache_update 调 reshape_and_cache_flash（L1098-L1132）；forward 把 block_table 传 flash_attn_varlen_func 穿表读（L934、L1041-L1066）；get_supported_kernel_block_sizes=[MultipleOf(16)]（kernel 块细分的约束源）。"
+  },
+  {
+   "name": "reshape_and_cache_flash（CUDA kernel）",
+   "file": "csrc/libtorch_stable/cache_kernels.cu",
+   "responsibility": "写腿终点：逐 token 取 slot_mapping[token]；slot_idx<0（PAD）直接 return；否则 block_idx=slot//block_size、block_offset=slot%block_size 定位页内落点，把 K/V 行写进页张量——恒等式的逆运算在写侧 kernel 里再做一遍。"
+  },
+  {
+   "name": "GPUModelRunner（块表线三站方法）",
+   "file": "vllm/v1/worker/gpu_model_runner.py",
+   "responsibility": "_update_states 的 append 落行（L1441-L1474）、_prepare_inputs 的 commit 先行 + GPU positions + 派发（L1977-L1979、L2188-L2201）、_get_slot_mappings/_build_attention_metadata 的双口径装配（L4082-L4154、L2284-L2449）、set_forward_context 的逐层铺设（L4432-L4449）。"
+  }
+ ],
+ "data_flow": [
+  "总述：本章数据流 = deepread/gpu-exec.json data_flow 第 4b 段（_prepare_inputs：commit 先行 → GPU 端 positions/seq_lens → compute_slot_mapping）+ 第 4d 段（_get_slot_mappings / _build_attention_metadata）+ 第 5 段（forward 内 unified_kv_cache_update → unified_attention）+ why_chains[12]（slot_mapping GPU 端换算）与 deepread/memory-kv.json data_flow [GPU] 段（块 id append → block_table.append_row → compute_slot_mapping → attention 照 slot_mapping 写、照块表读）——不重挖，下面按站号账本重排：",
+  "【调和·站1-2】gpu_model_runner.py:L1192 _update_states：新块 GPU 置零（L1219-L1222，ch13 第 8 站）→ block_ids extend / 恢复整表替换（L1441-L1452）→ block_table.append_row 写 CPU 行（L1473-L1474；hybrid 时 block_table.py:L146-L149 先拆块）。",
+  "【先行拷·站3】L1977-L1979 commit_block_table(num_reqs) = copy_to_gpu(num_reqs)（block_table.py:L213-L214）：块表 CPU→GPU 活跃行先发车，与 np.repeat/index_select 等 CPU 活重叠。",
+  "【GPU 换算·站4-7】L2188-L2195 positions/seq_lens 在 GPU 组装（num_computed_tokens[req_indices_gpu] + query_pos.gpu）→ L2197-L2201 compute_slot_mapping → block_table.py:L195-L211 kernel 启动 grid=(num_reqs+1,) → L399-L408 PAD 程序填 [num_tokens, max) + L410-L442 恒等式写 slot_mapping.gpu（CP 分片烤在 kernel，单卡退化恒等）。",
+  "【装配·站8-10】L4307-L4318 has_separate_kv_update（+FULL 判 pad_attn）→ L4367-L4376 把 padded/unpadded 传给 _get_slot_mappings（L4082-L4154：切片 + 尾段 fill_(-1) + by-layer dict）→ L2325-L2341 块表尾行 NULL_BLOCK_ID + L2430-L2449 CommonAttentionMetadata(block_table_tensor=, slot_mapping=)。",
+  "【前向·站11-14】L4432-L4449 set_forward_context(slot_mapping=slot_mappings)：逐层 dict 进 ForwardContext → 模型前向内每 Attention 层 attention.py:L775-L798 unified_kv_cache_update（slot_mapping 按 layer_name 取）→ flash_attn.py:L1123-L1132 reshape_and_cache_flash 写 KV（cache_kernels.cu:L326-L333 slot<0 跳过、slot//bs 与 slot%bs 分解）；attention.py:L817+ unified_attention_with_output → flash_attn.py:L929-L1066 forward（block_table 进 flash_attn_varlen_func 穿表读历史 KV）。",
+  "【落池·回环】写下的 KV 留在池内：下一拍同请求读到（decode 依赖）、别的请求命中前缀读到（ch15 的物质基础）；块表行 append-only、slot_mapping 每拍全量重算并写回固定地址 max 形状 buffer——CUDA graph 回放的地址前提（ch19）。"
+ ],
+ "why_chains": [
+  {
+   "id": "WC1",
+   "card": "deepread/gpu-exec.json why_chains[12]",
+   "decision": "slot_mapping 用 Triton kernel 在 GPU 端算，block_table 是 CPU/GPU 双镜像页表",
+   "old_design": "CPU 上用 numpy 算 (req, position)→flat slot 映射再整段拷 GPU。",
+   "pain": "本拍 positions 本身就是 GPU 张量（positions = GPU num_computed_tokens[req_indices_gpu] + query_pos.gpu，gpu_model_runner.py:L2188-L2191）——CPU 算法要先 D2H 同步把 positions 拉回来，同步点斩断异步调度；且 O(tokens) 的 Python/numpy 每拍开销。",
+   "solution": "vllm/v1/worker/block_table.py:L379-L442 _compute_slot_mapping_kernel（@triton.jit）：grid=(num_reqs+1,)，每 program 处理一请求的 token 区间——slot_id = block_table[req][pos 对应块号]*block_size + 块内偏移（L410-L442）；最后一个 program 专职把 [num_tokens, max_num_tokens) 填 PAD_SLOT_ID（L399-L408——CUDA graph 捕获的是 max 形状，尾部必须每次重填）。CP（上下文并行）的 interleave 分片烤在 kernel 里（virtual_block_size 计算 L413、本 rank 判定与重排 L421-L428，非本 rank 槽位填 PAD L441）。block_table 本体是 [max_num_reqs, max_blocks_per_req] int32 的 CpuGpuBuffer 页表（L105-L112），CPU 侧 append_row 增量追加新块（L138-L154；分配块≠kernel 块时 hybrid 细分 map_to_kernel_blocks L82-L103、L220-L248——例：32 token 内存块拆两个 16 token kernel 块）；commit_block_table 每拍只拷活跃行（L213-L214），且 _prepare_inputs 第一句就是 commit（gpu_model_runner.py:L1977-L1979，注释 \"OPTIMIZATION: Start copying the block table first. This way, we can overlap the copy with the following CPU operations\"）。v0.27：Mamba/GDN 类状态缓存组用 SlotMappingMode.NONE 跳过 per-token slot（block_table.py:L43-L45、L189-L192——块表直接当状态索引用）。",
+   "cost": "一次 kernel launch 固定 µs 级开销（小 batch 下也是）；kernel 内逻辑复杂化（CP 分片+hybrid 细分）；PAD 值语义贯穿全栈——PAD_SLOT_ID / -1 / NULL_BLOCK_ID 三种 pad 值各有分工，读者要记住哪个 kernel 吃哪个 pad。",
+   "note": "本章第一主角与主线（=任务书 WC 引用链原样）。行号核验注：卡内 kernel 引 L379-L442 含 @triton.jit 装饰器行，锚点规范口径为 L380-L442（def 行本身）——source_anchors/mechanisms 一律用后者，embed_excerpts 保留 L379 起以带上 do_not_specialize（防逐拍重编译的教学点）。卡内 solution 引 L410-L442 主体——v0.27.1 现核仍准（start_idx 载入正是 L410）。cost 的「PAD 三值语义」即本章 introduces 之二，正文正面展开为机制 m3。"
+  },
+  {
+   "id": "WC2",
+   "card": "deepread/gpu-exec.json why_chains[5]",
+   "decision": "异步调度：调度下一拍与执行当前拍完全重叠，采样 token 不落 CPU（『GPU 不等 Python』的旗舰落地）",
+   "old_design": "同步调度：schedule()（CPU）→ execute_model（GPU）→ 等结果回 CPU → update_from_output → 下一拍 schedule。GPU 在 CPU 准备下一批的整段时间空转；decode 小 batch 一拍 GPU 计算量极小，整拍时长被 CPU 端（Python 调度 + 输入准备 + bookkeeping 的 D2H sync）支配。",
+   "pain": "『GPU 等 Python』是 vLLM 一整条 PR 线的靶子（git log 实证）：98f47f2a40 \"[V1] Optimize the CPU overheads in FlashAttention custom op (#10733)\"（2024-11-28）、3b61cb450d \"[V1] Further reduce CPU overheads in flash-attn (#10989)\"（2024-12-09）、dae6896977 \"[Perf] Reduce MLA CPU overheads in V1 (#14384)\"（2025-03-06，两周后 revert ca7a2d5f28——说明这条战线有多脆弱）——全在砍『kernel 之间那点 Python 时间』。CommonAttentionMetadata 两个 deprecated 属性的措辞即纪律成文：\"Prefer using device seq_lens directly to avoid implicit H<>D sync which breaks full async scheduling\"（vllm/v1/attention/backend.py:L506-L530）。落地里程碑：d4d309409 \"Implement Async Scheduling (#19970)\"（2025-07-14）→ cee182b29 \"[Perf][V1] Fully overlap model execution (#23569)\"（2025-09-05）→ fafe76b4a \"Zero-bubble async scheduling + spec decoding (#32951)\"（2026-03-23）。v0.27 新增运行期纠察：VLLM_GPU_SYNC_CHECK 在 warmup 完成后开启（gpu_worker.py:L846-L848 enable_gpu_sync_check），execute_model/sample_tokens 被 @with_gpu_sync_check 包住（L1010-L1019），任何 CPU<->GPU sync 直接抛 \"GPU<->CPU sync detected - avoid it or wrap with gpu_sync_allowed()\"（vllm/utils/gpu_sync_debug.py:L9-L17）——纪律从注释升级为运行期 tripwire。",
+   "solution": "三件套。(1) 采样 token 留 GPU：_bookkeeping_sync 异步分支不把 sampled_token_ids 拉回 CPU，缓存在 input_batch.prev_sampled_token_ids（gpu_model_runner.py:L3797-L3813，注释 \"Cache the sampled tokens on the GPU and avoid CPU sync\"），CPU 侧 token_ids_cpu 行只写占位 -1（L3821-L3842）；下一拍 _prepare_input_ids（L1784-L1913）用 GPU 张量直接写 input_ids.gpu——common-case 优化是单 slice 直拷（L1868-L1877），否则按 index scatter（L1879-L1891），spec draft token 再补一轮 scatter（L1893-L1913）。(2) 异步输出：AsyncGPUModelRunnerOutput（L259-L350）在专用 async_output_copy_stream 上 non_blocking D2H + event record（L286-L306）；uniproc 的 AsyncOutputFuture 延迟到 result() 才同步。（3）乐观假设+延迟纠偏：seq_lens 用乐观值（L2081-L2090），spec decode 纠偏回调推迟到 forward 发起之后执行。pinned buffer 防踩协议：synchronize_input_prep contextmanager 等上拍 prepare_inputs_event（L3864-L3877）。",
+   "cost": "状态机复杂度暴涨：需要 prev_req_id_to_index/prev_positions/discard_request_mask/optimistic_seq_lens_cpu 等一整套『上一拍』影子状态（_update_states 膨胀到 ~375 行）；调度器必须盲调度（看不到上拍真实结果），错了要在 GPU 端纠；异步路径输出张量的数据所有权延迟到 event.synchronize 之后才可读。",
+   "note": "节选回收：本章只取『positions 是 GPU 张量、CPU 换算即 D2H 同步斩断重叠』（WC1 的 pain 同源）与『纪律成文/运行期纠察』两块——deprecated 属性措辞（backend.py:L505-L533，v0.27.1 现核为 L505-L533 含 @property 行）与 VLLM_GPU_SYNC_CHECK（gpu_sync_debug.py:L12-L14 SYNC_ERROR_MESSAGE + gpu_worker.py:L846-L848/L1010-L1019）是 writer 必引的官印；采样留 GPU/prev_sampled_token_ids 已由 ch12 立体讲过、ch18 第 10 站回指——本章只回指不重讲。pedagogy-plan ch22 notes 原话「D2H 斩断异步调度之忌」即此链。"
+  },
+  {
+   "id": "WC3",
+   "card": "deepread/gpu-exec.json why_chains[10]",
+   "decision": "CUDA Graph 捕获回放：按 BatchDescriptor 查表命中，实际 batch padding 到捕获形状",
+   "old_design": "eager 每拍重新 launch 全部 kernel（Python dispatch + cudaLaunchKernel × 每层数十次）。v1 的重做核心是显式 dispatch 协议（74f441f4b \"Allow full cudagraph with separate attention routines (#20059)\" 2025-08-15），2025-09-23 24fab45d9 把默认档位升到混合模式。",
+   "pain": "为什么形状必须精确匹配（本质）：CUDA graph 录的是『对这块固定地址的显存执行这串 kernel launch』——kernel 的 grid/block 配置、指针、乃至宿主端分支（如 FA3 的 scheduler_metadata 计算）都在捕获时烤死在图里；replay 不会重新读取张量的 shape 元数据。形状或地址变了，图执行的就是错误的工作量/错误的数据。所以回放命中条件 = BatchDescriptor 全等 AND 输入张量地址不变。",
+   "solution": "（节选·本章相关）(d) padding 配套四件套全在 runner：query_start_loc 尾部填非递减值（L2073-L2078，注释 \"kernels like FlashAttention requires that\"）、block_table 尾行填 NULL_BLOCK_ID（L2338-L2341，注释 \"Block 0 is reserved for padding\"）、slot_mapping 尾部填 -1（L4128-L4130，让 KV 写 kernel 跳过写）、positions 尾部清零（L3663-L3664）。",
+   "cost": "（节选）(4) 一切输入必须写回捕获时的固定 buffer——这是 CpuGpuBuffer/持久批次整条设计链的下游约束，设计间环环相扣。",
+   "note": "节选回收：本章只取 pain（形状纪律的本质——PAD 存在的根本原因）与 solution (d) padding 四件套（四件里三件落在本章领地：slot_mapping 尾部 -1、块表尾行 0、连同 query_start_loc/positions 两件点名）；(a)(b)(c)(e)-(h)（BatchDescriptor/dispatch 协议/捕获编排/DP 一致性/-O 档位）归 ch19 已讲。PAD 程序（block_table.py:L399-L408）是四件套中 slot_mapping 尾部的『每拍重填』半边——持久 buffer 地址不变、内容每拍不同。"
+  },
+  {
+   "id": "WC4",
+   "card": "deepread/gpu-exec.json why_chains[8]",
+   "decision": "注意力=不透明自定义算子：layer_name 进图、metadata 走 thread-local forward context",
+   "old_design": "v0/v1 早期：attention 层 forward 直接调 kernel，attn_metadata 作为参数从 model.forward 一路透传（污染所有模型 forward 签名）；torch.compile 遇动态控制流+外部副作用（写 KV cache）无法全图捕获。",
+   "pain": "(1) metadata 透传把『执行环境』泄漏进『模型定义』——每个模型文件的 forward 签名都被引擎内部结构绑架；(2) 想用 torch.compile 就必须让 attention 变成图里的一个节点。",
+   "solution": "（节选·本章相关）0f8cafe2d \"unified_attention for Attention.forward (#11967)\"（2025-01-13）确立算子化。KV 写拆成独立算子 unified_kv_cache_update（attention.py:L775-L798：经 get_attention_context 从 ForwardContext 按 layer_name 取 attn_metadata/kv_cache/slot_mapping），其返回的空张量作为 dummy 数据依赖传入 attention 算子保序（L829-L832 \"accepting it creates a data dependency that ensures torch.compile preserves ordering\"）。set_forward_context 每拍把 slot_mapping（dict[layer_name]）推进 ForwardContext（gpu_model_runner.py:L4432-L4449；ForwardContext.slot_mapping 字段 vllm/forward_context.py:L136）。",
+   "cost": "（节选）forward_includes_kv_cache_update 语义分叉（vllm/v1/attention/backend.py:L67 默认 True，FlashAttentionBackend 改 False flash_attn.py:L86）——即 CUDA 上 KV 写与 attention 是两个 op 各多一次 dispatch，且 v0.27 起 execute_model 要按 has_separate_kv_update 决定 slot_mapping 用 padded 维度（gpu_model_runner.py:L4307-L4317）。",
+   "note": "节选回收：本章只取『KV 写独立成算子 + dummy 数据依赖 + forward context 逐层取 slot_mapping』（写腿的通道）与 cost 的 forward_includes_kv_cache_update 分叉（双口径裁决的由来）；算子化/splitting_ops/LayerName 的编译侧故事归 ch19 已讲。"
+  },
+  {
+   "id": "WC5",
+   "card": "deepread/memory-kv.json why_chains[0]",
+   "decision": "分页 KV：固定大小 block 池 + 每请求一张逻辑块表（PagedAttention 的虚拟内存类比）",
+   "old_design": "vLLM 之前的服务系统（FasterTransformer/Orca）按请求最大长度一次性预分配连续显存。vLLM 论文原话「they pre-allocate a contiguous chunk of memory with the request's maximum length (e.g., 2048 tokens)」（arXiv:2309.06180 §2.2）。浪费三源：内部碎片、外部碎片、冗余复制。",
+   "pain": "有效 KV 显存利用率被卡死：论文实测「only 20.4% - 38.2% of the KV cache memory is used to store the actual token states in the existing systems」（§5.2）。显存浪费直接压 batch size → 吞吐被卡；论文报告分页后同延迟下吞吐 2-4×。",
+   "solution": "整块 KV 显存切成 num_gpu_blocks 个等大 block 的池（vllm/v1/core/block_pool.py:L175-L181）；每个请求每组建一张逻辑块表 req_to_blocks（vllm/v1/core/single_type_kv_cache_manager.py:L97）；物理槽位由 token 位置在 GPU 上换算：slot = block_table[req][pos // block_size] * block_size + pos % block_size（vllm/v1/worker/block_table.py:L430-L440 Triton kernel）。论文类比原话「blocks as pages, tokens as bytes, requests as processes」。",
+   "cost": "① 注意力 kernel 必须穿过块表间接寻址（PagedAttention/FlashAttention 变体），比连续读复杂；② 尾部最多浪费 block_size-1 个 token 位（默认 block_size=16）；③ 调度器与 GPU 各持一份真相，block_id 是唯一共享键，两侧必须严格同步。",
+   "note": "F7 回收的锚链：ch13 以本链作 WC1 讲分页总布局，cost ①「注意力 kernel 必须穿过块表间接寻址」当时埋为 F7 伏笔——本章正面回收：读腿 flash_attn_varlen_func(block_table=…) 的穿表内景（flash_attn.py:L929-L934、L1041-L1066）+ 写腿 slot_mapping 的直寻址对照（attention.py:L775-L798 → cache_kernels.cu:L326-L333）。行号核验注：卡内 kernel 引 L430-L440——v0.27.1 现核为 L434-L440（恒等式本体）与 L410-L442（主体），本章自产锚点用后者。"
+  },
+  {
+   "id": "WC6",
+   "card": "deepread/memory-kv.json why_chains[6]",
+   "decision": "混合注意力模型：一个 BlockPool、每组一张块表、null_block 占位、不动点收敛的多组最长命中",
+   "old_design": "早期 v1 只有一张块表；混合模型（Gemma3 5:1 SWA:full、LLaMA4 3:1 local:full、Mamba 混合）要么不支持，要么退化为「全部按 full attention 分配」。",
+   "pain": "SWA 层只需要窗口内 token，按 full 分配时窗口外的块全在白占显存——混合模型的可用并发被显存虚耗直接卡死。",
+   "solution": "（节选·本章相关）按 KVCacheSpec 把层分成 kv_cache_groups（get_kv_cache_groups），页大小不等时先统一：调大较小层 block_size、Mamba 按状态形状 pad（unify_kv_cache_spec_page_size）。GPU 侧 MultiGroupBlockTable 每组一张表、必要时把大块拆成 kernel 块（vllm/v1/worker/block_table.py:L270-L376、L221-L248 map_to_kernel_blocks）。",
+   "cost": "（节选）多组意味着同一模型走多条 metadata 构建路径；等量化组要加 padding 层，warning 明说可能浪费显存。",
+   "note": "节选回收：本章只取 GPU 侧半句——多组块表（MultiGroupBlockTable 每组一张、扇出行原语/commit/compute_slot_mapping）与 kernel 块细分（分配块≠kernel 块：worker/utils.py select_common_block_sizes L266-L332 / prepare_kernel_block_sizes L335-L376、FA [MultipleOf(16)] flash_attn.py:L82-L84）；调度器侧的一池多组/不动点/null_block 换位归 ch14 已讲。细分给本章机制 m9。"
+  }
+ ],
+ "embed_excerpts": [
+  {
+   "path": "vllm/v1/worker/block_table.py",
+   "lines": "L20-L45",
+   "code": "def get_block_table_width(\n    max_num_blocks: int,\n    block_size: int,\n    kernel_block_size: int | None = None,\n    *,\n    token_alignment: int | None = 128,\n) -> int:\n    \"\"\"Return the width after optional alignment and virtual block splitting.\"\"\"\n    if kernel_block_size is None:\n        kernel_block_size = block_size\n    if block_size % kernel_block_size != 0:\n        raise ValueError(\n            f\"kernel_block_size {kernel_block_size} must divide \"\n            f\"block_size {block_size} evenly\"\n        )\n    if token_alignment is not None:\n        if token_alignment <= 0:\n            raise ValueError(\"token_alignment must be positive\")\n        block_alignment = token_alignment // math.gcd(token_alignment, block_size)\n        max_num_blocks = cdiv(max_num_blocks, block_alignment) * block_alignment\n    return max_num_blocks * block_size // kernel_block_size\n\n\nclass SlotMappingMode(Enum):\n    TOKEN_TO_KV_SLOT = \"token_to_kv_slot\"\n    NONE = \"none\"",
+   "what": "块表宽度的两重约束：宽度先按 token 对齐到 128 的倍数（token_alignment，#50302「Universally align block table width to 128 tokens」把此前 DSA indexer 的要求推广到全部后端；NONE 组不对齐），再按 kernel 块细分放大（max_num_blocks × block_size // kernel_block_size）。SlotMappingMode 两值：Mamba/GDN 类状态缓存组用 NONE 跳过 per-token slot。",
+   "elide": [
+    "L28-L34 kernel_block_size 缺省回填与整除校验（raise）一句话带过"
+   ]
+  },
+  {
+   "path": "vllm/v1/worker/block_table.py",
+   "lines": "L82-L119",
+   "code": "        if kernel_block_size == block_size:\n            # Standard case: allocation and computation use same block size\n            # No block splitting needed, direct mapping\n            self.block_size = block_size\n            self.blocks_per_kv_block = 1\n            self.use_hybrid_blocks = False\n        else:\n            # Hybrid case: allocation block size differs from kernel block size\n            # Memory blocks are subdivided to match kernel requirements\n            # Example: 32-token memory blocks with 16-token kernel blocks\n            # → Each memory block corresponds to 2 kernel blocks\n            if block_size % kernel_block_size != 0:\n                raise ValueError(\n                    f\"kernel_block_size {kernel_block_size} must divide \"\n                    f\"kv_manager_block_size size {block_size} evenly\"\n                )\n\n            self.block_size = kernel_block_size\n            self.blocks_per_kv_block = block_size // kernel_block_size\n            self.use_hybrid_blocks = True\n\n        self.max_num_blocks_per_req = max_num_blocks_per_req * self.blocks_per_kv_block\n\n        self.block_table = self._make_buffer(\n            self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32\n        )\n        self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)\n\n        self.slot_mapping = self._make_buffer(\n            self.max_num_batched_tokens, dtype=torch.int64\n        )\n\n        if self.use_hybrid_blocks:\n            self._kernel_block_arange = np.arange(0, self.blocks_per_kv_block).reshape(\n                1, -1\n            )\n        else:\n            self._kernel_block_arange = None",
+   "what": "BlockTable 构造核心：分配块（kv_cache_block_size）与 kernel 块（self.block_size）解耦——相等时直通（blocks_per_kv_block=1），不等时 hybrid 细分（表宽乘 blocks_per_kv_block，例：32-token 内存块 × 16-token kernel 块 = 2）。两个持久缓冲：block_table [max_num_reqs, max_num_blocks_per_req] int32 的 CpuGpuBuffer（CPU/GPU 双镜像页表）+ slot_mapping [max_num_batched_tokens] int64（恒等式的输出，max 形状）。",
+   "elide": [
+    "L93-L97 整除校验 raise 一句话带过",
+    "L121-L135（紧随其后）pcp/dcp 分布式组引导 try/except——测试环境缺组时回退 world_size=1；注意 v0.27.1 只有 dcp 组喂 kernel（L206-L207），pcp 字段存而不用（PCP 有自己的 manager）"
+   ]
+  },
+  {
+   "path": "vllm/v1/worker/block_table.py",
+   "lines": "L138-L180",
+   "code": "    def append_row(\n        self,\n        block_ids: list[int],\n        row_idx: int,\n    ) -> None:\n        if not block_ids:\n            return\n\n        if self.use_hybrid_blocks:\n            block_ids = self.map_to_kernel_blocks(\n                np.array(block_ids), self.blocks_per_kv_block, self._kernel_block_arange\n            )\n\n        num_blocks = len(block_ids)\n        start = self.num_blocks_per_row[row_idx]\n        self.num_blocks_per_row[row_idx] += num_blocks\n        self.block_table.np[row_idx, start : start + num_blocks] = block_ids\n\n    def add_row(self, block_ids: list[int], row_idx: int) -> None:\n        self.num_blocks_per_row[row_idx] = 0\n        self.append_row(block_ids, row_idx)\n\n    def clear_row(self, row_idx: int) -> None:\n        num_blocks = self.num_blocks_per_row[row_idx]\n        if num_blocks > 0:\n            self.block_table.np[row_idx, :num_blocks] = 0\n        self.num_blocks_per_row[row_idx] = 0\n\n    def move_row(self, src: int, tgt: int) -> None:\n        num_blocks = self.num_blocks_per_row[src]\n        block_table_np = self.block_table.np\n        block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]\n        self.num_blocks_per_row[tgt] = num_blocks\n        # Clear the vacated source row: dummy-run batches dereference stale\n        # rows as mamba state slots and write state in place there, possibly\n        # after the blocks have been freed and reallocated.\n        block_table_np[src, :num_blocks] = 0\n        self.num_blocks_per_row[src] = 0\n\n    def swap_row(self, src: int, tgt: int) -> None:\n        src_tgt, tgt_src = [src, tgt], [tgt, src]\n        self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]\n        self.block_table.np[src_tgt] = self.block_table.np[tgt_src]",
+   "what": "CPU 侧行维护五原语：append_row 差量追加（hybrid 先 map_to_kernel_blocks 拆块）、add_row 重置重写（新增/恢复请求）、clear_row 清行、move_row 压实搬行——v0.27.1 起搬完清空源行，注释自述 dummy-run 批会把陈旧行当 mamba 状态槽在原位写状态（#49757 bugfix）、swap_row 重排交换（attention 后端重排批次用）。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/block_table.py",
+   "lines": "L182-L214",
+   "code": "    def compute_slot_mapping(\n        self,\n        num_reqs: int,\n        query_start_loc: torch.Tensor,\n        positions: torch.Tensor,\n    ) -> None:\n        num_tokens = positions.shape[0]\n        if self.slot_mapping_mode == SlotMappingMode.NONE:\n            # Mamba/GDN groups consume the block table as recurrent state\n            # indices and do not use per-token slot mappings.\n            return\n        assert self.slot_mapping_mode == SlotMappingMode.TOKEN_TO_KV_SLOT\n\n        _compute_slot_mapping_kernel[(num_reqs + 1,)](\n            num_tokens,\n            self.max_num_batched_tokens,\n            query_start_loc,\n            positions,\n            self.block_table.gpu,\n            self.block_table.gpu.stride(0),\n            self.block_size,\n            self.slot_mapping.gpu,\n            KV_CACHE_BLOCK_SIZE=self.kv_cache_block_size,\n            BLOCKS_PER_KV_BLOCK=self.blocks_per_kv_block,\n            TOTAL_CP_WORLD_SIZE=self.dcp_world_size,\n            TOTAL_CP_RANK=self.dcp_rank,\n            CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,\n            PAD_ID=PAD_SLOT_ID,\n            BLOCK_SIZE=1024,\n        )\n\n    def commit_block_table(self, num_reqs: int) -> None:\n        self.block_table.copy_to_gpu(num_reqs)",
+   "what": "派发与先行拷贝：SlotMappingMode.NONE 直接早退（Mamba/GDN 组的块表当状态索引用、不算 per-token slot）；kernel 启动 grid=(num_reqs+1,)——比请求数多一个 program 专职 PAD；全部块尺寸/秩/PAD 值作 constexpr 烤进 kernel（TOTAL_CP_* 喂的是 dcp 组）。commit_block_table = copy_to_gpu(num_reqs)：每拍只拷活跃行。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/block_table.py",
+   "lines": "L220-L248",
+   "code": "    @staticmethod\n    def map_to_kernel_blocks(\n        kv_manager_block_ids: np.ndarray,\n        blocks_per_kv_block: int,\n        kernel_block_arange: np.ndarray,\n    ) -> np.ndarray:\n        \"\"\"Convert kv_manager_block_id IDs to kernel block IDs.\n\n        Example:\n            # kv_manager_block_ids: 32 tokens,\n            # Kernel block size: 16 tokens\n            # blocks_per_kv_block = 2\n            >>> kv_manager_block_ids = np.array([0, 1, 2])\n            >>> Result: [0, 1, 2, 3, 4, 5]\n\n            # Each kv_manager_block_id maps to 2 kernel block id:\n            # kv_manager_block_id 0 → kernel block id [0, 1]\n            # kv_manager_block_id 1 → kernel block id [2, 3]\n            # kv_manager_block_id 2 → kernel block id [4, 5]\n        \"\"\"\n        if blocks_per_kv_block == 1:\n            return kv_manager_block_ids\n\n        kernel_block_ids = (\n            kv_manager_block_ids.reshape(-1, 1) * blocks_per_kv_block\n            + kernel_block_arange\n        )\n\n        return kernel_block_ids.reshape(-1)",
+   "what": "拆块算术：kv_manager 块 b → kernel 块 [b×k, b×k+1, …]（docstring 自带 32-token 块 × 16-token kernel 块的例子：[0,1,2]→[0,1,2,3,4,5]）；blocks_per_kv_block=1 时直通返回。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/block_table.py",
+   "lines": "L379-L442",
+   "code": "@triton.jit(do_not_specialize=[\"num_tokens\", \"max_num_tokens\"])\ndef _compute_slot_mapping_kernel(\n    num_tokens,\n    max_num_tokens,\n    query_start_loc_ptr,  # [num_reqs + 1], int32\n    positions_ptr,  # [num_tokens], int64\n    block_table_ptr,  # [max_num_reqs, max_num_blocks_per_req], int32 (flat)\n    block_table_stride,  # max_num_blocks_per_req\n    block_size,\n    slot_mapping_ptr,  # [max_num_tokens], int64\n    KV_CACHE_BLOCK_SIZE: tl.constexpr,\n    BLOCKS_PER_KV_BLOCK: tl.constexpr,\n    TOTAL_CP_WORLD_SIZE: tl.constexpr,\n    TOTAL_CP_RANK: tl.constexpr,\n    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,\n    PAD_ID: tl.constexpr,\n    BLOCK_SIZE: tl.constexpr,\n):\n    req_idx = tl.program_id(0)\n\n    if req_idx == tl.num_programs(0) - 1:\n        # Pad remaining slots for CUDA graph compatibility.\n        for i in range(num_tokens, max_num_tokens, BLOCK_SIZE):\n            offsets = i + tl.arange(0, BLOCK_SIZE)\n            tl.store(\n                slot_mapping_ptr + offsets,\n                PAD_ID,\n                mask=offsets < max_num_tokens,\n            )\n        return\n\n    start_idx = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)\n    end_idx = tl.load(query_start_loc_ptr + req_idx + 1).to(tl.int64)\n\n    virtual_block_size = KV_CACHE_BLOCK_SIZE * TOTAL_CP_WORLD_SIZE\n    row_offset = req_idx * block_table_stride\n    for i in range(start_idx, end_idx, BLOCK_SIZE):\n        offsets = i + tl.arange(0, BLOCK_SIZE)\n        mask = offsets < end_idx\n        pos = tl.load(positions_ptr + offsets, mask=mask, other=0)\n        virtual_block_indices = pos // virtual_block_size\n        virtual_block_offsets = pos - virtual_block_indices * virtual_block_size\n        is_local = (\n            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE\n        ) % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK\n        local_block_offsets = (\n            virtual_block_offsets // (TOTAL_CP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)\n        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (\n            virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE\n        )\n\n        block_indices = (\n            virtual_block_indices * BLOCKS_PER_KV_BLOCK\n            + local_block_offsets // block_size\n        )\n        block_numbers = tl.load(\n            block_table_ptr + row_offset + block_indices,\n            mask=mask & is_local,\n            other=0,\n        ).to(tl.int64)\n        slot_offsets = local_block_offsets % block_size\n        slot_ids = block_numbers * block_size + slot_offsets\n        slot_ids = tl.where(is_local, slot_ids, PAD_ID)\n        tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)",
+   "what": "本章主角（kernel 全文）：@triton.jit(do_not_specialize=[\"num_tokens\", \"max_num_tokens\"])——两个每拍变化的标量不特化，避免逐拍触发 Triton 重编译；PAD 程序（最后一个 program 把 [num_tokens, max_num_tokens) 填 PAD_SLOT_ID）+ 恒等式主体（每 program 一请求区间：块号查表、slot = 块号×block_size + 块内偏移）+ CP 分片三件（virtual_block_size 放大 / is_local 本秩判定 / local_block_offsets 重排，非本秩槽位打 PAD）。",
+   "elide": [
+    "单卡（TOTAL_CP_WORLD_SIZE=1、CP_KV_CACHE_INTERLEAVE_SIZE=1）时 L413/L421-L428 全部退化为恒等：virtual_block_size=block_size、is_local 恒真、local_block_offsets=pos%block_size——正文先立简化形态再点名推广"
+   ]
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L1977-L1979",
+   "code": "        # OPTIMIZATION: Start copying the block table first.\n        # This way, we can overlap the copy with the following CPU operations.\n        self.input_batch.block_table.commit_block_table(num_reqs)",
+   "what": "先行拷贝三行：_prepare_inputs 的第一句先发块表 H2D，让拷贝与后续 CPU 操作重叠——注释原话 'OPTIMIZATION: Start copying the block table first. This way, we can overlap the copy with the following CPU operations.'",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L2188-L2209",
+   "code": "        self.positions[:total_num_scheduled_tokens] = (\n            self.num_computed_tokens[req_indices_gpu].to(torch.int64)\n            + self.query_pos.gpu[:total_num_scheduled_tokens]\n        )\n        self.seq_lens[:num_reqs] = (\n            self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu\n        )\n        self.seq_lens[num_reqs:].fill_(0)\n\n        self.input_batch.block_table.compute_slot_mapping(\n            num_reqs,\n            self.query_start_loc.gpu[: num_reqs + 1],\n            self.positions[:total_num_scheduled_tokens],\n        )\n\n        # Copy the tensors to the GPU.\n        self._prepare_input_ids(\n            scheduler_output,\n            num_reqs,\n            total_num_scheduled_tokens,\n            cu_num_tokens,\n        )",
+   "what": "GPU 端组装与派发：positions = num_computed_tokens[req_indices_gpu].to(int64) + query_pos.gpu（L2188-L2191）——换算 slot 的输入在 GPU 上算好、全程不落 CPU；seq_lens = num_computed + scheduled 同式（L2192-L2195，尾部清 0）；compute_slot_mapping 吃 query_start_loc.gpu 与 positions（L2197-L2201）。",
+   "elide": [
+    "L2204-L2209 _prepare_input_ids（固定地址前缀上载；async 下 prev_sampled_token_ids 的 GPU scatter → ch12/ch18）"
+   ]
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L4082-L4154",
+   "code": "    def _get_slot_mappings(\n        self,\n        num_tokens_padded: int,\n        num_reqs_padded: int,\n        num_tokens_unpadded: int,\n        ubatch_slices: \"UBatchSlices | None\" = None,\n    ) -> tuple[\n        dict[int, torch.Tensor] | None,\n        dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,\n    ]:\n        \"\"\"\n        Build slot mappings in both formats needed by the system.\n\n        Args:\n            num_tokens_padded: Total number of tokens (padded)\n            num_reqs_padded: Total number of requests (padded)\n            num_tokens_unpadded: Actual number of tokens (unpadded)\n            ubatch_slices: Optional ubatch slicing info for DBO\n\n        Returns:\n            A tuple of:\n            - slot_mappings_by_gid: dict[int, torch.Tensor] for attention metadata\n            - slot_mappings_by_layer: dict[str, torch.Tensor] or list for ForwardContext\n        \"\"\"\n        if not (\n            hasattr(self, \"kv_cache_config\")\n            and self.kv_cache_config is not None\n            and len(self.kv_cache_config.kv_cache_groups) > 0\n        ):\n            return None, None\n\n        def _get_slot_mapping(kv_cache_gid: int):\n            assert num_reqs_padded is not None and num_tokens_padded is not None\n            kv_cache_spec = self.kv_cache_config.kv_cache_groups[\n                kv_cache_gid\n            ].kv_cache_spec\n            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):\n                slot_mapping = torch.zeros(\n                    (num_tokens_padded,),\n                    dtype=torch.int64,\n                    device=self.device,\n                )\n            else:\n                blk_table = self.input_batch.block_table[kv_cache_gid]\n                slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]\n\n            # Fill unused with -1. Needed for reshape_and_cache in full cuda\n            # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID\n            slot_mapping[num_tokens_unpadded:num_tokens_padded].fill_(-1)\n\n            return slot_mapping\n\n        slot_mappings_by_gid = {\n            gid: _get_slot_mapping(gid)\n            for gid, _ in enumerate(self.kv_cache_config.kv_cache_groups)\n        }\n\n        slot_mappings_by_layer: dict[str, torch.Tensor] = {}\n        for gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):\n            slot_mapping = slot_mappings_by_gid[gid]\n            for layer_name in kv_cache_group.layer_names:\n                slot_mappings_by_layer[layer_name] = slot_mapping\n\n        if ubatch_slices is not None:\n            result: list[dict[str, torch.Tensor]] = []\n            for ubatch in ubatch_slices:\n                sliced_mappings: dict[str, torch.Tensor] = {}\n                for layer_name, slot_mapping in slot_mappings_by_layer.items():\n                    sliced_mappings[layer_name] = slot_mapping[ubatch.token_slice]\n                result.append(sliced_mappings)\n            return slot_mappings_by_gid, result\n\n        return slot_mappings_by_gid, slot_mappings_by_layer",
+   "what": "slot 双口径装配：_get_slot_mapping 闭包——切 blk_table.slot_mapping.gpu[:num_tokens_padded] 前缀，尾段 [num_tokens_unpadded, num_tokens_padded) fill_(-1)（注释原话 'Needed for reshape_and_cache in full cuda graph mode'）；再按 kv_cache_group 的 layer_names 把同一份张量铺成 dict[layer_name]（供 ForwardContext 逐层取用）。docstring 自述双格式：by_gid 给 attention metadata、by_layer 给 ForwardContext。",
+   "elide": [
+    "L4118-L4123 EncoderOnlyAttentionSpec 零向量分支（encoder-only 模型无 paged KV）一句话带过",
+    "L4145-L4152 ubatch（DBO）切片分支 → 扩展态"
+   ]
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L4307-L4318",
+   "code": "            # True if any attention backend handles KV cache update separately\n            # from forward() (i.e., forward_includes_kv_cache_update=False). When true,\n            # slot_mappings must use padded dimensions to match the key/value tensors.\n            has_separate_kv_update = not all(\n                all(\n                    g.backend.forward_includes_kv_cache_update\n                    for g in self.attn_groups[id]\n                )\n                for id, spec in enumerate(self.kv_cache_config.kv_cache_groups)\n                if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)\n            )\n            pad_attn = cudagraph_mode == CUDAGraphMode.FULL",
+   "what": "padded/unpadded 裁决：has_separate_kv_update = 存在后端 forward_includes_kv_cache_update=False（KV 写与 attention 是两个 op，如 FlashAttention）——此时 slot_mappings 必须用 padded 维度去匹配 key/value 张量（注释原话）；FULL cudagraph 时 pad_attn 亦为真。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L4367-L4376",
+   "code": "            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(\n                num_tokens_padded=num_tokens_padded\n                if pad_attn or has_separate_kv_update\n                else num_tokens_unpadded,\n                num_reqs_padded=(\n                    num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs\n                ),\n                num_tokens_unpadded=num_tokens_unpadded,\n                ubatch_slices=ubatch_slices_padded,\n            )",
+   "what": "裁决落地：num_tokens_padded / num_reqs_padded 按 pad_attn or has_separate_kv_update 三元选择——padded 维度交给 _get_slot_mappings 切片与尾段 -1 填充。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L2325-L2341",
+   "code": "        def _get_block_table(kv_cache_gid: int):\n            assert num_reqs_padded is not None and num_tokens_padded is not None\n            kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec\n            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):\n                blk_table_tensor = torch.zeros(\n                    (num_reqs_padded, 1),\n                    dtype=torch.int32,\n                    device=self.device,\n                )\n            else:\n                blk_table = self.input_batch.block_table[kv_cache_gid]\n                blk_table_tensor = blk_table.get_device_tensor(num_reqs_padded)\n\n            # Fill unused block table entries with NULL_BLOCK_ID (null block)\n            # for CUDAGraph padding. Block 0 is reserved for padding.\n            blk_table_tensor[num_reqs:num_reqs_padded].fill_(NULL_BLOCK_ID)\n            return blk_table_tensor",
+   "what": "行侧装配：get_device_tensor(num_reqs_padded) 取块表 GPU 镜像，尾行 [num_reqs, num_reqs_padded) 填 NULL_BLOCK_ID=0——注释原话 'Fill unused block table entries with NULL_BLOCK_ID (null block) for CUDAGraph padding. Block 0 is reserved for padding.'（与 ch13 第 1 站 null_block 从队头 popleft 占 block_id=0 同源）。",
+   "elide": [
+    "L2328-L2333 EncoderOnlyAttentionSpec 零表分支一句话带过"
+   ]
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L2430-L2449",
+   "code": "        cm_base = CommonAttentionMetadata(\n            query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],\n            query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],\n            seq_lens=self.seq_lens[:num_reqs_padded],\n            _seq_lens_cpu=seq_lens_cpu,\n            _num_computed_tokens_cpu=num_computed_tokens_cpu,\n            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,\n            replayssm_decode_base_cpu=replayssm_decode_base_cpu,\n            num_reqs=num_reqs_padded,\n            num_actual_tokens=num_tokens_padded,\n            max_query_len=max_query_len,\n            max_seq_len=max_seq_len,\n            block_table_tensor=block_table_gid_0,\n            slot_mapping=slot_mapping_gid_0,\n            causal=True,\n            is_prefilling=is_prefilling,\n            positions=self.positions[:num_tokens_padded],\n            mm_req_doc_ranges=req_doc_ranges,\n            rswa_prefix_lens=rswa_prefix_lens,\n        )",
+   "what": "收束：块表张量（block_table_tensor）与 slot_mapping 连同 query_start_loc/seq_lens/num_reqs/positions 一起进 CommonAttentionMetadata——读腿（块表）与写腿（slot_mapping）在同一份元数据里过桥给全部注意力后端的 builder。",
+   "elide": [
+    "mm_req_doc_ranges / rswa_prefix_lens / replayssm_decode_base_cpu 三参数为多模态/滑窗/Mamba 特性分支，一句话带过"
+   ]
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L4432-L4449",
+   "code": "        with (\n            set_forward_context(\n                attn_metadata,\n                self.vllm_config,\n                num_tokens=num_tokens_padded,\n                num_tokens_across_dp=num_tokens_across_dp,\n                cudagraph_runtime_mode=cudagraph_mode,\n                batch_descriptor=batch_desc,\n                ubatch_slices=ubatch_slices_padded,\n                slot_mapping=slot_mappings,\n                skip_compiled=has_encoder_input,\n            ),\n            record_function_or_nullcontext(\"gpu_model_runner: forward\"),\n            self.maybe_get_kv_connector_output(\n                scheduler_output,\n                defer_finalize=defer_kv_connector_finalize,\n            ) as kv_connector_output,\n        ):",
+   "what": "逐层铺设：set_forward_context(slot_mapping=slot_mappings, …)——slot_mapping（dict[layer_name]）进 ForwardContext（forward_context.py:L136），模型前向里每个 Attention 层按自己的 layer_name 取表；同一上下文还带 cudagraph_runtime_mode/batch_descriptor（ch19 已立）。",
+   "elide": [
+    "maybe_get_kv_connector_output 上下文管理器为 KVConnector 分支 → ch16"
+   ]
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L7254-L7272",
+   "code": "        block_sizes = []\n        max_num_blocks = []\n        slot_mapping_modes = []\n        max_model_len = max(self.max_model_len, self.max_encoder_len)\n        for kv_cache_group in kv_cache_config.kv_cache_groups:\n            kv_cache_spec = kv_cache_group.kv_cache_spec\n            kv_cache_spec_kind = get_kv_cache_spec_kind(kv_cache_spec)\n            if kv_cache_spec_kind == KVCacheSpecKind.ENCODER_ONLY_ATTENTION:\n                continue\n            block_size = kv_cache_spec.block_size\n            block_sizes.append(block_size)\n            if kv_cache_spec_kind == KVCacheSpecKind.MAMBA:\n                slot_mapping_modes.append(SlotMappingMode.NONE)\n            else:\n                slot_mapping_modes.append(SlotMappingMode.TOKEN_TO_KV_SLOT)\n            max_num_blocks_per_req = kv_cache_spec.max_num_blocks_per_req(\n                self.vllm_config, max_model_len\n            )\n            max_num_blocks.append(max_num_blocks_per_req)",
+   "what": "模式装配：may_reinitialize_input_batch 按 KVCacheSpecKind 选 SlotMappingMode——MAMBA 组 NONE（块表当状态索引）、其余 TOKEN_TO_KV_SLOT；块尺寸/模式与初始化占位不符时整个 InputBatch 连同块表重建。",
+   "elide": [
+    "L7261-L7262 ENCODER_ONLY 组 continue 一句话带过"
+   ]
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/attention.py",
+   "lines": "L775-L798",
+   "code": "def unified_kv_cache_update(\n    key: torch.Tensor,\n    value: torch.Tensor,\n    layer_name: LayerNameType,\n) -> torch.Tensor:\n    \"\"\"\n    Returns a dummy that is passed to unified_attention to signal a side effect and\n    the data dependency between them to ensure torch.compile preserves ordering.\n    \"\"\"\n    layer_name = _resolve_layer_name(layer_name)\n    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)\n    if layer_slot_mapping is not None:\n        assert hasattr(attn_layer.impl, \"do_kv_cache_update\"), (\n            f\"{attn_layer.impl.__class__.__name__} does not support kv cache update\"\n        )\n        attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]\n            attn_layer,\n            key,\n            value,\n            kv_cache,\n            layer_slot_mapping,\n        )\n\n    return key.new_empty(0)",
+   "what": "写腿入口（算子化 KV 写）：get_attention_context(layer_name) 从 ForwardContext 取该层 slot_mapping（dict[layer_name]，attention.py:L767-L771），交 impl.do_kv_cache_update；返回空张量 key.new_empty(0) 作 dummy 数据依赖——docstring 自述 'to ensure torch.compile preserves ordering'。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/attention/backends/flash_attn.py",
+   "lines": "L1098-L1132",
+   "code": "    def do_kv_cache_update(\n        self,\n        layer: torch.nn.Module,\n        key: torch.Tensor,\n        value: torch.Tensor,\n        kv_cache: torch.Tensor,\n        slot_mapping: torch.Tensor,\n    ) -> None:\n        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):\n            # For encoder attention,\n            # we use direct Q, K, V tensors without caching\n            return\n\n        # Scatter write into the KV cache using slot_mapping indices.\n        # No TMA kernel is invoked here, so stride canonicalization is not needed.\n        # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))\n        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)\n\n        # Reshape the input keys and values and store them in the cache.\n        # Skip this if sharing KV cache with an earlier attention layer.\n        # NOTE(woosuk): Here, key and value are padded while slot_mapping is\n        # not padded. However, we don't need to do key[:num_actual_tokens]\n        # and value[:num_actual_tokens] because the reshape_and_cache_flash\n        # op uses the slot_mapping's shape to determine the number of\n        # actual tokens.\n        reshape_and_cache_flash(\n            key,\n            value,\n            key_cache,\n            value_cache,\n            slot_mapping,\n            self.kv_cache_dtype,\n            layer._k_scale,\n            layer._v_scale,\n        )",
+   "what": "写腿落地（FlashAttention 代表后端）：key/value 转 (B,N,H,D) 后调 reshape_and_cache_flash 散写 KV 池——woosuk NOTE 原话：key/value 可以是 padded 的而 slot_mapping 不必 pad，因为该 op 以 slot_mapping 的形状决定 token 数（这正是第 12 站 slot<0 跳过成立的前提）。",
+   "elide": [
+    "L1106-L1109 ENCODER_ONLY/ENCODER 早退（encoder 注意力不落池）一句话带过"
+   ]
+  },
+  {
+   "path": "csrc/libtorch_stable/cache_kernels.cu",
+   "lines": "L315-L342",
+   "code": "__global__ void reshape_and_cache_flash_kernel(\n    const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size]\n    const scalar_t* __restrict__ value,  // [num_tokens, num_heads, head_size]\n    cache_t* __restrict__ key_cache,     // NHD or HND, shape see comments below\n    cache_t* __restrict__ value_cache,   // same above\n    const int64_t* __restrict__ slot_mapping,  // [num_tokens]\n    const int64_t block_stride, const int64_t page_stride,\n    const int64_t head_stride, const int64_t key_stride,\n    const int64_t value_stride, const int num_heads, const int head_size,\n    const int block_size, const float* k_scale, const float* v_scale,\n    const int kv_scale_stride) {\n  const int64_t token_idx = blockIdx.x;\n  const int64_t slot_idx = slot_mapping[token_idx];\n  // NOTE: slot_idx can be -1 if the token is padded\n  if (slot_idx < 0) {\n    return;\n  }\n  const int64_t block_idx = slot_idx / block_size;\n  const int64_t block_offset = slot_idx % block_size;\n  const int n_elems = num_heads * head_size;\n\n  // pointers to the beginning of the source row for this token.\n  const scalar_t* __restrict__ key_src = key + token_idx * key_stride;\n  const scalar_t* __restrict__ value_src = value + token_idx * value_stride;\n\n  // find the start position inside the kv-cache for this token.\n  cache_t* __restrict__ key_dst =\n      key_cache + block_idx * block_stride + block_offset * page_stride;",
+   "what": "PAD 的消费端与 slot 逆分解（CUDA kernel）：reshape_and_cache_flash_kernel 逐 token——slot_idx = slot_mapping[token]；slot_idx < 0 直接 return（注释原话 'NOTE: slot_idx can be -1 if the token is padded'）；否则 block_idx = slot_idx / block_size、block_offset = slot_idx % block_size——写侧 kernel 用的是恒等式的逆运算。",
+   "elide": [
+    "L334-L342 源/目的指针算术（向量化拷贝细节）可摘要"
+   ]
+  },
+  {
+   "path": "vllm/v1/attention/backends/utils.py",
+   "lines": "L42-L46",
+   "code": "KVCacheLayoutType = Literal[\"NHD\", \"HND\"]\n_KV_CACHE_LAYOUT_OVERRIDE: KVCacheLayoutType | None = None\n\nPAD_SLOT_ID = -1\nNULL_BLOCK_ID = 0",
+   "what": "两个 pad 常量的出生地：PAD_SLOT_ID = -1（token 侧：slot_mapping 的哨兵）与 NULL_BLOCK_ID = 0（行侧：块表尾行的空块号）——本章「PAD 语义」的两块界碑。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/utils.py",
+   "lines": "L110-L142",
+   "code": "class CpuGpuBuffer:\n    \"\"\"Buffer to easily copy tensors between CPU and GPU.\"\"\"\n\n    def __init__(\n        self,\n        *size: int | torch.SymInt,\n        dtype: torch.dtype,\n        device: torch.device,\n        pin_memory: bool = PIN_MEMORY,\n        with_numpy: bool = True,\n    ) -> None:\n        # these buffers are mutable runtime state, so allocate them as normal\n        with torch.inference_mode(False):\n            self.cpu = torch.zeros(\n                *size, dtype=dtype, device=\"cpu\", pin_memory=pin_memory\n            )\n            self.gpu = torch.zeros_like(self.cpu, device=device)\n        self.np: np.ndarray\n        # To keep type hints simple (avoiding generics and subclasses), we\n        # only conditionally create the numpy array attribute. This can cause\n        # AttributeError if `self.np` is accessed when `with_numpy=False`.\n        if with_numpy:\n            if dtype == torch.bfloat16:\n                raise ValueError(\n                    \"Bfloat16 torch tensors cannot be directly cast to a \"\n                    \"numpy array, so call CpuGpuBuffer with with_numpy=False\"\n                )\n            self.np = self.cpu.numpy()\n\n    def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:\n        if n is None:\n            return self.gpu.copy_(self.cpu, non_blocking=True)\n        return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)",
+   "what": "双镜像基座（ch18 已立，本章看块表这一份）：cpu（pinned）+ gpu + np 三视图一体的固定形状缓冲；copy_to_gpu(n) 只传活跃前缀、non_blocking——块表的 CPU 写（append_row）与 GPU 读（kernel/attention）两端都落在它身上。",
+   "elide": [
+    "L131-L137 with_numpy=False 的 bfloat16 特判一句话带过"
+   ]
+  },
+  {
+   "path": "vllm/v1/attention/backend.py",
+   "lines": "L505-L533",
+   "code": "    @property\n    @deprecated(\n        \"\"\"\n    Prefer using device seq_lens directly to avoid implicit H<>D sync.\n    If a CPU copy is needed, use `seq_lens.cpu()` instead.\n    Will be removed in a future release, please migrate as soon as possible.\n    \"\"\"\n    )\n    def seq_lens_cpu(self) -> torch.Tensor:\n        if self._seq_lens_cpu is None:\n            self._seq_lens_cpu = self.seq_lens.to(\"cpu\")\n        return self._seq_lens_cpu\n\n    @property\n    @deprecated(\n        \"\"\"\n    Prefer using device seq_lens directly to avoid implicit H<>D sync which breaks full\n    async scheduling. If a CPU copy is needed, it can be derived from \n    query_start_loc_cpu and seq_lens.\n    Will be removed in a future release, please migrate as soon as possible.\n    \"\"\"\n    )\n    def num_computed_tokens_cpu(self) -> torch.Tensor:\n        if self._num_computed_tokens_cpu is None:\n            query_seq_lens = (\n                self.query_start_loc_cpu[1:] - self.query_start_loc_cpu[:-1]\n            )\n            self._num_computed_tokens_cpu = self.seq_lens_cpu - query_seq_lens\n        return self._num_computed_tokens_cpu",
+   "what": "D2H 之忌的成文纪律：CommonAttentionMetadata 两个 deprecated 属性的措辞原话——'Prefer using device seq_lens directly to avoid implicit H<>D sync which breaks full async scheduling'。本章 why 主线（换算必须在 GPU）的官印：连「顺手 .cpu() 一下」都被点名禁用。",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/attention/backends/flash_attn.py",
+   "lines": "L1041-L1066",
+   "code": "                flash_attn_varlen_func(\n                    q=query[:num_actual_tokens],\n                    k=key_cache,\n                    v=value_cache,\n                    out=output[:num_actual_tokens],\n                    cu_seqlens_q=cu_seqlens_q,\n                    max_seqlen_q=max_seqlen_q,\n                    seqused_k=seqused_k,\n                    max_seqlen_k=max_seqlen_k,\n                    softmax_scale=self.scale,\n                    causal=causal,\n                    alibi_slopes=self.alibi_slopes,\n                    window_size=sliding_window_size,\n                    block_table=block_table,\n                    softcap=self.logits_soft_cap,\n                    scheduler_metadata=scheduler_metadata,\n                    fa_version=self.vllm_flash_attn_version,\n                    q_descale=q_descale,\n                    k_descale=k_descale,\n                    v_descale=v_descale,\n                    dynamic_causal=dynamic_causal,\n                    num_splits=attn_metadata.max_num_splits,\n                    s_aux=self.sinks,\n                    mask_mod=rswa_mask_mod_fn or mm_mask_mod,\n                    aux_tensors=rswa_aux or mm_aux,\n                )",
+   "what": "读腿：flash_attn_varlen_func(block_table=block_table, …)——历史 KV 的读全靠 kernel 穿表间接寻址（每个逻辑块号现场查物理块再访存）。F7 回收点：ch13 埋的「注意力 kernel 必须穿过块表间接寻址」在此兑现。",
+   "elide": [
+    "q_descale/k_descale/mask_mod/aux_tensors 等参数为量化/多模态/FA4 分支，可省略"
+   ]
+  }
+ ],
+ "theory": [
+  {
+   "topic": "槽位恒等式与双向换算（worked example 的算术底座）",
+   "detail": "正向（读侧换算）：slot = block_table[req][pos // block_size] × block_size + pos % block_size（block_table.py:L434-L440）。逆向（写侧分解）：block_idx = slot // block_size、block_offset = slot % block_size（cache_kernels.cu:L332-L333）——写侧 kernel 用的是同一恒等式的逆运算。例：block_size=16、请求 prompt 100 token，第 100 个 token（pos=99）落在第 99//16=6 个逻辑块的第 99%16=3 槽；块表行第 6 项=物理块 9 → slot = 9×16+3 = 147。校验：147//16=9、147%16=3——正逆闭合。hybrid 细分下乘子 blocks_per_kv_block 进 block_indices（block_table.py:L430-L433），外层恒等式不变。"
+  },
+  {
+   "topic": "PAD 语义表：两个值、三处分工、各自的消费端",
+   "detail": "值 -1（PAD_SLOT_ID，backends/utils.py:L45）填在 token 侧：①kernel PAD 程序每拍重填 [num_tokens, max_num_tokens)（block_table.py:L399-L408）；②_get_slot_mappings 尾段 [unpadded, padded) fill_(-1)（gpu_model_runner.py:L4128-L4130）。消费端：reshape_and_cache* 系写 kernel 逐 token 查 slot，<0 直接 return（cache_kernels.cu:L326-L331 注释原话 'slot_idx can be -1 if the token is padded'）。值 0（NULL_BLOCK_ID，backends/utils.py:L46）填在行侧：块表尾行 [num_reqs, num_reqs_padded)（gpu_model_runner.py:L2338-L2341）——块 0 被调度器 null_block 保留且清零（ch13 第 1 站），padded 请求即使读它也只有零。为什么 -1 安全：合法 slot 恒 ≥ 0（块号 ≥0、偏移 ≥0），-1 是不可能误判的哨兵；为什么 0 安全：block 0 全局保留、永不属于任何请求。配套两件：query_start_loc 尾部非递减（L2075-L2077 注释 'kernels like FlashAttention requires that'）、positions 尾部清零（L3663-L3664）——padding 四件套（WC3）。"
+  },
+  {
+   "topic": "为什么换算必须在 GPU（D2H 斩断异步调度之忌）",
+   "detail": "positions 的两个来源张量都在 GPU：num_computed_tokens[req_indices_gpu] 与 query_pos.gpu（gpu_model_runner.py:L2188-L2191）。CPU 换算需先 .cpu()——隐式 D2H sync，CPU 要等 GPU 排空队列，ch12 的重叠心跳在此断流。这条纪律在 v0.27.1 三重成文：①CommonAttentionMetadata 两个 deprecated 属性措辞原话 'avoid implicit H<>D sync which breaks full async scheduling'（backend.py:L505-L533）；②VLLM_GPU_SYNC_CHECK 运行期纠察，任何 sync 直接抛 'GPU<->CPU sync detected'（gpu_sync_debug.py:L12-L14；execute_model/sample_tokens 被 @with_gpu_sync_check 包住 gpu_worker.py:L1010-L1019，warmup 完成后开启 L846-L848）；③替代方案的账：CPU numpy O(tokens) 每拍 Python 循环 + 一次 D2H sync + 一次 H2D 回拷 vs 一次异步 Triton launch（µs 级、与 CPU 重叠）——三种开销对一种。"
+  },
+  {
+   "topic": "CUDA graph 的形状纪律与 PAD 程序存在的根本原因",
+   "detail": "CUDA graph 录的是『对固定地址显存执行这串 kernel launch』——grid/block/指针全在捕获时烤死，replay 不重读 shape 元数据（WC3 pain）。slot_mapping 是 [max_num_batched_tokens] 的持久 buffer：地址不变（回放前提）但活跃前缀长度每拍不同（本拍真相）——尾部内容每拍都可能残留上一拍的真数据。PAD 程序（grid 多出的第 num_reqs+1 个 program）每拍把 [num_tokens, max) 重填 -1，让「形状=max、地址不变、尾部是可跳过哨兵」三条件同时成立；do_not_specialize=[num_tokens, max_num_tokens]（block_table.py:L379）让这两个每拍变化的标量不触发 Triton 重编译——同为「形状恒定」纪律的 kernel 侧半边。"
+  },
+  {
+   "topic": "kernel 块细分算术（hybrid blocks）",
+   "detail": "分配块（kv_cache_block_size）与 kernel 块（attention kernel 要求的块）解耦：blocks_per_kv_block = block_size // kernel_block_size（block_table.py:L82-L103）。拆块映射：kv_manager 块 b → kernel 块 [b×k, b×k+1, …]（map_to_kernel_blocks，L220-L248，docstring 例：[0,1,2]×k=2 → [0,1,2,3,4,5]）；表宽按 max_num_blocks × k 放大。kernel 块大小由后端声明（get_supported_kernel_block_sizes，FA=[MultipleOf(16)] flash_attn.py:L82-L84），prepare_kernel_block_sizes 对每组取全部后端公共尺寸（worker/utils.py:L266-L332：先试管理块尺寸本身、否则从 int 型候选里降序取第一个公共因子）。"
+  },
+  {
+   "topic": "CP（上下文并行）分片数学（kernel 内）",
+   "detail": "三件（block_table.py:L413-L428）：virtual_block_size = KV_CACHE_BLOCK_SIZE × TOTAL_CP_WORLD_SIZE（把 W 个 rank 的块拼成虚拟大块）；is_local = (virtual_block_offsets // I) % W == R（I=interleave_size——按 I-token 粒度交错归属，而非整块切分）；local_block_offsets = (voff // (W×I)) × I + voff % I（把全局偏移重排成本 rank 的连续偏移）。非本秩 token 的 slot 打 PAD（L441 tl.where）。例：W=2、I=2、block_size=16 → virtual_block_size=32；pos=35 → vbi=1、voff=3；is_local = (3//2)%2==R → rank1 为真；rank1 的 local_block_offsets = (3//4)×2 + 3%2 = 1；block_indices = 1×k + 1//16 = 1；slot = 块表行[1]×16+1。rank0 该 token 打 PAD。单卡 W=1、I=1 时三件全部退化为恒等（virtual_block_size=block_size、is_local 恒真、local=pos%block_size）——正文先立简化形态。注意 v0.27.1 kernel 的 TOTAL_CP_* 喂的是 dcp 组（L206-L207），pcp 组有自己的 manager（PCP 不走此 kernel 参数）。"
+  },
+  {
+   "topic": "复杂度与开销账",
+   "detail": "换算 kernel：grid = num_reqs+1 个 program 一次 launch（µs 级、异步）；每 program 的循环次数 = ceil(该请求 token 数 / 1024)（BLOCK_SIZE=1024 常量 tile）。commit 拷贝 = num_reqs × stride(0) × 4B（int32）只拷活跃行。slot_mapping 每拍全量重算 O(total_tokens) 但全在 GPU、与 CPU 重叠。对照（WC2）：CPU 方案 = O(tokens) Python/numpy 循环 + D2H sync + H2D 回拷——三开销对一。PAD 程序的额外代价 = 尾部 [num_tokens, max) 的填充写——图回放形状纪律的固定税。"
+  }
+ ],
+ "mechanisms": [
+  {
+   "id": "m1",
+   "name": "槽位恒等式与逆分解：slot = block_table[req][pos//bs] × bs + pos%bs；写侧 kernel 用 slot//bs、slot%bs 复原（正逆闭合）",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/worker/block_table.py:L410-L442",
+    "csrc/libtorch_stable/cache_kernels.cu:L326-L333"
+   ],
+   "paper_origin": {
+    "paper": "arXiv:2309.06180",
+    "sections": [
+     "§3.1"
+    ]
+   }
+  },
+  {
+   "id": "m2",
+   "name": "Triton GPU 端换算的 kernel 组织：grid=(num_reqs+1,) 每 program 一请求区间、BLOCK_SIZE=1024 分块循环、do_not_specialize 防逐拍重编译",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/worker/block_table.py:L182-L211",
+    "vllm/v1/worker/block_table.py:L380-L442",
+    "vllm/v1/worker/gpu_model_runner.py:L2197-L2201"
+   ]
+  },
+  {
+   "id": "m3",
+   "name": "PAD 语义三处分工：-1（PAD_SLOT_ID）token 侧两处（kernel PAD 程序每拍重填 + _get_slot_mappings 尾段）/ 0（NULL_BLOCK_ID）行侧尾行——各消费端各自的跳过方式；配套 query_start_loc 非递减与 positions 尾清零（四件套）",
+   "kind": "dataflow",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/worker/block_table.py:L399-L408",
+    "vllm/v1/worker/gpu_model_runner.py:L4128-L4130",
+    "vllm/v1/worker/gpu_model_runner.py:L2338-L2341",
+    "vllm/v1/attention/backends/utils.py:L45-L46",
+    "vllm/v1/worker/gpu_model_runner.py:L2073-L2078",
+    "vllm/v1/worker/gpu_model_runner.py:L3663-L3664"
+   ]
+  },
+  {
+   "id": "m4",
+   "name": "block_table 双镜像与 commit 先行重叠：CPU numpy 增量写行（append_row）→ copy_to_gpu 只拷活跃行 → _prepare_inputs 第一句先发车（H2D 与 CPU 活重叠）",
+   "kind": "dataflow",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/worker/block_table.py:L105-L112",
+    "vllm/v1/worker/block_table.py:L138-L154",
+    "vllm/v1/worker/block_table.py:L213-L214",
+    "vllm/v1/worker/gpu_model_runner.py:L1977-L1979",
+    "vllm/v1/utils.py:L110-L142"
+   ]
+  },
+  {
+   "id": "m5",
+   "name": "写腿：unified_kv_cache_update 算子经 ForwardContext 按 layer_name 取 slot_mapping → do_kv_cache_update → reshape_and_cache_flash（CUDA kernel slot<0 跳过；key/value 可 padded 而 slot_mapping 定 token 数）",
+   "kind": "protocol",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/model_executor/layers/attention/attention.py:L775-L798",
+    "vllm/v1/attention/backends/flash_attn.py:L1098-L1132",
+    "csrc/libtorch_stable/cache_kernels.cu:L315-L342"
+   ]
+  },
+  {
+   "id": "m6",
+   "name": "读腿：block_table 间接寻址——CommonAttentionMetadata.block_table_tensor → FlashAttentionMetadata.block_table → flash_attn_varlen_func(block_table=) 穿表读历史 KV（F7 回收：写直寻址、读间接寻址）",
+   "kind": "dataflow",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/worker/gpu_model_runner.py:L2325-L2341",
+    "vllm/v1/worker/gpu_model_runner.py:L2430-L2449",
+    "vllm/v1/attention/backends/flash_attn.py:L929-L934",
+    "vllm/v1/attention/backends/flash_attn.py:L1041-L1066"
+   ]
+  },
+  {
+   "id": "m7",
+   "name": "padded/unpadded 双口径：has_separate_kv_update（任一后端 forward_includes_kv_cache_update=False，如 FlashAttention）→ slot_mappings 用 padded 维度匹配 key/value 张量；FULL cudagraph 时 pad_attn",
+   "kind": "protocol",
+   "difficulty": "core",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/worker/gpu_model_runner.py:L4307-L4318",
+    "vllm/v1/worker/gpu_model_runner.py:L4367-L4376",
+    "vllm/v1/attention/backend.py:L66-L67",
+    "vllm/v1/attention/backends/flash_attn.py:L86",
+    "vllm/v1/attention/backends/flash_attn.py:L1116-L1122"
+   ]
+  },
+  {
+   "id": "m8",
+   "name": "CP（上下文并行）分片烤进 kernel：virtual_block_size 放大 / is_local 本秩判定（I-token 交错）/ local_block_offsets 重排 / 非本秩打 PAD（TOTAL_CP_* 喂 dcp 组；单卡退化恒等）",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/worker/block_table.py:L413-L428",
+    "vllm/v1/worker/block_table.py:L441",
+    "vllm/v1/worker/block_table.py:L206-L207"
+   ]
+  },
+  {
+   "id": "m9",
+   "name": "kernel 块细分（hybrid blocks）：分配块≠kernel 块——后端声明 get_supported_kernel_block_sizes（FA=[MultipleOf(16)]）、prepare_kernel_block_sizes 取公共尺寸、map_to_kernel_blocks CPU 拆块 + kernel BLOCKS_PER_KV_BLOCK 乘子、表宽放大",
+   "kind": "algorithm",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/worker/utils.py:L266-L332",
+    "vllm/v1/worker/utils.py:L335-L376",
+    "vllm/v1/worker/block_table.py:L82-L103",
+    "vllm/v1/worker/block_table.py:L221-L248",
+    "vllm/v1/attention/backends/flash_attn.py:L83-L84"
+   ]
+  },
+  {
+   "id": "m10",
+   "name": "SlotMappingMode.NONE：Mamba/GDN 状态缓存组跳过 per-token slot（块表直接当状态索引用；compute_slot_mapping 早退；may_reinitialize 按 spec kind 装配）",
+   "kind": "config",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/worker/block_table.py:L43-L45",
+    "vllm/v1/worker/block_table.py:L189-L192",
+    "vllm/v1/worker/gpu_model_runner.py:L7263-L7268"
+   ]
+  },
+  {
+   "id": "m11",
+   "name": "块表宽度 128-token 对齐：get_block_table_width 的 token_alignment=128（#50302 把 indexer 的要求推广到全部后端；NONE 组不对齐）",
+   "kind": "layout",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/worker/block_table.py:L20-L40",
+    "vllm/v1/worker/block_table.py:L304-L313"
+   ]
+  },
+  {
+   "id": "m12",
+   "name": "多组块表与逐层铺设：MultiGroupBlockTable 每组一张扇出全部行原语；slot_mappings_by_gid → by_layer dict → ForwardContext.slot_mapping（forward_context.py:L136）；ExecuteModelState 随行带过 sample_tokens",
+   "kind": "dataflow",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/worker/block_table.py:L270-L376",
+    "vllm/v1/worker/gpu_model_runner.py:L4134-L4154",
+    "vllm/v1/worker/gpu_model_runner.py:L4432-L4449",
+    "vllm/forward_context.py:L136"
+   ]
+  },
+  {
+   "id": "m13",
+   "name": "move_row 清空源行防 stale：压实搬行后源行清零——dummy-run 批会把陈旧行当 mamba 状态槽在原位写状态（#49757 bugfix）",
+   "kind": "dataflow",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/worker/block_table.py:L166-L180"
+   ]
+  },
+  {
+   "id": "m14",
+   "name": "routed_experts 的 slot_mapping 私有快照：共享 buffer 会被下拍 _prepare_inputs 覆写、async D2H 可能还在途——先拷私有快照再慢用（数据所有权纪律）",
+   "kind": "dataflow",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/worker/gpu_model_runner.py:L2347-L2358"
+   ]
+  }
+ ],
+ "subtraction_plan": {
+  "delete": [
+   {
+    "what": "M-RoPE / XD-RoPE 分支：_calc_mrope_positions/_calc_xdrope_positions 调用与 uses_mrope/uses_xdrope_dim 守卫块、mrope/xdrope positions 拷贝（gpu_model_runner.py L1997-L2005、L2211-L2230、L3657-L3661 的两分支）",
+    "why_safe": "多模态/特定模型专用；纯文本主线 positions 路径完整无缺。"
+   },
+   {
+    "what": "prompt_embeds 路径：is_token_ids 收集、req_prompt_embeds 逐请求填入、inputs_embeds 拷贝（gpu_model_runner.py L2025-L2070、L3636-L3647）",
+    "why_safe": "enable_prompt_embeds=False 时整段跳过；token-only 主线不触及。"
+   },
+   {
+    "what": "async spec decode 乐观纠偏全家：optimistic_seq_lens/discard_request_mask/num_accepted_tokens 同步分支/update_num_computed_tokens_for_batch_change/prev_positions（gpu_model_runner.py L2081-L2178）",
+    "why_safe": "非 async spec decode 配置下走 else 支（L2174-L2178 直接 copy_），数值等价；领地属 ch12/ch33。"
+   },
+   {
+    "what": "mamba 预处理管线：mamba_prev_last_scheduled_idx/preprocess_mamba_all_specdec、mamba_cache_mode=='align' 块与 mamba_bufs（gpu_model_runner.py L2143-L2150、L4320-L4362）",
+    "why_safe": "Mamba/hybrid 模型专用；本章保留 SlotMappingMode.NONE 早退（教学点），其背后的状态拷贝管线不进精简版。"
+   },
+   {
+    "what": "cascade attention prefix 预计算（gpu_model_runner.py L4255-L4263）",
+    "why_safe": "cascade_attn_enabled=False 时不执行；可选优化。"
+   },
+   {
+    "what": "ubatching/DBO：maybe_create_ubatch_slices、ubatch_slices* 全部、_get_slot_mappings 的 ubatch 分支（L4145-L4152）",
+    "why_safe": "use_ubatching=False 时 should_ubatch=False、slices=None，主路径单批。"
+   },
+   {
+    "what": "routed_experts slot_mapping 私有快照（gpu_model_runner.py L2347-L2358 及 routed_experts_initialized 相关）",
+    "why_safe": "MoE 专家路由捕获特性，默认关。"
+   },
+   {
+    "what": "Encoder-only 分支：_get_block_table 的零表（L2328-L2333）、_get_slot_mapping 的零向量（L4118-L4123）、may_reinitialize 的 ENCODER_ONLY continue（L7261-L7262）",
+    "why_safe": "encoder-only 模型无 paged KV；生成式主线不触发。"
+   },
+   {
+    "what": "hybrid metadata 缓存复用：cached_attn_metadata 与 builder.update_block_table 分支（gpu_model_runner.py L2472-L2538 的 cache 命中支）",
+    "why_safe": "单组首次 build 必 miss；删后逐组独立 build，语义等价（优化路径）。"
+   },
+   {
+    "what": "KV/EC connector 与 kv_sharing_fast_prefill 分支：has_kv_transfer_group、maybe_get_kv_connector_output、kv_connector_no_forward、EC consumer 早退（gpu_model_runner.py L4197-L4200、L4210-L4216、L4231-L4234、L4236-L4241、L4445-L4448）",
+    "why_safe": "P/D 与 encoder-cache 连接器路径（ch16 领地）；单机无 connector 全不进。"
+   },
+   {
+    "what": "PP 相关：is_last_rank token 回填、broadcast_pp_output、非末 rank 早返回（gpu_model_runner.py L1408-L1428、L4467-L4473）",
+    "why_safe": "PP=1 时 is_last_rank 恒真；单 rank 主线不进。"
+   },
+   {
+    "what": "ngram-GPU 的 scheduler_output replace 复制（gpu_model_runner.py L4180-L4195）",
+    "why_safe": "speculative_config 为 None 时跳过。"
+   },
+   {
+    "what": "external_launcher+DP 空拍 dummy-run 边角（gpu_model_runner.py L4218-L4230 的 external_launcher 分支）",
+    "why_safe": "特定后端+DP 组合；保留空拍早退即可。"
+   },
+   {
+    "what": "dcp_local_seq_lens 分支（gpu_model_runner.py L2451-L2464）",
+    "why_safe": "dcp_world_size=1 时不进；CP 多 rank 部署属分布式 Part。"
+   },
+   {
+    "what": "InputBatch 的采样参数列/thinking budget/replayssm/reasoning 等与块表无关的装填（gpu_input_batch.py 相应段）",
+    "why_safe": "本章精简版聚焦 block_table.py + gpu_model_runner 块表线 + 消费端两函数；InputBatch 直接复用 ch18 精简版产物（append_row/clear_row/move_row 接口不变）。"
+   }
+  ],
+  "must_keep": [
+   {
+    "symbol": "BlockTable",
+    "why": "本章主角类：单组页表 + slot_mapping 缓冲。"
+   },
+   {
+    "symbol": "MultiGroupBlockTable",
+    "why": "多组扇出封装（每组一张表）。"
+   },
+   {
+    "symbol": "block_table",
+    "why": "[max_num_reqs, max_blocks_per_req] int32 双镜像页表本体。"
+   },
+   {
+    "symbol": "slot_mapping",
+    "why": "[max_num_batched_tokens] int64 持久缓冲——恒等式的输出（也是 CommonAttentionMetadata/ForwardContext 的字段名）。"
+   },
+   {
+    "symbol": "num_blocks_per_row",
+    "why": "行长度账：append_row 差量追加的依据。"
+   },
+   {
+    "symbol": "append_row",
+    "why": "CPU 侧差量写行——第 2 站。"
+   },
+   {
+    "symbol": "add_row",
+    "why": "重置重写（新增/恢复请求）。"
+   },
+   {
+    "symbol": "clear_row",
+    "why": "remove_request 的清行半边。"
+   },
+   {
+    "symbol": "move_row",
+    "why": "condense 压实搬行 + 清空源行防 stale（#49757）。"
+   },
+   {
+    "symbol": "swap_row",
+    "why": "attention 后端重排批次的交换半边。"
+   },
+   {
+    "symbol": "compute_slot_mapping",
+    "why": "派发入口（含 NONE 早退）。"
+   },
+   {
+    "symbol": "commit_block_table",
+    "why": "只拷活跃行 = copy_to_gpu(num_reqs)。"
+   },
+   {
+    "symbol": "_compute_slot_mapping_kernel",
+    "why": "恒等式 + PAD 程序 + CP 分片本体（kernel 整体保留，含 do_not_specialize 装饰器）。"
+   },
+   {
+    "symbol": "do_not_specialize",
+    "why": "每拍变化的标量不特化、防逐拍重编译——kernel 侧的形状纪律。"
+   },
+   {
+    "symbol": "get_device_tensor",
+    "why": "块表 GPU 镜像交给 attention metadata 的出口。"
+   },
+   {
+    "symbol": "get_block_table_width",
+    "why": "128-token 对齐 + 细分定宽。"
+   },
+   {
+    "symbol": "map_to_kernel_blocks",
+    "why": "hybrid 拆块算术（含 docstring 例子）。"
+   },
+   {
+    "symbol": "SlotMappingMode",
+    "why": "TOKEN_TO_KV_SLOT / NONE 两值——Mamba/GDN 的跳过模式。"
+   },
+   {
+    "symbol": "use_hybrid_blocks",
+    "why": "分配块≠kernel 块的开关位。"
+   },
+   {
+    "symbol": "blocks_per_kv_block",
+    "why": "细分乘子。"
+   },
+   {
+    "symbol": "kv_cache_block_size",
+    "why": "分配块尺寸字段（与 kernel 块 self.block_size 区分）。"
+   },
+   {
+    "symbol": "PAD_SLOT_ID",
+    "why": "-1：token 侧 pad 常量。"
+   },
+   {
+    "symbol": "NULL_BLOCK_ID",
+    "why": "0：行侧 pad 常量。"
+   },
+   {
+    "symbol": "CpuGpuBuffer",
+    "why": "双镜像基座。"
+   },
+   {
+    "symbol": "copy_to_gpu",
+    "why": "只传活跃前缀 non_blocking。"
+   },
+   {
+    "symbol": "virtual_block_size",
+    "why": "CP 分片三件之一。"
+   },
+   {
+    "symbol": "is_local",
+    "why": "CP 本秩判定。"
+   },
+   {
+    "symbol": "local_block_offsets",
+    "why": "CP 偏移重排。"
+   },
+   {
+    "symbol": "_get_slot_mappings",
+    "why": "slot 双口径装配（切片 + 尾段 -1 + by-layer dict）。"
+   },
+   {
+    "symbol": "_get_slot_mapping",
+    "why": "内层闭包（fill_(-1) 所在）。"
+   },
+   {
+    "symbol": "num_tokens_padded",
+    "why": "padded 口径的量纲。"
+   },
+   {
+    "symbol": "num_tokens_unpadded",
+    "why": "unpadded 口径的量纲。"
+   },
+   {
+    "symbol": "has_separate_kv_update",
+    "why": "padded/unpadded 裁决。"
+   },
+   {
+    "symbol": "forward_includes_kv_cache_update",
+    "why": "后端语义分叉位（backend.py 默认 True / FA False）。"
+   },
+   {
+    "symbol": "pad_attn",
+    "why": "FULL cudagraph 时的 pad 开关。"
+   },
+   {
+    "symbol": "_get_block_table",
+    "why": "行侧装配（NULL_BLOCK_ID 填尾行）。"
+   },
+   {
+    "symbol": "CommonAttentionMetadata",
+    "why": "块表+slot_mapping 的收束载体。"
+   },
+   {
+    "symbol": "block_table_tensor",
+    "why": "读腿字段。"
+   },
+   {
+    "symbol": "set_forward_context",
+    "why": "逐层铺设进 ForwardContext。"
+   },
+   {
+    "symbol": "unified_kv_cache_update",
+    "why": "写腿算子。"
+   },
+   {
+    "symbol": "get_attention_context",
+    "why": "按 layer_name 取 slot_mapping/kv_cache。"
+   },
+   {
+    "symbol": "do_kv_cache_update",
+    "why": "后端写腿方法。"
+   },
+   {
+    "symbol": "reshape_and_cache_flash",
+    "why": "写腿最终 op（其 CUDA kernel slot<0 跳过）。"
+   },
+   {
+    "symbol": "flash_attn_varlen_func",
+    "why": "读腿 kernel 调用（block_table= 参数）。"
+   },
+   {
+    "symbol": "prepare_kernel_block_sizes",
+    "why": "每组 kernel 块尺寸装配。"
+   },
+   {
+    "symbol": "select_common_block_size",
+    "why": "公共块尺寸选取。"
+   },
+   {
+    "symbol": "may_reinitialize_input_batch",
+    "why": "块尺寸/模式不符时连块表重建 InputBatch。"
+   },
+   {
+    "symbol": "slot_mapping_modes",
+    "why": "模式列表参数（NONE/TOKEN 装配入口）。"
+   },
+   {
+    "symbol": "token_alignment",
+    "why": "128-token 对齐参数名。"
+   }
+  ]
+ },
+ "foreshadow_due": {
+  "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，取回必错，不跑）",
+  "should_plant": [],
+  "should_payoff": [
+   {
+    "id": "F7",
+    "text": "block_table 间接寻址",
+    "planted": 13,
+    "paid": 22,
+    "payoff_how": "ch13 第 10 站埋下：『写侧 slot_mapping 每 token 直寻址、读侧历史 KV 全靠 kernel 穿 block_table 间接寻址——这套间接寻址让 PagedAttention/FlashAttention 变体 kernel 比连续读复杂』（WC5 cost ①）。本章第 14 站正面回收：flash_attn_varlen_func(block_table=…) 的穿表读（flash_attn.py:L929-L934、L1041-L1066）与写腿 reshape_and_cache_flash 的直寻址（attention.py:L775-L798 → cache_kernels.cu:L326-L333）并排对照——『写直读间』的完整故事 + 恒等式正逆双向闭合（m1/m6，配图）。注：ch21（注意力后端）notes 自称『回收 block_table 伏笔』，但其视角是后端选择与逐组混布里块表的消费契约；ledger F7 paid=22——正式回收落本章，写作时 ch21 部分回收、ch22 全量回收，正文可回指 ch21 已见消费面、本章补 kernel 内景。"
+   }
+  ],
+  "note": "pedagogy-plan.foreshadows：F7 planted=13、paid=22（本章唯一应回收项）；无 planted=22 条目——本章不埋新伏笔。邻章衔接：ch18 第 8 站已把 compute_slot_mapping 指给本章（『数学与 PAD 语义归 ch22』）、ch13 第 9/10 站已把 CP 分片/PAD 指给本章——两处回指在正文收口时点名；本章是 Part V 收官，Part VI（ch23 模型定义层）从模型层拼装重新出发，L0 缩放切回模型层框。"
+ },
+ "l2_spec": "book/cartography/l2-specs/ch22.json（stations 与本档案 stations 同一份账本）"
+}

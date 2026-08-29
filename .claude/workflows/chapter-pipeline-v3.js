@@ -219,7 +219,7 @@ const dv = await agent(
   '④ mechanisms 完整性（有无漏掉读者必须懂的机制）、needs_figure/needs_worked_example/difficulty 标得对吗？\n' +
   '⑤ subtraction_plan.delete 都安全吗、must_keep 完整吗（有无遗漏读者要学的关键符号）？\n' +
   (PRIMER ? '⑥（PRIMER）确认 dossier.json 顶层有 "kind":"primer"——没有则 sound=false。\n' : '') +
-  '返回 sound（是否可放行）与 problems（具体问题列表）。（rev2 注记：若 dossier 曾按首轮 problems 修订落盘，本轮为修订后重验——逐条独立复核修订处与其波及面，仍按上述全项扫，不复述首轮。）',
+  '返回 sound（是否可放行）与 problems（具体问题列表）。（rev2 注记：若 dossier 曾按首轮 problems 修订落盘，本轮为修订后重验——逐条独立复核修订处与其波及面，仍按上述全项扫，不复述首轮。rev3：同前，适用任何轮次的修订后重验。）',
   mo({ schema: VERIFY_SCHEMA, label: 'dossier-verify', phase: 'Dossier', agentType: 'general-purpose' }, 'verify', false)
 )
 if (!dv) return { chapter: CHID, escalated: 'dossier-verify-failed', stage: 'Dossier', note: 'dossier 对抗性自核 agent 失败（限流/崩溃），未核对不得放行' }

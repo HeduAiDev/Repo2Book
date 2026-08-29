@@ -1,0 +1,415 @@
+{
+ "figures": [
+  {
+   "figure_id": "L2-ch22",
+   "svg": "L2-ch22.svg",
+   "png": "L2-ch22.png",
+   "claim": "一张页表，两副面孔：写 KV 拿每 token 一个的 slot_mapping 直进直出，读历史却要穿一张 block_table——凭什么？position→slot 为什么必须用 Triton 在 GPU 上换算、搬回 CPU 就踩异步调度的忌讳？CUDA graph 录 max 形状，真只来 10 个 token，剩下八千个槽位凭什么不写花 KV 池？",
+   "numbers": [
+    {
+     "n": 1,
+     "where": "gpu_model_runner.py:L1441-L1474",
+     "what": "块号过线落行：_update_states 的块表线——在跑请求逐组 block_ids.extend(new_ids)（差量）、被抢占恢复的整表替换（L1447-L1452），再 input_batch.block_table.append_row 把块 id 写进 CPU 页表行（L1473-L1474）。ch18 讲过整段调和，本章只跟块号这一条线"
+    },
+    {
+     "n": 2,
+     "where": "block_table.py:L138-L158",
+     "what": "append_row 本体：CPU numpy 增量写——start = num_blocks_per_row[row] 记行长度、新块 id 接着写；hybrid（分配块≠kernel 块）时先 map_to_kernel_blocks 拆块再写。add_row（L156-L158）重置行重写 = 新增/恢复请求用"
+    },
+    {
+     "n": 3,
+     "where": "gpu_model_runner.py:L1977-L1979",
+     "what": "先行拷贝：_prepare_inputs 第一句 commit_block_table——把块表活跃行 H2D 先发车，让 PCIe 拷贝与随后的 np.repeat/index_select 等 CPU 活重叠（注释原话 'OPTIMIZATION: Start copying the block table first … overlap the copy with the following CPU operations'）；commit = copy_to_gpu(num_reqs) 只拷活跃行"
+    },
+    {
+     "n": 4,
+     "where": "gpu_model_runner.py:L2188-L2195",
+     "what": "GPU 端组装输入：positions = num_computed_tokens[req_indices_gpu].to(int64) + query_pos.gpu（L2188-L2191）——换算 slot 的输入在 GPU 上算好、全程不落 CPU；seq_lens = num_computed + scheduled 同式（L2192-L2195）。把 positions D2H 拉回 CPU 换算 = 同步点斩断异步调度（本章 why 主线）"
+    },
+    {
+     "n": 5,
+     "where": "block_table.py:L182-L211",
+     "what": "派发：compute_slot_mapping——SlotMappingMode.NONE（Mamba/GDN 状态缓存组）直接早退：块表当状态索引用、不算 per-token slot；否则 _compute_slot_mapping_kernel[(num_reqs+1,)](…) 启动——grid 比 num_reqs 多一个 program，全部块尺寸/秩/PAD 值作 constexpr 烤进 kernel"
+    },
+    {
+     "n": 6,
+     "where": "block_table.py:L399-L408",
+     "what": "PAD 程序：第 num_reqs+1 个 program 专职把 [num_tokens, max_num_tokens) 填 PAD_SLOT_ID——CUDA graph 捕获的是 max 形状、slot_mapping 是持久 buffer，上一拍的真数据还躺在尾部，每拍必须重填。「PAD 语义」的出生地"
+    },
+    {
+     "n": 7,
+     "where": "block_table.py:L410-L442",
+     "what": "恒等式主体：每 program 处理一请求 token 区间 [start_idx, end_idx)（query_start_loc 圈定）——块号 = block_table[req][virtual_block_indices]、slot_ids = 块号 × block_size + 块内偏移（L430-L440）；CP 分片三件（virtual_block_size 放大 L413、is_local 本秩判定 L421-L423、local_block_offsets 重排 L424-L428）单卡全部退化为恒等、非本秩槽位打 PAD（L441）"
+    },
+    {
+     "n": 8,
+     "where": "gpu_model_runner.py:L4307-L4318",
+     "what": "padded/unpadded 裁决：has_separate_kv_update = 存在后端 forward_includes_kv_cache_update=False（FlashAttention 系：KV 写与 attention 是两个 op）——此时 slot_mappings 必须用 padded 维度匹配 key/value 张量；FULL cudagraph 时 pad_attn 亦为真（调用点 L4367-L4376 三元选择）"
+    },
+    {
+     "n": 9,
+     "where": "gpu_model_runner.py:L4082-L4154",
+     "what": "slot 双口径装配：_get_slot_mappings——按第 8 站裁决切 blk_table.slot_mapping.gpu 前缀；尾段 [num_tokens_unpadded, num_tokens_padded) fill_(-1)（注释：Needed for reshape_and_cache in full cuda graph mode）；再按 layer_name 铺成 dict 供 ForwardContext"
+    },
+    {
+     "n": 10,
+     "where": "gpu_model_runner.py:L2325-L2341",
+     "what": "行侧装配：_get_block_table——get_device_tensor(num_reqs_padded) 取 GPU 镜像，尾行 [num_reqs, num_reqs_padded) 填 NULL_BLOCK_ID=0（注释原话 'Block 0 is reserved for padding'——与 ch13 第 1 站 null_block 占 block_id=0 同源）；块表与 slot_mapping 一起进 CommonAttentionMetadata（L2430-L2449）"
+    },
+    {
+     "n": 11,
+     "where": "gpu_model_runner.py:L4432-L4449",
+     "what": "逐层铺设：set_forward_context(slot_mapping=slot_mappings, …)——slot_mapping 进 ForwardContext（dict[layer_name]，forward_context.py:L136）；模型前向里每个 Attention 层按自己的 layer_name 取表（不透传、不污染模型 forward 签名——ch19 已立的算子化纪律）"
+    },
+    {
+     "n": 12,
+     "where": "attention.py:L775-L798",
+     "what": "写腿入口：unified_kv_cache_update 算子——get_attention_context(layer_name) 从 ForwardContext 取该层 slot_mapping（L767-L771），交 impl.do_kv_cache_update；返回空张量作 dummy 数据依赖保 torch.compile 顺序"
+    },
+    {
+     "n": 13,
+     "where": "flash_attn.py:L1098-L1132",
+     "what": "写腿落地：do_kv_cache_update → reshape_and_cache_flash——CUDA kernel 逐 token（cache_kernels.cu:L326-L333）：slot_idx = slot_mapping[token]；slot_idx < 0 直接 return（注释原话 'slot_idx can be -1 if the token is padded'——第 6 站 PAD 的消费端）；否则 block_idx = slot//block_size、offset = slot%block_size 把 K/V 行写进页张量"
+    },
+    {
+     "n": 14,
+     "where": "flash_attn.py:L1041-L1066",
+     "what": "读腿：attention forward 从 metadata 取 block_table（L934），flash_attn_varlen_func(block_table=block_table, …)——历史 KV 的读全靠 kernel 穿表间接寻址（每个逻辑块号现场查物理块）。F7 回收：ch13 埋的「间接寻址代价」在此兑现——写是直寻址（slot 每 token 现算）、读是间接寻址（表随请求长大）"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "开篇章图（v3 图系，L2 层）。gen_L2 渲染：首渲即无校验错、无 overflow 告警，但 geometry lint 报 1 处 arrow-crossed——『写腿→出·KV落池』ns 上行肘形流按目标框中心 x=1849.8 直上、正穿 ⑥ 拍片（1726.9-1925.4, 199×178）整框。修渲染器不修数据（契约：几何问题改渲染器）：gen_L2.py 补 ns 肘形流竖段穿拍片让位（exp-2026-08-29，竖段挪最近拍片缝且钳在所属框边线内；snap 在 lane_obs/标签防撞/halo 预算之前算好保证一致性；触发式），入场竖段落 x=1943.4=⑥/⑦ 拍片缝(1925.4-1961.4)中点、箭头仍落 出 框底边(y=265)——重渲后 geometry lint strict（cartography 路径）零问题；回归核查 ch17（此前唯一 ns 肘形流章）+ch12 重渲 git 零差异=逐字节不变。spec 一处精简文字（任务允许类）：why·D2H 注删内部对账指针『（gpu-exec why_chains[12]）』——全 corpus 仅本章出现、属契约零脚手架泄漏禁的内部追踪编号类（exp-0717-8/exp-0829 同类），机制论断『同步点斩断异步调度』原样保留；F7 等伏笔 ID 为全 corpus 9+ 章 L2 图既定惯例（ch4/7/9/11/13/15/16/19 均印且过盲审），保留。Read PNG 亲眼看（全图+8 裁片：修复区入场竖段/写腿出口+车道/北行/拍片①-④/拍片⑤-⑦/南行/站号轨道/why 注，用完即删）逐项核：顶带 ch22·slot_mapping 与 block_table+hook 逐字+右上「L2 · L0 位置：执行臂+KV 接缝」；左 minimap 高亮 gpu_column、站号轨道 14 站 1-14 逐行 where·what 与 spec.stations 逐字一致+rail_header；detail 北入「入·new_block_ids 差量过线（ch18）」/北出「出·KV 落池（F7 回收）」、center 拍片①-⑦（badge 第1-2/3/4/5/6-7/8-10/11站）、南行 写腿(第12-13站)/读腿(第14站)/CpuGpuBuffer/why·D2H/why·PAD/邻章分界 六框方法行全部逐字对上 spec；11 条流标签齐全（SchedulerOutput 差量/CPU 页表行就绪/GPU 镜像先行上路/positions.gpu/grid=(num_reqs+1,)/slot_mapping.gpu（max 形状）/CommonAttentionMetadata/slot_mapping[layer]（直寻址）/block_table（间接寻址）/cpu 写 · gpu 读/KV 落池——下拍可读），回环线+loop 文字、底部 reading+依赖 ch18/ch13 逐字；中文渲染无豆腐、站序读法清晰（上排进出/中排①-⑦/下排两腿+基座+why）。拷贝进本章为字节级 cmp 校验一致（一张图原则：cartography 为唯一权威产出点）。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "独立盲审（22 处 3.25x 放大裁片+全图亲读，未看 gen/dossier/正文）：14 站站序 1→14、where、what 与 spec.stations 逐字一致；15 组件（入/出/①-⑦/写腿/读腿/CpuGpuBuffer/两 why/邻章分界）名称·站徽标·灰字 file·方法行全数对上 spec.components，11 条流标签、rail_header、frame 标题、hook、loop、reading、依赖 ch18·ch13 逐字一致，minimap 高亮=gpu_column（执行臂+KV 接缝）；无豆腐/无裁切/无压框相撞、箭头均落框边、写腿→出 上行流走 ⑥⑦ 拍片缝不穿框，未发现 cosmetic 级以上缺陷；本章无 L0/L1 拷贝图（manifest 仅登记 L2），图内嵌 L0 minimap 可读。"
+   }
+  },
+  {
+   "figure_id": "ch22-fig-slot-identity",
+   "gen": "gen_ch22-fig-slot-identity.py",
+   "svg": "ch22-fig-slot-identity.svg",
+   "png": "ch22-fig-slot-identity.png",
+   "claim": "一个 token 的物理槽位 = 块表行条目 × block_size + 块内偏移——pos=99 查行得物理块 9，slot=9×16+3=147；写侧 kernel 再用 slot//16、slot%16 逆着做回同一格",
+   "numbers": [
+    {
+     "value": "16",
+     "provenance": "traces/m1.json params.block_size"
+    },
+    {
+     "value": "99",
+     "provenance": "traces/m1.json dossier_example.pos"
+    },
+    {
+     "value": "6",
+     "provenance": "traces/m1.json dossier_example.logical"
+    },
+    {
+     "value": "3",
+     "provenance": "traces/m1.json dossier_example.offset"
+    },
+    {
+     "value": "9",
+     "provenance": "traces/m1.json dossier_example.row_entry"
+    },
+    {
+     "value": "147",
+     "provenance": "traces/m1.json dossier_example.slot"
+    },
+    {
+     "value": "128",
+     "provenance": "traces/m1.json per_token[2].slot（pos=16 落物理块 8）"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "2026-08-29 Illustrate 站自查（Read PNG 亲眼看：全图 3000px 整览 + 右下 ④区 3.2x 裁片，用完即删）：①token 位置条 0..99 按逻辑块 0-6 分段、pos=16/pos=99 绿色子格+标签 ②块表行 [3,8,2,7,1,5,9] 与分段同 x 对位、带余除法箭头 99//16=6 与 16//16=1 ③KV 池三货栈 块3(pos 0-15 全落)/块8(行0=slot128←pos16)/块9(行3=slot147←pos99) 绿格落点+行[k]=v 肘形箭头 ④正向 slot=行[pos//16]×16+pos%16（pos=99→147）与逆向 147//16=9、147%16=3 round-trip 并排、100/100 闭合注；spec 七数 16/99/6/3/9/147/128 逐个在图且语义位置正确；标题公式即 claim、①→④ 阅读序显式；无相撞/无越界（fit 预检+geometry lint 双绿）、箭头全落框边、中文无豆腐。首渲 2 处 fit 越界（seg6/s2:t）已修；④标题『逆同分解』错字改『逆向分解』后重渲复核。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "独立盲审（全图亲读+②③④区放大裁片复核，未看 gen/正文/trace）：只看图复述=『token 位置按 pos//16 带余除法拆逻辑块+块内偏移→查块表行得一维物理块排列→KV 池物理块×16 行落格；正向 slot=行[pos//16]×16+pos%16，写侧 kernel 用 slot//16、slot%16 原路返回同一格』——与 claim 一致；spec 七数 16/99/6/3/9/147/128 逐个在图且语义位置正确（99//16=6 余 3 注、行[6]=9、块9 行3=slot147←pos99、块8 行0=slot128←pos16、④ 147//16=9、147%16=3、100/100 round-trip 闭合注）；①→④ 阅读序显式、肘形箭头全落框边、无文字重叠、中文无豆腐。"
+   }
+  },
+  {
+   "figure_id": "ch22-fig-pad-sentries",
+   "gen": "gen_ch22-fig-pad-sentries.py",
+   "svg": "ch22-fig-pad-sentries.svg",
+   "png": "ch22-fig-pad-sentries.png",
+   "claim": "CUDA graph 回放要求形状恒为 max、地址恒不变，持久缓冲尾部会残留上一拍真数据——PAD 程序每拍重填 [num_tokens,max) 为 -1、块表尾行填 0，每个哨兵各配消费端的跳过逻辑",
+   "numbers": [
+    {
+     "value": "128",
+     "provenance": "traces/m3.json B_runner_full_cudagraph.params.num_tokens_padded"
+    },
+    {
+     "value": "120",
+     "provenance": "traces/m3.json B_runner_full_cudagraph.params.num_tokens_unpadded"
+    },
+    {
+     "value": "100",
+     "provenance": "traces/m3.json A_blocktable_two_step_residual.step1_100_tokens.num_tokens"
+    },
+    {
+     "value": "10",
+     "provenance": "traces/m3.json A_blocktable_two_step_residual.step2_10_tokens.num_tokens"
+    },
+    {
+     "value": "-1",
+     "provenance": "traces/m3.json pad_constants.PAD_SLOT_ID"
+    },
+    {
+     "value": "0",
+     "provenance": "traces/m3.json pad_constants.NULL_BLOCK_ID"
+    },
+    {
+     "value": "74",
+     "provenance": "traces/m3.json A.step2 stale_tail_before[0]（拍1 残留的真 slot）"
+    },
+    {
+     "value": "999",
+     "provenance": "traces/m3.json B.positions_stale_before（positions 尾部预埋残留）"
+    },
+    {
+     "value": "6",
+     "provenance": "traces/m3.json B.padded_rows_filled_null（块表尾行数）"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "2026-08-29 Illustrate 站自查（Read PNG 亲眼看 3000px 整览）：横幅两恒前提（形状恒 128·地址恒不变）→ A 两拍残留实验三态条（拍1 100 token 真+PAD [100,128)；拍2 开拍前 [10,20) 灰残留；放大条 74 75 76 77 78 79 144 145 146 147 → -1 -1 -1 ……全 -1）→ 拍2 写完 PAD 重填 [10,128)，残留寿命≤一拍 → B FULL 四件（slot 尾 8 项 -1/块表尾 6 行 0/qsl 尾 6 项 120/positions 999→0）各配消费端（写腿 return/读腿查块 0/非递减/清零）→ 值域论证+PAD 税注。spec 九数 128/120/100/10/-1/0/74/999/6 逐个在图、语义位置正确（另 73/8/16/2 等皆 explainer 表同源值）；无相撞、箭头落框边（geometry lint 绿）、中文无豆腐、A→B 阅读序显式。首渲 2 处 fit 越界（pr1/ft:1）已修重渲。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "独立盲审（全图亲读+A/B 两区放大裁片复核，未看 gen/正文/trace）：只看图复述=『CUDA graph 两恒前提（形状恒 max=128、地址恒不变）→ 持久缓冲尾部残留上一拍真 slot（A 拍2 开拍前 [10,20) 灰段还躺着拍1 的 74..79/144..147）→ PAD 程序每拍重填 [num_tokens,128) 全 -1、残留寿命≤一拍；B FULL 四件套 slot 尾 -1/块表尾行 0/qsl 尾填 120/positions 999→0 各配消费端跳过逻辑』——与 claim 一致；spec 九数 128/120/100/10/-1/0/74/999/6 逐个在图且语义位置正确；横幅→A→B→值域论证+PAD 税注阅读序清晰、放大条与灰段对位、无文字重叠、中文无豆腐。"
+   }
+  },
+  {
+   "figure_id": "ch22-fig-commit-overlap",
+   "gen": "gen_ch22-fig-commit-overlap.py",
+   "svg": "ch22-fig-commit-overlap.svg",
+   "png": "ch22-fig-commit-overlap.png",
+   "claim": "块表是 CPU/GPU 双镜像页表：CPU 侧行长账增量写行，每拍第一句 commit 只拷活跃行先发车——H2D 拷贝与后续 CPU 活重叠",
+   "numbers": [
+    {
+     "value": "2",
+     "provenance": "traces/m4.json commit.num_active_rows"
+    },
+    {
+     "value": "8",
+     "provenance": "traces/m4.json params.max_num_reqs"
+    },
+    {
+     "value": "64",
+     "provenance": "traces/m4.json commit.bytes_copied（2 行 × 8 项 × 4B）"
+    },
+    {
+     "value": "4",
+     "provenance": "traces/m4.json params.dtype_bytes（int32）"
+    },
+    {
+     "value": "5",
+     "provenance": "traces/m4.json row_ledger.row0_len（两拍 append 接成 5 项）"
+    },
+    {
+     "value": "88",
+     "provenance": "traces/m4.json commit.gpu_row2_after_stale_cpu_write（非活跃行后写不上 GPU 镜像）"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "2026-08-29 Illustrate 站自查（Read PNG 亲眼看：3000px 整览 + 传送带区 2x 裁片，用完即删）：①CPU 8×8 行长账（r0 拍1 [3,8,2] 青 + 拍2 [7,1] 橙接龙→行长账 5；r1 add_row [9,4,6,8]）→ ②PCIe 传送带 copy_to_gpu(num_reqs=2) 双行芯片、只带 2/8 行、2 行×8 项×4B=64B non_blocking、发车时机=_prepare_inputs 第一句 → ③GPU 镜像（r0/r1 整行含尾零）→ ④时序面板：commit 短橙发车+长青 CPU 活、PCIe 64B 在路上、绿虚线重叠带 t0→t1 GPU 拿到 2 行、右侧灰虚对照（串行更晚）+ 注释原话两行逐字。证据卡：迟到写 88 不上镜像（CPU 行2 红 88 vs GPU 行2 全 0）。spec 六数 2/8/64/4/5/88 逐个在图；geometry lint 绿、无相撞、箭头贴框边、中文无豆腐、①→④ 阅读序显式。两轮修复：belt:b fit 越界、时序面板上移撞 CPU 注记（text-text+tag-on-title 双抓）→ 面板下移 PY0=356；传送带第二芯片越框 16px → 收进框内。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "独立盲审（全图亲读+CPU 账本/时序面板放大裁片复核，未看 gen/正文/trace）：只看图复述=『块表 CPU/GPU 双镜像：CPU 侧行长账增量 append（r0 两拍 [3,8,2]+[7,1] 接成 5 项）、commit 在 _prepare_inputs 第一句发车、copy_to_gpu(2) 只带 2/8 活跃行 64B non_blocking，H2D 在路上与后续 CPU 活重叠（绿重叠带，灰虚对照串行更晚）；非活跃行迟到写 88 不上 GPU 镜像——只拷前缀是设计』——与 claim 一致；spec 六数 2/8/64/4/5/88 逐个在图且语义位置正确；①→④ 阅读序显式、注释原话两行逐字、芯片/箭头贴框、无文字重叠、中文无豆腐。"
+   }
+  },
+  {
+   "figure_id": "ch22-fig-write-leg",
+   "gen": "gen_ch22-fig-write-leg.py",
+   "svg": "ch22-fig-write-leg.svg",
+   "png": "ch22-fig-write-leg.png",
+   "claim": "写腿每 token 一次直寻址：前向内按 layer_name 从 ForwardContext 取 slot_mapping，reshape_and_cache_flash 逐 token 散写——slot=50 落块 3 行 2，slot<0 的 token 直接 return",
+   "numbers": [
+    {
+     "value": "50",
+     "provenance": "traces/m5.json per_token[0].slot"
+    },
+    {
+     "value": "-1",
+     "provenance": "traces/m5.json per_token[1].slot（PAD token）"
+    },
+    {
+     "value": "3",
+     "provenance": "traces/m5.json per_token[0].block（50//16）"
+    },
+    {
+     "value": "2",
+     "provenance": "traces/m5.json per_token[0].offset（50%16）"
+    },
+    {
+     "value": "51",
+     "provenance": "traces/m5.json per_token[2].slot"
+    },
+    {
+     "value": "52",
+     "provenance": "traces/m5.json per_token[3].slot"
+    },
+    {
+     "value": "16",
+     "provenance": "traces/m5.json params.block_size"
+    },
+    {
+     "value": "0",
+     "provenance": "traces/m5.json forward_context.dummy_return_numel（空张量 dummy）"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "2026-08-29 Illustrate 站自查（Read PNG 亲眼看 3000px 整览）：左列调用链 4 节点（模型前向 Attention 层→unified_kv_cache_update(key,value,layer_name)→get_attention_context 从 ForwardContext 取 slot_mapping[layer_name]（与第 11 站同一张 GPU 张量）→do_kv_cache_update→reshape_and_cache_flash）+ kernel 本体 7 行逐字（slot_idx/NOTE 注释/if<0 return/block_idx/offset）+2 灰注；右列 slot 条 4 格（token0-3 = 50/-1/51/52，PAD 橙）→ PAD 红虚盒（注释原话 slot_idx can be -1 if the token is padded）→ 块 3 货栈行 2/3/4 绿格落点（slot=50/51/52 ← token 0/2/3，三条肘形散写箭头）+ 直寻址算术卡（50//16=3、50%16=2、验算 3×16+2=50）+ dummy 返回盒（key.new_empty(0) numel=0 空张量保先写后读）。spec 八数 50/-1/3/2/51/52/16/0 逐个在图；geometry lint 绿、无相撞、箭头贴框边（t0/t2/t3 通道 686/678/670 分道入栈左缘）、中文无豆腐、左链→右落阅读序显式。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "独立盲审（全图亲读+调用链/右列落池放大裁片复核，未看 gen/正文/trace）：只看图复述=『写腿每 token 一次直寻址：前向内 Attention 层→unified_kv_cache_update(layer_name)→get_attention_context 从 ForwardContext 取 slot_mapping[layer_name]→reshape_and_cache_flash 逐 token：slot=50 → 50//16=3、50%16=2 落块3 行2；slot=-1 的 PAD token 见注释原话直接 return 不落池；返回 key.new_empty(0) 空张量 dummy 保 torch.compile 先写后读』——与 claim 一致；spec 八数 50/-1/3/2/51/52/16/0 逐个在图且语义位置正确（slot 条 token0-3=50/-1/51/52、块3 行2/3/4=slot 50/51/52 三散写箭头、验算 3×16+2=50、numel=0）；左链→右落阅读序显式、kernel 行逐字可读、无文字重叠、中文无豆腐。"
+   }
+  },
+  {
+   "figure_id": "ch22-fig-read-leg-f7",
+   "gen": "gen_ch22-fig-read-leg-f7.py",
+   "svg": "ch22-fig-read-leg-f7.svg",
+   "png": "ch22-fig-read-leg-f7.png",
+   "claim": "读腿与写腿寻址方式对偶（F7 回收）：写按 slot_mapping 每 token 直寻址（slot 96/97 直落块 6），读穿 block_table 逻辑块→物理块间接寻址（逻辑 0→3、1→8、2→6）——同一张页表的两副面孔",
+   "numbers": [
+    {
+     "value": "3",
+     "provenance": "traces/m6.json blocks_visited_by_read[0].physical_block"
+    },
+    {
+     "value": "8",
+     "provenance": "traces/m6.json blocks_visited_by_read[1].physical_block"
+    },
+    {
+     "value": "6",
+     "provenance": "traces/m6.json blocks_visited_by_read[2].physical_block"
+    },
+    {
+     "value": "96",
+     "provenance": "traces/m6.json write_leg_landing.slot0（6×16+0）"
+    },
+    {
+     "value": "97",
+     "provenance": "traces/m6.json write_leg_landing.slot1"
+    },
+    {
+     "value": "34",
+     "provenance": "traces/m6.json params.seq_len"
+    },
+    {
+     "value": "16",
+     "provenance": "traces/m6.json blocks_visited_by_read[0].rows_read"
+    },
+    {
+     "value": "2",
+     "provenance": "traces/m6.json blocks_visited_by_read[2].rows_read（本拍新写的 2 行）"
+    },
+    {
+     "value": "5.96e-08",
+     "provenance": "traces/m6.json max_abs_diff_overall（与稠密参照对拍）"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "2026-08-29 Illustrate 站自查（Read PNG 亲眼看 3000px 整览）：①写腿面板（本拍 2 新 token、slot 96/97、slot=6×16+{0,1}、不查表）→ 绿色大弧从顶部绕过页表、右通道下探进 ③ 块 6 右缘行 0/1（slot=96/97 刚写）——路径不碰 ② 块表行（对偶的可见证据）；② 块表行 [3,8,6]（逻辑块 0/1/2 → 物理块 3/8/6）→ 三条青肘形穿表箭头入 ③ 三栈左缘（间接寻址：逐逻辑块现场查行）；③ 三栈块 3（16 行 pos0-15）/块 8（16 行 pos16-31）/块 6（2 行刚写 pos32-33 容量 16）；④ 对拍盒：拼回 34-token 逻辑序列、稠密参照 max|diff|=5.96e-08 写直读间闭合。spec 九数 3/8/6/96/97/34/16/2/5.96e-08 逐个在图；geometry lint 绿、无相撞、箭头全贴框边、中文无豆腐、①→④ 阅读序显式。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "独立盲审（全图亲读+写腿/块表行/对拍盒放大裁片复核，未看 gen/正文/trace）：只看图复述=『同一张页表两副面孔（F7 回收）：写腿本拍 2 新 token slot=6×16+{0,1}=96/97 不查表直落块6 行0/1（绿大弧绕过块表——对偶的可见证据）；读腿 flash_attn_varlen_func(block_table=) 穿行 [3,8,6] 逐逻辑块现场查物理块 0→3、1→8、2→6 间接寻址；拼回 34-token 逻辑序列与稠密参照对拍 max|diff|=5.96e-08——写直读间闭合』——与 claim 一致；spec 九数 3/8/6/96/97/34/16/2/5.96e-08 逐个在图且语义位置正确（块3/块8 各 16 行历史、块6 2 行刚写容量 16）；①→④ 阅读序显式、绿弧不穿 ② 框、无文字重叠、中文无豆腐。"
+   }
+  },
+  {
+   "figure_id": "ch22-fig-cp-interleave",
+   "gen": "gen_ch22-fig-cp-interleave.py",
+   "svg": "ch22-fig-cp-interleave.svg",
+   "png": "ch22-fig-cp-interleave.png",
+   "claim": "CP 分片不是整块切分而是 I-token 交错：32-token 虚拟块切成 2-token 小条交替归属两个 rank，每 rank 把自己的条带紧凑重排成本地 [0,16) 偏移，非本秩 token 的 slot 打 PAD",
+   "numbers": [
+    {
+     "value": "32",
+     "provenance": "traces/m8.json params.virtual_block_size"
+    },
+    {
+     "value": "2",
+     "provenance": "traces/m8.json params.dcp_world_size / cp_kv_cache_interleave_size"
+    },
+    {
+     "value": "16",
+     "provenance": "traces/m8.json params.block_size（每 rank 每 vblock 的本地容量）"
+    },
+    {
+     "value": "35",
+     "provenance": "traces/m8.json dossier_example_pos35.pos"
+    },
+    {
+     "value": "321",
+     "provenance": "traces/m8.json dossier_example_pos35.slot_rank1（20×16+1）"
+    },
+    {
+     "value": "322",
+     "provenance": "traces/m8.json per_token[4].slot_r0（pos=36 回到 rank0）"
+    },
+    {
+     "value": "320",
+     "provenance": "traces/m8.json per_token[0].slot_r0"
+    },
+    {
+     "value": "-1",
+     "provenance": "traces/m8.json per_token[0].slot_r1（非本秩 PAD）"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "2026-08-29 Illustrate 站自查（Read PNG 亲眼看 3000px 整览）：①32-token 虚拟块条带图（vbi=1·行[1]=20·pos 32..63，绿紫 2-token 条带交替、条带 0..15 标注、hero 格 pos=35/36 粗框）；②rank0/rank1 双行紧凑重排（lbo 0..15 各带来源 pos：rank0←32,33,36,37,…、rank1←34,35,38,39,…——与逐 token 记账一致）+ 公式条（条带号=voff//I、归属=条带号%W、is_local、lbo 式）；③三例证卡 pos=32→320 / pos=35→321（rank1 ✓，rank0 -1 PAD）/ pos=36→322（rank0 ✓，rank1 -1 PAD）；④覆盖账（每 rank 32 真+32 PAD、无重无漏、本地偏移铺满 [0,16)、每 rank 只存一半 KV）+ 对照盒（整刀切 ✗ 红 16 分界 vs 实际交错 ✓）+ 单卡退化条（W=1、I=1 全退化为恒等，slot_35=179）。spec 八数 32/2/16/35/321/322/320/-1 逐个在图；geometry lint 绿、无相撞、中文无豆腐、①→④ 阅读序显式；本图无箭头元素（结构靠色块对位），arrows_attached 无悬空项。出图前清掉一段遗留死代码（CARDS 列表）并修 hero 标签错行避让。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "独立盲审（全图亲读+②重排行/③例证卡/④覆盖账放大裁片复核，未看 gen/正文/trace）：只看图复述=『CP 分片是 I-token 交错不是整刀切：32-token 虚拟块按 2-token 条带交替归 rank0/rank1（条带号=voff//2、归属=条带号%2），每 rank 把零散条带紧凑重排成本地 [0,16) 偏移（rank0←32,33,36,37…、rank1←34,35,38,39…），非本秩 slot 打 PAD；每 rank 32 真+32 PAD 无重无漏、只存一半 KV；W=1、I=1 单卡全退化恒等（slot_35=179）』——与 claim 一致（对照盒红✗整刀切 vs 绿✓交错把『不是整块切分』画明白了）；spec 八数 32/2/16/35/321/322/320/-1 逐个在图且语义位置正确（pos32→320、pos35→321=20×16+1、pos36→322，各配对侧 -1 PAD）；①→④ 阅读序显式、hero 格 pos35/36 粗框可辨、色块对位清晰、无文字重叠、中文无豆腐；本图无箭头元素、无悬空项。"
+   }
+  }
+ ]
+}
