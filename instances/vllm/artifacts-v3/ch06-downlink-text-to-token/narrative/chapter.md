@@ -26,7 +26,7 @@
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        return await self.online_renderer.render_chat(request)
+        return await self.online_renderer.render_chat(request)  # L217
 ```
 
 调用链一次说清：`_create_chat_completion` 在 `serving.py:L252` 调 serving 层的薄包装 `render_chat_request`——上面 `L211-L217` 这段就是它的收尾几行；包装层把渲染整件事交给渲染门面 `online_renderer.render_chat`（补工具校验、组装模板参数），门面再往下调编排本体 `BaseRenderer.render_chat_async`（下一个代码块）。注意交出去的是什么：**还是一段话的请求对象**；收回来的是什么：`engine_input`——token 已经躺在里面的渲染产物。也就是说，**tokenize 发生在 serving 层调 `generate()` 之前、发生在 API 进程里、与引擎进程无关**。这句话是本章第一条 why 链的结论，值得把它的来龙去脉拆开。
@@ -66,17 +66,17 @@
             tok_params = self.default_chat_tok_params
 
         rendered = [
-            self.render_messages_async(conversation, chat_params)
+            self.render_messages_async(conversation, chat_params)  # L1086
             for conversation in conversations
         ]
         # … 省略：await gather 收拢 render_messages 结果、分别装进 out_conversations 与 dict_prompts 两个列表 …
-        tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
+        tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)  # L1096
 
-        self._apply_prompt_extras(tok_prompts, prompt_extras)
+        self._apply_prompt_extras(tok_prompts, prompt_extras)  # L1098
 
         eng_prompts = await asyncio.gather(
             *(
-                self.process_for_engine_async(
+                self.process_for_engine_async(  # L1102
                     p, arrival_time, skip_mm_cache=skip_mm_cache
                 )
                 for p in tok_prompts
@@ -104,7 +104,7 @@
         kwargs = params.get_encode_kwargs()
         if want_offsets:
             kwargs = {**kwargs, "return_offsets_mapping": True}
-        encoding = tokenizer(prompt["prompt"], **kwargs)
+        encoding = tokenizer(prompt["prompt"], **kwargs)  # L482
         return self._build_tokens_prompt(
             encoding["input_ids"],
             prompt,
@@ -150,10 +150,10 @@ x: TokensInput = {"type": "token", "prompt_token_ids": [1, 2, 3]}
 class TokensInput(_InputOptions):
     """Represents token-based input to the engine."""
 
-    type: Literal["token"]
+    type: Literal["token"]  # L34
     """The type of input."""
 
-    prompt_token_ids: list[int]
+    prompt_token_ids: list[int]  # L37
     """The token IDs of the prompt."""
 
     prompt: NotRequired[str]
@@ -173,7 +173,7 @@ class TokensInput(_InputOptions):
         # Tensors must be on CPU for serialization between processes
         # in the MsgpackEncoder. Casting to CPU here ensures that there is no
         # hidden device transfer in the critical path of generation.
-        prompt_embeds = prompt_embeds.cpu()
+        prompt_embeds = prompt_embeds.cpu()  # L826
 ```
 
 注释原话说得直白：张量必须在 CPU 上才能跨进程序列化；在这里显式转，是为了保证生成关键路径上**不藏隐式设备搬运**——如果放任一个 GPU 张量混进消息，序列化那一刻才在关键路径上偷偷搬一次，比现在显式付这笔账贵得多。（`enable_prompt_embeds` 未开时这里直接报错；若传入形如 `(1, seq_len, hidden)` 的张量——单请求多套了个批维——这段代码上方几行会先把它无歧义地压回 2D：批维恰为 1 时压缩不丢信息，批维大于 1 则压不动、落到下面的形状报错。）
@@ -186,9 +186,9 @@ class TokensInput(_InputOptions):
 
 ```python
 # vllm/v1/engine/async_llm.py:L352-L380
-            if isinstance(prompt, dict) and "type" in prompt:
+            if isinstance(prompt, dict) and "type" in prompt:  # L352
                 # Rendered EngineInput; no blocking preprocessing needed.
-                request = self.input_processor.process_inputs(
+                request = self.input_processor.process_inputs(  # L354
                     request_id,
                     prompt,
                     params,
@@ -197,7 +197,7 @@ class TokensInput(_InputOptions):
             else:
                 # Raw prompts require tokenization and possibly multimodal
                 # processing, which must not block the event loop.
-                request = await self.input_processor.process_inputs_async(
+                request = await self.input_processor.process_inputs_async(  # L369
                     request_id,
                     prompt,
                     params,
@@ -212,7 +212,7 @@ class TokensInput(_InputOptions):
         # Raw-prompt preprocessing (tokenization and multimodal processing)
         # is blocking, so async callers should run it on the renderer's
         # thread pool to keep their event loop responsive.
-        self.process_inputs_async = make_async(
+        self.process_inputs_async = make_async(  # L80
             self.process_inputs, executor=self.renderer._executor
         )
 ```
@@ -235,8 +235,8 @@ def make_async(
 
     def _async_wrapper(*args: P.args, **kwargs: P.kwargs) -> Future[T]:
         loop = asyncio.get_event_loop()
-        p_func = partial(func, *args, **kwargs)
-        return loop.run_in_executor(executor=executor, func=p_func)
+        p_func = partial(func, *args, **kwargs)  # L42
+        return loop.run_in_executor(executor=executor, func=p_func)  # L43
 
     return _async_wrapper
 ```
@@ -253,17 +253,17 @@ def make_async(
         # multimodal processor receives a deep-copied tokenizer (see #36557)
         # so it is safe to run tokenization and MM preprocessing concurrently.
         pool_workers = config.model_config.renderer_num_workers
-        self._executor = ThreadPoolExecutor(max_workers=pool_workers)
+        self._executor = ThreadPoolExecutor(max_workers=pool_workers)  # L86
 
         # Separate single-worker executor so tokenization never queues behind
         # MM preprocessing; must stay single-worker per #38418 (P0/P1 order).
-        self._mm_executor: Executor = ThreadPoolExecutor(max_workers=1)
+        self._mm_executor: Executor = ThreadPoolExecutor(max_workers=1)  # L90
 
         # Offload tokenization to the thread pool. The sync
         # ``_tokenize_prompt`` already encapsulates the unified ``__call__``
         # path and char-offset extraction, so the async variant is just it
         # offloaded (mirrors ``_process_multimodal_async`` below).
-        self._tokenize_prompt_async = make_async(
+        self._tokenize_prompt_async = make_async(  # L96
             self._tokenize_prompt, executor=self._executor
         )
 ```
@@ -292,13 +292,13 @@ def make_async(
 
 ```python
 # vllm/v1/engine/input_processor.py:L265-L303
-        self._validate_params(params, supported_tasks)
+        self._validate_params(params, supported_tasks)  # L265
         self._validate_lora(lora_request)
         # … 省略：data_parallel_rank 的 0 ≤ rank < num_ranks 界检查（越界即 raise）…
-        if isinstance(prompt, dict) and "type" in prompt:
+        if isinstance(prompt, dict) and "type" in prompt:  # L278
             # … 省略：tokenization_kwargs 的 deprecation 警告 …
             if arrival_time is None:
-                arrival_time = prompt.get("arrival_time", time.time())  # type: ignore[assignment]
+                arrival_time = prompt.get("arrival_time", time.time())  # type: ignore[assignment]  # L287
             processed_inputs: EngineInput = prompt  # type: ignore[assignment]
         else:
             logger.warning_once(
@@ -310,7 +310,7 @@ def make_async(
             if arrival_time is None:
                 arrival_time = time.time()
 
-            processed_inputs = self.input_preprocessor.preprocess(
+            processed_inputs = self.input_preprocessor.preprocess(  # L300
                 prompt,
                 tokenization_kwargs=tokenization_kwargs,
             )
@@ -340,20 +340,20 @@ def make_async(
         pooling_params = None
         if isinstance(params, SamplingParams):
             # TODO: can we avoid cloning here in multiproc case?
-            sampling_params = params.clone()
+            sampling_params = params.clone()  # L324
             # If unset max tokens, then generate up to the max_model_len.
             if sampling_params.max_tokens is None:
                 seq_len = length_from_prompt_token_ids_or_embeds(
                     prompt_token_ids, prompt_embeds
                 )
-                sampling_params.max_tokens = self.model_config.max_model_len - seq_len
+                sampling_params.max_tokens = self.model_config.max_model_len - seq_len  # L330
 
-            sampling_params.update_from_generation_config(
+            sampling_params.update_from_generation_config(  # L332
                 self.generation_config_fields,
                 self.renderer.get_eos_token_id(),
             )
             if self.tokenizer is not None:
-                sampling_params.update_from_tokenizer(self.tokenizer)
+                sampling_params.update_from_tokenizer(self.tokenizer)  # L337
         else:
             pooling_params = params.clone()
 ```
@@ -404,10 +404,10 @@ class PlaceholderRange:
     # … 省略：docstring 接着给出 A/B 两图的示例，见下文 …
     """
 
-    offset: int
+    offset: int  # L138
     """The start index of the placeholder in the prompt."""
 
-    length: int
+    length: int  # L141
     """The length of the placeholder."""
 ```
 
@@ -420,11 +420,11 @@ docstring 自带教学例：prompt `AAAA BBBB What is in these images?`，两张
     @cached_property
     def embeds_cumsum(self) -> list[int] | None:
         # python list so python indexing avoids torch C++ overhead/conversions/deallocs
-        return None if self.is_embed is None else self.is_embed.cumsum(dim=0).tolist()
+        return None if self.is_embed is None else self.is_embed.cumsum(dim=0).tolist()  # L153
 
     def get_num_embeds(self) -> int:
         if self.embeds_cumsum is None:
-            return self.length
+            return self.length  # L157
 
         return self.embeds_cumsum[-1] if self.embeds_cumsum else 0
 ```
@@ -461,13 +461,13 @@ def argsort_mm_positions(
         A list of `(modality, idx)`, which can be used to access an item
         by `mm_positions[modality][idx]`.
     """
-    flat_items = (
+    flat_items = (  # L157
         (modality, idx, item)
         for modality, items in mm_positions.items()
         for idx, item in enumerate(items)
     )
 
-    sorted_flat_items = sorted(flat_items, key=lambda x: x[2].offset)
+    sorted_flat_items = sorted(flat_items, key=lambda x: x[2].offset)  # L163
 
     return [(modality, idx) for modality, idx, _ in sorted_flat_items]
 ```
@@ -486,7 +486,7 @@ class MultiModalFeatureSpec:
     `MultiModalFeatureSpec` per item.
     """
 
-    data: "MultiModalKwargsItem | None"
+    data: "MultiModalKwargsItem | None"  # L331
     """
     Represents multimodal data for this feature.
 
@@ -497,12 +497,12 @@ class MultiModalFeatureSpec:
     modality: str
     """The input modality, e.g., `"image"`, `"audio"`, `"video"`."""
 
-    identifier: str
+    identifier: str  # L342
     """The hash for caching encoder outputs (with LoRA prefix if applicable)."""
 
-    mm_position: PlaceholderRange
+    mm_position: PlaceholderRange  # L345
     # … 省略：mm_position 的 docstring（示例 PlaceholderRange(offset=2, length=336)）…
-    mm_hash: str | None = None
+    mm_hash: str | None = None  # L351
     """The hash for caching processor outputs (without LoRA prefix)."""
 ```
 
@@ -522,10 +522,10 @@ class MultiModalFeatureSpec:
             # Merge and flatten multimodal placeholders, hashes and inputs
             # from dictionaries to lists, and sort them by each item's position
             # in the input sequence.
-            sorted_mm_idxs = argsort_mm_positions(decoder_mm_positions)
+            sorted_mm_idxs = argsort_mm_positions(decoder_mm_positions)  # L361
 
             mm_features = []
-            for modality, idx in sorted_mm_idxs:
+            for modality, idx in sorted_mm_idxs:  # L364
                 base_mm_hash = decoder_mm_hashes[modality][idx]
                 mm_features.append(
                     MultiModalFeatureSpec(
@@ -540,7 +540,7 @@ class MultiModalFeatureSpec:
                     )
                 )
 
-        return EngineCoreRequest(
+        return EngineCoreRequest(  # L379
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
             prompt_embeds=prompt_embeds,
@@ -588,32 +588,32 @@ class EngineCoreRequest(
     gc=False,
 ):  # type: ignore[call-arg]
     request_id: str
-    prompt_token_ids: list[int] | None
-    mm_features: list[MultiModalFeatureSpec] | None
+    prompt_token_ids: list[int] | None  # L104
+    mm_features: list[MultiModalFeatureSpec] | None  # L105
     sampling_params: SamplingParams | None
     pooling_params: PoolingParams | None
-    arrival_time: float
+    arrival_time: float  # L108
     lora_request: LoRARequest | None
     cache_salt: str | None
     data_parallel_rank: int | None
-    prompt_embeds: torch.Tensor | None = None
+    prompt_embeds: torch.Tensor | None = None  # L112
 
     # Per-position mask for mixed-mode inputs (e.g chat completion with
     # prompt_embeds content parts). `True` means the position is a real
     # token ID; `False` means the position uses a pre-computed entry from
     # `prompt_embeds`. `None` for pure-tokens and pure-embeds requests.
-    prompt_is_token_ids: list[bool] | None = None
+    prompt_is_token_ids: list[bool] | None = None  # L118
 
     # Index of the client, used to ensure outputs are sent back to the same
     # client for this request when scaling out the front-end.
-    client_index: int = 0
+    client_index: int = 0  # L122
     # … 省略：current_wave/priority/trace_headers/resumable 四个默认值字段（DP 波次、优先级等主线之外的旋钮）…
 
     # The user-provided request ID. This field is set internally,
     # copied from the provided request_id that's originally assigned
     # to the request_id field, see InputProcessor.assign_request_id().
     # Used in outputs and to support abort(req_id, internal=False).
-    external_req_id: str | None = None
+    external_req_id: str | None = None  # L137
     # … 省略：reasoning_ended/reasoning_parser_kwargs/abort_immediately 三个旁支字段 …
 ```
 
@@ -636,20 +636,20 @@ class EngineCoreRequest(
         """Replace the externally supplied request ID with an internal request ID
         that adds 8 random characters in order to ensure uniqueness.
         """
-        if request.external_req_id is not None:
+        if request.external_req_id is not None:  # L236
             raise ValueError(
                 "The external_req_id field should not be set on EngineCoreRequests"
                 " passed to vLLM; use the request_id field."
             )
-        request.external_req_id = request.request_id
-        if envs.VLLM_DISABLE_REQUEST_ID_RANDOMIZATION:
+        request.external_req_id = request.request_id  # L241
+        if envs.VLLM_DISABLE_REQUEST_ID_RANDOMIZATION:  # L242
             logger.warning_once(
                 "VLLM_DISABLE_REQUEST_ID_RANDOMIZATION is set and will be "
                 "removed in a future release. Duplicate externally-provided "
                 "request IDs may cause failures and/or subtle correctness errors."
             )
         else:
-            request.request_id = f"{request.external_req_id}-{random_uuid():.8}"
+            request.request_id = f"{request.external_req_id}-{random_uuid():.8}"  # L249
 ```
 
 改名逻辑：外部 id 原样存进 `external_req_id`；随机化没关，内部 id 重写为「外部 id-随机 8 字符」。`random_uuid()` 生成 16 个十六进制字符（`vllm/utils/__init__.py:L11-L12`，uuid4 均匀采样的低 64 位），f-string 的 `:.8` 截前 8 个——**8 hex = 32 bit 熵**。出发前还有一道门禁：调用方若预设了 `external_req_id` 字段（它本来是内部字段），`assign_request_id` 开头就 `ValueError` 拒绝——这个字段是 vLLM 内部专用，不许外部携带。实测四轮：
@@ -685,10 +685,10 @@ class EngineCoreRequest(
         queue: RequestOutputCollector,
     ):
         # Add the request to OutputProcessor (this process).
-        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        self.output_processor.add_request(request, prompt, parent_req, index, queue)  # L429
 
         # Add the EngineCoreRequest to EngineCore (separate process).
-        await self.engine_core.add_request_async(request)
+        await self.engine_core.add_request_async(request)  # L432
 ```
 
 两行注释点名双登记两侧：先本进程建 `RequestState`（回程对账靠它——先建表后发请求的顺序是防竞态纪律，反了的话回程可能比建表先到）、后跨进程发请求。`add_request_async` 的三行在[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)站 5 看过：盖 `client_index`、发 `ADD` 帧——请求离开 API 进程，本章终点。有个分支留了个念想：`params.n > 1`（一次采样要 n 个答案）时，这里会扇出 n 个子请求、内部 id 前面拼上子请求序号前缀（`0_`、`1_` 这样，来自 `vllm/v1/engine/parallel_sampling.py:L92` 的 `f"{index}_{self.request_id}"`）、输出聚合回一条流——那是上行章的故事，本章按 n=1 主线走完。

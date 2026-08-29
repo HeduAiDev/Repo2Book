@@ -62,7 +62,7 @@
         self.model_config = self.llm_engine.model_config
         self.engine_class = type(self.llm_engine)
 
-        self.request_counter = Counter()
+        self.request_counter = Counter()  # L345
 ```
 
 `LLM()` 构造期直接拿到 `LLMEngine`（离线使用面的同步引擎，`vllm/v1/engine/llm_engine.py:L48`）这个具体类，不经任何抽象。为什么离线不需要协议面？库形态下调用方就在本进程里同步调用，不存在「serving 与引擎实现解耦」的诉求；协议面是给「常驻服务可能换门面」买的保险，离线用不上。顺带认出最后一行：`request_counter` 是个自增计数器（vLLM 自带的 `Counter` 小类，`vllm/utils/counter.py:L6`：每次 `next()` 吐一个新号——不是标准库那个数频次用的同名 `collections.Counter`），它是离线面「自己发号」的源头，本章末节会回来对账。
@@ -89,7 +89,7 @@
         )
 
         # EngineCore (starts the engine in background process).
-        self.engine_core = EngineCoreClient.make_async_mp_client(
+        self.engine_core = EngineCoreClient.make_async_mp_client(  # L149
             vllm_config=vllm_config,
             executor_class=executor_class,
             log_stats=self.log_stats,
@@ -117,7 +117,7 @@
         )
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
-        self.engine_core = EngineCoreClient.make_client(
+        self.engine_core = EngineCoreClient.make_client(  # L105
             multiprocess_mode=multiprocess_mode,
             asyncio_mode=False,
             vllm_config=vllm_config,
@@ -153,7 +153,7 @@
             log_stats=not engine_args.disable_log_stats,
             usage_context=usage_context,
             stat_loggers=stat_loggers,
-            multiprocess_mode=enable_multiprocessing,
+            multiprocess_mode=enable_multiprocessing,  # L185
         )
 ```
 
@@ -192,8 +192,8 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
         executor_class: type[Executor],
         log_stats: bool,
         client_addresses: dict[str, Any] | None = None,
-        client_count: int = 1,
-        client_index: int = 0,
+        client_count: int = 1,  # L121
+        client_index: int = 0,  # L122
     ) -> "AsyncMPClient":
         parallel_config = vllm_config.parallel_config
         client_args = (
@@ -210,7 +210,7 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
                 return DPAsyncMPClient(*client_args)
             # Internal load balancer - client balances to all DP ranks.
             return DPLBAsyncMPClient(*client_args)
-        return AsyncMPClient(*client_args)
+        return AsyncMPClient(*client_args)  # L139
 ```
 
 两个新面孔先记住名字：签名里的 `client_count` / `client_index`（默认 1 / 0）随构造传入——「这个前端是第几个、一共几个」。顺手把三个叫法钉死：**前端 = API 进程 = 代码里的一个 client**（本章 L0 图那条「API 进程带」，在线部署时一个服务进程就是一个前端，`client_count` 数的就是它）；发请求来的下游程序（浏览器、调用脚本）叫**调用方**——下文「调用方断连」说的是后者，别与前端混。这是 AsyncMPClient 的出生参数，本章末段会看到它盖进每个请求；`data_parallel_size > 1` 的两个分支（外部/内部负载均衡）是多引擎部署的地图，留给 Part VIII。两个 `__init__` 的全部装配差异，就此收进一张图：
@@ -238,15 +238,15 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
                 "The external_req_id field should not be set on EngineCoreRequests"
                 " passed to vLLM; use the request_id field."
             )
-        request.external_req_id = request.request_id
-        if envs.VLLM_DISABLE_REQUEST_ID_RANDOMIZATION:
+        request.external_req_id = request.request_id  # L241
+        if envs.VLLM_DISABLE_REQUEST_ID_RANDOMIZATION:  # L242
             logger.warning_once(
                 "VLLM_DISABLE_REQUEST_ID_RANDOMIZATION is set and will be "
                 "removed in a future release. Duplicate externally-provided "
                 "request IDs may cause failures and/or subtle correctness errors."
             )
         else:
-            request.request_id = f"{request.external_req_id}-{random_uuid():.8}"
+            request.request_id = f"{request.external_req_id}-{random_uuid():.8}"  # L249
 ```
 
 「网名与本名」这个比喻[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)立过：对外叫 `chatcmpl-x`，进系统领工牌 `chatcmpl-x-3f9a2c1b`。这里看账本侧——外部 id 原样存进 `external_req_id`，内部 id 换成「外部 id + 8 位随机后缀」（8 位 hex 的后缀空间有 16⁸ = 2³² ≈ 42.9 亿种，同一个外部 id 重试 8 次也零碰撞——本章精简版的测试实测），而 `OutputProcessor` 手里握着一张外→内的名册：`external_req_ids: defaultdict[str, list[str]]`（`vllm/v1/engine/output_processor.py:L445`），登记在双登记的第一行（下文源码的末两行）。为什么是一对多？该章站 6 交代过的那对形参 `parent_req` / `index` 在这里显形——并行采样 n>1 时一个外部 id 名下裂 n 条内部子请求，名册就得是一外多内。这张名册在退号时派上用场，abort 的双轨就写在它身上：
@@ -255,7 +255,7 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
 # vllm/v1/engine/output_processor.py:L477-L492
         internal_req_ids = []
         for request_id in request_ids:
-            if internal:
+            if internal:  # L479
                 # Internal ID - this may be a parent request
                 internal_req_ids.append(request_id)
 
@@ -263,10 +263,10 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
                 if req_state := self.request_states.get(request_id):
                     external_req_id = req_state.external_req_id
                     internal_ids = self.external_req_ids[external_req_id]
-                    internal_ids.remove(request_id)
+                    internal_ids.remove(request_id)  # L487
                     if not internal_ids:
                         del self.external_req_ids[external_req_id]
-            elif internal_ids := self.external_req_ids.pop(request_id, []):
+            elif internal_ids := self.external_req_ids.pop(request_id, []):  # L490
                 # External ID - abort all requests in the external->internal mapping
                 internal_req_ids.extend(internal_ids)
 ```
@@ -286,10 +286,10 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
         queue: RequestOutputCollector,
     ):
         # Add the request to OutputProcessor (this process).
-        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        self.output_processor.add_request(request, prompt, parent_req, index, queue)  # L429
 
         # Add the EngineCoreRequest to EngineCore (separate process).
-        await self.engine_core.add_request_async(request)
+        await self.engine_core.add_request_async(request)  # L432
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
@@ -301,9 +301,9 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
 # vllm/v1/engine/llm_engine.py:L272-L277
         if n == 1:
             # Make a new RequestState and queue.
-            self.output_processor.add_request(request, prompt_text, None, 0)
+            self.output_processor.add_request(request, prompt_text, None, 0)  # L274
             # Add the request to EngineCore.
-            self.engine_core.add_request(request)
+            self.engine_core.add_request(request)  # L276
             return req_id
 ```
 
@@ -321,7 +321,7 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
     ) -> None:
         request_id = request.request_id
         req_state = self.request_states.get(request_id)
-        if req_state is not None:
+        if req_state is not None:  # L535
             self._update_streaming_request_state(req_state, request, prompt)
             return
 
@@ -340,7 +340,7 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
             self.parent_requests[parent_req.request_id] = parent_req
 
         # Track the external_req_id -> [internal_req_id, ...] mapping
-        self.external_req_ids[req_state.external_req_id].append(request_id)
+        self.external_req_ids[req_state.external_req_id].append(request_id)  # L554
 ```
 
 `RequestState`（`vllm/v1/engine/output_processor.py:L129`）装着回程还原所需的本进程上下文：detokenizer（增量解码器）、logprobs 处理器、信箱、输出方式、外部 id——末两行把外→内名册也登记了。开头的 `if req_state is not None` 分支是流式输入的续跑：流式输入（就是开篇 `generate` 签名里 `AsyncGenerator[StreamingInput, None]` 那一臂）＝调用方不一次交齐 prompt、而是把后续输入分块继续送进同一请求的多轮用法，后续块带着同一内部 id 再进 `add_request`，故只更新表项、不重建；本书主线是一次性 prompt，这个旁支不展开，主线请求碰不到该分支。
@@ -379,12 +379,12 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
 
     # Index of the client, used to ensure outputs are sent back to the same
     # client for this request when scaling out the front-end.
-    client_index: int = 0
+    client_index: int = 0  # L122
 
     # Used in DP case to indicate which wave of requests this is expected to
     # belong to, to cover a race condition where the request is sent before
     # a wave finished notification is received.
-    current_wave: int = 0
+    current_wave: int = 0  # L127
     priority: int = 0
 
     trace_headers: Mapping[str, str] | None = None
@@ -394,7 +394,7 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
     # copied from the provided request_id that's originally assigned
     # to the request_id field, see InputProcessor.assign_request_id().
     # Used in outputs and to support abort(req_id, internal=False).
-    external_req_id: str | None = None
+    external_req_id: str | None = None  # L137
 ```
 
 注释原话值得逐字读：`client_index`「used to ensure outputs are sent back to the same client ... when scaling out the front-end」——**回程路由键写进请求本身**。盖章的动作在发送前一行：
@@ -402,9 +402,9 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
 ```python
 # vllm/v1/engine/core_client.py:L1145-L1148
     async def add_request_async(self, request: EngineCoreRequest) -> None:
-        request.client_index = self.client_index
-        await self._send_input(EngineCoreRequestType.ADD, request)
-        self._ensure_output_queue_task()
+        request.client_index = self.client_index  # L1146
+        await self._send_input(EngineCoreRequestType.ADD, request)  # L1147
+        self._ensure_output_queue_task()  # L1148
 ```
 
 三行三件事：盖章（值来自构造时确定的出生参数，`make_async_mp_client` 签名里那个默认 0）、发 ADD 消息、确保输出泵任务在跑。为什么把路由键印在请求上，而不是让引擎维护一张「连接↔在飞请求」映射表？对应物很日常：快递面单上的网点编号——包裹全网流转只认面单，分发中心看一眼编号就把回件放进对应网点的筐，不需要一块要专人维护、要上锁、要跟每个包裹一生对账的大黑板。替代方案那张映射表正是如此：多前端多引擎下是要加锁的共享状态，增删必须与每个请求的生命周期精确同步，错一处就错路由。把编号印进每张面单，单前端时恒为 0（一个 int 字段的开销约等于零），多前端时引擎一次下标查表。
@@ -428,7 +428,7 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
                 client_index, outputs = output
                 outputs.engine_index = engine_index
 
-                if client_index == -1:
+                if client_index == -1:  # L1788
                     # Don't reuse buffer for coordinator message
                     # which will be very small.
                     assert coord_socket is not None
@@ -436,7 +436,7 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
                     continue
 
                 # Reclaim buffers that zmq is finished with.
-                while pending and pending[-1][0].done:
+                while pending and pending[-1][0].done:  # L1796
                     reclaimed = pending.pop()[1]
                     if len(reuse_buffers) < max_reuse_bufs:
                         reuse_buffers.append(reclaimed)
@@ -466,7 +466,7 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
 
         vLLM V1 minimizes the number of python loops over the full
         batch to ensure system overheads are minimized. This is the
-        only function that should loop over EngineCoreOutputs.
+        only function that should loop over EngineCoreOutputs.  # L611
 
         If you need to touch every element of the batch, do it from
         within the loop below.
@@ -479,12 +479,12 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
 
 ```python
 # vllm/v1/engine/output_processor.py:L679-L684
-                if req_state.queue is not None:
+                if req_state.queue is not None:  # L679
                     # AsyncLLM: put into queue for handling by generate().
-                    req_state.queue.put(request_output)
+                    req_state.queue.put(request_output)  # L681
                 else:
                     # LLMEngine: return list of RequestOutputs.
-                    request_outputs.append(request_output)
+                    request_outputs.append(request_output)  # L684
 ```
 
 两条注释直接点名两种面：信箱在，就投进该请求的单槽信箱等 `generate` 来拉（在线）；信箱不在（`queue=None`），就收进 list 由 `step()` 返回（离线）。**一个函数、一个分支、吃下两种使用面**——「一套三件套」在运行期的最硬证据。表项自身的清账也在本进程这一侧合拢：
@@ -493,12 +493,12 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
 # vllm/v1/engine/output_processor.py:L713-L720
     def _finish_request(self, req_state: RequestState) -> None:
         req_id = req_state.request_id
-        self.request_states.pop(req_id)
+        self.request_states.pop(req_id)  # L715
 
         internal_ids = self.external_req_ids[req_state.external_req_id]
-        internal_ids.remove(req_id)
+        internal_ids.remove(req_id)  # L718
         if not internal_ids:
-            del self.external_req_ids[req_state.external_req_id]
+            del self.external_req_ids[req_state.external_req_id]  # L720
 ```
 
 终拍一到：账本①弹掉表项、名册划掉这条内部 id（名下空了连键一起删）——与引擎侧按 `finished` 清账各清各的，两本账同时归零，上表轮 4 的两列 0 就是它。
@@ -521,12 +521,12 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
 
         # 1) Get EngineCoreOutput from the EngineCore.
         with record_function_or_nullcontext("llm_engine step: get_output"):
-            outputs = self.engine_core.get_output()
+            outputs = self.engine_core.get_output()  # L304
 
         # 2) Process EngineCoreOutputs.
         with record_function_or_nullcontext("llm_engine step: process_outputs"):
             iteration_stats = IterationStats() if self.log_stats else None
-            processed_outputs = self.output_processor.process_outputs(
+            processed_outputs = self.output_processor.process_outputs(  # L309
                 outputs.outputs,
                 engine_core_timestamp=outputs.timestamp,
                 iteration_stats=iteration_stats,
@@ -535,12 +535,12 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
 
         # 3) Abort any reqs that finished due to stop strings.
         with record_function_or_nullcontext("llm_engine step: abort_requests"):
-            self.engine_core.abort_requests(processed_outputs.reqs_to_abort)
+            self.engine_core.abort_requests(processed_outputs.reqs_to_abort)  # L318
 
         # 4) Record stats
         with record_function_or_nullcontext("llm_engine step: record_stats"):
             # … 省略：logger_manager 的统计记录块（观测旁路） …
-        return processed_outputs.request_outputs
+        return processed_outputs.request_outputs  # L334
 ```
 
 （开头的 dummy-batch 分支是多引擎部署专用，单引擎下恒不触发；`record_function_or_nullcontext` 只是 profiler 标签。）四步读下来：取输出 → 送进**与在线面同一个** `process_outputs` → 把 stop-string 命中的请求反向 abort → 返回 list。没有事件循环、没有后台任务，调用方线程亲自一拍一拍踩。那「取输出」到底阻塞在哪？在 `SyncMPClient` 的这一行：
@@ -551,12 +551,12 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
         # If an exception arises in process_outputs_socket task,
         # it is forwarded to the outputs_queue so we can raise it
         # from this (run_output_handler) task to shut down the server.
-        outputs = self.outputs_queue.get()
+        outputs = self.outputs_queue.get()  # L876
 
         if isinstance(outputs, Exception):
             raise self._format_exception(outputs) from None
-        if outputs.wave_complete is not None:
-            self.engines_running = False
+        if outputs.wave_complete is not None:  # L880
+            self.engines_running = False  # L881
         return outputs
 ```
 
@@ -575,9 +575,9 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
     ) -> str:
         if isinstance(params, SamplingParams):
             # We only care about the final output
-            params.output_kind = RequestOutputKind.FINAL_ONLY
+            params.output_kind = RequestOutputKind.FINAL_ONLY  # L561
 
-        request_id = str(next(self.request_counter))
+        request_id = str(next(self.request_counter))  # L563
 
         return self.llm_engine.add_request(
             # … 省略：五个实参（request_id、prompt、params 等） …
@@ -590,7 +590,7 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
         # Sort the outputs by request ID.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
-        return sorted(outputs, key=lambda x: int(x.request_id))
+        return sorted(outputs, key=lambda x: int(x.request_id))  # L626
 ```
 
 请求是乱序完成的（短请求先完），交付前按 `int(request_id)` 排序还原输入序——自增的数字串保证了这个 `int()` 永远解析得动，`generate` 返回的列表与 prompts 一一对应。
@@ -604,12 +604,12 @@ V0-style、进程内、no busy loop——busy loop 指「引擎自己常驻一�
         # If the request is disconnected by the client, generate()
         # is cancelled or the generator is garbage collected. So,
         # we abort the request if we end up here.
-        except (asyncio.CancelledError, GeneratorExit):
+        except (asyncio.CancelledError, GeneratorExit):  # L611
             if q is not None:
-                await self.abort(q.request_id, internal=True)
+                await self.abort(q.request_id, internal=True)  # L613
             if self.log_requests:
                 logger.info("Request %s aborted.", request_id)
-            raise
+            raise  # L616
 ```
 
 [第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)讲过三层接力的「谁触发」；这里补上「为什么 `except` 挂在协程内部就能接得住」的语言层机制——asyncio 的取消不是从外面杀掉一个协程，而是**把一个异常扔进它当时停住的那一行**：`Task.cancel()` 的官方语义是让 `CancelledError` 在被取消协程下一个 await 点炸入；关闭一个异步生成器（`aclose()`，或被事件循环善后）则是把 `GeneratorExit` 扔进它挂起的那个 `yield` 处。最小例子（说明性，纯标准库可直接跑）：

@@ -39,17 +39,17 @@
                 self.input_socket = self.resources.input_socket = make_zmq_socket(
                     self.ctx,
                     addresses.inputs[0],
-                    zmq.ROUTER,
+                    zmq.ROUTER,  # L592
                     bind=True,
                     router_handover=enable_input_socket_handover,
                 )
                 self.resources.output_socket = make_zmq_socket(
-                    self.ctx, addresses.outputs[0], zmq.PULL
+                    self.ctx, addresses.outputs[0], zmq.PULL  # L597
                 )
 
                 # Resolve ``tcp://host:0`` placeholders to bound endpoints
                 # before engines DEALER-connect. No-op for IPC.
-                addresses.inputs[0] = self.input_socket.getsockopt(
+                addresses.inputs[0] = self.input_socket.getsockopt(  # L602
                     zmq.LAST_ENDPOINT
                 ).decode()
                 addresses.outputs[0] = self.resources.output_socket.getsockopt(
@@ -72,19 +72,19 @@
                         ctx, input_address, zmq.DEALER, identity=identity, bind=False
                     )
                 )
-                for input_address in input_addresses
+                for input_address in input_addresses  # L1667
             ]
             # … 省略：coord_input_address 非空时的 XSUB 分支（DP 控制面订阅，Part VIII 分布式章） …
 
             # Register sockets with poller.
             poller = zmq.Poller()
             ready_response = self._make_ready_response()
-            ready_payload = msgspec.msgpack.encode(ready_response)
+            ready_payload = msgspec.msgpack.encode(ready_response)  # L1687
             for input_socket in input_sockets:
                 # Send initial message to each input socket - this is required
                 # before the front-end ROUTER socket can send input messages
                 # back to us.
-                input_socket.send(ready_payload)
+                input_socket.send(ready_payload)  # L1692
                 poller.register(input_socket, zmq.POLLIN)
 ```
 
@@ -92,14 +92,14 @@
 
 ```python
 # vllm/v1/engine/core.py:L1027-L1042
-        self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
+        self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()  # L1027
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
         executor_fail_callback = lambda: self.input_queue.put_nowait(
             (EngineCoreRequestType.EXECUTOR_FAILED, b"")
         )
 
         self.engine_index = engine_index
-        identity = self.engine_index.to_bytes(length=2, byteorder="little")
+        identity = self.engine_index.to_bytes(length=2, byteorder="little")  # L1034
         self.engines_running = False
         self.shutdown_state = EngineShutdownState.RUNNING
 
@@ -134,15 +134,15 @@
 
             # ZMQ identity of each engine that this client will talk to.
             self.core_engines: list[EngineIdentity] = [
-                rank.to_bytes(2, "little") for rank in self.engine_ranks_managed
+                rank.to_bytes(2, "little") for rank in self.engine_ranks_managed  # L648
             ]
 
             # Wait for ready messages from each engine on the input socket.
             identities = set(self.core_engines)
-            sync_input_socket = zmq.Socket.shadow(self.input_socket)
+            sync_input_socket = zmq.Socket.shadow(self.input_socket)  # L653
             while identities:
                 if not sync_input_socket.poll(
-                    timeout=VLLM_ENGINE_READY_TIMEOUT_S * 1000  # convert to ms
+                    timeout=VLLM_ENGINE_READY_TIMEOUT_S * 1000  # convert to ms  # L656
                 ):
                     raise TimeoutError(
                         f"Timed out waiting for engine core processes to "
@@ -184,10 +184,10 @@ class EngineCoreRequestType(enum.Enum):
     without separate encoding step.
     """
 
-    ADD = b"\x00"
-    ABORT = b"\x01"
+    ADD = b"\x00"  # L267
+    ABORT = b"\x01"  # L268
     START_DP_WAVE = b"\x02"
-    UTILITY = b"\x03"
+    UTILITY = b"\x03"  # L270
     # Sentinel used within EngineCoreProc.
     EXECUTOR_FAILED = b"\x04"
     # Sentinel to wake up input_queue.get() during shutdown.
@@ -202,12 +202,12 @@ class EngineCoreRequestType(enum.Enum):
 # vllm/v1/engine/__init__.py:L97-L130
 class EngineCoreRequest(
     msgspec.Struct,
-    array_like=True,  # type: ignore[call-arg]
+    array_like=True,  # type: ignore[call-arg]  # L99
     omit_defaults=True,  # type: ignore[call-arg]
     gc=False,
 ):  # type: ignore[call-arg]
     request_id: str
-    prompt_token_ids: list[int] | None
+    prompt_token_ids: list[int] | None  # L104
     mm_features: list[MultiModalFeatureSpec] | None
     sampling_params: SamplingParams | None
     pooling_params: PoolingParams | None
@@ -225,7 +225,7 @@ class EngineCoreRequest(
 
     # Index of the client, used to ensure outputs are sent back to the same
     # client for this request when scaling out the front-end.
-    client_index: int = 0
+    client_index: int = 0  # L122
 
     # Used in DP case to indicate which wave of requests this is expected to
     # belong to, to cover a race condition where the request is sent before
@@ -256,7 +256,7 @@ class EngineCoreRequest(
         if engine is None:
             engine = self.core_engine
 
-        message = (request_type.value, *self.encoder.encode(request))
+        message = (request_type.value, *self.encoder.encode(request))  # L1113
         return self._send_input_message(message, engine)
 
     def _send_input_message(
@@ -266,7 +266,7 @@ class EngineCoreRequest(
         # Any zero-copy tensor/ndarray frames are kept alive by zmq itself
         # until it's finished sending them (there is a ref chain from the underlying
         # memoryview back to the original owning tensor/ndarray).
-        return self.input_socket.send_multipart((engine,) + message, copy=False)
+        return self.input_socket.send_multipart((engine,) + message, copy=False)  # L1123
 ```
 
 最后一行把三段拼齐：`(engine,) + message`，而 `message` 本身就是「标签帧在前、载荷帧随后」的元组（类型注解里的 `bytestr` 是 vLLM 给 bytes/bytearray/memoryview 一族字节对象起的别名，信封帧、标签帧都是这类字节串）——信封永远第 0 帧，`send_multipart` 一次发出，`copy=False`（零拷贝发送，下节主角）。同步版 `SyncMPClient._send_input` 与这版逐行同构（`core_client.py:L884-L891`），开头的注释就是布局的官方自述：`# (Identity, RequestType, SerializedRequest)`。`encoder.encode(request)` 返回的不止一帧——主帧加零拷贝张量帧，也是下一节；这里先看 `add_request_async` 怎么走到它：
@@ -274,9 +274,9 @@ class EngineCoreRequest(
 ```python
 # vllm/v1/engine/core_client.py:L1145-L1148
     async def add_request_async(self, request: EngineCoreRequest) -> None:
-        request.client_index = self.client_index
-        await self._send_input(EngineCoreRequestType.ADD, request)
-        self._ensure_output_queue_task()
+        request.client_index = self.client_index  # L1146
+        await self._send_input(EngineCoreRequestType.ADD, request)  # L1147
+        self._ensure_output_queue_task()  # L1148
 ```
 
 [第 4 章](../../ch04-two-usage-faces-one-trio/narrative/chapter.md)嵌过这三行：盖章、发 ADD、确保输出泵在跑——那就是本章站 5 的全景。
@@ -291,7 +291,7 @@ class EngineCoreRequest(
             # overlap ZMQ socket IO with GPU since they release the GIL,
             # and to overlap some serialization/deserialization with the
             # model forward pass.
-            # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
+            # Threads handle Socket <-> Queues and core_busy_loop uses Queue.  # L1096
             ready_event = threading.Event()
             input_thread = threading.Thread(
                 target=self.process_input_sockets,
@@ -324,20 +324,20 @@ class EngineCoreRequest(
             while True:
                 for input_socket, _ in poller.poll():
                     # (RequestType, RequestData)
-                    type_frame, *data_frames = input_socket.recv_multipart(copy=False)
+                    type_frame, *data_frames = input_socket.recv_multipart(copy=False)  # L1705
                     # NOTE(yongji): ignore READY message sent by DP coordinator
                     # that is used to notify newly started engines
                     if type_frame.buffer == b"READY":
                         assert input_socket == coord_socket
                         continue
-                    request_type = EngineCoreRequestType(bytes(type_frame.buffer))
+                    request_type = EngineCoreRequestType(bytes(type_frame.buffer))  # L1711
 
                     # Deserialize the request data.
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
-                        req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                        req: EngineCoreRequest = add_request_decoder.decode(data_frames)  # L1716
                         try:
-                            request = self.preprocess_add_request(req)
+                            request = self.preprocess_add_request(req)  # L1718
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
@@ -357,7 +357,7 @@ class EngineCoreRequest(
                             # process aborts while also ensuring ordering in the input
                             # queue to avoid leaking requests. This is ok because
                             # aborting in the scheduler is idempotent.
-                            self.aborts_queue.put_nowait(request)
+                            self.aborts_queue.put_nowait(request)  # L1738
 
                     # Push to input queue for core busy loop.
                     self.input_queue.put_nowait((request_type, request))  # L1741
@@ -418,8 +418,8 @@ vLLM 真正干活的库不是 msgpack 官方 Python 库，是 **msgspec**——m
         try:
             if self.oob_tensor_consumer is not None:
                 self.oob_tensor_consumer.new_message()
-            self.aux_buffers = bufs = [b""]
-            bufs[0] = self.encoder.encode(obj)
+            self.aux_buffers = bufs = [b""]  # L170
+            bufs[0] = self.encoder.encode(obj)  # L171
             # This `bufs` list allows us to collect direct pointers to backing
             # buffers of tensors and np arrays, and return them along with the
             # top-level encoded buffer instead of copying their data into the
@@ -451,16 +451,16 @@ vLLM 真正干活的库不是 msgpack 官方 Python 库，是 **msgspec**——m
     ) -> tuple[str, tuple[int, ...], int | dict | memoryview]:
         oob_consumer = self.oob_tensor_consumer
         # view the tensor as a contiguous 1D array of bytes
-        if obj.nbytes < self.size_threshold and obj.is_cpu:
+        if obj.nbytes < self.size_threshold and obj.is_cpu:  # L262
             # Smaller tensors are encoded inline, just like ndarrays.
-            data = msgpack.Ext(CUSTOM_TYPE_RAW_VIEW, tensor_data(obj))
-        elif oob_consumer is not None and (data := oob_consumer(obj)) is not None:
+            data = msgpack.Ext(CUSTOM_TYPE_RAW_VIEW, tensor_data(obj))  # L264
+        elif oob_consumer is not None and (data := oob_consumer(obj)) is not None:  # L265
             assert isinstance(data, dict)
         else:
             # Otherwise encode index of backing buffer to avoid copy.
             assert self.aux_buffers is not None
             data = len(self.aux_buffers)
-            self.aux_buffers.append(tensor_data(obj))
+            self.aux_buffers.append(tensor_data(obj))  # L271
         dtype = str(obj.dtype).removeprefix("torch.")
         return dtype, obj.shape, data
 ```
@@ -514,33 +514,33 @@ vLLM 真正干活的库不是 msgpack 官方 Python 库，是 **msgspec**——m
                 for output_path in output_paths
             ]
             # … 省略：coord_output_path 非空时的 DP coordinator PUSH（Part VIII 分布式章） …
-            max_reuse_bufs = len(sockets) + 1
+            max_reuse_bufs = len(sockets) + 1  # L1776
 
             while True:
                 output = self.output_queue.get()
-                if output == EngineCoreProc.ENGINE_CORE_DEAD:
+                if output == EngineCoreProc.ENGINE_CORE_DEAD:  # L1780
                     for socket in sockets:
                         socket.send(output)
                     break
                 assert not isinstance(output, bytes)
                 client_index, outputs = output
-                outputs.engine_index = engine_index
+                outputs.engine_index = engine_index  # L1786
 
                 # … 省略：client_index == -1 走 coordinator 的哨兵分支（Part VIII 分布式章） …
 
                 # Reclaim buffers that zmq is finished with.
-                while pending and pending[-1][0].done:
+                while pending and pending[-1][0].done:  # L1796
                     reclaimed = pending.pop()[1]
                     if len(reuse_buffers) < max_reuse_bufs:
                         reuse_buffers.append(reclaimed)
 
-                buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
-                buffers = encoder.encode_into(outputs, buffer)
+                buffer = reuse_buffers.pop() if reuse_buffers else bytearray()  # L1801
+                buffers = encoder.encode_into(outputs, buffer)  # L1802
                 tracker = self._send_msg_tracking_payload(
-                    sockets[client_index], buffers
+                    sockets[client_index], buffers  # L1804
                 )
-                if not tracker.done:
-                    pending.appendleft((tracker, buffer))
+                if not tracker.done:  # L1806
+                    pending.appendleft((tracker, buffer))  # L1807
                 elif len(reuse_buffers) < max_reuse_bufs:
                     # Limit the number of buffers to reuse.
                     reuse_buffers.append(buffer)
@@ -564,9 +564,9 @@ vLLM 真正干活的库不是 msgpack 官方 Python 库，是 **msgspec**——m
         tracker for the last frame only.
         """
         more_flag = zmq.SNDMORE if len(buffers) > 1 else 0
-        tracker = socket.send(buffers[0], more_flag, copy=False, track=True)
+        tracker = socket.send(buffers[0], more_flag, copy=False, track=True)  # L1824
         if more_flag:
-            socket.send_multipart(buffers[1:], copy=False)
+            socket.send_multipart(buffers[1:], copy=False)  # L1826
         return tracker
 ```
 
@@ -595,14 +595,14 @@ docstring 把缘由说尽：第一帧单独 `send(track=True)` 拿 tracker，其
             assert 0 in shape
             return torch.empty(shape, dtype=torch_dtype)
         # Create uint8 array
-        arr = torch.frombuffer(buffer, dtype=torch.uint8)
+        arr = torch.frombuffer(buffer, dtype=torch.uint8)  # L416
         # Clone ensures tensor is backed by pytorch-owned memory for safe
         # future async CPU->GPU transfer.
         # Pin larger tensors for more efficient CPU->GPU transfer.
         if not is_aux:
-            arr = arr.clone()
+            arr = arr.clone()  # L421
         elif not self.share_mem:
-            arr = arr.pin_memory() if self.pin_tensors else arr.clone()
+            arr = arr.pin_memory() if self.pin_tensors else arr.clone()  # L423
         # Convert back to proper shape & type
         return arr.view(torch_dtype).view(shape)
 ```
@@ -645,7 +645,7 @@ torch 这套能力是为多进程 DataLoader 原生设计的（`torch.multiproce
             # Move tensor to shared memory for IPC
             # This is required for proper inter-process communication
             if not tensor.is_shared():
-                tensor = tensor.share_memory_()
+                tensor = tensor.share_memory_()  # L75
 
             metadata = {
                 "sender_id": self._sender_id,
@@ -658,7 +658,7 @@ torch 这套能力是为多进程 DataLoader 原生设计的（`torch.multiproce
             ipc_data = TensorIpcData(**metadata, tensor=tensor)  # type: ignore[arg-type]
 
             # Use a timeout to avoid blocking indefinitely
-            self.queue.put(ipc_data, timeout=10.0)
+            self.queue.put(ipc_data, timeout=10.0)  # L88
 
             # … 省略：一条 logger.debug（观测旁路） …
 
@@ -669,7 +669,7 @@ torch 这套能力是为多进程 DataLoader 原生设计的（`torch.multiproce
                 "Falling back to standard serialization.",
                 e,
             )
-            return None
+            return None  # L105
 ```
 
 它作为 `oob_tensor_consumer` 钩子挂进编码器——正是 `_encode_tensor` 三分支里的第②支：钩子接单，张量 `share_memory_()`（把底层存储搬进 OS 共享内存段）、`TensorIpcData`（句柄+张量）进 `torch.multiprocessing.Queue`，返回的 metadata dict（`sender_id` 8 位随机十六进制 + 递增的 `message_id`/`tensor_id`，合起来是全局唯一的提货码）嵌进 msgpack 主帧随消息过 ZMQ。except 兜底返回 None = 优雅回退：专线出任何故障，编码器退回普通序列化，消息照发。
@@ -710,17 +710,17 @@ def make_zmq_socket(
     # - Set a large 0.5GB buffer to improve throughput
     # For systems with less memory:
     # - Use system default (-1) to avoid excessive memory consumption
-    buf_size = int(0.5 * 1024**3) if total_mem > 32 and available_mem > 16 else -1
+    buf_size = int(0.5 * 1024**3) if total_mem > 32 and available_mem > 16 else -1  # L305
 
     if bind is None:
         bind = socket_type not in (zmq.PUSH, zmq.SUB, zmq.XSUB)  # L308
 
     if socket_type in (zmq.PULL, zmq.DEALER, zmq.ROUTER):
-        socket.setsockopt(zmq.RCVHWM, 0)
+        socket.setsockopt(zmq.RCVHWM, 0)  # L311
         socket.setsockopt(zmq.RCVBUF, buf_size)
 
     if socket_type in (zmq.PUSH, zmq.DEALER, zmq.ROUTER):
-        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.SNDHWM, 0)  # L315
         socket.setsockopt(zmq.SNDBUF, buf_size)
 
     # … 省略：ROUTER_HANDOVER 两行（弹性扩缩容重连接管，Part VIII 弹性章） …
@@ -752,13 +752,13 @@ class EngineCoreOutputs(
     omit_defaults=True,  # type: ignore[call-arg]
     gc=False,
 ):  # type: ignore[call-arg]
-    # NOTE(Nick): We could consider ways to make this more compact,
+    # NOTE(Nick): We could consider ways to make this more compact,  # L236
     # e.g. columnwise layout
 
     engine_index: int = 0
 
     # [num_reqs]
-    outputs: list[EngineCoreOutput] = []
+    outputs: list[EngineCoreOutput] = []  # L242
     scheduler_stats: SchedulerStats | None = None
     timestamp: float = 0.0
 
@@ -784,7 +784,7 @@ class EngineCoreOutputs(
         # outputs in this step.
         engine_core_outputs = {
             client_index: EngineCoreOutputs(outputs=outs)
-            for client_index, outs in outputs.items()
+            for client_index, outs in outputs.items()  # L2016
         }
 ```
 
@@ -801,9 +801,9 @@ class EngineCoreOutputs(
         async def process_outputs_socket():
             try:
                 while True:
-                    frames = await output_socket.recv_multipart(copy=False)
-                    resources.validate_alive(frames)
-                    outputs: EngineCoreOutputs = decoder.decode(frames)
+                    frames = await output_socket.recv_multipart(copy=False)  # L1040
+                    resources.validate_alive(frames)  # L1041
+                    outputs: EngineCoreOutputs = decoder.decode(frames)  # L1042
                     if outputs.utility_output:
                         # … 省略：utility_output 的分流（按 call_id 配对唤醒，见下文；
                         # EEP 弹性专家并行/FT 容错两个保留编号的分支属 Part VIII）…
@@ -830,12 +830,12 @@ class EngineCoreOutputs(
     async def _call_utility_async(
         self, method: str, *args, engine: EngineIdentity
     ) -> Any:
-        call_id = uuid.uuid1().int >> 64
+        call_id = uuid.uuid1().int >> 64  # L1131
         future = asyncio.get_running_loop().create_future()
-        self.utility_results[call_id] = future
+        self.utility_results[call_id] = future  # L1133
         message = (
             EngineCoreRequestType.UTILITY.value,
-            *self.encoder.encode((self.client_index, call_id, method, args)),
+            *self.encoder.encode((self.client_index, call_id, method, args)),  # L1136
         )
         await self._send_input_message(message, engine)
         self._ensure_output_queue_task()
@@ -856,10 +856,10 @@ class EngineCoreOutputs(
         """Send EngineDead status to the EngineCoreClient."""
 
         # Put ENGINE_CORE_DEAD in the queue.
-        self.output_queue.put_nowait(EngineCoreProc.ENGINE_CORE_DEAD)
+        self.output_queue.put_nowait(EngineCoreProc.ENGINE_CORE_DEAD)  # L1609
 
         # Wait until msg sent by the daemon before shutdown.
-        self.output_thread.join(timeout=5.0)
+        self.output_thread.join(timeout=5.0)  # L1612
         if self.output_thread.is_alive():
             logger.fatal(
                 "vLLM shutdown signal from EngineCore failed "
@@ -874,7 +874,7 @@ class EngineCoreOutputs(
 ```python
 # vllm/v1/engine/core_client.py:L490-L493
     def validate_alive(self, frames: Sequence[zmq.Frame]):
-        if len(frames) == 1 and (frames[0].buffer == EngineCoreProc.ENGINE_CORE_DEAD):
+        if len(frames) == 1 and (frames[0].buffer == EngineCoreProc.ENGINE_CORE_DEAD):  # L491
             self.engine_dead = True
             raise EngineDeadError()
 ```

@@ -30,7 +30,7 @@ GPU 一步前向只有几十毫秒，驱动它的却是一个**单线程的 Pyth
             local_dp_ranks.append(local_index)
             self.processes.append(
                 context.Process(
-                    target=EngineCoreProc.run_engine_core,
+                    target=EngineCoreProc.run_engine_core,  # L166
                     name=f"EngineCore_DP{global_index}" if is_dp else "EngineCore",
                     kwargs=common_kwargs
                     | {"dp_rank": global_index, "local_dp_rank": local_index},
@@ -64,7 +64,7 @@ GPU 一步前向只有几十毫秒，驱动它的却是一个**单线程的 Pyth
             bind=False,
         ) as handshake_socket:
             # Register engine with front-end.
-            addresses = self.startup_handshake(
+            addresses = self.startup_handshake(  # L1214
                 handshake_socket, local_client, headless, parallel_config_to_update
             )
             yield addresses  # L1217
@@ -75,12 +75,12 @@ GPU 一步前向只有几十毫秒，驱动它的却是一个**单线程的 Pyth
                 "headless": headless,
             }
             # Include config hash for DP configuration validation
-            if vllm_config.parallel_config.data_parallel_size > 1:
+            if vllm_config.parallel_config.data_parallel_size > 1:  # L1226
                 ready_msg["parallel_config_hash"] = (
                     vllm_config.parallel_config.compute_hash()
                 )
 
-            handshake_socket.send(msgspec.msgpack.encode(ready_msg))
+            handshake_socket.send(msgspec.msgpack.encode(ready_msg))  # L1231
 ```
 
 这是一个上下文管理器，关键在 `yield` 那一行（L1217）：`startup_handshake` 先在握手专线上喊 HELLO、等前端回一包 `EngineHandshakeMetadata`（里面是全部 ZMQ 地址集，`core.py:L1233-L1269`，等不到 5 分钟直接报错）；然后 **`yield` 把控制权交出去——EngineCore 的全量构造（executor、KV cache、调度器）就发生在 `with` 体内这段窗口里**；构造完了，管理器收尾时才在同一条 socket 上发 READY。顺序不是礼节：前端收到 READY 就认为引擎可用、开始发请求，若 READY 发在构造前，请求会砸进一个还没有 KV cache 的引擎。多引擎（DP）部署还在 READY 里附 `parallel_config_hash` 供前端校验各引擎配置一致。
@@ -97,7 +97,7 @@ GPU 一步前向只有几十毫秒，驱动它的却是一个**单线程的 Pyth
                 # Send initial message to each input socket - this is required
                 # before the front-end ROUTER socket can send input messages
                 # back to us.
-                input_socket.send(ready_payload)
+                input_socket.send(ready_payload)  # L1692
                 poller.register(input_socket, zmq.POLLIN)
 ```
 
@@ -113,8 +113,8 @@ class EngineCoreReadyResponse:
     values (e.g. max_model_len after KV cache auto-fitting).
     """
 
-    max_model_len: int
-    num_gpu_blocks: int
+    max_model_len: int  # L76
+    num_gpu_blocks: int  # L77
     block_size: int
     dp_stats_address: str | None
     dtype: str
@@ -156,14 +156,14 @@ docstring 自己说明用途：「post-initialization config that may differ fro
                 request.mm_features
             )
 
-        req = Request.from_engine_core_request(request, self.request_block_hasher)
+        req = Request.from_engine_core_request(request, self.request_block_hasher)  # L983
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For
             # `structured_output_manager`, each request is independent and
             # grammar compilation is async. Scheduler always checks grammar
             # compilation status before scheduling request.
-            self.structured_output_manager.grammar_init(req)
+            self.structured_output_manager.grammar_init(req)  # L990
         return req, request.current_wave
 ```
 
@@ -199,13 +199,13 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
 # vllm/v1/engine/core.py:L1378-L1389
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
-        while self._handle_shutdown():
+        while self._handle_shutdown():  # L1380
             # 1) Poll the input queue until there is work to do.
-            self._process_input_queue()
+            self._process_input_queue()  # L1382
             # Publish request counts before and after GPU step to ensure freshness.
             self._maybe_publish_request_counts()
             # 2) Step the engine core and return the outputs.
-            self._process_engine_step()
+            self._process_engine_step()  # L1386
             self._maybe_publish_request_counts()
 
         raise SystemExit  # L1389
@@ -223,18 +223,18 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
         """Exits when an engine step needs to be performed."""
 
         waited = False
-        while not self.has_work() and self.is_running():
+        while not self.has_work() and self.is_running():  # L1408
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
             if self.input_queue.empty():
                 # Drain aborts queue; all aborts are also processed via input_queue.
                 with self.aborts_queue.mutex:
-                    self.aborts_queue.queue.clear()
+                    self.aborts_queue.queue.clear()  # L1414
                 # … 省略：两行 DEBUG 日志（"waiting for work" / waited 标记），
                 #       及循环外睡醒补记的 "EngineCore loop active." 日志行 …
             block = self.process_input_queue_block
             try:
-                req = self.input_queue.get(block=block)
+                req = self.input_queue.get(block=block)  # L1420
                 self._handle_client_request(*req)
             except queue.Empty:
                 break
@@ -242,7 +242,7 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
                 break
 
         # Handle any more client requests.
-        while not self.input_queue.empty():
+        while not self.input_queue.empty():  # L1431
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 ```
@@ -261,10 +261,10 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
         """Called only when there are unfinished local requests."""
 
         # Step the engine core.
-        outputs, model_executed = self.step_fn()
+        outputs, model_executed = self.step_fn()  # L1439
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
-            self.output_queue.put_nowait(output)
+            self.output_queue.put_nowait(output)  # L1442
         # Post-step hook.
         self.post_step(model_executed)
 
@@ -272,7 +272,7 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
         # the GIL briefly to allow background transfer threads to make progress.
         if not model_executed and self.scheduler.has_requests():
-            time.sleep(0.001)
+            time.sleep(0.001)  # L1450
 
         return model_executed
 ```
@@ -292,7 +292,7 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
 ```python
 # vllm/v1/engine/core.py:L231-L236
         self.step_fn = (
-            self.step if self.batch_queue is None else self.step_with_batch_queue
+            self.step if self.batch_queue is None else self.step_with_batch_queue  # L232
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
@@ -318,7 +318,7 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
-        if not self.scheduler.has_requests():
+        if not self.scheduler.has_requests():  # L593
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())  # L595
         future = self.model_executor.execute_model(scheduler_output, non_block=True)  # L596
@@ -388,9 +388,9 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
     def schedule(self, throttle_prefills: bool = False) -> "SchedulerOutput":
         """Schedule the requests to process in this scheduling step.
 
-        The scheduling decision is made at the iteration level. Each scheduling
+        The scheduling decision is made at the iteration level. Each scheduling  # L57
         step corresponds to a single forward pass of the model. Therefore, this
-        method is called repeatedly by a busy loop in the engine.
+        method is called repeatedly by a busy loop in the engine.  # L59
 
         Essentially, the scheduler produces a dictionary of {req_id: num_tokens}
         that specifies how many tokens to process for each request in this
@@ -440,7 +440,7 @@ executor（单机执行器的转发层）把两拍都转发给 worker：
             single_value=True,
         )
         # In non-blocking mode, surface any exception as early as possible.
-        if non_block and output.done():
+        if non_block and output.done():  # L118
             # Raise the exception in-line if the task failed.
             output.result()
         return output
@@ -472,7 +472,7 @@ class AsyncOutputFuture(Future):
 
         if not super().done():
             try:
-                output = self.async_output.get_output()
+                output = self.async_output.get_output()  # L38
                 self.set_result(output if self.single_value else [output])
             except Exception as e:
                 self.set_exception(e)
@@ -497,7 +497,7 @@ GPU worker（真正跑模型的那层）收到的两段契约长这样。第一�
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
-        if self.execute_model_state is not None:
+        if self.execute_model_state is not None:  # L4171
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
@@ -508,7 +508,7 @@ GPU worker（真正跑模型的那层）收到的两段契约长这样。第一�
 
 ```python
 # vllm/v1/worker/gpu_model_runner.py:L437-L450
-class ExecuteModelState(NamedTuple):
+class ExecuteModelState(NamedTuple):  # L437
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
 
@@ -528,7 +528,7 @@ class ExecuteModelState(NamedTuple):
 
 ```python
 # vllm/v1/worker/gpu_model_runner.py:L4516-L4535
-        self.execute_model_state = ExecuteModelState(
+        self.execute_model_state = ExecuteModelState(  # L4516
             scheduler_output,
             logits,
             spec_decode_metadata,
@@ -547,7 +547,7 @@ class ExecuteModelState(NamedTuple):
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
-        return None
+        return None  # L4535
 ```
 
 （`deferred_state_corrections_fn` 是重叠版的延迟状态修正钩子，Part III 末章的地盘，此处过路。）第四拍第二段，解包、清态、掩码、采样：
@@ -566,16 +566,16 @@ class ExecuteModelState(NamedTuple):
             # … 省略：spec_decode / hidden_states 等 6 个解包字段 …
         ) = self.execute_model_state
         # Clear ephemeral state.
-        self.execute_model_state = None
+        self.execute_model_state = None  # L4580
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
-            apply_grammar_bitmask(
+            apply_grammar_bitmask(  # L4584
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(logits, spec_decode_metadata)  # L4589
 ```
 
 一置一清、互斥推进：`execute_model` 入口查旧值非 None 即炸，`sample_tokens` 入口先解包立即置 None——所以「前向算完、采样欠着」的中间态永不重叠，误序被入口防御拦死。掩码应用（`apply_grammar_bitmask`）恰在 `_sample` 之前——这个位置是下一节的全部内容。
@@ -626,24 +626,24 @@ vLLM v0.27.1 里这张表由默认后端 xgrammar 提供（版本钉 `xgrammar >
     ) -> GrammarOutput | None:
         # Collect list of scheduled request ids that use structured output.
         # The corresponding rows of the bitmask will be in this order.
-        if not scheduler_output.has_structured_output_requests:
+        if not scheduler_output.has_structured_output_requests:  # L1651
             return None
 
         structured_output_request_ids = [
             req_id
             for req_id in scheduler_output.num_scheduled_tokens
             if (req := self.requests.get(req_id))
-            and (req.use_structured_output and not req.is_prefill_chunk)
+            and (req.use_structured_output and not req.is_prefill_chunk)  # L1658
         ]
         if not structured_output_request_ids:
             return None
 
-        bitmask = self.structured_output_manager.grammar_bitmask(
+        bitmask = self.structured_output_manager.grammar_bitmask(  # L1663
             self.requests,
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
         )
-        return GrammarOutput(structured_output_request_ids, bitmask)
+        return GrammarOutput(structured_output_request_ids, bitmask)  # L1668
 ```
 
 两个快速出口先看：批里没有结构化输出请求，返回 None（第一拍表里③列的 None 就是它——多数流量不过这张表）；有结构化请求但都在 prefill 中段，也返回 None（`is_prefill_chunk`——被切块的 prefill 还在消化 prompt，此刻不算掩码）。剩下的交给 `structured_output_manager.grammar_bitmask` 算出表，包成 `GrammarOutput(request_ids, bitmask)` 传给④。
@@ -686,13 +686,13 @@ vLLM v0.27.1 里这张表由默认后端 xgrammar 提供（版本钉 `xgrammar >
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
-        for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+        for req_id, num_tokens_scheduled in num_scheduled_tokens.items():  # L1733
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             # … 省略：num_in_flight_tokens 记账与 stale 份额排干两行（抢占协议，
             #       Part III 第三、四章）与 failed_kv_load 跳过分支（KV connector
             #       装载失败/待重排的请求不进本拍账——KV 传输域，他章）…
-            if request is None or request.is_finished():
+            if request is None or request.is_finished():  # L1747
                 # The request is already finished. This can happen if the
                 # request is aborted while the model is executing it (e.g.,
                 # in pipeline parallelism or in async scheduling).
@@ -703,7 +703,7 @@ vLLM v0.27.1 里这张表由默认后端 xgrammar 提供（版本钉 `xgrammar >
                 continue
 
             # … 省略：drop-mode stale 输出丢弃（同拍恢复的抢占配套）…
-            req_index = model_runner_output.req_id_to_index[req_id]
+            req_index = model_runner_output.req_id_to_index[req_id]  # L1761
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
@@ -725,7 +725,7 @@ vLLM v0.27.1 里这张表由默认后端 xgrammar 提供（版本钉 `xgrammar >
                 # Should be a list here, but also handle string just in case.
                 request_ids.extend((ids,) if isinstance(ids, str) else ids)
             # More efficient to abort all as a single batch.
-            self.abort_requests(request_ids)
+            self.abort_requests(request_ids)  # L749
 ```
 
 把急件通道里积压的撤单**合并成一次** `abort_requests`（落成 `FINISHED_ABORTED`）——比逐个高效，且赶在⑤记账之前，被撤请求当拍就从名单上划掉。为什么撤单要双投两条队列（`input_queue` 保序 + `aborts_queue` 及时）、为什么敢双投（调度器侧撤单幂等）——[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)末节拆过，不重讲；本章补的是它在拍内的落点：执行期到达的撤单走这条急件通道，⑤之前批量落地；引擎全闲时这条通道直接被清空（忙循环节里见过）。[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)末尾「客人离席」一节讲过的断连反向 abort，前端发起端走的就是这条路。
@@ -759,7 +759,7 @@ vLLM v0.27.1 里这张表由默认后端 xgrammar 提供（版本钉 `xgrammar >
                 # Wakes up idle engine via input_queue when shutdown is requested
                 # Not safe in a signal handler - we may interrupt the main thread
                 # while it is holding the non-reentrant input_queue.mutex
-                engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+                engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))  # L1326
 
             signal_callback = SignalCallback(wakeup_engine)
 
@@ -769,13 +769,13 @@ vLLM v0.27.1 里这张表由默认后端 xgrammar 提供（版本钉 `xgrammar >
                     "[shutdown] EngineCore: trigger received signal=%s",
                     signal_name,
                 )
-                engine_core.shutdown_state = EngineShutdownState.REQUESTED
-                signal_callback.trigger()
+                engine_core.shutdown_state = EngineShutdownState.REQUESTED  # L1336
+                signal_callback.trigger()  # L1337
 
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
 
-            engine_core.run_busy_loop()
+            engine_core.run_busy_loop()  # L1342
 ```
 
 读这段要带着一条 Unix/Python 通用铁律：**信号处理器里不能拿锁**——处理器可能在任意两条字节码之间插入执行，插入点若恰是主线程攥着锁的那一刻，处理器再去拿同一把锁就是自己等自己（官方文档警告原话「Synchronization primitives such as threading.Lock should not be used within signal handlers. Doing so can lead to unexpected deadlocks」，[Python signal 文档](https://docs.python.org/3/library/signal.html)）。`wakeup_engine` 的注释自己点破处境：「Not safe in a signal handler - we may interrupt the main thread while it is holding the non-reentrant input_queue.mutex」——`queue.Queue` 的内部锁不处理同线程重入（queue 文档原话「they are not designed to handle reentrancy within a thread」）。所以处理器只做两件最轻的事：把 `shutdown_state` 置为 REQUESTED、触发 `SignalCallback`（`utils.py:L253-L277`，一条睡在 Event 上的守护线程，`trigger()` 只是 `event.set()`）；真正的动作——往 `input_queue` 投 WAKEUP 哨兵叫醒可能睡在 `get()` 上的忙循环——在信号上下文**之外**的线程里执行。这是 self-pipe trick（自管道技巧：处理器只写一个字节唤醒主循环，真正的活在正常上下文做）的标准变体，把「写管道字节」换成了「set 一个 Event」。回想忙循环节那句 Windows 注脚——无超时的阻塞 get 信号打断不了——WAKEUP 哨兵是跨平台的可靠叫醒方式。
@@ -791,13 +791,13 @@ vLLM v0.27.1 里这张表由默认后端 xgrammar 提供（版本钉 `xgrammar >
 
         if self.shutdown_state == EngineShutdownState.REQUESTED:
             shutdown_timeout = self.vllm_config.shutdown_timeout
-            mode = "abort" if shutdown_timeout == 0 else "drain"
+            mode = "abort" if shutdown_timeout == 0 else "drain"  # L1466
             # … 省略：两种模式各两行 INFO 日志 …
             if shutdown_timeout == 0:
                 num_requests = self.scheduler.get_num_unfinished_requests()
                 if num_requests > 0:
                     # … 省略：aborting in-flight requests 日志 …
-                aborted_reqs = self.scheduler.finish_requests(
+                aborted_reqs = self.scheduler.finish_requests(  # L1481
                     None, RequestStatus.FINISHED_ABORTED
                 )
                 self._send_abort_outputs(aborted_reqs)
@@ -805,10 +805,10 @@ vLLM v0.27.1 里这张表由默认后端 xgrammar 提供（版本钉 `xgrammar >
                 num_requests = self.scheduler.get_num_unfinished_requests()
                 if num_requests > 0:
                     # … 省略：draining in-flight requests 日志 …
-            self.shutdown_state = EngineShutdownState.SHUTTING_DOWN
+            self.shutdown_state = EngineShutdownState.SHUTTING_DOWN  # L1495
 
         # Exit when no work remaining
-        if not self.has_work():
+        if not self.has_work():  # L1498
             logger.info(
                 "[shutdown] EngineCore: request processing complete; "
                 "starting resource teardown"
@@ -826,10 +826,10 @@ REQUESTED 之后按 `shutdown_timeout` 分流两种死法：**abort 模式**（�
         """Send EngineDead status to the EngineCoreClient."""
 
         # Put ENGINE_CORE_DEAD in the queue.
-        self.output_queue.put_nowait(EngineCoreProc.ENGINE_CORE_DEAD)
+        self.output_queue.put_nowait(EngineCoreProc.ENGINE_CORE_DEAD)  # L1609
 
         # Wait until msg sent by the daemon before shutdown.
-        self.output_thread.join(timeout=5.0)
+        self.output_thread.join(timeout=5.0)  # L1612
         if self.output_thread.is_alive():
             logger.fatal(
                 "vLLM shutdown signal from EngineCore failed "
@@ -843,9 +843,9 @@ REQUESTED 之后按 `shutdown_timeout` 分流两种死法：**abort 模式**（�
 # vllm/v1/engine/core.py:L1778-L1787
         while True:
             output = self.output_queue.get()
-            if output == EngineCoreProc.ENGINE_CORE_DEAD:
+            if output == EngineCoreProc.ENGINE_CORE_DEAD:  # L1780
                 for socket in sockets:
-                    socket.send(output)
+                    socket.send(output)  # L1782
                 break
             assert not isinstance(output, bytes)
             client_index, outputs = output
@@ -874,8 +874,8 @@ class InprocClient(EngineCoreClient):
         self.engine_core = EngineCore(*args, **kwargs)
 
     def get_output(self) -> EngineCoreOutputs:
-        outputs, model_executed = self.engine_core.step_fn()
-        self.engine_core.post_step(model_executed=model_executed)
+        outputs, model_executed = self.engine_core.step_fn()  # L320
+        self.engine_core.post_step(model_executed=model_executed)  # L321
         return outputs and outputs.get(0) or EngineCoreOutputs()
 ```
 
@@ -884,14 +884,14 @@ docstring 自己招供「no busy loop」：`get_output` 直接调 `step_fn()` �
 ```python
 # vllm/v1/engine/llm_engine.py:L296-L322
     def step(self) -> list[RequestOutput | PoolingRequestOutput]:
-        if self.should_execute_dummy_batch:
+        if self.should_execute_dummy_batch:  # L297
             self.should_execute_dummy_batch = False
-            self.engine_core.execute_dummy_batch()
+            self.engine_core.execute_dummy_batch()  # L299
             return []
 
         # 1) Get EngineCoreOutput from the EngineCore.
         with record_function_or_nullcontext("llm_engine step: get_output"):
-            outputs = self.engine_core.get_output()
+            outputs = self.engine_core.get_output()  # L304
 
         # 2) Process EngineCoreOutputs.
         # … 省略：process_outputs 与 scheduler_stats 更新（输出处理是
