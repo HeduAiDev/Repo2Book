@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-"""ch09 机制图 · ④ 收货的两种路径——同步阻塞 vs 异步发起/等待分离（figure_spec
-ch09-fig-two-phase-two-paths，模板 swimlane 双栏对照）
+"""ch09 机制图 · ④ 收货的两种路径——UML 时序图文法 v3（figure_spec
+ch09-fig-two-phase-two-paths）
 
-放大自 L0 循环框（loop_box）内 ④拍收货窗口——即本章 L2 章图 center ④拍片
-『future.result + 条件 sample_tokens』的时序展开：回答『④ 收货到底在等什么、
-同步版与异步版（v0.27.1 服务默认）差在哪』。与 m1 五段时间轴图（同一拍全景）
-互为缩放关系，架构归属回指 L0/L2。
+v3 重建（2026-09-05，读者反馈两轮『生硬连接、没有语义』后按 Lead 规格书重写）：
+  文法铁律——①每栏 4 条竖直生命线（EngineCore/Worker/GPU/D2H copy stream，顶部名牌）；
+  ②统一竖直线性时间轴 + 浅色水平 gridlines 贯穿 4 线，栏内一切元素严格按时间戳 y 对齐
+  （左栏 K=210px/ms、右栏 K=84px/ms，右栏恰压缩 2.5×，各栏左缘 1ms 比例尺）；
+  ③活动条骑生命线：y=时间戳、高=时长×K（dur×K<8px 的瞬时动作退化为骑线时刻标记，
+  标注真实值）；④消息=水平直线（A 线某时刻→B 线同一 y，箭头+动词标签），
+  禁折线/肘形/绕行，跨中间生命线的水平线是 UML 标准画法；
+  ⑤GPU 完成区间 (1.412,1.770]（左栏）用水平虚线 + 开闭括号标签（同图 A 口径）。
 
-claim：④ 收货的两种路径（真引擎实测）：同步版 worker.sample_tokens 是阻塞收货——
-0.358ms 里含『等 GPU 前向尾程（入口时 CUDA event 未完）+ 掩码/采样 kernel + 同步 D2H』；
-异步版发起与等待分离——sample_tokens(non_block=True) 0.314ms 返回
-AsyncGPUModelRunnerOutput→executor 包 AsyncOutputFuture 入队，之后 result() 只等
-D2H 拷贝事件（0.022ms，其中 event.synchronize 0.012ms），且 batch_queue 的 ⑤
-延迟一拍处理上一批——收货等待被推出关键路径。
-
-数字全部取自真引擎实测 trace（explainer m3 spec.numbers：sync 0.358/0.225/0.246、
-async 0.314/0.022/0.012/4.146、延迟一拍 [7189]、返回类型两真身）。
-坐标由常量/循环计算；文本全 esc()；两栏各按本拍实测时刻布点（分段非线性）。
+数据全部取自真引擎实测 trace（m1_real.json：左=sync beat 3、右=async 拍 2；
+区间端点 t 字段=结束时刻，起点=t−dur）。印在图上的数字仅 spec 集：
+1.341/4.146/1.281/0.045/0.001/0.358/0.056/0.314/0.022/0.012/0.225/0.246/
+1.860/1.873/(1.412,1.770]/[7189]/批形状。布局时刻不印数。
 """
 import sys
 from pathlib import Path
@@ -27,15 +25,82 @@ import l0_common as lc  # noqa: E402
 
 lc.reset()
 
-# ---------------- 画布与版式常量 ----------------
-W, H = 1660, 884
+W, H = 1660, 800
 MX, BXR = 56, 1604
-COL_W = 744
-LX, RX = 56.0, 860.0                     # 左/右栏左缘
-PAD = 12.0
-BLK_W = 178.0
+TL_Y0 = 170.0
 
-# ---------------- 标题区 ----------------
+# ---------------- 生命线（每栏 4 条，同构并排；线距 208） ----------------
+LANE_NAMES = ['EngineCore (CPU)', 'Worker (CPU)', 'GPU', 'D2H copy stream']
+L_LANES = [118.0, 326.0, 534.0, 742.0]
+R_LANES = [930.0, 1138.0, 1346.0, 1554.0]
+NAMEPLATE_W = 104
+LX0, LX1 = 66.0, 794.0      # 左栏 gridlines 贯穿范围
+RX0, RX1 = 878.0, 1606.0
+
+# ---------------- 时间轴（线性；K 单位 px/ms；右栏恰压缩 2.5×） ----------------
+K_L, K_R = 210.0, 84.0
+T_END_L, T_END_R = 1.873, 4.659
+
+
+def yl(t):
+    return TL_Y0 + t * K_L
+
+
+def yr(t):
+    return TL_Y0 + t * K_R
+
+
+# ---------------- 数据（m1_real.json；区间=(起点, 终点)，端点=trace 时刻） ----------------
+# 左栏 sync beat 3
+L_ACTS = [
+    # (lane_idx, t0, t1, style, label 行, 标签侧)
+    (0, 0.006, 0.051, 'eng', ['① schedule 0.045ms'], 'r-below'),
+    (0, 0.054, 1.395, 'eng', ['② execute_model 1.341ms', '（non_block=True 发起）'], 'r'),
+    (1, 0.068, 1.349, 'wrk', ['launch 1.281ms', '（16 层 kernel 入队）'], 'r'),
+    (1, 1.412, 1.770, 'beat3', None, None),          # ④b 三段（专用绘制）
+    (0, 1.777, 1.833, 'eng', ['⑤ update 0.056ms'], 'r'),
+    (2, 1.349, 1.770, 'gpu', ['前向 kernel', '（GPU 后台执行）'], 'r'),
+    (3, 1.651, 1.770, 'd2h', ['同步 D2H'], 'r'),     # 段界=④b 三段均分（无数字标注）
+]
+L_MARKS = [  # (lane_idx, t_center, 标签, 标签侧, dy微移±3)
+    (0, 1.4005, '③ bitmask 0.001ms', 'left', -3.5),
+    (0, 1.409, '④a result 0.001ms', 'right', 3.5),
+]
+L_MSGS = [  # (x_from, x_to, t, 颜色, 标签, 标签上下, marker)
+    (L_LANES[0], L_LANES[1], 0.054, 'call', 'execute_model(non_block=True) →', 'above', 'dn'),
+    (L_LANES[1], L_LANES[2], 0.068, 'call', 'launch kernels（16 层入队）→', 'above', 'dn'),
+    (L_LANES[1], L_LANES[0], 1.395, 'ret', '← 返回 None（launch 完即交回）', 'above', 'up'),
+    (L_LANES[0], L_LANES[1], 1.412, 'call', 'sample_tokens(grammar) →', 'below', 'dn'),
+    (L_LANES[1], L_LANES[0], 1.770, 'ret', '← ModelRunnerOutput（D2H 已在内）', 'above', 'up'),
+    (L_LANES[1], L_LANES[3], 1.651, 'ret', '同步 D2H（阻塞拷贝）→', 'below', 'std'),
+    (L_LANES[3], L_LANES[1], 1.770, 'sam', '← 数据落地', 'below', 'sam'),
+]
+
+# 右栏 async 拍 2
+R_ACTS = [
+    (0, 0.005, 0.078, 'eng', ['① schedule'], 'r-below'),
+    (0, 0.081, 4.227, 'eng', ['② execute_model 4.146ms', '（non_block=True 发起）'], 'r'),
+    (1, 0.098, 4.166, 'wrk', ['launch（16 层 kernel 入队）'], 'r'),
+    (1, 4.260, 4.547, 'wrk3', None, None),           # ④ worker 段（专用绘制）
+    (2, 0.098, 4.588, 'gpu', ['前向 kernel（GPU 后台）'], 'r'),
+    (3, 4.244, 4.588, 'd2h', ['copy stream D2H', '（构造时起飞→事件置位）'], 'r'),
+]
+R_MARKS = [
+    (0, 4.2385, '③ bitmask', 'left', -3.0),
+    (0, 4.582, ['result() 0.022ms', '（内 D2H.get_output 0.012ms）'], 'right', 0.0),
+    (0, 4.646, ['⑤ 延迟一拍：本拍记 beat 1 的账', '（A [7189]；schedule 填队列优先）'],
+     'left', 4.0),
+]
+R_MSGS = [
+    (R_LANES[0], R_LANES[1], 0.081, 'call', 'execute_model(non_block=True) →', 'above', 'dn'),
+    (R_LANES[1], R_LANES[2], 0.098, 'call', 'launch kernels →', 'above', 'dn'),
+    (R_LANES[1], R_LANES[0], 4.227, 'ret', '← 返回 None（暂存 worker，采样欠着）', 'above', 'up'),
+    (R_LANES[0], R_LANES[1], 4.244, 'call', 'sample_tokens(non_block=True) →', 'below', 'dn'),
+    (R_LANES[1], R_LANES[0], 4.558, 'ret', '← AsyncGPUModelRunnerOutput', 'above', 'up'),
+    (R_LANES[3], R_LANES[0], 4.588, 'sam', '← 事件就绪（D2H 拷贝事件）', 'below', 'sam'),
+]
+
+# ---------------- 标题区 / 顶幅 ----------------
 lc.text(MX, 34, '④ 收货的两种路径——同步版阻塞收货 vs 异步版发起与等待分离',
         16.5, lc.C_TXT, 'start', True, maxw=1000, tag='title')
 lc.text(MX, 58, '起点相同：② 已把前向 kernel 入队、GPU 后台执行；差别不在风格，'
@@ -45,255 +110,158 @@ _ch = '放大自 L2 ④拍片『future.result+条件 sample_tokens』· L0：循
 _cw = lc.chip_w(_ch)
 lc.rect(BXR - _cw, 12, _cw, 20, '#ffffff', lc.C_MUTE, rx=9, sw=1.1, dash=True)
 lc.text(BXR - _cw / 2, 26.5, _ch, 9.5, lc.C_BEAT_T, 'middle', True, maxw=_cw - 4, tag='chip')
-
-# ---------------- 共享起点横幅（含两栏比例不同声明） ----------------
-BN_X, BN_W, BN_Y, BN_H = 460, 740, 80, 46
+BN_X, BN_W, BN_Y, BN_H = 460, 740, 72, 40
 lc.rect(BN_X, BN_Y, BN_W, BN_H, lc.C_GPU_F, lc.C_GPU_S, rx=8, sw=1.6)
-lc.text(BN_X + BN_W / 2, BN_Y + 18, '② 前向 kernel 已入队 · GPU 后台执行中——两栏同一时刻起步',
+lc.text(BN_X + BN_W / 2, BN_Y + 14, '② 前向 kernel 已入队 · GPU 后台执行中——两栏同一时刻起步',
         10.5, lc.C_GPU_S, 'middle', True, maxw=BN_W - 16, tag='banner')
-lc.text(BN_X + BN_W / 2, BN_Y + 36, '两栏时间轴比例不同——右栏压缩约 2.5×（1ms 比例尺见各栏左缘；'
-        '块高经最小可见宽放大，时长以标注为准）', 8.5, lc.C_MUTE, 'middle',
+lc.text(BN_X + BN_W / 2, BN_Y + 31, '两栏时间轴比例不同——右栏恰压缩 2.5×（1ms 比例尺见各栏左缘；'
+        '瞬时动作按最小可见高度画、标注真实值）', 8.5, lc.C_MUTE, 'middle',
         maxw=BN_W - 16, tag='banner:scale')
 
-# ---------------- 栏容器 / 栏头 / 泳道 ----------------
-CONT_Y, CONT_H_L, CONT_H_R = 128, 438, 540
-HDR_Y, HDR_H = 136, 34
-LANE_HDR_Y, LANE_HDR_H = 182, 26
-TL_Y0 = 224.0
-LANE_N = 3
-LANE_W = (COL_W - 2 * PAD) / LANE_N
-
-
-def lane_c(col_x, i):
-    return col_x + PAD + LANE_W * (i + 0.5)
-
-
-lc.rect(LX, CONT_Y, COL_W, CONT_H_L, '#ffffff', lc.C_FAINT, rx=10, sw=1.2, dash=True)
-lc.rect(RX, CONT_Y, COL_W, CONT_H_R, '#ffffff', lc.C_FAINT, rx=10, sw=1.2, dash=True)
-lc.text(LX + 14, HDR_Y + 14, '左 · 同步版 step()——阻塞收货', 11, lc.C_ENG_S, 'start', True,
-        maxw=430, tag='colL')
-lc.text(LX + 14, HDR_Y + 28, '拍 3 · 批 {A:1, B:1}（双 decode）· async_scheduling=False（本章主线）',
-        8.5, lc.C_MUTE, 'start', maxw=560, tag='colL:sub')
-lc.text(RX + 14, HDR_Y + 14, '右 · 异步版 step_with_batch_queue()——发起与等待分离', 11,
-        lc.C_ENG_S, 'start', True, maxw=520, tag='colR')
-lc.text(RX + 14, HDR_Y + 28, '拍 2 · 批 {A:1, B:4}（混相）· v0.27.1 服务默认',
-        8.5, lc.C_MUTE, 'start', maxw=560, tag='colR:sub')
-
-LANE_NAMES = ['EngineCore 侧（executor）', 'worker · GPUModelRunner', 'GPU（Blackwell）']
-LANE_STYLES = [(lc.C_BEAT_F, lc.C_BEAT_S, lc.C_ENG_S), (lc.C_GPU_F, lc.C_GPU_S, lc.C_GPU_S),
-               (lc.C_GPU_S, lc.C_GPU_S, '#ffffff')]
-for _cx_col, _cbottom in ((LX, CONT_Y + CONT_H_L), (RX, CONT_Y + CONT_H_R)):
-    for _i, (_nm, (_f, _s, _t)) in enumerate(zip(LANE_NAMES, LANE_STYLES)):
-        _cx = lane_c(_cx_col, _i)
-        lc.rect(_cx - 112, LANE_HDR_Y, 224, LANE_HDR_H, _f, _s, rx=6, sw=1.3)
-        lc.text(_cx, LANE_HDR_Y + 16.5, _nm, 9, _t, 'middle', True, maxw=214, tag='lane:' + _nm[:6])
-        lc.seg(_cx, LANE_HDR_Y + LANE_HDR_H + 2, _cx, _cbottom - 8, lc.C_FAINT, 1.0, dash=True)
-
-# ---------------- 左栏时间分段（同步版拍 3；dy = max(ms*K, min_px)） ----------------
-KL = 115.0
-BANDS_L = [
-    ('b2', 1.341, 154),    # ② 发起
-    ('g1', 0.007, 12),
-    ('b4a', 0.001, 18),    # ④a
-    ('g2', 0.002, 10),
-    ('b4b', 0.358, 76),    # ④b（表头 16 + 三段 20×3）
-    ('g3', 0.007, 12),
-    ('b5', 0.056, 34),     # ⑤
-    ('ret', 0, 14),        # 返回箭头行
+# ---------------- 生命线 + 名牌 + 栏头 ----------------
+NP_Y, NP_H = 138, 22
+LANE_STYLES = [(lc.C_ENG_F, lc.C_ENG_S, lc.C_ENG_S), (lc.C_GPU_F, lc.C_GPU_S, lc.C_GPU_S),
+               (lc.C_GPU_S, lc.C_GPU_S, '#ffffff'), (lc.C_SAM_F, lc.C_SAM_S, lc.C_SAM_S)]
+COL_META = [
+    (L_LANES, LX0, LX1, yl, T_END_L,
+     '左 · 同步版 step()——阻塞收货（拍 3 · 批 {A:1, B:1} 双 decode）', 'async_scheduling=False'),
+    (R_LANES, RX0, RX1, yr, T_END_R,
+     '右 · 异步版 step_with_batch_queue()——发起与等待分离（拍 2 · 批 {A:1, B:4} 混相）',
+     'v0.27.1 服务默认'),
 ]
-YL = {'t0': TL_Y0}
-_y = TL_Y0
-for _key, _ms, _minh in BANDS_L:
-    YL[_key + '_s'] = _y
-    _y += max(_ms * KL, _minh)
-    YL[_key + '_e'] = _y
+for lanes, gx0, gx1, tf, t_end, col_title, col_note in COL_META:
+    for i, (nm, (fill, stroke, tcol)) in enumerate(zip(LANE_NAMES, LANE_STYLES)):
+        lc.rect(lanes[i] - NAMEPLATE_W / 2, NP_Y, NAMEPLATE_W, NP_H, fill, stroke, rx=6, sw=1.3)
+        lc.text(lanes[i], NP_Y + 14.5, nm, 8.5, tcol, 'middle', True, maxw=NAMEPLATE_W - 8,
+                tag='np:' + nm[:6])
+        lc.seg(lanes[i], NP_Y + NP_H + 2, lanes[i], tf(t_end) + 8,
+               lc.C_FAINT, 1.0, dash=True)
+    lc.text(gx0, 122, col_title, 10.5, lc.C_ENG_S, 'start', True, maxw=620, tag='col:t')
+    lc.text(gx1, 122, col_note, 8.5, lc.C_MUTE, 'end', maxw=180, tag='col:note')
 
-# ---------------- 右栏时间分段（异步版拍 2） ----------------
-KR = 44.0
-BANDS_R = [
-    ('b2', 4.146, 182),    # ② 发起（kernel 入队）
-    ('g1', 0.017, 12),
-    ('b4', 0.314, 64),     # ④ 发起即返回（4 行）
-    ('g2', 0, 10),
-    ('wrap', 0, 56),       # 包 AsyncOutputFuture 入 batch_queue
-    ('g3', 0.016, 12),
-    ('result', 0.022, 34), # result()（块内两行：0.022 + 内 event.synchronize 0.012）
-    ('g4', 0.052, 12),
-    ('b5', 0.046, 44),     # ⑤ 延迟一拍
-]
-YR = {'t0': TL_Y0}
-_y = TL_Y0
-for _key, _ms, _minh in BANDS_R:
-    YR[_key + '_s'] = _y
-    _y += max(_ms * KR, _minh)
-    YR[_key + '_e'] = _y
+# ---------------- 1ms 比例尺（各栏左缘） ----------------
+for sx, k in ((76.0, K_L), (888.0, K_R)):
+    lc.seg(sx, TL_Y0, sx, TL_Y0 + k, lc.C_MUTE, 1.4)
+    lc.seg(sx - 5, TL_Y0, sx + 5, TL_Y0, lc.C_MUTE, 1.4)
+    lc.seg(sx - 5, TL_Y0 + k, sx + 5, TL_Y0 + k, lc.C_MUTE, 1.4)
+    lc.text(sx, TL_Y0 + k + 14, '1ms', 7.5, lc.C_MUTE, 'middle', tag='scale')
 
-# 几何锚点
-L_EXEC, L_WORK = lane_c(LX, 0), lane_c(LX, 1)
-L_GPU = lane_c(LX, 2)
-R_EXEC, R_WORK, R_GPU = lane_c(RX, 0), lane_c(RX, 1), lane_c(RX, 2)
-L_GPU_X0, L_GPU_X1 = L_GPU - 85, L_GPU + 85          # 左栏前向条 583..753
-R_FWD_X0, R_FWD_X1 = R_GPU - 87, R_GPU - 17          # 右栏 default stream 条
-R_CP_X0, R_CP_X1 = R_GPU + 7, R_GPU + 77             # 右栏 copy stream 条
+# ---------------- gridlines（事件边界贯穿线 + 主刻度线） ----------------
+L_EVENTS = [0.051, 0.068, 1.349, 1.395, 1.412, 1.770, 1.777, 1.833, 1.860]
+L_MAJOR = [0.5, 1.0, 1.5]
+R_EVENTS = [0.078, 0.098, 4.166, 4.227, 4.244, 4.547, 4.588, 4.646, 4.659]
+R_MAJOR = [1.0, 2.0, 3.0, 4.0]
+for t in L_EVENTS:
+    lc.seg(LX0, yl(t), LX1, yl(t), '#e2e8f0', 0.8)
+for t in L_MAJOR:
+    lc.seg(LX0 - 8, yl(t), LX1, yl(t), '#cbd5e1', 0.9)
+    lc.text(104, yl(t) + 3, ('%.1f' % t), 7.5, lc.C_MUTE, 'end', tag='ax' + str(t))
+for t in R_EVENTS:
+    lc.seg(RX0, yr(t), RX1, yr(t), '#e2e8f0', 0.8)
+for t in R_MAJOR:
+    lc.seg(RX0 - 8, yr(t), RX1, yr(t), '#cbd5e1', 0.9)
+    lc.text(916, yr(t) + 3, ('%.0f' % t), 7.5, lc.C_MUTE, 'end', tag='ax' + str(t))
+lc.text(104, yl(1.860) + 3, '拍尾 1.860', 7.5, lc.C_MUTE, 'end', tag='ax:end')
 
-# ---------------- 每栏 1ms 比例尺（修图单 1：两栏比例不同，给绝对标尺防误读） ----------------
-for _sx, _k in ((LX + 14, KL), (RX + 14, KR)):
-    lc.seg(_sx, TL_Y0, _sx, TL_Y0 + _k, lc.C_MUTE, 1.4)
-    lc.seg(_sx - 6, TL_Y0, _sx + 6, TL_Y0, lc.C_MUTE, 1.4)
-    lc.seg(_sx - 6, TL_Y0 + _k, _sx + 6, TL_Y0 + _k, lc.C_MUTE, 1.4)
-    lc.text(_sx, TL_Y0 + _k + 16, '1ms（比例尺）', 7.5, lc.C_MUTE, 'middle',
-            maxw=58, tag='scale:' + ('L' if _sx == LX + 14 else 'R'))
+# ---------------- 活动条 / 时刻标记 / 消息 ----------------
+ACT_FILL = {'eng': (lc.C_ENG_F, lc.C_ENG_S), 'wrk': (lc.C_GPU_F, lc.C_GPU_S),
+            'wrk3': (lc.C_BEAT_F, lc.C_BEAT_S), 'gpu': (lc.C_GPU_S, 'none'),
+            'd2h': (lc.C_SAM_S, 'none')}
+MSG_COLOR = {'call': lc.C_API_S, 'ret': lc.C_ENG_S, 'sam': lc.C_SAM_S}
+MSG_MARKER = {'dn': 'dn', 'up': 'up', 'std': 'std', 'sam': 'sam'}
+MIN_MARK = 8.0     # dur×K 低于此 → 时刻标记（方块，中心=时间戳，允许 ±3px 微移）
+MIN_BAR = 8.0      # 活动条最小可见高（中心锚定时间戳中点，标注真实值）
 
-# ---------------- 左栏：同步版 ----------------
-# ② 发起块
-lc.rect(L_EXEC - BLK_W / 2, YL['b2_s'], BLK_W, YL['b2_e'] - YL['b2_s'],
-        lc.C_BEAT_F, lc.C_BEAT_S, rx=4, sw=1.4)
-_m2 = (YL['b2_s'] + YL['b2_e']) / 2
-for _i, _ln in enumerate(['② execute_model', '（non_block=True）', '发起 1.341ms',
-                          'kernel 入队即返回', 'Future（内 None · 已 done）']):
-    lc.text(L_EXEC, _m2 - 32 + _i * 17, _ln, 9, lc.C_TXT, 'middle', maxw=BLK_W - 8,
-            tag='Lb2:' + str(_i))
-# ② → GPU：kernel 入队
-_yk = TL_Y0 + 16
-lc.seg(L_EXEC + BLK_W / 2, _yk, L_GPU_X0, _yk, lc.C_API_S, 1.8, 'dn')
-lc.text((L_EXEC + BLK_W / 2 + L_GPU_X0) / 2, _yk - 6, 'kernel 入队（16 层）', 8.2,
-        lc.C_API_S, 'middle', maxw=110, tag='La:launch')
-# GPU 前向条（贯穿全栏）
-lc.rect(L_GPU_X0, TL_Y0, L_GPU_X1 - L_GPU_X0, YL['b5_e'] - TL_Y0, lc.C_GPU_S, 'none',
-        rx=3, sw=0)
-_lm = (TL_Y0 + YL['b5_e']) / 2
-for _i, _ln in enumerate(['前向 kernel', '后台执行', '（default stream）']):
-    lc.text(L_GPU, _lm - 14 + _i * 15, _ln, 9, '#ffffff', 'middle', maxw=160, tag='Lbar:' + str(_i))
-# ④a
-lc.rect(L_EXEC - BLK_W / 2, YL['b4a_s'], BLK_W, YL['b4a_e'] - YL['b4a_s'],
-        lc.C_BEAT_F, lc.C_BEAT_S, rx=4, sw=1.4)
-lc.text(L_EXEC, YL['b4a_s'] + 12.5, '④a result 0.001ms（done→None）', 8.5, lc.C_TXT,
-        'middle', True, maxw=BLK_W - 8, tag='Lb4a')
-# ④b（表头 + 三段着色）
-lc.rect(L_WORK - BLK_W / 2, YL['b4b_s'], BLK_W, YL['b4b_e'] - YL['b4b_s'],
-        lc.C_BEAT_F, lc.C_BEAT_S, rx=4, sw=1.4)
-lc.text(L_WORK, YL['b4b_s'] + 11, '④b sample_tokens 0.358ms', 8.5, lc.C_TXT, 'middle',
-        True, maxw=BLK_W - 8, tag='Lb4b')
-SUB_H = (YL['b4b_e'] - YL['b4b_s'] - 16) / 3
-SUBS = [('等 GPU 尾程', 'wait', lc.C_MUTE), ('掩码+采样 kernel', 'gpu', '#ffffff'),
-        ('同步 D2H', 'sam', '#ffffff')]
-for _i, (_nm, _kind, _tc) in enumerate(SUBS):
-    _sy = YL['b4b_s'] + 16 + _i * SUB_H
-    _fill = 'url(#wait)' if _kind == 'wait' else (lc.C_GPU_S if _kind == 'gpu' else lc.C_SAM_S)
-    _stroke = lc.C_FAINT if _kind == 'wait' else 'none'
-    lc.rect(L_WORK - BLK_W / 2 + 6, _sy, BLK_W - 12, SUB_H, _fill, _stroke, rx=2, sw=1.0)
-    lc.text(L_WORK, _sy + SUB_H / 2 + 3, _nm, 8.2, _tc, 'middle', maxw=BLK_W - 20,
-            tag='Lb4b:sub' + str(_i))
-# ④b 调用（④a 块底 → ④b 块左缘，肘形）
-lc.parrow([(L_EXEC, YL['b4a_e']), (L_EXEC, YL['b4b_s'] + 9), (L_WORK - BLK_W / 2, YL['b4b_s'] + 9)],
-          lc.C_API_S, 1.8, 'dn')
-# ④b 等待段 → GPU 条（event 未完，虚线；完整语义见 GPU 条白字，此处短标签避让）
-_yw = YL['b4b_s'] + 16 + SUB_H / 2
-lc.seg(L_WORK + BLK_W / 2, _yw, L_GPU_X0, _yw, lc.C_FAINT, 1.3, dash=True)
-lc.text((L_WORK + BLK_W / 2 + L_GPU_X0) / 2, _yw - 5, 'event 未完', 7.5, lc.C_MUTE,
-        'middle', maxw=64, tag='La:wait')
-# GPU 条上的 ④b 入口取证刻度
-lc.text(L_GPU, YL['b4b_s'] + 8, '④b 入口：event 未完', 8, '#ffffff', 'middle',
-        maxw=150, tag='Lbar:probe')
-# ④b 返回 → ⑤（肘形：worker 块底边 → ⑤ 块顶边，端点逐贴块边）
-_yr = YL['b4b_e']
-lc.parrow([(L_WORK - BLK_W / 2, _yr), (L_EXEC, _yr), (L_EXEC, YL['b5_s'])],
-          lc.C_ENG_S, 1.8, 'up')
-lc.text(L_EXEC + 78, _yr - 7, 'ModelRunnerOutput（采样+D2H 已在内落地）', 8.5, lc.C_ENG_S,
-        'middle', maxw=200, tag='La:ret4b')
-# ⑤ 当拍记账（标 0.056ms——块高经放大，时长以标注为准）
-lc.rect(L_EXEC - BLK_W / 2, YL['b5_s'], BLK_W, YL['b5_e'] - YL['b5_s'],
-        lc.C_ENG_F, lc.C_ENG_S, rx=4, sw=1.4)
-lc.text(L_EXEC, YL['b5_s'] + 14, '⑤ 紧随其后 · 当拍记账 0.056ms', 8.8, lc.C_TXT, 'middle', True,
-        maxw=BLK_W - 10, tag='Lb5')
-lc.text(L_EXEC, YL['b5_s'] + 27, '（本拍产物本拍出账）', 8.2, lc.C_MUTE, 'middle',
-        maxw=BLK_W - 10, tag='Lb5:sub')
-# 左栏脚注：同步版各拍对照
-lc.text(LX + PAD, CONT_Y + CONT_H_L + 18, '同步版 ④b 各拍实测：0.225 / 0.246 / 0.358 ms'
-        '（prefill / 混相拍同量级）', 8.5, lc.C_MUTE, 'start', maxw=560, tag='Lnote')
 
-# ---------------- 右栏：异步版 ----------------
-# ② 发起块
-lc.rect(R_EXEC - BLK_W / 2, YR['b2_s'], BLK_W, YR['b2_e'] - YR['b2_s'],
-        lc.C_BEAT_F, lc.C_BEAT_S, rx=4, sw=1.4)
-_m2 = (YR['b2_s'] + YR['b2_e']) / 2
-for _i, _ln in enumerate(['② execute_model', '（non_block=True）', '发起 4.146ms',
-                          'kernel 入队即返回']):
-    lc.text(R_EXEC, _m2 - 24 + _i * 17, _ln, 9, lc.C_TXT, 'middle', maxw=BLK_W - 8,
-            tag='Rb2:' + str(_i))
-# ② → GPU：kernel 入队
-_yk = TL_Y0 + 16
-lc.seg(R_EXEC + BLK_W / 2, _yk, R_FWD_X0, _yk, lc.C_API_S, 1.8, 'dn')
-lc.text((R_EXEC + BLK_W / 2 + R_FWD_X0) / 2, _yk - 6, 'kernel 入队', 8.2, lc.C_API_S,
-        'middle', maxw=90, tag='Ra:launch')
-# GPU default stream 前向条（贯穿）
-lc.rect(R_FWD_X0, TL_Y0, R_FWD_X1 - R_FWD_X0, YR['b5_e'] - TL_Y0, lc.C_GPU_S, 'none',
-        rx=3, sw=0)
-lc.text((R_FWD_X0 + R_FWD_X1) / 2, TL_Y0 + 14, '前向', 8.5, '#ffffff', 'middle', True,
-        maxw=60, tag='Rbar:fwd')
-# ④ 发起即返回块（worker）
-lc.rect(R_WORK - BLK_W / 2, YR['b4_s'], BLK_W, YR['b4_e'] - YR['b4_s'],
-        lc.C_GPU_F, lc.C_GPU_S, rx=4, sw=1.4)
-for _i, _ln in enumerate(['④ sample_tokens', '（non_block=True）', '0.314ms 发起即返回',
-                          '→ AsyncGPUModelRunnerOutput']):
-    lc.text(R_WORK, YR['b4_s'] + 15 + _i * 14, _ln, 8.5, lc.C_TXT, 'middle',
-            maxw=BLK_W - 8, tag='Rb4:' + str(_i))
-# copy stream 条（构造时 D2H 起飞 + record event；两行标签挂条右外侧，让开绕底等待线）
-lc.rect(R_CP_X0, YR['b4_e'], R_CP_X1 - R_CP_X0, YR['result_e'] - YR['b4_e'],
-        lc.C_SAM_S, 'none', rx=3, sw=0)
-lc.text(RX + COL_W - 8, YR['b4_e'] - 20, 'copy stream：D2H 起飞', 8,
-        lc.C_SAM_S, 'end', maxw=100, tag='Rcp:top1')
-lc.text(RX + COL_W - 8, YR['b4_e'] - 9, '+ record event', 8,
-        lc.C_SAM_S, 'end', maxw=100, tag='Rcp:top2')
-# ④ 返回 → 包装（肘形：④ 块底边 → wrap 块右缘，逐贴块边、不穿块）
-_yw4 = (YR['wrap_s'] + YR['wrap_e']) / 2
-lc.parrow([(1224, YR['b4_e']), (1224, _yw4), (R_EXEC + BLK_W / 2, _yw4)],
-          lc.C_ENG_S, 1.8, 'up')
-lc.text((1224 + R_EXEC + BLK_W / 2) / 2, _yw4 - 7, 'AsyncGPUModelRunnerOutput', 8.2,
-        lc.C_ENG_S, 'middle', maxw=140, tag='Ra:ret4')
-# 包装块（executor）
-lc.rect(R_EXEC - BLK_W / 2, YR['wrap_s'], BLK_W, YR['wrap_e'] - YR['wrap_s'],
-        lc.C_BEAT_F, lc.C_BEAT_S, rx=4, sw=1.4)
-for _i, _ln in enumerate(['包成 AsyncOutputFuture', '入 batch_queue', '（⑤ 延迟一拍收上一批）']):
-    lc.text(R_EXEC, YR['wrap_s'] + 16 + _i * 15, _ln, 8.5, lc.C_TXT, 'middle',
-            maxw=BLK_W - 8, tag='Rwrap:' + str(_i))
-# result() 块（两行：0.022 主值 + 内 event.synchronize 0.012——极短值按最小可见宽、标注真实值）
-lc.rect(R_EXEC - BLK_W / 2, YR['result_s'], BLK_W, YR['result_e'] - YR['result_s'],
-        lc.C_SAM_F, lc.C_SAM_S, rx=4, sw=1.5)
-lc.text(R_EXEC, YR['result_s'] + 13, 'result() 0.022ms', 9,
-        lc.C_TXT, 'middle', True, maxw=BLK_W - 8, tag='Rresult')
-lc.text(R_EXEC, YR['result_s'] + 27, '内 event.synchronize 0.012ms', 7.8,
-        lc.C_SAM_S, 'middle', maxw=BLK_W - 8, tag='Rresult:sub')
-# result() 只等 D2H 事件（虚线品红绕底路由：result 块右缘 → copy 条底边，不穿任何块）
-lc.parrow([(R_EXEC + BLK_W / 2, (YR['result_s'] + YR['result_e']) / 2),
-           (1112, (YR['result_s'] + YR['result_e']) / 2),
-           (1112, YR['b5_e'] + 10), (1490, YR['b5_e'] + 10), (1490, YR['result_e'])],
-          lc.C_SAM_S, 1.4, 'sam', dash=True)
-lc.text(1301, YR['b5_e'] + 3, '只等 D2H 事件（synchronize，不等计算）', 8.2,
-        lc.C_SAM_S, 'middle', maxw=180, tag='Ra:waitline')
-# ⑤ 延迟一拍块
-lc.rect(R_EXEC - BLK_W / 2, YR['b5_s'], BLK_W, YR['b5_e'] - YR['b5_s'],
-        lc.C_ENG_F, lc.C_ENG_S, rx=4, sw=1.4)
-for _i, _ln in enumerate(['⑤ 延迟一拍：本拍记上一拍的账', '收 beat 1 的 prefill 货：A [7189]',
-                          '（beat 1 无 ⑤ · schedule 填队列优先）']):
-    lc.text(R_EXEC, YR['b5_s'] + 18 + _i * 12, _ln, 8.2, lc.C_TXT, 'middle',
-            maxw=BLK_W - 8, tag='Rb5:' + str(_i))
-# 右栏 GPU 两条流的底部标注（让开绕底等待线）
-lc.text((R_FWD_X0 + R_FWD_X1) / 2, YR['b5_e'] + 30, 'default stream · 前向 kernel', 8,
-        lc.C_MUTE, 'middle', maxw=140, tag='Rbar:sub1')
-lc.text((R_CP_X0 + R_CP_X1) / 2, YR['b5_e'] + 44, 'copy stream · D2H', 8, lc.C_SAM_S,
-        'middle', maxw=100, tag='Rbar:sub2')
+def draw_column(lanes, tf, acts, marks, msgs, lane_tag):
+    for lane_i, t0, t1, style, label_lines, side in acts:
+        x = lanes[lane_i]
+        y0, y1 = tf(t0), tf(t1)
+        h = y1 - y0
+        if style == 'beat3':
+            # ④b/④ 活动条：外框 + 条内竖直三段（④b 三段均分，段界无数字）
+            y_mid, y_top = (y0 + y1) / 2, y0
+            if h < MIN_BAR * 1.5:
+                y_top, h = y_mid - MIN_BAR, MIN_BAR * 2
+            fill, stroke = ACT_FILL['wrk3']
+            lc.rect(x - 6, y_top, 12, h, fill, stroke, rx=2, sw=1.1)
+            seg_h = h / 3
+            subs = [('url(#wait)', lc.C_FAINT), (lc.C_GPU_S, 'none'), (lc.C_SAM_S, 'none')]
+            for si, (sf, ss) in enumerate(subs):
+                lc.rect(x - 4.5, y_top + 1 + si * seg_h, 9, seg_h - 1, sf, ss, rx=1.5, sw=0.8)
+            lc.text(x + 11, y_top - 6, ('④b sample_tokens 0.358ms' if lane_tag == 'L'
+                                        else '④ sample_tokens 0.314ms'), 8, lc.C_TXT, 'start',
+                    True, maxw=170, tag='act4' + lane_tag)
+            continue
+        if h < MIN_BAR:   # 瞬时动作 → 时刻标记
+            ym = (y0 + y1) / 2
+            fill, stroke = ACT_FILL[style]
+            lc.rect(x - 4.5, ym - 4, 9, 8, '#ffffff', stroke, rx=1.5, sw=1.1)
+            continue
+        fill, stroke = ACT_FILL[style]
+        lc.rect(x - 6, y0, 12, h, fill, stroke, rx=2, sw=1.1)
+        if label_lines:
+            for li, ln in enumerate(label_lines):
+                ly = y0 + h / 2 + 5 + li * 12 - (len(label_lines) - 1) * 6
+                if side == 'r-below':
+                    ly = y1 + 12 + li * 12
+                lc.text(x + 11, ly, ln, 8, lc.C_TXT if li == 0 else lc.C_MUTE, 'start',
+                        maxw=186, tag='act' + lane_tag + ln[:6])
+    for lane_i, tc, label, side, dy in marks:
+        x = lanes[lane_i]
+        ym = tf(tc) + dy
+        lc.rect(x - 4.5, ym - 4, 9, 8, '#ffffff', lc.C_ENG_S, rx=1.5, sw=1.1)
+        lines = label if isinstance(label, (list, tuple)) else [label]
+        for li, ln in enumerate(lines):
+            if side == 'left':
+                lc.text(x - 9, ym + 3 + li * 11, ln, 7.8, lc.C_ENG_S, 'end', maxw=150,
+                        tag='mk' + ln[:6])
+            else:
+                lc.text(x + 9, ym + 3 + li * 11, ln, 7.8, lc.C_ENG_S, 'start', maxw=186,
+                        tag='mk' + ln[:6])
+    for xf, xt, t, kind, label, pos, mk in msgs:
+        y = tf(t)
+        lc.seg(xf, y, xt, y, MSG_COLOR[kind], 1.7, MSG_MARKER[mk])
+        mx = (xf + xt) / 2
+        if pos == 'above':
+            lc.text(mx, y - 5, label, 7.8, MSG_COLOR[kind], 'middle', maxw=200,
+                    tag='msg' + label[:6])
+        else:
+            lc.text(mx, y + 12, label, 7.8, MSG_COLOR[kind], 'middle', maxw=200,
+                    tag='msg' + label[:6])
 
-# ---------------- 底部对照条 ----------------
-ST_Y, ST_H = 700, 92
+
+draw_column(L_LANES, yl, L_ACTS, L_MARKS, L_MSGS, 'L')
+draw_column(R_LANES, yr, R_ACTS, R_MARKS, R_MSGS, 'R')
+
+# ---------------- 左栏：GPU 完成区间（水平虚线 + 开闭括号，同图 A 口径） ----------------
+IVL_T0, IVL_T1 = 1.412, 1.770
+IVL_X0, IVL_X1 = L_LANES[1] + 14, L_LANES[2] - 8      # ④b 条旁 → GPU 生命线
+for t in (IVL_T0, IVL_T1):
+    lc.seg(IVL_X0, yl(t), IVL_X1, yl(t), lc.C_KV_S, 1.1, dash=True)
+lc.circle(IVL_X0, yl(IVL_T0), 3.0, lc.C_KV_S, 1.1, dash=False)          # 开端空心圆
+lc.seg(IVL_X0 - 5, yl(IVL_T1), IVL_X0 + 5, yl(IVL_T1), lc.C_KV_S, 2.0)  # 闭端刻度
+lc.seg(IVL_X0, yl(IVL_T0), IVL_X0, yl(IVL_T1), lc.C_KV_S, 1.1, dash=True)
+lc.text((IVL_X0 + IVL_X1) / 2 + 6, (yl(IVL_T0) + yl(IVL_T1)) / 2 + 3,
+        '完成 ∈ (1.412, 1.770]', 8, lc.C_KV_S, 'middle', maxw=130, tag='ivl')
+# fwd_done 拍尾取证上界（GPU 线上虚线延伸）
+lc.seg(L_LANES[2], yl(IVL_T1), L_LANES[2], yl(1.873), lc.C_GPU_S, 1.3, dash=True)
+lc.circle(L_LANES[2], yl(1.873), 3.2, lc.C_KV_S, 1.2, dash=False)
+lc.text(L_LANES[2] + 8, yl(1.873) + 8, '拍尾取证上界 1.873ms', 7.8, lc.C_KV_S, 'start',
+        maxw=150, tag='fwdub')
+
+# 右栏 D2H 事件置位 → result 标记的呼应线（水平虚线，D2H 条底时刻）
+lc.seg(R_LANES[3] - 6, yr(4.588), R_LANES[0] + 14, yr(4.588), lc.C_SAM_S, 1.1, dash=True)
+
+# ---------------- 底部对照条（保留） ----------------
+ST_Y, ST_H = 620, 92
 lc.rect(MX, ST_Y, BXR - MX, ST_H, '#ffffff', lc.C_MUTE, rx=8, sw=1.3)
 lc.text(MX + 16, ST_Y + 20, '发起 vs 等待——同一场景两版对照：谁在关键路径上等', 10.5,
         lc.C_TXT, 'start', True, maxw=520, tag='strip:t')
 LBL_X, SYNC_X, ASYNC_X, NOTE_X = MX + 20, 400.0, 810.0, 1180.0
 CELL_W2 = 360.0
 ROWS = [
-    (ST_Y + 32, '② 发起（kernel 入队）', '同步 1.341ms', '异步 4.146ms',
-     lc.C_ENG_F, lc.C_ENG_S),
+    (ST_Y + 32, '② 发起（kernel 入队）', '同步 1.341ms', '异步 4.146ms', lc.C_ENG_F, lc.C_ENG_S),
     (ST_Y + 60, '④ 收货等待', '同步 0.358ms（阻塞收货）', '异步 0.022ms（只等 D2H）',
      lc.C_SAM_F, lc.C_SAM_S),
 ]
@@ -311,6 +279,10 @@ for _i, _ln in enumerate(['异步版同拍：② 4.146ms vs ④ 0.022ms', '—�
     lc.text(NOTE_X + 10, ST_Y + 32 + _i * 13, _ln, 8.5, lc.C_TXT if _i < 3 else lc.C_MUTE,
             'start', maxw=400, tag='note:' + str(_i))
 
+# 左栏脚注（同步版各拍对照，保留）
+lc.text(66, 592, '同步版 ④b 各拍实测：0.225 / 0.246 / 0.358ms（prefill / 混相拍同量级）',
+        8.5, lc.C_MUTE, 'start', maxw=560, tag='Lnote')
+
 # ---------------- 图例 ----------------
 LEG_Y = ST_Y + ST_H + 20
 lx = MX
@@ -318,37 +290,46 @@ lx = MX
 
 def leg(kind, name):
     global lx
-    if kind == 'gpu':
-        lc.rect(lx, LEG_Y - 9, 20, 12, lc.C_GPU_S, 'none', rx=3, sw=0)
-    elif kind == 'sam':
-        lc.rect(lx, LEG_Y - 9, 20, 12, lc.C_SAM_S, 'none', rx=3, sw=0)
+    if kind == 'eng':
+        lc.rect(lx, LEG_Y - 9, 8, 12, lc.C_ENG_F, lc.C_ENG_S, rx=1.5, sw=1.1)
+    elif kind == 'wrk':
+        lc.rect(lx + 2, LEG_Y - 9, 8, 12, lc.C_GPU_F, lc.C_GPU_S, rx=1.5, sw=1.1)
+    elif kind == 'gpu':
+        lc.rect(lx + 4, LEG_Y - 9, 8, 12, lc.C_GPU_S, 'none', rx=1.5, sw=0)
+    elif kind == 'd2h':
+        lc.rect(lx + 6, LEG_Y - 9, 8, 12, lc.C_SAM_S, 'none', rx=1.5, sw=0)
     elif kind == 'hatch':
-        lc.rect(lx, LEG_Y - 9, 20, 12, 'url(#wait)', lc.C_FAINT, rx=3, sw=1.0)
-    elif kind == 'cpu':
-        lc.rect(lx, LEG_Y - 9, 20, 12, lc.C_BEAT_F, lc.C_BEAT_S, rx=3, sw=1.3)
+        lc.rect(lx + 8, LEG_Y - 9, 8, 12, 'url(#wait)', lc.C_FAINT, rx=1.5, sw=1.0)
+    elif kind == 'mark':
+        lc.rect(lx + 10, LEG_Y - 6, 9, 8, '#ffffff', lc.C_ENG_S, rx=1.5, sw=1.1)
     elif kind == 'call':
-        lc.seg(lx, LEG_Y - 3, lx + 26, LEG_Y - 3, lc.C_API_S, 2.0)
+        lc.seg(lx + 14, LEG_Y - 3, lx + 40, LEG_Y - 3, lc.C_API_S, 1.7, 'dn')
+    elif kind == 'grid':
+        lc.seg(lx + 14, LEG_Y - 3, lx + 40, LEG_Y - 3, '#cbd5e1', 0.9)
     else:
-        lc.seg(lx, LEG_Y - 3, lx + 26, LEG_Y - 3, lc.C_ENG_S, 2.0)
-    lc.text(lx + 26, LEG_Y + 1, name, 8.5, lc.C_TXT, 'start', maxw=300, tag='leg:' + name[:8])
-    lx += 26 + lc.tw(name, 8.5) + 20
+        lc.seg(lx + 14, LEG_Y - 3, lx + 40, LEG_Y - 3, lc.C_ENG_S, 1.7, 'up')
+    lc.text(lx + 46, LEG_Y + 1, name, 8.5, lc.C_TXT, 'start', maxw=300, tag='leg:' + name[:8])
+    lx += 46 + lc.tw(name, 8.5) + 20
 
 
-leg('gpu', 'GPU kernel（default stream）')
-leg('sam', 'D2H 拷贝 / 事件（收货等待点）')
-leg('hatch', '等待（非计算）')
-leg('cpu', 'CPU 侧发起 / 包装')
-leg('call', '调用 / 发起 →')
-leg('ret', '← 返回')
+leg('eng', 'EngineCore 活动')
+leg('wrk', 'Worker 活动')
+leg('gpu', 'GPU 前向执行')
+leg('d2h', 'D2H 拷贝')
+leg('hatch', '等 GPU 尾程（非计算）')
+leg('mark', '瞬时动作标记')
+leg('grid', 'gridline=同一时刻')
+leg('call', '消息·调用 →')
+leg('ret', '← 消息·返回')
 
 # ---------------- 页脚 ----------------
-lc.text(MX, H - 34, '数字取自真引擎实测：容器内钉版 v0.27.1 源树全链路 + NVIDIA RTX PRO 6000 '
+lc.text(MX, H - 30, '数字取自真引擎实测：容器内钉版 v0.27.1 源树全链路 + NVIDIA RTX PRO 6000 '
         'Blackwell + tiny 随机权重 Llama（16 层）· 同一请求场景两版各跑一遍（左 = 拍 3、右 = 拍 2）',
         8.5, lc.C_FAINT, 'start', maxw=BXR - MX, tag='foot:1')
-lc.text(MX, H - 16, '逐字锚 vllm/v1/executor/uniproc_executor.py:L26-L42（AsyncOutputFuture）'
+lc.text(MX, H - 12, '逐字锚 vllm/v1/executor/uniproc_executor.py:L26-L42（AsyncOutputFuture）'
         '· L91-L106（collective_rpc 两条支）· vllm/v1/worker/gpu_model_runner.py'
-        '（AsyncGPUModelRunnerOutput · copy stream D2H）· 两栏时间轴比例不同（右栏约压缩 2.5×，'
-        '1ms 比例尺见各栏左缘）· 分段非线性、块高经最小可见宽放大，时长一律以标注数值为准',
+        '（AsyncGPUModelRunnerOutput · copy stream D2H）· 线性时间轴：y=时间戳×比例尺'
+        '（右栏恰压缩 2.5×）；瞬时动作最小可见高度、标注真实值',
         8.5, lc.C_FAINT, 'start', maxw=BXR - MX, tag='foot:2')
 
 # ---------------- 装配输出 ----------------
@@ -365,7 +346,9 @@ svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
 out = HERE / 'ch09-fig-two-phase-two-paths.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
-print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
+print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems, '
+      f'K_L={K_L} K_R={K_R} ratio={K_L / K_R:.2f}, '
+      f'L axis {TL_Y0:.0f}..{yl(T_END_L):.0f}, R axis {TL_Y0:.0f}..{yr(T_END_R):.0f})')
 if lc.WARN:
     print('--- OVERFLOW WARNINGS ---')
     for w_ in lc.WARN:
