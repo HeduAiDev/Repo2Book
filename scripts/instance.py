@@ -78,12 +78,19 @@ def book_dir(name=None):
 
 
 def chapters_glob(name=None):
-    """活动实例的所有章节正文（相对仓库根，linter --all 用）。"""
-    return os.path.relpath(artifacts_dir(name) / "ch*" / "narrative" / "chapter.md", ROOT)
+    """活动实例的所有章节正文 glob 模式（相对仓库根，linter --all 自行 glob）。
+
+    v3 起章目录在 artifacts-v3/（artifacts/ 是 v2 存量）——`artifacts*` 通配
+    两代都扫，否则 --all 对 v3 章节恒空转=假绿灯（exp-2026-09-05，ch27 评审
+    发现，与 active_instance 扫错实例是两层叠加盲区）。返回值保持 pattern
+    字符串契约（消费方 `glob.glob(instance.chapters_glob())`）。
+    """
+    return os.path.relpath(instance_dir(name) / "artifacts*" / "ch*" / "narrative" / "chapter.md", ROOT)
 
 
 def diagrams_glob(name=None):
-    return os.path.relpath(artifacts_dir(name) / "ch*" / "diagrams" / "*.svg", ROOT)
+    """同 chapters_glob：`artifacts*` 通配两代章目录（v2 artifacts/ + v3 artifacts-v3/）。"""
+    return os.path.relpath(instance_dir(name) / "artifacts*" / "ch*" / "diagrams" / "*.svg", ROOT)
 
 
 def canonical_prefix(name=None):
