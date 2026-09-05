@@ -2,28 +2,28 @@
 
 [第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)结尾留了个念想：`EngineCoreOutput` 的字段表里，`new_logprobs` 每次路过都没打开过。现在打开它——顺着这个字段往下走，三个问题会一个比一个硌手。
 
-第一问：采样之前，惩罚（对已出现 token 压分的干预）和温度（把分布拉尖或摊平的旋钮）已经把 logits 改了个底朝天（[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)立过的记分板——全词表分数向量，此刻正被逐项改写）。用户要的 logprobs，报的是改之前的数还是改之后的数？两份答案差多远、坑的是谁？
+第一问：采样之前，惩罚（对已出现 token 压分的干预）和温度（把分布拉尖或摊平的旋钮）已经把 logits 改了个底朝天（[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)立过的记分板，即全词表分数向量，此刻正被逐项改写）。用户要的 logprobs，报的是改之前的数还是改之后的数？两份答案差多远、坑的是谁？
 
-第二问：一个汉字被 byte-fallback 词表拆成三个 byte token（[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)立过的字节回退——词表外的字符按 UTF-8 逐字节拆开）。主泳道的增量解码靠「扣住尾巴等凑齐」拼回整字；可 logprobs 的要求苛刻得多——每个位置要报一排候选：不止被采中的那个，还有模型最想要的另外几个，**每个候选都得独立成词**。半个字节拼不成字，那半个字怎么单独报？
+第二问：一个汉字被 byte-fallback 词表拆成三个 byte token（[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)立过的字节回退，词表外的字符按 UTF-8 逐字节拆开）。主泳道的增量解码靠「扣住尾巴等凑齐」拼回整字；可 logprobs 的要求苛刻得多。每个位置要报一排候选：不止被采中的那个，还有模型最想要的另外几个，**每个候选都得独立成词**。半个字节拼不成字，那半个字怎么单独报？
 
 第三问：响应里那串 bytes 数字 `[228, 184, 173]`，到底在告诉你什么？半个字的候选文本被修成空串后，为什么把全位置的 bytes 串起来，仍能无损还原原文？
 
-这三个问题在同一条支路上。上一章走的是上行泳道的主泳道——token 变文字；本章走它的邻座——概率维度。两条泳道搭同一班车、进同一个循环、在同一个门口出门，但一路上干的是完全不同的活。
+这三个问题在同一条支路上。上一章走的是上行泳道的主泳道（token 变文字），本章走它的邻座（概率维度）。两条泳道搭同一班车、进同一个循环、在同一个门口出门，但一路上干的是完全不同的活。
 
 ## 你在这里
 
-![L2 章图：logprobs 支路——从 GPU 采样器到 SSE 三件套](../diagrams/L2-ch8.png)
+![L2 章图：logprobs 支路（从 GPU 采样器到 SSE 三件套）](../diagrams/L2-ch8.png)
 
-> *图注：本章放大的是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 图上横跨三段的一线——橙色 EngineCore 带里的采样出口列（品红那列，logprobs 在这里诞生，对应 L0 图一拍里 ④ sample 那一步的内部，sampler.py 的 ④ sample_tokens 框就画在这列）、紫色 ZMQ 带（跟主泳道同车过线）、蓝色 API 进程带（装配与出门）——正是[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)十六站走读里站 13 采样、站 15 回程、站 16 理货这三站的支路视角。上排是支路的两个门：进门把用户的 logprobs 声明翻译成采样参数，出门装出 token/logprob/bytes 三件套；中排 ①-⑩ 是十道工序（①-④ 在引擎侧的 GPU 执行臂与采样出口列、⑤ 也在引擎进程——它的「过线」指发车动作，切行的 scheduler.py 与 msgpack 编码钩子都仍在引擎侧跑；⑥-⑩ 在 API 进程），与[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)主泳道的九道工序同车不同步；下排是 prompt 支路（支路中的支路）与四笔小注（三笔 why 注 + 一笔 v0.27 新契约登记）。接点：⑥ 分派正是上一章 process_outputs 单循环里「第 3 步」那个每次路过都没展开的调用点；⑩ 出口装车兑现上一章装箱时省略的 logprobs 与 cumulative_logprob 两个桶。站号 1-14 = 支路流经代码的顺序（与上一章主泳道的站号各自独立），正文按讲解需要编排、不必照站号读。*
+> *图注：本章放大的是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 图上横跨三段的一线：橙色 EngineCore 带里的采样出口列（品红那列，logprobs 在这里诞生，对应 L0 图一拍里 ④ sample 那一步的内部，sampler.py 的 ④ sample_tokens 框就画在这列）、紫色 ZMQ 带（跟主泳道同车过线）、蓝色 API 进程带（装配与出门）。正是[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)十六站走读里站 13 采样、站 15 回程、站 16 理货这三站的支路视角。上排是支路的两个门：进门把用户的 logprobs 声明翻译成采样参数，出门装出 token/logprob/bytes 三件套；中排 ①-⑩ 是十道工序（①-④ 在引擎侧的 GPU 执行臂与采样出口列、⑤ 也在引擎进程：它的「过线」指发车动作，切行的 scheduler.py 与 msgpack 编码钩子都仍在引擎侧跑；⑥-⑩ 在 API 进程），与[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)主泳道的九道工序同车不同步；下排是 prompt 支路（支路中的支路）与四笔小注（三笔 why 注 + 一笔 v0.27 新契约登记）。接点：⑥ 分派正是上一章 process_outputs 单循环里「第 3 步」那个每次路过都没展开的调用点；⑩ 出口装车兑现上一章装箱时省略的 logprobs 与 cumulative_logprob 两个桶。站号 1-14 = 支路流经代码的顺序（与上一章主泳道的站号各自独立），正文按讲解需要编排、不必照站号读。*
 
-读法建议：只想知道「惩罚前还是惩罚后」这个题眼，直奔[「留底要早：惩罚不扭曲模型意见」](#留底要早惩罚不扭曲模型意见站-3)；「半个字怎么报」在[「半个字怎么报：U+FFFD 修正」](#半个字怎么报ufffd-修正站-10)；「bytes 数字是什么」在[「出口三件套：token、logprob、bytes」](#出口三件套tokenlogprobbytes站-14)；想从头跟支路全程，按序读。图与正文有两套编号，对照是：中排工序 ①=站 2（批登记）、②=站 3（raw 留底）、③=站 4（gather 三件套）、④=站 5（D2H）、⑤=站 6-7（切行+过线）、⑥=站 8（分派）、⑦=站 9（sample 装配）、⑧=站 10（U+FFFD 修正）、⑨=站 11（落容器）、⑩=站 13（出口装车）——站 1（进门翻译）、站 12（prompt 支路）、站 14（OpenAI 门面）不在中排十道工序内，图上分别住在北排与下排。
+读法建议：只想知道「惩罚前还是惩罚后」这个题眼，直奔[「留底要早：惩罚不扭曲模型意见」](#留底要早惩罚不扭曲模型意见站-3)；「半个字怎么报」在[「半个字怎么报：U+FFFD 修正」](#半个字怎么报ufffd-修正站-10)；「bytes 数字是什么」在[「出口三件套：token、logprob、bytes」](#出口三件套tokenlogprobbytes站-14)；想从头跟支路全程，按序读。图与正文有两套编号，对照是：中排工序 ①=站 2（批登记）、②=站 3（raw 留底）、③=站 4（gather 三件套）、④=站 5（D2H）、⑤=站 6-7（切行+过线）、⑥=站 8（分派）、⑦=站 9（sample 装配）、⑧=站 10（U+FFFD 修正）、⑨=站 11（落容器）、⑩=站 13（出口装车）。站 1（进门翻译）、站 12（prompt 支路）、站 14（OpenAI 门面）不在中排十道工序内，图上分别住在北排与下排。
 
 ## 一个开关，四份声明（站 1）
 
 支路的第一站不在引擎、不在 GPU，在 HTTP 请求进门的翻译处。[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)走过这里：`to_sampling_params` 把请求参数逐项抄进 `SamplingParams`。上一章抄的是 `output_kind`（三态契约的入口声明），这次轮到 logprobs 的四份声明：
 
 ```python
-# vllm/entrypoints/openai/chat_completion/protocol.py:L709-L715
+# vllm/entrypoints/openai/chat_completion/protocol.py:L709-L715 · ChatCompletionRequest.to_sampling_params
             logprobs=(
                 self.top_logprobs
                 if self.logprobs and not self.logprob_token_ids
@@ -33,25 +33,25 @@
             logprob_token_ids=self.logprob_token_ids or None,
 ```
 
-（节选自 `to_sampling_params` 的参数抄写处——上面是 `SamplingParams.from_optional(...)` 这个大调用里的七行，前后的采样参数与输出参数行省去；`output_kind` 那两行上一章见过：`stream=True` → DELTA、否则 FINAL_ONLY——三态契约见[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)，本章第 13 站是它在概率维度上的投影。）
+（节选自 `to_sampling_params` 的参数抄写处：上面是 `SamplingParams.from_optional(...)` 这个大调用里的七行，前后的采样参数与输出参数行省去；`output_kind` 那两行上一章见过：`stream=True` → DELTA、否则 FINAL_ONLY；三态契约见[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)，本章第 13 站是它在概率维度上的投影。）
 
 四份声明对应四个采样参数（`vllm/sampling_params.py:L267-L289`），语义各管一段：
 
-- **`logprobs`（整数）**：每个**生成**位置要报几个最可能 token 的对数概率——vLLM 自家的口径是「k 个候选 + 恒含被采样 token，最多 k+1 条」。这个「+1」的形状是从 OpenAI 那里继承的：legacy Completions API 的 `logprobs` 本来就是整数参数，官方定义是「返回前 logprobs 名最可能 token 的对数概率，**外加被选中的 token**」、取值 0-5（[官方参考](https://developers.openai.com/api/reference/resources/completions/methods/create/)）；Chat API 后来改成了 `logprobs=true` + `top_logprobs=N` 两参数的形状。vLLM 对齐的是这份接口**形状**：入口把 `logprobs=true` 与 `top_logprobs=N` 合并翻译成 `SamplingParams.logprobs=N`（L713 那个条件表达式）。
-- **`prompt_logprobs`（整数）**：给 **prompt** 的每个位置也报概率——「模型看这段前文时，有多想写下一个字」。它跟 `logprobs` 完全独立：不想要生成侧的概率、只想要 prompt 侧的，可以单开它。
-- **`logprob_token_ids`（token id 列表）**：不报 top-k（前 k 名），只报你点名的几个 token 的概率——打分场景（scoring，比较固定几个标签 token 的概率）比全词表省得多。注意 L713 的条件里藏着优先级：设了 `logprob_token_ids`，`logprobs` 就被置 None——点名册优先于领奖台（第 4 站细看）。
-- **`flat_logprobs`（布尔，默认 False）**：容器形状开关——概率数据用嵌套 dict 还是扁平列表存。第 11 站专门算这笔账。
+- **`logprobs`（整数）**：每个**生成**位置要报几个最可能 token 的对数概率：vLLM 自家的口径是「k 个候选 + 恒含被采样 token，最多 k+1 条」。这个「+1」的形状是从 OpenAI 那里继承的：legacy Completions API 的 `logprobs` 本来就是整数参数，官方定义是「返回前 logprobs 名最可能 token 的对数概率，**外加被选中的 token**」、取值 0-5（[官方参考](https://developers.openai.com/api/reference/resources/completions/methods/create/)）；Chat API 后来改成了 `logprobs=true` + `top_logprobs=N` 两参数的形状。vLLM 对齐的是这份接口**形状**：入口把 `logprobs=true` 与 `top_logprobs=N` 合并翻译成 `SamplingParams.logprobs=N`（L713 那个条件表达式）。
+- **`prompt_logprobs`（整数）**：给 **prompt** 的每个位置也报概率：「模型看这段前文时，有多想写下一个字」。它跟 `logprobs` 完全独立：不想要生成侧的概率、只想要 prompt 侧的，可以单开它。
+- **`logprob_token_ids`（token id 列表）**：不报 top-k（前 k 名），只报你点名的几个 token 的概率。打分场景（scoring，比较固定几个标签 token 的概率）比全词表省得多。注意 L713 的条件里藏着优先级：设了 `logprob_token_ids`，`logprobs` 就被置 None——点名册优先于领奖台（第 4 站细看）。
+- **`flat_logprobs`（布尔，默认 False）**：容器形状开关：概率数据用嵌套 dict 还是扁平列表存。第 11 站专门算这笔账。
 
-四份声明全空时发生什么？**整条支路一行不跑**。采样器不留底（`sampler.py:L86` 的条件不满足）、引擎批不登记、`EngineCoreOutput` 的两个 logprobs 字段恒为 None、API 进程的装配器三个容器全 None、出口字段全 None。没开 logprobs 的请求，每个环节只付一次 None 判断的成本——这条支路与主泳道零耦合，开了才付账（每步 k+1 列的 GPU、搬运、过线、装配四道税，第 5-7 站算）。一个「可选维度」从入口到出口全程静默关闭，这是引擎能把可选功能做便宜的唯一方式。
+四份声明全空时发生什么？**整条支路一行不跑**。采样器不留底（`sampler.py:L86` 的条件不满足）、引擎批不登记、`EngineCoreOutput` 的两个 logprobs 字段恒为 None、API 进程的装配器三个容器全 None、出口字段全 None。没开 logprobs 的请求，每个环节只付一次 None 判断的成本。这条支路与主泳道零耦合，开了才付账（每步 k+1 列的 GPU、搬运、过线、装配四道税，第 5-7 站算）。一个「可选维度」从入口到出口全程静默关闭，这是引擎能把可选功能做便宜的唯一方式。
 
-顺带一句边界：OpenAI Chat API 的 `top_logprobs` 上限是 20（服务端硬顶，[官方参考](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create/)；legacy Completions `logprobs` 才是上面那个 0-5 档），vLLM 的上限是自家的引擎参数 `max_logprobs`——默认 20（源码 docstring 自注默认值取自 OpenAI Chat Completions API），但可配置、设 -1 不设顶可要全词表（`config/model.py:L242`）。兼容的是形状；上限一硬一软。
+顺带一句边界：OpenAI Chat API 的 `top_logprobs` 上限是 20（服务端硬顶，[官方参考](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create/)；legacy Completions `logprobs` 才是上面那个 0-5 档），vLLM 的上限是自家的引擎参数 `max_logprobs`，默认 20（源码 docstring 自注默认值取自 OpenAI Chat Completions API），但可配置、设 -1 不设顶可要全词表（`config/model.py:L242`）。兼容的是形状；上限一硬一软。
 
 ## 团体餐的账：批登记与批级最大值（站 2）
 
 镜头切到 L0 图的 EngineCore 带（橙色带里那段绿色 GPU 执行臂）。请求进了引擎批（[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)站 10 调度组的那个持久批次），它对 logprobs 的需求要在批上登记：
 
 ```python
-# vllm/v1/worker/gpu_input_batch.py:L435-L444
+# vllm/v1/worker/gpu_input_batch.py:L435-L444 · InputBatch.add_request
             if sampling_params.logprobs is not None:
                 self.num_logprobs[req_id] = (
                     self.vocab_size
@@ -64,7 +64,7 @@
                 self.logprob_token_ids[req_id] = sampling_params.logprob_token_ids
 ```
 
-一个 dict 记账：`num_logprobs[req_id] = k`，请求完成时弹出。`logprobs=-1`（全词表）在登记位就换算成 `vocab_size`——引擎批这份账里从此没有「-1」这个值、sampler 只见具体数字（API 侧请求参数里那份 -1 仍原样保留，装配端有专门分支兜住——第 11 站情形 4 就是它）。
+一个 dict 记账：`num_logprobs[req_id] = k`，请求完成时弹出。`logprobs=-1`（全词表）在登记位就换算成 `vocab_size`：引擎批这份账里从此没有「-1」这个值、sampler 只见具体数字（API 侧请求参数里那份 -1 仍原样保留，装配端有专门分支兜住（第 11 站情形 4 就是它）。
 
 登记的用途只有一个：算批级最大值。
 
@@ -75,21 +75,21 @@
         return max(self.num_logprobs.values()) if self.num_logprobs else None
 ```
 
-为什么取 max 而不是各算各的？直觉是**团体餐按最挑食的人点菜**：GPU 张量必须批内形状一致——全批一个 `[num_tok, k+1]` 张量装下所有请求的候选。批内一人要 20 个候选，sampler 就为全批每行都算满 21 列；回程各请求下车时再按自己的 k 截断，多算的候选静默丢弃。这笔账实测过（配套精简版，host 实跑；引擎侧输入手工构造、形状与真实 gather 产出同构）：
+为什么取 max 而不是各算各的？直觉是**团体餐按最挑食的人点菜**：GPU 张量必须批内形状一致：全批一个 `[num_tok, k+1]` 张量装下所有请求的候选。批内一人要 20 个候选，sampler 就为全批每行都算满 21 列；回程各请求下车时再按自己的 k 截断，多算的候选静默丢弃。这笔账实测过（配套精简版，host 实跑；引擎侧输入手工构造、形状与真实 gather 产出同构）：
 
 <!-- trace: m3 -->
 | 阶段 | 动作 | 数字 | 结果 |
 |---|---|---|---|
-| 登记 · 三请求进批 | num_logprobs 字典记账 | r_a=1、r_b=3、r_c 不进字典 | 静默请求零记账——max_num_logprobs=3 |
+| 登记 · 三请求进批 | num_logprobs 字典记账 | r_a=1、r_b=3、r_c 不进字典 | 静默请求零记账，max_num_logprobs=3 |
 | 均一化 · 采样元数据 | max_num_logprobs=max(全部) 进 SamplingMetadata | k=3 → 全批算 k+1=4 列 | r_a 的行也带满 4 列过线（indices [5,3,2,4]）；r_b 行 [0,0,1,2] |
 | -1 探针 | logprobs=-1 登记 | -1 → vocab_size=8 | 全词表档在登记位换算；此刻批 max 跳到 8 |
 | 回程切行 | slice_request 按请求行数切 | 各 1 行、4 列 | 调度器给每请求切出自己的 numpy 行 |
 | 装配截断 | append 时按自己的 k 截 rank 链 | r_a(k=1) 留 2 项 [5,3]；r_b(k=3) 收 4 列去重成 3 项 [0,1,2] | 多算的候选静默丢弃；被采样==top1 的重复列被 dict 键吃掉 |
 | 退场 | finish 时 remove_request 弹出 | max 3 → 1 → None | 最后一人退场，sampler 的 k 随批收缩 |
 
-（探测的 r_d 加入后批 max 短暂跳 8 又随退场回落，只为看清登记位换算；真实批按请求生命周期进出，不会这样振荡。表里三个先用的词按结论记：indices＝过线的候选 token id 列，第 4 站 gather 三件套的产物；SamplingMetadata＝每拍随采样调用下发的批级参数包，k 值从批账本到采样器就靠它传递——max_num_logprobs 与点名册名单都装在里面往 sampler 送（下一站代码里 `sampling_metadata.max_num_logprobs` 读的就是它）；「按自己的 k 截 rank 链」「dict 键吃掉重复列」两处机关第 11 站才展开——结论是批 max 算宽的列会在装配端按各请求自己的 k 截掉，多算的候选静默丢弃。）
+（探测的 r_d 加入后批 max 短暂跳 8 又随退场回落，只为看清登记位换算；真实批按请求生命周期进出，不会这样振荡。表里三个先用的词按结论记：indices＝过线的候选 token id 列，第 4 站 gather 三件套的产物；SamplingMetadata＝每拍随采样调用下发的批级参数包，k 值从批账本到采样器就靠它传递：max_num_logprobs 与点名册名单都装在里面往 sampler 送（下一站代码里 `sampling_metadata.max_num_logprobs` 读的就是它）；「按自己的 k 截 rank 链」「dict 键吃掉重复列」两处机关第 11 站才展开。结论是批 max 算宽的列会在装配端按各请求自己的 k 截掉，多算的候选静默丢弃。）
 
-两笔对冲的账：批内 max=20 而多数请求 k=1 时，每步每请求多算 19 列 GPU gather、多搬 19 列、多编 19 列的字节——纯浪费；换来的是**批均一张量**这个前提——一个张量装全批、一次 GPU 算子跑全批、一条消息带全批（回程班车的形状要求，第 7 站细看）。变长列需要变长编码与逐请求 kernel，vLLM 选了「算宽点、传一条」。
+两笔对冲的账：批内 max=20 而多数请求 k=1 时，每步每请求多算 19 列 GPU gather、多搬 19 列、多编 19 列的字节，纯浪费；换来的是**批均一张量**这个前提：一个张量装全批、一次 GPU 算子跑全批、一条消息带全批（回程班车的形状要求，第 7 站细看）。变长列需要变长编码与逐请求 kernel，vLLM 选了「算宽点、传一条」。
 
 ## 留底要早：惩罚不扭曲模型意见（站 3）
 
@@ -97,7 +97,7 @@
 
 ### logprob 是什么：概率在浮点机里的住法
 
-**logprob 就是概率取自然对数**：模型在某个位置对「下一个 token 是它」打出的对数分。OpenAI Cookbook 的定义：「a logprob is log(p), where p = probability of a token occurring at a specific position based on the previous tokens in the context」（[Cookbook](https://developers.openai.com/cookbook/examples/using_logprobs)）——取值是任意负数或 0，0 对应 100% 概率。
+**logprob 就是概率取自然对数**：模型在某个位置对「下一个 token 是它」打出的对数分。OpenAI Cookbook 的定义：「a logprob is log(p), where p = probability of a token occurring at a specific position based on the previous tokens in the context」（[Cookbook](https://developers.openai.com/cookbook/examples/using_logprobs)）。取值是任意负数或 0，0 对应 100% 概率。
 
 模型每步吐的原始产物是 logits（[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)的记分板：全词表、未归一化的分数向量）。从 logit 到 logprob 只差一个归一化：
 
@@ -112,18 +112,18 @@
 \mathrm{logsumexp} = \ln(e^{2.0} + e^{1.0} + e^{0.1}) = \ln(7.389 + 2.718 + 1.105) = \ln(11.212) = 2.417
 ```
 
-归一化项 2.417，逐项减它得 logprobs = [−0.417, −1.417, −2.317]；验算 $`e^{-0.417} \approx 0.659`$，正是 softmax 第一名（softmax＝把 logits 逐项指数化再归一化成概率分布的那一步——上面手算在 log 空间做的就是它：先指数化求和、再逐项减去总账）。要点在那句减法：**每个 token 的 logprob = 自家 logit − 全词表公共归一化项**——「模型意见」的分布形状由此定。
+归一化项 2.417，逐项减它得 logprobs = [−0.417, −1.417, −2.317]；验算 $`e^{-0.417} \approx 0.659`$，正是 softmax 第一名（softmax＝把 logits 逐项指数化再归一化成概率分布的那一步，上面手算在 log 空间做的就是它：先指数化求和、再逐项减去总账）。要点在那句减法：**每个 token 的 logprob = 自家 logit − 全词表公共归一化项**——「模型意见」的分布形状由此定。
 
-为什么整个生态都住 log 空间而不是概率空间？两个硬理由。一是数值：PyTorch 文档对 `log_softmax` 的原话——「While mathematically equivalent to log(softmax(x)), doing these two operations separately is slower and numerically unstable」（[文档](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.log_softmax.html)）；朴素地先 softmax 再取对数，小概率会下溢成 0、log(0) 直接 −inf，log_softmax 用 log-sum-exp 技巧单 kernel 保稳（`logsumexp` 文档原话「The computation is numerically stabilized」）。二是连乘：序列联合概率 $`\prod_i P(x_i)`$ 在 fp32（最小正规范数约 1.18e-38）下几十个 token 就下溢——100 个 token 每个 P=0.01，乘积 1e-200 存不下；log 域里换成加法 $`\sum_i \log P(x_i)`$，本例 = 100 × (−4.605) = −460.5，有限且精确。本章后面那个 `cumulative_logprob` 字段用加法不用乘法，全部理由就在这。
+为什么整个生态都住 log 空间而不是概率空间？两个硬理由。一是数值：PyTorch 文档对 `log_softmax` 的原话：「While mathematically equivalent to log(softmax(x)), doing these two operations separately is slower and numerically unstable」（[文档](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.log_softmax.html)）；朴素地先 softmax 再取对数，小概率会下溢成 0、log(0) 直接 −inf，log_softmax 用 log-sum-exp 技巧单 kernel 保稳（`logsumexp` 文档原话「The computation is numerically stabilized」）。二是连乘：序列联合概率 $`\prod_i P(x_i)`$ 在 fp32（最小正规范数约 1.18e-38）下几十个 token 就下溢：100 个 token 每个 P=0.01，乘积 1e-200 存不下；log 域里换成加法 $`\sum_i \log P(x_i)`$，本例 = 100 × (−4.605) = −460.5，有限且精确。本章后面那个 `cumulative_logprob` 字段用加法不用乘法，全部理由就在这。
 
-（顺带：训练 loss 是平均负对数似然、困惑度是它的指数——语言模型从来都在 log 域记账。本章 prompt 支路产的就是自建困惑度/打分管线的原料。）
+（顺带：训练 loss 是平均负对数似然、困惑度是它的指数，语言模型从来都在 log 域记账。本章 prompt 支路产的就是自建困惑度/打分管线的原料。）
 
 ### 代码：抢在一切变换之前
 
 采样器一拍里对 logits 的加工顺序是固定的：先算 logprobs 留底，再做 fp32 转换（fp32＝32 位单精度浮点，模型计算里的稳妥精度档）、上惩罚、上温度、采样。看代码：
 
 ```python
-# vllm/v1/sample/sampler.py:L79-L104
+# vllm/v1/sample/sampler.py:L79-L104 · Sampler.forward
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
         # NOTE(woosuk): Use the original logits (before any penalties or
         # temperature scaling) for the top-k logprobs.
@@ -152,39 +152,39 @@
             raw_logprobs = processed_logprobs  # L104
 ```
 
-留底发生在 L88——`compute_logprobs` 就一行（`log_softmax(dim=-1, dtype=float32)`，`sampler.py:L304-L306`）。注意时序：此刻 **fp32 转换、惩罚、温度、采样全都还没碰 logits**。变元名 `raw_logprobs` 里的 raw 说的就是这个——原始分布的对数概率。注释 NOTE(woosuk) 把话挑明：这份留底与 V0 采样器不同，V0 用的是「采样时真正用的 logits」——惩罚与温度**之后**的。
+留底发生在 L88：`compute_logprobs` 就一行（`log_softmax(dim=-1, dtype=float32)`，`sampler.py:L304-L306`）。注意时序：此刻 **fp32 转换、惩罚、温度、采样全都还没碰 logits**。变元名 `raw_logprobs` 里的 raw 说的就是这个：原始分布的对数概率。注释 NOTE(woosuk) 把话挑明：这份留底与 V0 采样器不同，V0 用的是「采样时真正用的 logits」——惩罚与温度**之后**的。
 
 这是个设计决策，四要素摆开：
 
 - **旧设计**：v0 采样器对每请求统一走温度+截断（temperature=0 的贪心请求也在做无意义的 softmax/排序）；且 v0 用惩罚+温度之后的 logits 算 top-k logprobs。
-- **痛点**：惩罚（presence/frequency/repetition——对已出现 token 压分的采样干预，具体公式归后面的采样章）和温度会改写整个分布。用户拿 logprobs 多半是想看**模型自己的意见**——最想要哪个词、第二想要哪个。被惩罚扭曲的报告会把模型的 top1 压到十名开外，下游全被带偏。
+- **痛点**：惩罚（presence/frequency/repetition，对已出现 token 压分的采样干预，具体公式归后面的采样章）和温度会改写整个分布。用户拿 logprobs 多半是想看**模型自己的意见**：最想要哪个词、第二想要哪个。被惩罚扭曲的报告会把模型的 top1 压到十名开外，下游全被带偏。
 - **v1 方案**：logprobs 在一切变换之前先算好（L84-L93）；随后 logits 才进加工管线，而且 `log_softmax` 产的是新张量（非原地），后面管线全程原地改写的是 logits 张量、物理碰不到已物化的 raw_logprobs。
-- **代价（如实记）**：额外一份 `[batch, vocab]` 的 fp32 张量驻留峰值显存——真实词表 129280（DeepSeek 规模）时一个 32 行批 ≈ 32 × 129280 × 4B ≈ 16MB/步；这就是下一站「gather 要窄」的原因：留底要早，带出 GPU 的只有 k+1 列。另有两笔小账：raw 与 processed 两个视角共享同一个 tensor——这条说的不是上面那份留底（那是 log_softmax 新物化的张量，物理碰不到），而是投机解码分支里 logits 自身兼任 raw 载体的路径，处理器原地改写前需要显式 clone 保住 raw（`vllm/v1/sample/rejection_sampler.py:L157-L159` 注释原话「preserve the original raw logits ... since apply_logits_processors modifies the tensor in-place」，投机解码章展开）；批全贪心时有条快路径提前返回，那里的留底走另一条物化路（下一小节）。
+- **代价（如实记）**：额外一份 `[batch, vocab]` 的 fp32 张量驻留峰值显存：真实词表 129280（DeepSeek 规模）时一个 32 行批 ≈ 32 × 129280 × 4B ≈ 16MB/步；这就是下一站「gather 要窄」的原因：留底要早，带出 GPU 的只有 k+1 列。另有两笔小账：raw 与 processed 两个视角共享同一个 tensor。这条说的不是上面那份留底（那是 log_softmax 新物化的张量，物理碰不到），而是投机解码分支里 logits 自身兼任 raw 载体的路径，处理器原地改写前需要显式 clone 保住 raw（`vllm/v1/sample/rejection_sampler.py:L157-L159` 注释原话「preserve the original raw logits ... since apply_logits_processors modifies the tensor in-place」，投机解码章展开）；批全贪心时有条快路径提前返回，那里的留底走另一条物化路（下一小节）。
 
-「惩罚是采样干预、不是模型意见」——这句话的下游论据最硬的一条来自 RL（强化学习）训练。策略梯度类算法（PPO 一脉——Proximal Policy Optimization，近端策略优化，[arXiv:1707.06347](https://arxiv.org/abs/1707.06347)）的核心量是新旧策略对同一动作的概率比，并把它裁剪在有界区间——OpenAI 官方教学页对裁剪的概括：「clipping serves as a regularizer by removing incentives for the policy to change dramatically」（[Spinning Up](https://spinningup.openai.com/en/latest/algorithms/ppo.html)）。映射到语言模型：动作就是 token，$`\pi_\theta(a|s)`$ 就是模型给该 token 的概率，推理引擎在 RL 循环里扮演的是「产 token + logprob 的数据服务器」。要是引擎报的 logprob 是惩罚之后的值，它描述的分布已不是任何策略：惩罚随序列内容漂移、温度是外加缩放。拿它算 ratio——设某位置 raw logprob = −0.2（P ≈ 0.82）、重复惩罚把它改到 −2.0（P ≈ 0.14），两数当分子分母，ratio 直接差 $`e^{1.8} \approx 6`$ 倍；clip 上限典型才 1+ε（ε ≈ 0.2）。这不是噪声，是方向性错误。今天 LLM RL 的主力算法 GRPO（组相对策略优化）同谱系（自述「a variant of Proximal Policy Optimization」，[arXiv:2402.03300](https://arxiv.org/abs/2402.03300)），同样逐 token 消费 logprob——这就是引擎把「logprobs 必须是 raw」做成默认的生态压力。
+「惩罚是采样干预、不是模型意见」——这句话的下游论据最硬的一条来自 RL（强化学习）训练。策略梯度类算法（PPO 一脉：Proximal Policy Optimization，近端策略优化，[arXiv:1707.06347](https://arxiv.org/abs/1707.06347)）的核心量是新旧策略对同一动作的概率比，并把它裁剪在有界区间。OpenAI 官方教学页对裁剪的概括：「clipping serves as a regularizer by removing incentives for the policy to change dramatically」（[Spinning Up](https://spinningup.openai.com/en/latest/algorithms/ppo.html)）。映射到语言模型：动作就是 token，$`\pi_\theta(a|s)`$ 就是模型给该 token 的概率，推理引擎在 RL 循环里扮演的是「产 token + logprob 的数据服务器」。要是引擎报的 logprob 是惩罚之后的值，它描述的分布已不是任何策略：惩罚随序列内容漂移、温度是外加缩放。拿它算 ratio：设某位置 raw logprob = −0.2（P ≈ 0.82）、重复惩罚把它改到 −2.0（P ≈ 0.14），两数当分子分母，ratio 直接差 $`e^{1.8} \approx 6`$ 倍；clip 上限典型才 1+ε（ε ≈ 0.2）。这不是噪声，是方向性错误。今天 LLM RL 的主力算法 GRPO（组相对策略优化）同谱系（自述「a variant of Proximal Policy Optimization」，[arXiv:2402.03300](https://arxiv.org/abs/2402.03300)），同样逐 token 消费 logprob，这就是引擎把「logprobs 必须是 raw」做成默认的生态压力。
 
-两份答案到底差多远？实测（配套精简版，host 实跑；五词表玩具、k=2，惩罚后张量按真实公式 `logits -= presence_penalties.unsqueeze(dim=1) * output_mask`（`unsqueeze(dim=1)` 把每请求一个的惩罚系数广播对到全部词表位；`vllm/model_executor/layers/utils.py:L88`）由驱动构造——精简版的处理器实现体是采样章之前的占位，对到达的张量做 log_softmax 是逐字真码，喂惩罚后的张量进去就是 V0 语义，无数值模拟）：
+两份答案到底差多远？实测（配套精简版，host 实跑；五词表玩具、k=2，惩罚后张量按真实公式 `logits -= presence_penalties.unsqueeze(dim=1) * output_mask`（`unsqueeze(dim=1)` 把每请求一个的惩罚系数广播对到全部词表位；`vllm/model_executor/layers/utils.py:L88`）由驱动构造。精简版的处理器实现体是采样章之前的占位，对到达的张量做 log_softmax 是逐字真码，喂惩罚后的张量进去就是 V0 语义，无数值模拟）：
 
 <!-- trace: m1 -->
 | 镜头 | 喂给 forward 的 logits | greedy 采样 | top-k 报告（列 0=被采样） | 关键观察 |
 |---|---|---|---|---|
-| 镜头 A · v1 默认（raw 留底） | 模型原始 [2.0, 1.9, 0.5, 0.0, -1.0] | 0 | token0 -0.8386 / token0 -0.8386 / token1 -0.9386 | 留底发生在一切变换之前（fp32 转换、处理器、采样都还没碰 logits）——此刻模型的 top1 是 token 0（-0.8386） |
-| 镜头 B · V0 语义（惩罚后的 logits 喂进去） | 惩罚后 [0.0, 1.9, 0.5, 0.0, -1.0]（presence=2.0 把 token 0 压到 0.0） | 1 | token1 -0.4705 / token1 -0.4705 / token2 -1.8705 | V0 用「采样时真正用的分布」算 logprobs：top1 换人成 token 1，模型的 top1 token 0 掉到 -2.3705——被惩罚扭曲的报告 |
-| 镜头 C · v0.27 processed_logprobs 模式 | 同镜头 B 的输入（Sampler 构造期设模式） | 1 | 与镜头 B 逐位相同（-0.4705 / -0.4705 / -1.8705） | 贪心路径物化 processed 视角并覆写留底（sampler.py:L103-L104 覆写行）——把 V0 语义从「默认行为」降级成「显式开关」 |
-| 镜头 D · 同一被采样 token 的两个数字 | —— | 1 | raw 视角报 -0.9386（模型意见）vs processed 视角报 -0.4705（干预后） | 差 0.4681——惩罚是采样干预不是模型意见：RL 训练/评分消费的是前者，这正是 NOTE(woosuk) 与 V0 分道之处 |
+| 镜头 A · v1 默认（raw 留底） | 模型原始 [2.0, 1.9, 0.5, 0.0, -1.0] | 0 | token0 -0.8386 / token0 -0.8386 / token1 -0.9386 | 留底发生在一切变换之前（fp32 转换、处理器、采样都还没碰 logits）。此刻模型的 top1 是 token 0（-0.8386） |
+| 镜头 B · V0 语义（惩罚后的 logits 喂进去） | 惩罚后 [0.0, 1.9, 0.5, 0.0, -1.0]（presence=2.0 把 token 0 压到 0.0） | 1 | token1 -0.4705 / token1 -0.4705 / token2 -1.8705 | V0 用「采样时真正用的分布」算 logprobs：top1 换人成 token 1，模型的 top1 token 0 掉到 -2.3705（被惩罚扭曲的报告） |
+| 镜头 C · v0.27 processed_logprobs 模式 | 同镜头 B 的输入（Sampler 构造期设模式） | 1 | 与镜头 B 逐位相同（-0.4705 / -0.4705 / -1.8705） | 贪心路径物化 processed 视角并覆写留底（sampler.py:L103-L104 覆写行）。把 V0 语义从「默认行为」降级成「显式开关」 |
+| 镜头 D · 同一被采样 token 的两个数字 | —— | 1 | raw 视角报 -0.9386（模型意见）vs processed 视角报 -0.4705（干预后） | 差 0.4681。惩罚是采样干预不是模型意见：RL 训练/评分消费的是前者，这正是 NOTE(woosuk) 与 V0 分道之处 |
 
-（greedy＝贪心采样，永远取分数最高者；argmax＝取最大值的下标。镜头 A 的 greedy 采样 token 0 是该输入张量的 argmax；真实引擎同一拍会先施加惩罚再采样、采到 token 1——「同一被采样 token」行取的是 raw 视角对 token 1 的报告值 −0.9386。）
+（greedy＝贪心采样，永远取分数最高者；argmax＝取最大值的下标。镜头 A 的 greedy 采样 token 0 是该输入张量的 argmax；真实引擎同一拍会先施加惩罚再采样、采到 token 1；「同一被采样 token」行取的是 raw 视角对 token 1 的报告值 −0.9386。）
 
 ![raw 留底：同一行 logits 的两个命运](../diagrams/ch08-fig-raw-snapshot.png)
 
-> *图注：左半是 raw 留底——log_softmax 抢在改写器之前对原始 logits 物化（token0 以 −0.8386 领跑）；右半是 V0 视角——presence −2.0 先把 token0 压到 0.0 再算 logprob，top1 换成 token1（−0.4705）、模型 top1 掉到 −2.3705。底部对比条：同一被采样 token1 两视角 −0.9386 vs −0.4705、差 0.4681。放大自本章 L2 图 ②『raw 留底』工序（L0 采样出口列内部），上游 ① 批登记送 k、下游 ③ gather 取 raw_logprobs。*
+> *图注：左半是 raw 留底：log_softmax 抢在改写器之前对原始 logits 物化（token0 以 −0.8386 领跑）；右半是 V0 视角：presence −2.0 先把 token0 压到 0.0 再算 logprob，top1 换成 token1（−0.4705）、模型 top1 掉到 −2.3705。底部对比条：同一被采样 token1 两视角 −0.9386 vs −0.4705、差 0.4681。放大自本章 L2 图 ②『raw 留底』工序（L0 采样出口列内部），上游 ① 批登记送 k、下游 ③ gather 取 raw_logprobs。*
 
 ### 四态开关：把「要哪张照片」做成配置
 
-L79-L93 里那个 `logprobs_mode` 不是摆设——v0.27 把「报哪个视角」推广成了引擎级四选一（片段首行的 `logprobs_mode_override` 是调用方可临时覆盖引擎默认的入参，本章按引擎默认档走读）：
+L79-L93 里那个 `logprobs_mode` 不是摆设，v0.27 把「报哪个视角」推广成了引擎级四选一（片段首行的 `logprobs_mode_override` 是调用方可临时覆盖引擎默认的入参，本章按引擎默认档走读）：
 
 ```python
-# vllm/config/model.py:L99-L105
+# vllm/config/model.py:L99-L105 · 模块级常量
 LogprobsMode = Literal[
     "raw_logits", "raw_logprobs", "processed_logits", "processed_logprobs"
 ]
@@ -194,13 +194,13 @@ PROCESSED_LOGPROBS_MODES: tuple[LogprobsMode, ...] = (
 )
 ```
 
-（第二个常量是 processed 两档的名册——采样器拿它判断当前模式要不要在贪心快路径里物化加工后的视角。）
+（第二个常量是 processed 两档的名册：采样器拿它判断当前模式要不要在贪心快路径里物化加工后的视角。）
 
-两轴各两档：**raw**（模型素颜）× **processed**（采样管线加工后）为视角轴；**logits**（原始分数）× **logprobs**（归一化对数概率）为形态轴。默认 `raw_logprobs`——本节前面讲的留底。三个非默认档的去处：`raw_logits` 连 log_softmax 都不做，留底就是原始 logits（实测同一输入下「logprobs」列是 [2.0, 2.0, 1.9]——logits 原值）；`processed_*` 两档只在批全贪心的快路径里物化（贪心路径提前返回时顺手把加工后的 logits/logprobs 算出来，`sampler.py:L261-L271`），随后由 L103-L104 覆写留底——上一张表的镜头 C 就是它。谁需要 processed？想精确复现「采样器看到什么」的调试场景；而 RL/评分要 raw（动机前面算过）。**代价**：四态是又一处「同一份数据、两种真相」的分叉——所有消费端都得知道自己拿到的是哪个视角；prompt 支路干脆退化：prompt 不走采样处理器，四态在那一侧全部等价于 raw（`gpu_model_runner.py:L5696-L5702` 注释原话「prompt tokens skip sampling processors, so processed_* and raw_* yield the same scores here」）。这条契约面的深展开（RL/scoring 的完整故事）超出本书范围，留给后续的 RL/scoring 专题。
+两轴各两档：**raw**（模型素颜）× **processed**（采样管线加工后）为视角轴；**logits**（原始分数）× **logprobs**（归一化对数概率）为形态轴。默认 `raw_logprobs`，即本节前面讲的留底。三个非默认档的去处：`raw_logits` 连 log_softmax 都不做，留底就是原始 logits（实测同一输入下「logprobs」列是 [2.0, 2.0, 1.9]，logits 原值）；`processed_*` 两档只在批全贪心的快路径里物化（贪心路径提前返回时顺手把加工后的 logits/logprobs 算出来，`sampler.py:L261-L271`），随后由 L103-L104 覆写留底；上一张表的镜头 C 就是它。谁需要 processed？想精确复现「采样器看到什么」的调试场景；而 RL/评分要 raw（动机前面算过）。**代价**：四态是又一处「同一份数据、两种真相」的分叉，所有消费端都得知道自己拿到的是哪个视角；prompt 支路干脆退化：prompt 不走采样处理器，四态在那一侧全部等价于 raw（`gpu_model_runner.py:L5696-L5702` 注释原话「prompt tokens skip sampling processors, so processed_* and raw_* yield the same scores here」）。这条契约面的深展开（RL/scoring 的完整故事）超出本书范围，留给后续的 RL/scoring 专题。
 
 ## 三件套：领奖台、成绩单、名次（站 4）
 
-留底有了——一张 `[num_tok, V]` 的大张量躺在 GPU 上。全词表搬回 CPU 太贵（129280 列），下一站之前必须把它缩成 `[num_tok, k+1]`。缩法是三条并行取数，汇成一个张量（还在 L0 图采样出口列内，留底的下一个动作）：
+留底有了：一张 `[num_tok, V]` 的大张量躺在 GPU 上。全词表搬回 CPU 太贵（129280 列），下一站之前必须把它缩成 `[num_tok, k+1]`。缩法是三条并行取数，汇成一个张量（还在 L0 图采样出口列内，留底的下一个动作）：
 
 ```python
 # vllm/v1/sample/sampler.py:L304-L356
@@ -224,7 +224,7 @@ PROCESSED_LOGPROBS_MODES: tuple[LogprobsMode, ...] = (
         token_logprobs = logprobs.gather(-1, token_ids)  # L338
 
         # Compute the ranks of the actual token.
-        # … 省略：mark_unbacked 两行的注释——让 dynamo（torch.compile 的
+        # … 省略：mark_unbacked 两行的注释：让 dynamo（torch.compile 的
         #         编译前端）不对批大小 0/1 特化重编译 …
         torch._dynamo.decorators.mark_unbacked(logprobs, 0)
         torch._dynamo.decorators.mark_unbacked(token_logprobs, 0)
@@ -267,29 +267,29 @@ def batched_count_greater_than(x: torch.Tensor, values: torch.Tensor) -> torch.T
     return (x >= values).sum(-1)
 ```
 
-数全词表里 logprob **大于等于**本 token 的条目数（含自身）——一遍 O(V) 计数，出来直接是 1-based 名次。注意这是计数不是排序名次：并列时名次取并列上界（两个同分的 token 名次相同、都偏大）。这个 rank 是 vLLM 对 OpenAI 响应形状的**扩展字段**——OpenAI 的响应里没有 rank 对应物：站 14 出场的 `ChatCompletionLogProb`（OpenAI 形状的候选记录类，三栏 token/logprob/bytes）里没有它，站 1 引的 OpenAI 官方响应形状同样没有（`vllm/logprobs.py` 的 `Logprob` docstring 自述「supporting OpenAI compatible logprobs and token ranks」——「and token ranks」正是 vLLM 在兼容形状之外多给的部分）；下游想快速判断「被采样 token 是不是模型 top1」时它比看 top_logprobs 列表省事。
+数全词表里 logprob **大于等于**本 token 的条目数（含自身）：一遍 O(V) 计数，出来直接是 1-based 名次。注意这是计数不是排序名次：并列时名次取并列上界（两个同分的 token 名次相同、都偏大）。这个 rank 是 vLLM 对 OpenAI 响应形状的**扩展字段**。OpenAI 的响应里没有 rank 对应物：站 14 出场的 `ChatCompletionLogProb`（OpenAI 形状的候选记录类，三栏 token/logprob/bytes）里没有它，站 1 引的 OpenAI 官方响应形状同样没有（`vllm/logprobs.py` 的 `Logprob` docstring 自述「supporting OpenAI compatible logprobs and token ranks」。「and token ranks」正是 vLLM 在兼容形状之外多给的部分）；下游想快速判断「被采样 token 是不是模型 top1」时它比看 top_logprobs 列表省事。
 
 最后两行 cat 是本章最重要的不变式的物理起点：**被采样 token 恒在第 0 列**。`cat((token_ids, topk_indices))` 把被采样者钉在位置 0，后面才是 top1..topk。下游所有「第 0 个 = 被采样」的约定（累计账加 `logprobs[0]`、rank 链首元素、dict 首键）全是这一行的后代。
 
-实测（配套精简版，六词表、logits 行 [3.0, 2.5, 2.5, 1.0, 0.5, 0.0]——id1/id2 并列 2.5 专为踩并列边界；「被采样 token」由参数显式给定、同一 logits 行复用三次，gather 逐字真码走真 `torch.topk`/`gather` 全链）：
+实测（配套精简版，六词表、logits 行 [3.0, 2.5, 2.5, 1.0, 0.5, 0.0]，id1/id2 并列 2.5 专为踩并列边界；「被采样 token」由参数显式给定、同一 logits 行复用三次，gather 逐字真码走真 `torch.topk`/`gather` 全链）：
 
 <!-- trace: m2 -->
 | 行 | 被采样 token | count 式 rank = (x>=v).sum(-1) | cat 出的 3 列 token id | 3 列 logprob | 看点 |
 |---|---|---|---|---|---|
-| 行 0 · 常态：被采样=top1 | 0 | 1 | [0, 0, 1] | [-0.9084, -0.9084, -1.4084] | 列 0 与 topk 首列重复——回程 dict 键去重（见 rank 链条目） |
-| 行 1 · 落榜者：被采样不在 topk | 3 | 4 | [3, 0, 1] | [-2.9084, -0.9084, -1.4084] | k=2 只带 2 个候选，被采样 token 3 排名 4 也必须给——张量恒 k+1=3 列、被采样恒列 0 |
+| 行 0 · 常态：被采样=top1 | 0 | 1 | [0, 0, 1] | [-0.9084, -0.9084, -1.4084] | 列 0 与 topk 首列重复，回程 dict 键去重（见 rank 链条目） |
+| 行 1 · 落榜者：被采样不在 topk | 3 | 4 | [3, 0, 1] | [-2.9084, -0.9084, -1.4084] | k=2 只带 2 个候选，被采样 token 3 排名 4 也必须给：张量恒 k+1=3 列、被采样恒列 0 |
 | 行 2 · 并列平手（2.5/2.5） | 2 | 3 | [2, 0, 1] | [-1.4084, -0.9084, -1.4084] | 计数把并列者都算上 → rank 3（上界）；topk 平手按下标排：id1 进 topk、id2 只剩被采样列 |
-| kernel 直证 · batched_count_greater_than | 0 / 3 / 2 | 1 / 4 / 3 | —— | 对应 -0.9084 / -2.9084 / -1.4084 | 不排序：一遍计数数完全词表——O(V) 计数免 O(V log V) 排序 |
+| kernel 直证 · batched_count_greater_than | 0 / 3 / 2 | 1 / 4 / 3 | —— | 对应 -0.9084 / -2.9084 / -1.4084 | 不排序：一遍计数数完全词表，O(V) 计数免 O(V log V) 排序 |
 
 输入行是 log_softmax 后的 [-0.9084, -1.4084, -1.4084, -2.9084, -3.4084, -3.9084]，可手算复验。三行产出形状恒 [3, 3]：**落榜者与并列上界都有交代**——被采样者不管多差都在列 0，rank 恒 1..V。
 
 ![gather 三件套](../diagrams/ch08-fig-gather-triple.png)
 
-> *图注：一张 [num_tok, V] 的 raw_logprobs（六词表例）经三路汇成 [num_tok, k+1]——topk 摘领奖台、gather 取被采样者成绩、(x>=v).sum(-1) 一遍数出 1-based 名次；cat 把被采样者钉在列 0（列 0 高亮贯穿三行），落榜行与并列行各挂气泡注。放大自本章 L2 图 ③『gather 三件套』工序，上游 ② 送 raw_logprobs、下游 ④ D2H 取 [num_tok, k+1]。*
+> *图注：一张 [num_tok, V] 的 raw_logprobs（六词表例）经三路汇成 [num_tok, k+1]：topk 摘领奖台、gather 取被采样者成绩、(x>=v).sum(-1) 一遍数出 1-based 名次；cat 把被采样者钉在列 0（列 0 高亮贯穿三行），落榜行与并列行各挂气泡注。放大自本章 L2 图 ③『gather 三件套』工序，上游 ② 送 raw_logprobs、下游 ④ D2H 取 [num_tok, k+1]。*
 
 ### 点名册：稀疏变体（轻讲）
 
-第 1 站埋的 `logprob_token_ids` 在这里兑现。`gather_specific_token_logprobs`（`sampler.py:L151-L225`）不取 top-k，只 gather 你点名的 token id：批内各请求名单长度不齐，按最长者 padding 成矩阵，列 0 仍恒为被采样 token（直接在 GPU 上从 sampled 张量填充）、点名的 id 依次列 1..n、padding 位 `masked_fill` 成 −inf 作废；rank 仍只对被采样者计数——源码注释原话「log_softmax is monotonic w.r.t. the original logits, so ranks computed from logprobs are equivalent」（log_softmax 单调，在 logprobs 上数名次与在 logits 上等价）。两个开关同时在场时点名册无条件覆盖领奖台（`sampler.py:L133-L136` 的 prefer 分支）。实测形状（配套精简版，两请求异长名单 padding 到 3 列）：
+第 1 站埋的 `logprob_token_ids` 在这里兑现。`gather_specific_token_logprobs`（`sampler.py:L151-L225`）不取 top-k，只 gather 你点名的 token id：批内各请求名单长度不齐，按最长者 padding 成矩阵，列 0 仍恒为被采样 token（直接在 GPU 上从 sampled 张量填充）、点名的 id 依次列 1..n、padding 位 `masked_fill` 成 −inf 作废；rank 仍只对被采样者计数：源码注释原话「log_softmax is monotonic w.r.t. the original logits, so ranks computed from logprobs are equivalent」（log_softmax 单调，在 logprobs 上数名次与在 logits 上等价）。两个开关同时在场时点名册无条件覆盖领奖台（`sampler.py:L133-L136` 的 prefer 分支）。实测形状（配套精简版，两请求异长名单 padding 到 3 列）：
 
 <!-- trace: m17 -->
 | req_index | 指定 ids / 被采样 | 矩阵行（列 0=被采样） | logprob 行 | rank |
@@ -302,12 +302,12 @@ def batched_count_greater_than(x: torch.Tensor, values: torch.Tensor) -> torch.T
 
 ## 同一趟班车：D2H 与过线（站 5-7）
 
-gather 之后，logprobs 缩成了 k+1 列的小张量。接下来三站横穿 L0 图——从采样出口列出发、穿过紫色 ZMQ 带、抵达蓝色 API 带的门口，全程是「搬运」。但值得看清楚它搬的是哪辆车、走的哪条道，因为 logprobs 从头到尾**没有专车**。
+gather 之后，logprobs 缩成了 k+1 列的小张量。接下来三站横穿 L0 图：从采样出口列出发、穿过紫色 ZMQ 带、抵达蓝色 API 带的门口，全程是「搬运」。但值得看清楚它搬的是哪辆车、走的哪条道，因为 logprobs 从头到尾**没有专车**。
 
 ### D2H：copy stream 上的捎带（站 5）
 
 ```python
-# vllm/v1/worker/gpu_model_runner.py:L286-L297
+# vllm/v1/worker/gpu_model_runner.py:L286-L297 · AsyncGPUModelRunnerOutput.__init__
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(async_output_copy_stream):
@@ -320,14 +320,14 @@ gather 之后，logprobs 缩成了 k+1 列的小张量。接下来三站横穿 L
                 if self._logprobs_tensors
                 else None
             )
-            # … 省略：routed_experts 拷贝、EP（专家并行）故障查询、event.record()——
+            # … 省略：routed_experts 拷贝、EP（专家并行）故障查询、event.record()，
             #         并行搬运的其他载荷与完成标记 …
 ```
 
-对岸取货在 `get_output`——这个函数**阻塞到拷贝完成为止**：
+对岸取货在 `get_output`，这个函数**阻塞到拷贝完成为止**：
 
 ```python
-# vllm/v1/worker/gpu_model_runner.py:L308-L325
+# vllm/v1/worker/gpu_model_runner.py:L308-L325 · AsyncGPUModelRunnerOutput.get_output
     def get_output(self) -> ModelRunnerOutput:
         """Copy the device tensors to the host and return a ModelRunnerOutput.
 
@@ -348,7 +348,7 @@ gather 之后，logprobs 缩成了 k+1 列的小张量。接下来三站横穿 L
                 logprobs_lists = self._logprobs_tensors_cpu.tolists()  # L325
 ```
 
-这是采样结果回家的最后一程——D2H 拷贝（D2H＝device to host，GPU 到主机内存）。[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)站 13 的 `sample_tokens`（采样那一步）里它只是被发起、没有等（那一章只认「分数向量进、token id 出」），这里打开看：采样 token 与 logprobs 张量在**独立的 copy stream**（CUDA 流——GPU 上的任务队列，独立流让拷贝与前向计算重叠）上一起发车、`non_blocking`（不等拷完先返回，页锁定内存配合——[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)立过 pinned memory 语境）、event（GPU 事件——流上的完成标记）到点同步。logprobs 的搬运没有单独的车次——L294 跟采样 token 同一次发车，L325 同一次 `get_output` 里转成 numpy。转换接口在两个形态类上：
+这是采样结果回家的最后一程：D2H 拷贝（D2H＝device to host，GPU 到主机内存）。[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)站 13 的 `sample_tokens`（采样那一步）里它只是被发起、没有等（那一章只认「分数向量进、token id 出」），这里打开看：采样 token 与 logprobs 张量在**独立的 copy stream**（CUDA 流，GPU 上的任务队列，独立流让拷贝与前向计算重叠）上一起发车、`non_blocking`（不等拷完先返回，页锁定内存配合；[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)立过 pinned memory 语境）、event（GPU 事件，流上的完成标记）到点同步。logprobs 的搬运没有单独的车次——L294 跟采样 token 同一次发车，L325 同一次 `get_output` 里转成 numpy。转换接口在两个形态类上：
 
 ```python
 # vllm/v1/outputs.py:L28-L71
@@ -390,14 +390,14 @@ class LogprobsTensors(NamedTuple):
         )
 ```
 
-一对孪生形态：`LogprobsTensors` 是 torch 张量版（GPU/CPU 上流动），`LogprobsLists` 是 numpy 版（跨进程信封里的载荷）——`tolists()` 是两者间的转换点（转换时名次字段换了名：张量版叫 `selected_token_ranks`、numpy 版叫 `sampled_token_ranks`，同物异名）。NamedTuple（带字段名的元组）保证形状契约写死在类型里。那行注释里 `cu_num_generated_tokens`（逐请求累计生成数）是投机解码（[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)立过的 speculative decoding——小模型起草、大模型批量验证的加速法）的偏移账：一步多 token 时按它定位各请求的行区间，本章只需知道「slice_request 靠它切得准」。
+一对孪生形态：`LogprobsTensors` 是 torch 张量版（GPU/CPU 上流动），`LogprobsLists` 是 numpy 版（跨进程信封里的载荷）。`tolists()` 是两者间的转换点（转换时名次字段换了名：张量版叫 `selected_token_ranks`、numpy 版叫 `sampled_token_ranks`，同物异名）。NamedTuple（带字段名的元组）保证形状契约写死在类型里。那行注释里 `cu_num_generated_tokens`（逐请求累计生成数）是投机解码（[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)立过的 speculative decoding，小模型起草、大模型批量验证的加速法）的偏移账：一步多 token 时按它定位各请求的行区间，本章只需知道「slice_request 靠它切得准」。
 
 ### 调度切行与装车（站 6）
 
 引擎一拍的收尾（[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)站 14 `update_from_output`）把整批 logprobs 按请求切行、装进各自的回程明细：
 
 ```python
-# vllm/v1/core/sched/scheduler.py:L1909-L1941
+# vllm/v1/core/sched/scheduler.py:L1909-L1941 · Scheduler.update_from_output
             # Extract sample logprobs if needed.
             if (
                 request.sampling_params is not None
@@ -424,7 +424,7 @@ class LogprobsTensors(NamedTuple):
             #         等非本章字段（L1931-L1939）…
 ```
 
-三条件守卫（参数在、开了 logprobs、批产物在）过了才切行——没开 logprobs 的请求连 `slice_request` 都不调，`new_logprobs` 保持 None。守卫里的 `request.sampling_params.num_logprobs` 是 `SamplingParams` 上的属性——`logprobs` 字段值或点名册长度的统一口径，站 8 末点破它的小机关；它与站 2 批级字典 `self.num_logprobs` 同名不同物：一个是每请求的声明，一个是引擎批的记账本。prompt 路另走一个字典（第 12 站）。切好的行装进回程明细的两个专用字段：
+三条件守卫（参数在、开了 logprobs、批产物在）过了才切行：没开 logprobs 的请求连 `slice_request` 都不调，`new_logprobs` 保持 None。守卫里的 `request.sampling_params.num_logprobs` 是 `SamplingParams` 上的属性，即 `logprobs` 字段值或点名册长度的统一口径，站 8 末点破它的小机关；它与站 2 批级字典 `self.num_logprobs` 同名不同物：一个是每请求的声明，一个是引擎批的记账本。prompt 路另走一个字典（第 12 站）。切好的行装进回程明细的两个专用字段：
 
 ```python
 # vllm/v1/engine/__init__.py:L184-L215
@@ -441,10 +441,10 @@ class EngineCoreOutput(
     new_prompt_logprobs_tensors: LogprobsTensors | None = None  # L194
 
     # … 省略：pooling_output / finish_reason / stop_reason / events
-    #         等非本章字段——上一章拆过整张字段表 …
+    #         等非本章字段，上一章拆过整张字段表 …
 ```
 
-`new_logprobs`（numpy 三件套）装生成侧、`new_prompt_logprobs_tensors`（torch 张量版）装 prompt 侧。两个默认 None 的字段在线上并不省——[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)实测过 `omit_defaults`（跳过「值等于默认值」的字段的 msgspec 编码选项）对 `array_like` 是空操作：按位置数组全字段上船，None 以 nil 占槽。没开 logprobs 的请求线上只多两个空槽，**没有任何 logprobs 载荷过线**。（上面类装饰器里那个 `array_like=True` 也是[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)立过的按位置线格式——字段按位置编成数组、字段名不上线。）
+`new_logprobs`（numpy 三件套）装生成侧、`new_prompt_logprobs_tensors`（torch 张量版）装 prompt 侧。两个默认 None 的字段在线上并不省：[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)实测过 `omit_defaults`（跳过「值等于默认值」的字段的 msgspec 编码选项）对 `array_like` 是空操作：按位置数组全字段上船，None 以 nil 占槽。没开 logprobs 的请求线上只多两个空槽，**没有任何 logprobs 载荷过线**。（上面类装饰器里那个 `array_like=True` 也是[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)立过的按位置线格式：字段按位置编成数组、字段名不上线。）
 
 ### 过线：海关的护照（站 7）
 
@@ -472,7 +472,7 @@ numpy 数组和 torch 张量不是 msgpack 的原生公民。回程消息编码�
                 return self._decode_ndarray(obj)
             if issubclass(t, torch.Tensor):
                 return self._decode_tensor(obj)
-            # … 省略：slice / 多模态 / utility 的其余重建分支——
+            # … 省略：slice / 多模态 / utility 的其余重建分支，
             #         都不命中则原样交回（函数末行 return obj）…
 ```
 
@@ -480,22 +480,22 @@ numpy 数组和 torch 张量不是 msgpack 的原生公民。回程消息编码�
 
 这条「班车」本身的 why 链值得四要素摆一遍，因为 logprobs 的 IPC 账全记在它头上：
 
-- **旧设计**：朴素做法是逐请求、逐 token 发事件/回调——多数自研推理服务的第一版都这么写。v0.21 时代这仓还经历过 msgspec → pickle → msgpack 的序列化三段演变（多模态输入带 PIL image 等类型时一度整体退回 pickle）。
+- **旧设计**：朴素做法是逐请求、逐 token 发事件/回调。多数自研推理服务的第一版都这么写。v0.21 时代这仓还经历过 msgspec → pickle → msgpack 的序列化三段演变（多模态输入带 PIL image 等类型时一度整体退回 pickle）。
 - **痛点**：每条消息有固定开销（ZMQ 帧 + msgpack 头 + 解码 + 前端事件循环唤醒）；小模型 5ms/拍、批内几十上百请求时，逐 token 发消息的 IPC 次数爆炸。pickle 那条回头路则慢且有安全面（对象反序列化可执行代码）。
-- **v1 方案**：msgpack + 自定义钩子（本节开头那对 enc/dec），输出按步聚合——每个 forward step 每个前端**只发一条** `EngineCoreOutputs`，批内所有请求的明细打包（`vllm/v1/engine/__init__.py:L230-L258`；`step()` 按 client_index（客户端索引——发给哪个前端，[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)立过）分组产出，`core.py:L584-L614`）。
-- **代价（如实记）**：单条消息变大——开 logprobs 后每请求每步多 k+1 列浮点、整数、名次，消息明显变重，但**条数不变**；解码与后续处理若一口气做完会长时间霸占前端事件循环，逼出「拉批分块、片间 `await asyncio.sleep(0)` 让出」的消化机制（上一章拆过；分块消化的实测收益——PR #12287 外部基准：吞吐 +6.4%、平均首 token 延迟 −14%、p99（99 分位）每 token 延迟 −31%）。代码里还留着行家注：行式布局（每请求一条）序列化密度低于列式，NOTE 原话「We could consider ways to make this more compact, e.g. columnwise layout」——班车没榨干，但方向定了。
+- **v1 方案**：msgpack + 自定义钩子（本节开头那对 enc/dec），输出按步聚合：每个 forward step 每个前端**只发一条** `EngineCoreOutputs`，批内所有请求的明细打包（`vllm/v1/engine/__init__.py:L230-L258`；`step()` 按 client_index（客户端索引，发给哪个前端，[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)立过）分组产出，`core.py:L584-L614`）。
+- **代价（如实记）**：单条消息变大：开 logprobs 后每请求每步多 k+1 列浮点、整数、名次，消息明显变重，但**条数不变**；解码与后续处理若一口气做完会长时间霸占前端事件循环，逼出「拉批分块、片间 `await asyncio.sleep(0)` 让出」的消化机制（上一章拆过；分块消化的实测收益，PR #12287 外部基准：吞吐 +6.4%、平均首 token 延迟 −14%、p99（99 分位）每 token 延迟 −31%）。代码里还留着行家注：行式布局（每请求一条）序列化密度低于列式，NOTE 原话「We could consider ways to make this more compact, e.g. columnwise layout」——班车没榨干，但方向定了。
 
 ## 到港第三步：LogprobsProcessor 开工（站 8）
 
 消息穿完紫色带、进港到 L0 图蓝色 API 带。上一章 process_outputs 单循环里那个每次路过都没展开的「第 3 步」，现在打开：
 
 ```python
-# vllm/v1/engine/output_processor.py:L652-L665
+# vllm/v1/engine/output_processor.py:L652-L665 · OutputProcessor.process_outputs
             if pooling_output is None:
                 assert req_state.detokenizer is not None
                 assert req_state.logprobs_processor is not None
                 # 2) Detokenize the token ids into text and perform stop checks.
-                # … 省略：detokenizer.update 与 stop-string 判定——主泳道（上一章第 2 步）…
+                # … 省略：detokenizer.update 与 stop-string 判定，主泳道（上一章第 2 步）…
                 # 3) Compute sample and prompt logprobs for request,
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)  # L665
@@ -559,7 +559,7 @@ class LogprobsProcessor:
 
 `new_logprobs` 非 None 走生成路（第 9-11 站的装配循环）、`new_prompt_logprobs_tensors` 非 None 走 prompt 路（第 12 站）——两路各装配各的容器，谁也不碰谁。
 
-`num_logprobs` 这个属性本身有个小机关（`vllm/sampling_params.py:L738-L746`）：设了 `logprob_token_ids` 而没设 `logprobs` 时，它返回 `len(logprob_token_ids)`——点名册把点名数当 k 并进同一本账，下游整条支路不用知道你走的是领奖台还是点名册。
+`num_logprobs` 这个属性本身有个小机关（`vllm/sampling_params.py:L738-L746`）：设了 `logprob_token_ids` 而没设 `logprobs` 时，它返回 `len(logprob_token_ids)`：点名册把点名数当 k 并进同一本账，下游整条支路不用知道你走的是领奖台还是点名册。
 
 ## 逐列拆包：非增量解码与累计账（站 9）
 
@@ -621,7 +621,7 @@ class LogprobsProcessor:
 
 三个看点。
 
-**其一，非增量解码。** `convert_ids_list_to_tokens` 对每个 token **单独**调一次 `decode`（还带前导空格恢复——`decode` 会吃掉 SentencePiece 的 ▁ 前缀记号，这里从词表原文里补回来，`vllm/tokenizers/detokenizer_utils.py:L143-L170`）：
+**其一，非增量解码。** `convert_ids_list_to_tokens` 对每个 token **单独**调一次 `decode`（还带前导空格恢复：`decode` 会吃掉 SentencePiece 的 ▁ 前缀记号，这里从词表原文里补回来，`vllm/tokenizers/detokenizer_utils.py:L143-L170`）：
 
 ```python
 # vllm/tokenizers/detokenizer_utils.py:L143-L170
@@ -655,13 +655,13 @@ def convert_ids_list_to_tokens(
     ]
 ```
 
-这跟主泳道的增量解码是**两套去 token 策略**，值得摆清为什么不能用同一套。主泳道（[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)的增量 detokenize）维护跨步状态：碰到不完整的字节尾巴就「扣住等凑齐」，每 token 摊还常数成本。logprobs 不行——它要的不是一个连贯字符串，是**每个候选各自的文本**：k=20 时一个位置 21 个候选，每个都要独立成词（第 10 站的修正也按候选独立走）。增量法没有「单个 token 的文本」这个产物可给。代价照实记：每位置解码 k+1 次 vs 主泳道每 token 增量 1 次——k=20 时是 21:1 的 tokenizer 调用比。换来的是无状态（不用维护解码器跨步状态）与逐候选独立修正的能力。
+这跟主泳道的增量解码是**两套去 token 策略**，值得摆清为什么不能用同一套。主泳道（[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)的增量 detokenize）维护跨步状态：碰到不完整的字节尾巴就「扣住等凑齐」，每 token 摊还常数成本。logprobs 不行：它要的不是一个连贯字符串，是**每个候选各自的文本**：k=20 时一个位置 21 个候选，每个都要独立成词（第 10 站的修正也按候选独立走）。增量法没有「单个 token 的文本」这个产物可给。代价照实记：每位置解码 k+1 次 vs 主泳道每 token 增量 1 次，k=20 时是 21:1 的 tokenizer 调用比。换来的是无状态（不用维护解码器跨步状态）与逐候选独立修正的能力。
 
-**其二，累计账。** L108-L109：`cumulative_logprob += logprobs[0]`。第 0 个恒是被采样 token 的 logprob（第 4 站 cat 列序传下来的），所以累计器加的**永远是被采样者**——终值 = 序列里每个被采样 token 的 logprob 之和 = 整条生成序列联合概率的对数（本章开头算过的「连乘变累加」）。这就是出口那个 `cumulative_logprob` 字段的语义：整个生成有多大概率发生的一把尺。它的历史回声：退役的 `best_of` 参数当年就是「多生成几条、按累计对数概率挑最好」——[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)提过它的退役，那把「尺」如今还留在这。（prompt 路从不累计——prompt 不是模型生成的，那些概率不是模型对自己输出的意见，加起来没有「联合概率」的含义；第 12 站会再遇到这个对照。）
+**其二，累计账。** L108-L109：`cumulative_logprob += logprobs[0]`。第 0 个恒是被采样 token 的 logprob（第 4 站 cat 列序传下来的），所以累计器加的**永远是被采样者**：终值 = 序列里每个被采样 token 的 logprob 之和 = 整条生成序列联合概率的对数（本章开头算过的「连乘变累加」）。这就是出口那个 `cumulative_logprob` 字段的语义：整个生成有多大概率发生的一把尺。它的历史回声：退役的 `best_of` 参数当年就是「多生成几条、按累计对数概率挑最好」——[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)提过它的退役，那把「尺」如今还留在这。（prompt 路从不累计：prompt 不是模型生成的，那些概率不是模型对自己输出的意见，加起来没有「联合概率」的含义；第 12 站会再遇到这个对照。）
 
-**其三，tokenizer 缺席的支路。** `tokenizer is None`（`detokenize=False` 或 `skip_tokenizer_init=True` 的请求）时 `decoded_tokens` 恒为 `NONES`（一个无限吐 None 的迭代器）——容器照建、数值照流、累计照加，只是每条记录的文本栏一律空。下游出口对空文本栏的处理是 bytes 给 None（第 14 站看）——「没有文本」与「文本是空串」在出口是两个语义。
+**其三，tokenizer 缺席的支路。** `tokenizer is None`（`detokenize=False` 或 `skip_tokenizer_init=True` 的请求）时 `decoded_tokens` 恒为 `NONES`（一个无限吐 None 的迭代器）。容器照建、数值照流、累计照加，只是每条记录的文本栏一律空。下游出口对空文本栏的处理是 bytes 给 None（第 14 站看）——「没有文本」与「文本是空串」在出口是两个语义。
 
-实测（配套精简版，真 tokenizers 0.22.2 Rust 解码器、手工玩具词表 256='hello'/257=' world'/65='A'——为了让数字可心算；三轮 logprob 值为构造的引擎侧输入，形状与真实 gather 产出同构，装配算法逐字保真）：
+实测（配套精简版，真 tokenizers 0.22.2 Rust 解码器、手工玩具词表 256='hello'/257=' world'/65='A'，为了让数字可心算；三轮 logprob 值为构造的引擎侧输入，形状与真实 gather 产出同构，装配算法逐字保真）：
 
 <!-- trace: m7 -->
 | 轮次 | 过线行 [被采样，top1] / logprob | 非增量解码 | cumulative += logprobs[0] | 容器 |
@@ -670,13 +670,13 @@ def convert_ids_list_to_tokens(
 | 轮 2 | [257, 256] / [-1.5, -2.0] | [' world', 'hello'] | -0.25 → -1.75 | 2 个位置；首键=被采样 257 |
 | 轮 3 | [65, 256] / [-0.05, -0.1] | ['A', 'hello'] | -1.75 → -1.8 | 3 个位置；首键=被采样 65；终值 -1.8 = -0.25 + -1.5 + -0.05 |
 
-累计器三轮 0.0 → −0.25 → −1.75 → −1.8，与手算逐位一致；容器每轮恰长 1。（表里第二列的「top1」是构造的次候选，只保 k+1 列的形状、不保 topk 次序——真实 gather 产出里，被采样者若已是 top1（轮 1 的 256 正是），第二列必然是重复的被采样 id 本身，靠容器键去重合并，第 11 站情形 2 演的就是这一步。）
+累计器三轮 0.0 → −0.25 → −1.75 → −1.8，与手算逐位一致；容器每轮恰长 1。（表里第二列的「top1」是构造的次候选，只保 k+1 列的形状、不保 topk 次序。真实 gather 产出里，被采样者若已是 top1（轮 1 的 256 正是），第二列必然是重复的被采样 id 本身，靠容器键去重合并，第 11 站情形 2 演的就是这一步。）
 
 ## 半个字怎么报：U+FFFD 修正（站 10）
 
-还在蓝色 API 带的装配工位上（L2 章图 ⑧），非增量解码的坑在第 9 站就埋下了：byte-fallback 词表把「中」拆成 E4/B8/AD 三个 byte token，`decode([228])` 拿到 3 字节序列的开头一个字节——Python 默认按「替换」策略解码不完整序列，吐出替换字符 U+FFFD（�，[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)立过的 Unicode 替换字符）。主泳道不怕它（扣住尾巴等凑齐）；logprobs 的每个候选都被迫独立解码，**半个字节序列必然解出 �**。这一站就是修它的。
+还在蓝色 API 带的装配工位上（L2 章图 ⑧），非增量解码的坑在第 9 站就埋下了：byte-fallback 词表把「中」拆成 E4/B8/AD 三个 byte token，`decode([228])` 拿到 3 字节序列的开头一个字节：Python 默认按「替换」策略解码不完整序列，吐出替换字符 U+FFFD（�，[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)立过的 Unicode 替换字符）。主泳道不怕它（扣住尾巴等凑齐）；logprobs 的每个候选都被迫独立解码，**半个字节序列必然解出 �**。这一站就是修它的。
 
-直觉一句话：**拼乐高缺件登记**——前三袋零件单独看都拼不出东西，修正员拿「已经拼好的前文」当参照，把零件袋试着往后接：接得成（拼出「中」）就把拼出的整字记在最后那袋头上、前几袋登记为空；接不成就老实记空串。
+直觉一句话：**拼乐高缺件登记**：前三袋零件单独看都拼不出东西，修正员拿「已经拼好的前文」当参照，把零件袋试着往后接：接得成（拼出「中」）就把拼出的整字记在最后那袋头上、前几袋登记为空；接不成就老实记空串。
 
 ```python
 # vllm/v1/engine/logprobs.py:L312-L346
@@ -717,7 +717,7 @@ def convert_ids_list_to_tokens(
         return decoded_tokens_list
 ```
 
-先看清两条轴，**不能混**：**横向**是同一位置的候选列表 `[被采样，top1，top2，…]`——docstring 特意强调「alternatives at the SAME position」；**纵向**是序列前文——真正落定的 token 串。修正对每个 � 尾候选**独立**做（横向各修各的），用的参照只有一份（纵向上下文共用）。
+先看清两条轴，**不能混**：**横向**是同一位置的候选列表 `[被采样，top1，top2，…]`：docstring 特意强调「alternatives at the SAME position」；**纵向**是序列前文：真正落定的 token 串。修正对每个 � 尾候选**独立**做（横向各修各的），用的参照只有一份（纵向上下文共用）。
 
 触发条件 L334 有讲究：只认**以** � **结尾**的候选。中置的 �（比如词表里真有不完整字节的怪 token）是真不完整，修不了也不该修；尾部的 � 才是「可能只是后面几袋零件还没到」。
 
@@ -780,7 +780,7 @@ def convert_ids_list_to_tokens(
         return ""
 ```
 
-三个问题逐个答。**试几袋零件？** L271-L273：从 1 个上下文 token 到最多 4 个逐档试拼（拼上下文+本 token 重新 decode），拼得成（不以 � 结尾）就进剥前缀。**为什么是 4？** 不是调出来的经验值——RFC 3629 的规定：UTF-8 里任何 Unicode 码点「are encoded using sequences of 1 to 4 octets」（[RFC 3629 §3](https://www.rfc-editor.org/rfc/rfc3629.html)）：汉字在 3 字节区（U+0800..U+FFFF），多数 emoji 在 4 字节区（U+10000..U+10FFFF）。被拆开的多字节字符**至多横跨 4 个 byte token**——带前 4 个落定 token 当上下文必然罩得住。4 字节 emoji（🙂 = F0 9F 99 82，拆 4 个 token）就是「为什么取 4 不取 3」的极端例。（早期 UTF-8 曾经允许 5-6 字节，2003 年 RFC 3629 把合法范围收紧到 U+10FFFF、序列上界定死 4——源码 docstring 的「4 is sufficient for any UTF-8 multi-byte sequence」是这个 2003 年决定的遗产。）**剥前缀是干嘛？** 拼成「hello中」时，得把「hello」还给前文——本 token 只该拿属于自己的部分。剥法：从尾往头扫上下文，凡是「自己也解出 �」的上下文 token（就是同一场缺件的零件袋）划出干净前缀；剩下的干净前缀 decode 出来从拼接结果里剥掉。极端情形整段上下文全是零件袋——干净前缀为空，**拼出的整字记在最后那袋（完成者）头上**。若全档试拼都失败（零件真的不齐，比如「中」的 E4 还没到）——老实返回空串。
+三个问题逐个答。**试几袋零件？** L271-L273：从 1 个上下文 token 到最多 4 个逐档试拼（拼上下文+本 token 重新 decode），拼得成（不以 � 结尾）就进剥前缀。**为什么是 4？** 不是调出来的经验值。RFC 3629 的规定：UTF-8 里任何 Unicode 码点「are encoded using sequences of 1 to 4 octets」（[RFC 3629 §3](https://www.rfc-editor.org/rfc/rfc3629.html)）：汉字在 3 字节区（U+0800..U+FFFF），多数 emoji 在 4 字节区（U+10000..U+10FFFF）。被拆开的多字节字符**至多横跨 4 个 byte token**：带前 4 个落定 token 当上下文必然罩得住。4 字节 emoji（🙂 = F0 9F 99 82，拆 4 个 token）就是「为什么取 4 不取 3」的极端例。（早期 UTF-8 曾经允许 5-6 字节，2003 年 RFC 3629 把合法范围收紧到 U+10FFFF、序列上界定死 4；源码 docstring 的「4 is sufficient for any UTF-8 multi-byte sequence」是这个 2003 年决定的遗产。）**剥前缀是干嘛？** 拼成「hello中」时，得把「hello」还给前文——本 token 只该拿属于自己的部分。剥法：从尾往头扫上下文，凡是「自己也解出 �」的上下文 token（就是同一场缺件的零件袋）划出干净前缀；剩下的干净前缀 decode 出来从拼接结果里剥掉。极端情形整段上下文全是零件袋：干净前缀为空，**拼出的整字记在最后那袋（完成者）头上**。若全档试拼都失败（零件真的不齐，比如「中」的 E4 还没到），老实返回空串。
 
 上下文从哪来：
 
@@ -828,9 +828,9 @@ def convert_ids_list_to_tokens(
         return result
 ```
 
-取已落定容器**每位置的第一个 token**当纵向上下文——「第一个=被采样」不变式的又一个消费端（第 11 站看它怎么被保证）。docstring 说 4 足够，理由就是上面 RFC 那条。
+取已落定容器**每位置的第一个 token**当纵向上下文：「第一个=被采样」不变式的又一个消费端（第 11 站看它怎么被保证）。docstring 说 4 足够，理由就是上面 RFC 那条。
 
-成本账：干净 ASCII 流零开销（没有 � 尾就不触发）；触发时每候选至多 4 次小 decode 加前缀回扫——k=20 的最坏位置也就百次量级的 tokenizer 调用，且只落在含多字节字符的请求上。「以 � 结尾才触发、试拼有 4 的硬上界、修正永不碰干净 token」——终止与无副作用都有结构保证。
+成本账：干净 ASCII 流零开销（没有 � 尾就不触发）；触发时每候选至多 4 次小 decode 加前缀回扫：k=20 的最坏位置也就百次量级的 tokenizer 调用，且只落在含多字节字符的请求上。「以 � 结尾才触发、试拼有 4 的硬上界、修正永不碰干净 token」——终止与无副作用都有结构保证。
 
 实测（配套精简版；真 Rust byte-fallback 解码器，「中」= E4/B8/AD 拆成 token 228/184/173 的逐 token � 与三袋拼整字都是解码器真行为、非模拟；采样序列 [256 'hello', 228, 184, 173]，第 4 位候选=[被采样 173, top1 228]，logprob 值为构造输入）：
 
@@ -842,17 +842,17 @@ def convert_ids_list_to_tokens(
 | 位置 3 | [184, 256] | ['�', 'hello'] | [256, 228] | ['', 'hello'] | decode([228,184])='��'、decode([256,228,184])='hello��' 都失败 → '' |
 | 位置 4（横向两轴） | [173, 228] | ['�', '�'] | [256, 228, 184] | ['中', ''] | 被采样 173：decode([184,173]) 失败 → decode([228,184,173])='中' 成功 → 剥前缀（decode([184])、decode([228]) 均 � → 前缀长 0）→ 整字归 173；候选 228 独立修：[184,228]/[228,184,228]/[256,228,184,228] 全 � → '' |
 
-修正后采样轴的解码序列是 `['hello', '', '', '中']`——两个空串加一个整字；累计值 −0.55（＝ −0.25 − 0.10 − 0.15 − 0.05，四个被采样 logprob 之和——logprob 值为构造输入、未进上表）一路不受文本修正影响（概率账与文本账是两本账）。
+修正后采样轴的解码序列是 `['hello', '', '', '中']`，两个空串加一个整字；累计值 −0.55（＝ −0.25 − 0.10 − 0.15 − 0.05，四个被采样 logprob 之和（logprob 值为构造输入、未进上表）一路不受文本修正影响（概率账与文本账是两本账）。
 
 ![U+FFFD 上下文重建](../diagrams/ch08-fig-ufffd-repair.png)
 
-> *图注：byte-fallback 把「中」拆成 228/184/173 三袋零件，位置 2/3 零件未齐修成空串、位置 4 被采样 173 拼出整字（decode([228,184,173]) 成功、干净前缀长 0、整字归 173），同位候选 228 独立修得空串——横向候选各修各的、纵向上下文共用一份；右侧注 max_context=4 的依据（UTF-8 四字节上界）。放大自本章 L2 图 ⑧『U+FFFD 修正』工序（L0 蓝色 API 带装配段），上游 ⑦ 送含 � 的候选文本、下游 ⑨ 落容器收修正文本。*
+> *图注：byte-fallback 把「中」拆成 228/184/173 三袋零件，位置 2/3 零件未齐修成空串、位置 4 被采样 173 拼出整字（decode([228,184,173]) 成功、干净前缀长 0、整字归 173），同位候选 228 独立修得空串：横向候选各修各的、纵向上下文共用一份；右侧注 max_context=4 的依据（UTF-8 四字节上界）。放大自本章 L2 图 ⑧『U+FFFD 修正』工序（L0 蓝色 API 带装配段），上游 ⑦ 送含 � 的候选文本、下游 ⑨ 落容器收修正文本。*
 
-回头看第二问的答案：半个字报不了整字——vLLM 的选择是**报空串、把整字记在完成者头上**，字节真相留给出口的 bytes 字段兜底（第 14 站）。
+回头看第二问的答案：半个字报不了整字。vLLM 的选择是**报空串、把整字记在完成者头上**，字节真相留给出口的 bytes 字段兜底（第 14 站）。
 
 ## 落容器：相册与长卷（站 11）
 
-还在蓝色带的装配工位（L2 章图 ⑨），修正完的文本与三列数值要落进容器。直觉一句话：**相册的排头兵规则**——每本相册的第一张永远先贴「实际被选中的人」（带他的全词表名次——第 4 站那个 count 名次），后面照领奖台名次贴 top1..topk；被选中的人若本来就在领奖台上，照片只贴一次。这条规矩是本站要守的不变式（它同时是第 9 站累计账、第 10 站上下文提取的地基），落到代码是这么写的：
+还在蓝色带的装配工位（L2 章图 ⑨），修正完的文本与三列数值要落进容器。直觉一句话：**相册的排头兵规则**：每本相册的第一张永远先贴「实际被选中的人」（带他的全词表名次，第 4 站那个 count 名次），后面照领奖台名次贴 top1..topk；被选中的人若本来就在领奖台上，照片只贴一次。这条规矩是本站要守的不变式（它同时是第 9 站累计账、第 10 站上下文提取的地基），落到代码是这么写的：
 
 ```python
 # vllm/logprobs.py:L175-L206
@@ -890,7 +890,7 @@ def append_logprobs_for_next_position(
         )  # L206
 ```
 
-机关在 L189-L190 那条 rank 链：`chain((rank,), range(1, k+1))`——首元素是被采样 token 的**计数名次**（第 4 站那个 count），其后是 topk 的**位置名次** 1..k。这条链与列序 [被采样，top1，…，topk] 一一对齐，落到 dict comprehension 里按序插入——Python dict 保首插序，被采样 token 恒为首页键。被采样==top1 时同一 token 写两次：注释原话「inserting duplicated data into a dictionary twice is the same as doing it once」——键去重、值覆盖，天然合并不重复。
+机关在 L189-L190 那条 rank 链：`chain((rank,), range(1, k+1))`：首元素是被采样 token 的**计数名次**（第 4 站那个 count），其后是 topk 的**位置名次** 1..k。这条链与列序 [被采样，top1，…，topk] 一一对齐，落到 dict comprehension 里按序插入。Python dict 保首插序，被采样 token 恒为首页键。被采样==top1 时同一 token 写两次：注释原话「inserting duplicated data into a dictionary twice is the same as doing it once」——键去重、值覆盖，天然合并不重复。
 
 实测五种情形（配套精简版，情形 3 走真 gather 全链）：
 
@@ -899,15 +899,15 @@ def append_logprobs_for_next_position(
 |---|---|---|---|---|---|
 | 情形 1 · 被采样落榜 | [12,4,7] / [-0.4,-1.1,-2.2] / rank 3 | (3, 1, 2) | [12, 4, 7] | [3, 1, 2] | 被采样带自己的词表 rank 领头；topk 用位置 rank 1..k |
 | 情形 2 · 被采样==top1 | [12,12,7] / rank 1 | (1, 1, 2) | [12, 7] | [1, 2] | 重复键两次插入==一次（源码注释原话）；键序仍被采样在前 |
-| 情形 3 · 并列平手（真 gather 全链） | logits [3.0,2.5,2.5,1.0] 采样 id1，gather 列 [1,0,1]，logprob [-1.3537,-0.8537,-1.3537] | (3, 1, 2) | [1, 0] | [2, 1] | 计数 rank=3（并列上界）被后来 topk 位置 rank 2 覆盖——值以后写为准、键序以首插为准（上游同码同行为，dict 语义） |
-| 情形 4 · k=-1 全词表 | [12,4] / rank 3 | (3, 1)——num_logprobs 取 len(logprobs) | [12, 4] | [3, 1] | 链条放开到所有列 |
-| 情形 5 · flat 容器 | [12,12,7] | (1, 1, 2) | 写入 3 列不去重（flat.start_indices=[0]、end=[3]）；读 flat[0] 得 2 键 | flat.ranks=[1,1,2] | 去重推迟到读（__getitem__ 现造 dict）——flat 与 nested 的唯一行为差 |
+| 情形 3 · 并列平手（真 gather 全链） | logits [3.0,2.5,2.5,1.0] 采样 id1，gather 列 [1,0,1]，logprob [-1.3537,-0.8537,-1.3537] | (3, 1, 2) | [1, 0] | [2, 1] | 计数 rank=3（并列上界）被后来 topk 位置 rank 2 覆盖，值以后写为准、键序以首插为准（上游同码同行为，dict 语义） |
+| 情形 4 · k=-1 全词表 | [12,4] / rank 3 | (3, 1)，num_logprobs 取 len(logprobs) | [12, 4] | [3, 1] | 链条放开到所有列 |
+| 情形 5 · flat 容器 | [12,12,7] | (1, 1, 2) | 写入 3 列不去重（flat.start_indices=[0]、end=[3]）；读 flat[0] 得 2 键 | flat.ranks=[1,1,2] | 去重推迟到读（__getitem__ 现造 dict），flat 与 nested 的唯一行为差 |
 
-（情形 3 如实记一笔：并列时展示的 rank 会被后写的 topk 位置名次覆盖——这是 dict comprehension 的标准语义、上游 vLLM 同码同行为；无并列时两个值恒等。）
+（情形 3 如实记一笔：并列时展示的 rank 会被后写的 topk 位置名次覆盖，这是 dict comprehension 的标准语义、上游 vLLM 同码同行为；无并列时两个值恒等。）
 
 ### 长卷：FlatLogprobs 的对象账
 
-情形 5 里的 flat 容器值得单开。nested 格式（`list[dict[int, Logprob]]`）每位置造一个 dict、每条记录造一个 `Logprob` 对象（`vllm/logprobs.py:L12-L27`：logprob 值、rank、decoded_token 三字段的数据类）。位置多了会怎样？CPython 的循环垃圾回收器（GC——引用计数之外、专抓引用环的回收器）**只追踪可能装引用的容器对象**：官方文档对 `gc.is_tracked` 的规则原话「As a general rule, instances of atomic types aren't tracked and instances of non-atomic types (containers, user-defined objects…) are」（[Python 文档](https://docs.python.org/3/library/gc.html)）——int/float/str 原子对象从不进它的扫描名单，dict 和实例全进。nested 存法把每个候选都变成一个被追踪对象，GC 分代扫描的账随序列长度线性涨。
+情形 5 里的 flat 容器值得单开。nested 格式（`list[dict[int, Logprob]]`）每位置造一个 dict、每条记录造一个 `Logprob` 对象（`vllm/logprobs.py:L12-L27`：logprob 值、rank、decoded_token 三字段的数据类）。位置多了会怎样？CPython 的循环垃圾回收器（GC＝引用计数之外、专抓引用环的回收器）**只追踪可能装引用的容器对象**：官方文档对 `gc.is_tracked` 的规则原话「As a general rule, instances of atomic types aren't tracked and instances of non-atomic types (containers, user-defined objects…) are」（[Python 文档](https://docs.python.org/3/library/gc.html)）。int/float/str 原子对象从不进它的扫描名单，dict 和实例全进。nested 存法把每个候选都变成一个被追踪对象，GC 分代扫描的账随序列长度线性涨。
 
 FlatLogprobs 换住法——**从「每页一本相册」到「一条长卷」**：
 
@@ -971,35 +971,35 @@ class FlatLogprobs(MutableSequence[LogprobsOnePosition | None]):
         self.end_indices.append(len(self.logprobs))
 ```
 
-六条平行原生列表（起止索引两卷 + id/值/名次/文本四卷），每位置的记录摊进 `[start_indices[i], end_indices[i])` 区间。类签名与 docstring 里的 `LogprobsOnePosition` 是 `dict[int, Logprob]` 的类型别名（`vllm/logprobs.py:L27`）——「单位置那页候选」的学名，下面 `__getitem__` 按位现造的 dict 就是它。它实现 `MutableSequence`（Python 标准库的可变序列协议）——对外照样能当 list 用：`__getitem__` 按位现造一个 dict（读侧 O(k)）、切片重建平移版（出口切尾就走这条）。
+六条平行原生列表（起止索引两卷 + id/值/名次/文本四卷），每位置的记录摊进 `[start_indices[i], end_indices[i])` 区间。类签名与 docstring 里的 `LogprobsOnePosition` 是 `dict[int, Logprob]` 的类型别名（`vllm/logprobs.py:L27`）：「单位置那页候选」的学名，下面 `__getitem__` 按位现造的 dict 就是它。它实现 `MutableSequence`（Python 标准库的可变序列协议），对外照样能当 list 用：`__getitem__` 按位现造一个 dict（读侧 O(k)）、切片重建平移版（出口切尾就走这条）。
 
 实测两种住法的对象账（配套精简版，`gc.get_objects()` 建造前后差，计的是受 GC 跟踪的容器对象）：
 
 <!-- trace: m10 -->
 | 容器 | 位置数 | 受跟踪对象（实测） | 构成 | 读侧 |
 |---|---|---|---|---|
-| nested list[dict] | 100 | 301 | 100 个 dict + 200 个 Logprob 实例 + 1 个外层 list（算术 301，与实测一致） | 直接索引——读零成本 |
+| nested list[dict] | 100 | 301 | 100 个 dict + 200 个 Logprob 实例 + 1 个外层 list（算术 301，与实测一致） | 直接索引，读零成本 |
 | FlatLogprobs | 100 | 7 | 6 条平行原生列表（start/end_indices + token_ids/logprobs/ranks/decoded_tokens）+ 容器实例本身；元素全是原语 | __getitem__ 每次现造 dict（O(k)）、slice 重建平移版 FlatLogprobs |
 | 10 倍探针 nested | 1000 | 3001 | 对象数随 L 线性涨（3001 = 1000 dict + 2000 Logprob + 1） | —— |
-| 10 倍探针 flat | 1000 | 7 | 恒 7——与 L 无关（实测比值 428.7） | flat[42] 两次调用返回相等但非同一对象（e1==e2 且 e1 is not e2）——每次现造 |
+| 10 倍探针 flat | 1000 | 7 | 恒 7，与 L 无关（实测比值 428.7） | flat[42] 两次调用返回相等但非同一对象（e1==e2 且 e1 is not e2），每次现造 |
 
-L=100：301 对 7；L=1000：3001 对 7——flat 的被追踪对象数是**常数**，不管多少位置、多大 k。真实规模的账：2000 token 的流 × k=20，nested 约 2000 × 21 + 1 = 42001 个对象进分代扫描（每位置 1 个 dict + 20 个 Logprob——k+1 列被采样==top1 去重后 20 条，与上表同一算术口径），flat 恒 7。**代价**：读侧从零成本变 O(k)（现造 dict）；顺序消费为主的 logprobs 场景正合适。开关 `SamplingParams.flat_logprobs` 默认 False——兼容第一、提速可选（docstring 原话「GC costs of FlatLogprobs is significantly smaller than list[dict[int, Logprob]]」）。省的这笔明确是 **GC 扫描成本**，不是数据本身的内存（原语列表也占内存，那是另一笔账）。
+L=100：301 对 7；L=1000：3001 对 7。flat 的被追踪对象数是**常数**，不管多少位置、多大 k。真实规模的账：2000 token 的流 × k=20，nested 约 2000 × 21 + 1 = 42001 个对象进分代扫描（每位置 1 个 dict + 20 个 Logprob，k+1 列被采样==top1 去重后 20 条，与上表同一算术口径），flat 恒 7。**代价**：读侧从零成本变 O(k)（现造 dict）；顺序消费为主的 logprobs 场景正合适。开关 `SamplingParams.flat_logprobs` 默认 False——兼容第一、提速可选（docstring 原话「GC costs of FlatLogprobs is significantly smaller than list[dict[int, Logprob]]」）。省的这笔明确是 **GC 扫描成本**，不是数据本身的内存（原语列表也占内存，那是另一笔账）。
 
 ![FlatLogprobs：相册与长卷](../diagrams/ch08-fig-flat-vs-nested.png)
 
-> *图注：同一份 logprobs 两种住法——左 nested 每位置一本 dict 相册、每条记录一张 Logprob 对象照片（L=100 实测 301 个受跟踪对象、十倍位置线性涨到 3001）；右 FlatLogprobs 摊进六条平行长卷、区间索引圈位（实测恒 7、比值徽章 428.7×），读某位置时现造 dict（O(k)）。放大自本章 L2 图 ⑨『落容器』工序（L0 蓝色 API 带装配段）。*
+> *图注：同一份 logprobs 两种住法：左 nested 每位置一本 dict 相册、每条记录一张 Logprob 对象照片（L=100 实测 301 个受跟踪对象、十倍位置线性涨到 3001）；右 FlatLogprobs 摊进六条平行长卷、区间索引圈位（实测恒 7、比值徽章 428.7×），读某位置时现造 dict（O(k)）。放大自本章 L2 图 ⑨『落容器』工序（L0 蓝色 API 带装配段）。*
 
 ## 支路中的支路：prompt logprobs（站 12）
 
-生成路的容器满了。还剩一条岔路（L2 章图下排那条从 ⑥ 分叉的 prompt 支路）：第 1 站那份 `prompt_logprobs` 声明——给 prompt 的每个位置也报概率。直觉一句话：**补考的分段批改**——prompt 的每个位置都欠一份概率账（模型看这段前文时有多想写下一个字），按 chunked prefill（[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)立过的切块预填充——长 prompt 分多拍消化）的节奏分批改，每块只改本块覆盖的位次，改完先押着，最后一块交卷才整本发给前端；目标答案永远是「下一位写下的字」。
+生成路的容器满了。还剩一条岔路（L2 章图下排那条从 ⑥ 分叉的 prompt 支路）：第 1 站那份 `prompt_logprobs` 声明：给 prompt 的每个位置也报概率。直觉一句话：**补考的分段批改**：prompt 的每个位置都欠一份概率账（模型看这段前文时有多想写下一个字），按 chunked prefill（[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)立过的切块预填充，长 prompt 分多拍消化）的节奏分批改，每块只改本块覆盖的位次，改完先押着，最后一块交卷才整本发给前端；目标答案永远是「下一位写下的字」。
 
 ### 为什么能补算：两方法契约
 
-prompt logprobs 要的是「对 prompt 的每个位置重算一遍 logits」——这在架构上成立，靠的是模型接口的一份契约，why 链四要素：
+prompt logprobs 要的是「对 prompt 的每个位置重算一遍 logits」，这在架构上成立，靠的是模型接口的一份契约，why 链四要素：
 
-- **旧设计**：HF transformers（HuggingFace 的模型库）的 `ForCausalLM.forward`（vLLM 的模型类就是从 `modeling_llama.py` 改编的，文件头注明 Adapted from）在 forward 里一口气跑 lm_head（词表投影层——意见向量变 logits 的最后一层变换）、返回**全部位置**的 logits——训练语义（每个位置都要算 loss）。v0 早期推理沿用这个形状。
+- **旧设计**：HF transformers（HuggingFace 的模型库）的 `ForCausalLM.forward`（vLLM 的模型类就是从 `modeling_llama.py` 改编的，文件头注明 Adapted from）在 forward 里一口气跑 lm_head（词表投影层，意见向量变 logits 的最后一层变换）、返回**全部位置**的 logits。训练语义（每个位置都要算 loss）。v0 早期推理沿用这个形状。
 - **痛点**：decode 批次每请求只有**最后 1 个**位置需要下一词分布；vocab 约 13 万（DeepSeek 129280）时一个 4096-token 的 prefill 块全量物化 fp32 logits ≈ 4096 × 129280 × 4B ≈ 2GB，纯属浪费；且张量并行（[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)点过名的并行方式）下 lm_head 按词表分片，全量物化意味着全量 gather（跨卡归拢），通信量同倍放大。
-- **v1 方案**：模型契约拆两方法——`forward` 只出 hidden_states（意见向量），`compute_logits(hidden_states)` 独立（`vllm/model_executor/models/llama.py:L516-L533`，内部走 lm_head 投影 → 张量并行 gather → 裁掉词表 padding（词表为让张量并行各卡均分而补的空位列））。「哪些位置要 logits」的策略归 runner：普通 decode 只取每请求最后一行，prompt logprobs 取 prompt 的行——同一份契约，两种取法。
+- **v1 方案**：模型契约拆两方法：`forward` 只出 hidden_states（意见向量），`compute_logits(hidden_states)` 独立（`vllm/model_executor/models/llama.py:L516-L533`，内部走 lm_head 投影 → 张量并行 gather → 裁掉词表 padding（词表为让张量并行各卡均分而补的空位列））。「哪些位置要 logits」的策略归 runner：普通 decode 只取每请求最后一行，prompt logprobs 取 prompt 的行——同一份契约，两种取法。
 - **代价（如实记）**：模型类接入面变大（两个方法都要实现）；「哪里要 logits」的策略散在 runner 各处（prompt logprobs / 投机解码 / 池化各不同），模型层无法自洽；流水线并行（模型竖切多段各居一卡）的场景还要把 logits 跨进程广播。
 
 **prompt 支路之所以能「事后补考」，正建立在这个契约上**——logits 没在 forward 里全量物化，才可能事后按需补算。
@@ -1066,10 +1066,10 @@ prompt logprobs 要的是「对 prompt 的每个位置重算一遍 logits」—�
                 prompt_logprobs_dict[req_id] = logprobs_tensors  # L5675
 ```
 
-（省去 L5676-L5681 的末块防御分支——上一块刚好算完前 n−1 个 token、本块只剩最后一个 token 的请求，没有可计分的位置，直接 continue。）循环体的下半场是补算与分块拷贝：
+（省去 L5676-L5681 的末块防御分支：上一块刚好算完前 n−1 个 token、本块只剩最后一个 token 的请求，没有可计分的位置，直接 continue。）循环体的下半场是补算与分块拷贝：
 
 ```python
-# vllm/v1/worker/gpu_model_runner.py:L5683-L5715
+# vllm/v1/worker/gpu_model_runner.py:L5683-L5715 · GPUModelRunner._get_prompt_logprobs_dict
             # Get the logits corresponding to this req's prompt tokens.
             # If this is a partial request (i.e. chunked prefill),
             # then there is prompt logprob generated for each index.
@@ -1105,23 +1105,23 @@ prompt logprobs 要的是「对 prompt 的每个位置重算一遍 logits」—�
             )
 ```
 
-（循环收尾在 L5717-L5727：交付过的请求从 `num_prompt_logprobs` 字典注销、挂账字段置 None，最后 `_sync_device()` 同步非阻塞拷贝——纯记账，不再展开。）
+（循环收尾在 L5717-L5727：交付过的请求从 `num_prompt_logprobs` 字典注销、挂账字段置 None，最后 `_sync_device()` 同步非阻塞拷贝，纯记账，不再展开。）
 
-L5631-L5632 那两行注释先记下——「prompt logprobs 是个罕见特性，优先简单可维护而非最优性能」，这条支路的实现取舍全在这句话里。主线五步：**整本预分配**（L5656-L5657：首次遇到就给整个 prompt 开好 CPU 张量，位次 = prompt 长度 − 1——首 token 没有条件概率、不计分）；**定位本块**（start_idx = 已算过的 token 数，随 chunk 推进）；**补算 logits**（L5689：两方法契约的兑现——先用 `query_start_loc`（批张量里每个请求的 token 起点表，`.np` 是转成 numpy 视图取值的写法）定出本请求在压平的批 hidden_states 里的行起点、切出 prompt 各行，再调 `compute_logits`）；**gather**（目标 token 恒为 prompt[i+1]——位置 i 的「被采样者」就是下一位真实写下的字，L5694）；**分块拷入、末块交付**（L5709：结果按位次区间拷进预分配张量；只有覆盖到最后一块的请求才把它放进交付字典——中间块全部押在请求的 `in_progress_prompt_logprobs_cpu` 挂账字段上）。
+L5631-L5632 那两行注释先记下：「prompt logprobs 是个罕见特性，优先简单可维护而非最优性能」，这条支路的实现取舍全在这句话里。主线五步：**整本预分配**（L5656-L5657：首次遇到就给整个 prompt 开好 CPU 张量，位次 = prompt 长度 − 1（首 token 没有条件概率、不计分）；**定位本块**（start_idx = 已算过的 token 数，随 chunk 推进）；**补算 logits**（L5689：两方法契约在此兑现，先用 `query_start_loc`（批张量里每个请求的 token 起点表，`.np` 是转成 numpy 视图取值的写法）定出本请求在压平的批 hidden_states 里的行起点、切出 prompt 各行，再调 `compute_logits`）；**gather**（目标 token 恒为 prompt[i+1]，位置 i 的「被采样者」就是下一位真实写下的字，L5694）；**分块拷入、末块交付**（L5709：结果按位次区间拷进预分配张量；只有覆盖到最后一块的请求才把它放进交付字典——中间块全部押在请求的 `in_progress_prompt_logprobs_cpu` 挂账字段上）。
 
-实测（配套精简版，五 token prompt [1,2,0,2,1] 分两块消化；模型用恒等 compute_logits——hidden 行即 logits 行，专为可心算；gather/log_softmax 逐字真码，如位 0 的分数可手算复核：log_softmax([5,4,3,2,1,0]) 对目标 2 = −2.4562）：
+实测（配套精简版，五 token prompt [1,2,0,2,1] 分两块消化；模型用恒等 compute_logits（hidden 行即 logits 行，专为可心算）；gather/log_softmax 逐字真码，如位 0 的分数可手算复核：log_softmax([5,4,3,2,1,0]) 对目标 2 = −2.4562）：
 
 <!-- trace: m11 -->
 | chunk | 排进本步 token 数 | start_idx / num_computed | 本步计分位（目标 = prompt[i+1]） | 交付？ | 挂账状态 |
 |---|---|---|---|---|---|
-| chunk 1 | 2 | 0 / 0 | 位 0、位 1 → 目标 prompt[1]=2（列 [2,0]，rank 3）、prompt[2]=0（列 [0,1]，rank 2） | 否——交付字典为空 | 首次调用即 empty_cpu(4,2) 整 prompt 预分配；结果拷进本块行，张量押在 in_progress_prompt_logprobs_cpu；num_prompt_logprobs 字典仍登记 p0 |
-| chunk 2 | 3 | 2 / 2 | 位 2、位 3 → 目标 prompt[3]=2（列 [2,2]，rank 1）、prompt[4]=1（列 [1,3]，rank 3） | 是——一次性交整张 [4,2] | num_tokens 3 > 剩余 2 → 末块；交完即注销：num_prompt_logprobs 字典清空、in_progress 置 None |
+| chunk 1 | 2 | 0 / 0 | 位 0、位 1 → 目标 prompt[1]=2（列 [2,0]，rank 3）、prompt[2]=0（列 [0,1]，rank 2） | 否，交付字典为空 | 首次调用即 empty_cpu(4,2) 整 prompt 预分配；结果拷进本块行，张量押在 in_progress_prompt_logprobs_cpu；num_prompt_logprobs 字典仍登记 p0 |
+| chunk 2 | 3 | 2 / 2 | 位 2、位 3 → 目标 prompt[3]=2（列 [2,2]，rank 1）、prompt[4]=1（列 [1,3]，rank 3） | 是，一次性交整张 [4,2] | num_tokens 3 > 剩余 2 → 末块；交完即注销：num_prompt_logprobs 字典清空、in_progress 置 None |
 
 两块的计分位区间 [0,2) 与 [2,4) 不重叠地铺满 [0, 5−1)，交付恰一次；各块目标列的首列 [2,0,2,1] 正是 prompt[1..4]。
 
 ### API 侧：装配、首位空位、一次性支票
 
-引擎侧交来的 `LogprobsTensors` 在到港第 3 步走 prompt 分支装配。直觉一句话：**整版排好版的拼贴表先过一遍塑封机**——按张量形状恢复版式，把所有 id 一把摊平、一次 decode 全部解完，再按每位的列数切回成条，每条各自做 U+FFFD 修正。看代码：
+引擎侧交来的 `LogprobsTensors` 在到港第 3 步走 prompt 分支装配。直觉一句话：**整版排好版的拼贴表先过一遍塑封机**：按张量形状恢复版式，把所有 id 一把摊平、一次 decode 全部解完，再按每位的列数切回成条，每条各自做 U+FFFD 修正。看代码：
 
 ```python
 # vllm/v1/engine/logprobs.py:L121-L187
@@ -1178,7 +1178,7 @@ L5631-L5632 那两行注释先记下——「prompt logprobs 是个罕见特性�
             )
 ```
 
-三个看点。**形状恢复**（L140）：张量形状自带版式——`logprobs.shape` 把 `[num_tok, k+1]` 拆回行列。**一次到位的扁平解码**：九个 id 摊平进一次 `convert_ids_list_to_tokens` 调用（省的是外层调用与切片开销；它内部仍逐 id 单独 decode、单 token decode 次数不变——全程 9 次，见下一张表后的记账）——再按 `offset = pos × num_logprobs` 切回各位置（行主序展开，切片与三列数据天然对齐）。**无累计**：这一路从头到尾不碰 `cumulative_logprob`——prompt 不是模型生成的，这些概率加起来没有联合概率的含义（与第 9 站的对照）。
+三个看点。**形状恢复**（L140）：张量形状自带版式：`logprobs.shape` 把 `[num_tok, k+1]` 拆回行列。**一次到位的扁平解码**：九个 id 摊平进一次 `convert_ids_list_to_tokens` 调用（省的是外层调用与切片开销；它内部仍逐 id 单独 decode、单 token decode 次数不变，全程 9 次，见下一张表后的记账）。再按 `offset = pos × num_logprobs` 切回各位置（行主序展开，切片与三列数据天然对齐）。**无累计**：这一路从头到尾不碰 `cumulative_logprob`，因为 prompt 不是模型生成的，这些概率加起来没有联合概率的含义（与第 9 站的对照）。
 
 容器的出生有个细节：
 
@@ -1192,7 +1192,7 @@ def create_prompt_logprobs(flat_logprobs: bool) -> PromptLogprobs:
     return logprobs
 ```
 
-账本的第一页永远印着「无此账」：prompt 首位前面什么都没有、没有条件概率可言，出生自带一个 None 占位——这样容器位次才能与 prompt 位次一一对齐。而整本账在流式（DELTA）模式下是一次性支票——第一次 pop 全额兑付、随即作废：
+账本的第一页永远印着「无此账」：prompt 首位前面什么都没有、没有条件概率可言，出生自带一个 None 占位。这样容器位次才能与 prompt 位次一一对齐。而整本账在流式（DELTA）模式下是一次性支票——第一次 pop 全额兑付、随即作废：
 
 ```python
 # vllm/v1/engine/logprobs.py:L189-L206
@@ -1213,20 +1213,20 @@ def create_prompt_logprobs(flat_logprobs: bool) -> PromptLogprobs:
         return plp
 ```
 
-取走即清空。为什么 pop 而不是直读？DELTA 语义下 prompt 账只该出现一次（prefill 末整本到齐）；若每个后续 step 都直读，每帧都会重复捎上整份 prompt logprobs——SSE（Server-Sent Events，流式响应协议，[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)立过）的帧白白膨胀。非 DELTA 直读无此问题（每帧本来就全量）。
+取走即清空。为什么 pop 而不是直读？DELTA 语义下 prompt 账只该出现一次（prefill 末整本到齐）；若每个后续 step 都直读，每帧都会重复捎上整份 prompt logprobs，SSE（Server-Sent Events，流式响应协议，[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)立过）的帧白白膨胀。非 DELTA 直读无此问题（每帧本来就全量）。
 
 实测（配套精简版；2 个计分位、k=1）：
 
 <!-- trace: m12 -->
 | 时刻 | 容器内容 / 动作 | 长度 | 语义 |
 |---|---|---|---|
-| 出生（请求登记时） | [None]（nested）/ 空位（flat：start=end=[0]） | 1 | 首 token 无条件概率——先占位 |
+| 出生（请求登记时） | [None]（nested）/ 空位（flat：start=end=[0]） | 1 | 首 token 无条件概率，先占位 |
 | 一次 prefill 装配完 | [None, 位1 {256:-0.1, 257:-0.3}, 位2 {257:-0.2, 256:-0.4}] | 3 | None 占位 + 2 个计分位 |
 | DELTA 第一次 pop | 取走全部并清空（logprobs -0.1/-0.3、-0.2/-0.4） | 3 | 跨 chunk 聚合的账在 prefill 末一次发清 |
-| DELTA 第二次 pop | 容器已空：返回 []（非 None——if plp: 守卫跳过重置、照样返回空容器） | 0 | 取走即遗忘 |
-| 禁用请求 pop | prompt_logprobs=None 的请求 | —— | 恒 None——开关关闭整条支路不设账 |
+| DELTA 第二次 pop | 容器已空：返回 []（非 None，if plp: 守卫跳过重置、照样返回空容器） | 0 | 取走即遗忘 |
+| 禁用请求 pop | prompt_logprobs=None 的请求 | —— | 恒 None，开关关闭整条支路不设账 |
 
-prompt 装配的完整逐位走一遍（含字节修正；配套精简版，prompt [256 'hello', 228, 184, 173]——含「中」的三字节拆分，num_prompt_logprobs=2 每位 3 列 [目标，top1，top2]；logprob 与 rank 为构造输入，形状恢复/扁平切片/修正路径逐字保真）：
+prompt 装配的完整逐位走一遍（含字节修正；配套精简版，prompt [256 'hello', 228, 184, 173]，含「中」的三字节拆分，num_prompt_logprobs=2 每位 3 列 [目标，top1，top2]；logprob 与 rank 为构造输入，形状恢复/扁平切片/修正路径逐字保真）：
 
 <!-- trace: m13 -->
 | 位置 | 列 [目标，top1，top2] / logprob | 扁平解码切片（offset..offset_end） | 修正后 decoded | rank |
@@ -1237,13 +1237,13 @@ prompt 装配的完整逐位走一遍（含字节修正；配套精简版，prom
 | 位 3 | [173, 256, 257] / [-0.05, -0.7, -1.3] | 6..9 → ['�', 'hello', ' world'] | ['中', 'hello', ' world'] | [1, 1, 2] |
 | 全程 | 形状恢复 [3,3]（num_tok=3、列=3） | flatten 长 9 → 一次 convert_ids_list_to_tokens 解 9 个 id | cumulative 恒 0.0（prompt 非模型生成、不累计） | —— |
 
-位 3 的目标 173 拼出整字「中」（上下文 [228,184]、与前一站同源同算法），decode 调用全程 9 次扁平 + 位 3 修正 5 次——修正只花在以 � 结尾的目标上。
+位 3 的目标 173 拼出整字「中」（上下文 [228,184]、与前一站同源同算法），decode 调用全程 9 次扁平 + 位 3 修正 5 次。修正只花在以 � 结尾的目标上。
 
-最后一句边界：prompt logprobs 与前缀缓存（[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)点过名的 prefix caching——重复前文复用 KV 的缓存）天然互斥：命中缓存的 token 当年没过模型前向、没有概率账可补。要 prompt logprobs 就必须整段重算——登记位一行 `skip_reading_prefix_cache = self.prompt_logprobs is not None`（`vllm/sampling_params.py:L509-L513`）把缓存通道对本请求关死；源码注释原话「If prefix caching is enabled, the output of prompt logprobs may less than n_prompt_tokens, we need to skip reading cache at this request」。前缀缓存机制本身留到后面专章展开。
+最后一句边界：prompt logprobs 与前缀缓存（[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)点过名的 prefix caching，重复前文复用 KV 的缓存）天然互斥：命中缓存的 token 当年没过模型前向、没有概率账可补。要 prompt logprobs 就必须整段重算。登记位一行 `skip_reading_prefix_cache = self.prompt_logprobs is not None`（`vllm/sampling_params.py:L509-L513`）把缓存通道对本请求关死；源码注释原话「If prefix caching is enabled, the output of prompt logprobs may less than n_prompt_tokens, we need to skip reading cache at this request」。前缀缓存机制本身留到后面专章展开。
 
 ## 出口装车：三态契约的投影（站 13）
 
-容器满了、账齐了，走到蓝色 API 带的出门工位（L2 章图 ⑩）。出口怎么装车由[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)立过的三态契约（`output_kind`：DELTA 流式增量 / CUMULATIVE 每帧全量 / FINAL_ONLY 只发终帧）决定——logprobs 的装法就是这份契约在概率维度上的投影：
+容器满了、账齐了，走到蓝色 API 带的出门工位（L2 章图 ⑩）。出口怎么装车由[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)立过的三态契约（`output_kind`：DELTA 流式增量 / CUMULATIVE 每帧全量 / FINAL_ONLY 只发终帧）决定。logprobs 的装法就是这份契约在概率维度上的投影：
 
 ```python
 # vllm/v1/engine/output_processor.py:L388-L423
@@ -1281,10 +1281,10 @@ prompt 装配的完整逐位走一遍（含字节修正；配套精简版，prom
         )
 ```
 
-L405-L407：DELTA 只带尾部——`logprobs[-len(token_ids):]` 切出与本帧 token 数一致的尾段（与文本切尾 `get_next_output_text` 同法；flat 容器走切片重建面）；CUMULATIVE/FINAL 直读全量容器。L420 的累计器不分模式、恒为整车读数（它从来只增不减）。
+L405-L407：DELTA 只带尾部：`logprobs[-len(token_ids):]` 切出与本帧 token 数一致的尾段（与文本切尾 `get_next_output_text` 同法；flat 容器走切片重建面）；CUMULATIVE/FINAL 直读全量容器。L420 的累计器不分模式、恒为整车读数（它从来只增不减）。
 
 ```python
-# vllm/v1/engine/output_processor.py:L366-L386
+# vllm/v1/engine/output_processor.py:L366-L386 · RequestState._new_request_output
         assert self.logprobs_processor is not None
         if self.output_kind == RequestOutputKind.DELTA:
             # Side effect: logprobs processor forgets prompt logprobs
@@ -1310,7 +1310,7 @@ L405-L407：DELTA 只带尾部——`logprobs[-len(token_ids):]` 切出与本帧
 
 prompt 账在 DELTA 下走第 12 站的 pop（一次性支票在此兑现），其余模式直读。注释原话点明副作用：「Side effect: logprobs processor forgets prompt logprobs」。
 
-三态契约本身的 why 链（[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)已给全案，这里只报 logprobs 相关的两端）——旧设计：v0 没这个维度，引擎对每个请求每步都产完整输出，流式与否全靠 API 层消化；痛点：离线批处理与非流式 HTTP 根本不需要中间输出，照样生产、照样跨进程、照样排队；v1 方案：使用面在入口声明消费方式（`stream=True` → DELTA、否则 FINAL_ONLY，离线强制 FINAL_ONLY），引擎照单裁剪——中间输出根本不构造；代价：logprobs 切片、prompt pop、信箱合并、指标统计……**所有下游都要感知这根新轴**——与 n>1 多候选（n＝每请求生成的候选条数）、流式输入两根旧维度并列，分支组合随它们继续膨胀。
+三态契约本身的 why 链（[第 7 章](../../ch07-uplink-token-to-text/narrative/chapter.md)已给全案，这里只报 logprobs 相关的两端）。旧设计：v0 没这个维度，引擎对每个请求每步都产完整输出，流式与否全靠 API 层消化；痛点：离线批处理与非流式 HTTP 根本不需要中间输出，照样生产、照样跨进程、照样排队；v1 方案：使用面在入口声明消费方式（`stream=True` → DELTA、否则 FINAL_ONLY，离线强制 FINAL_ONLY），引擎照单裁剪，中间输出根本不构造；代价：logprobs 切片、prompt pop、信箱合并、指标统计……**所有下游都要感知这根新轴**：与 n>1 多候选（n＝每请求生成的候选条数）、流式输入两根旧维度并列，分支组合随它们继续膨胀。
 
 实测三种模式的装车对照（配套精简版；token 流 [256, 257, 65] 三轮、每轮 1 token、k=1，第 1 轮随车 prompt 账 2 个计分位；detokenizer 是 host 面同语义实现，logprobs 段逐字保真）：
 
@@ -1318,16 +1318,16 @@ prompt 账在 DELTA 下走第 12 站的 pop（一次性支票在此兑现），�
 | 模式 · 轮次 | CompletionOutput.token_ids | logprobs 条数 | cumulative_logprob | RequestOutput.prompt_logprobs |
 |---|---|---|---|---|
 | DELTA · 轮 1 | [256] | 1（切尾） | -0.25 | 3（pop 一次性：None + 2 计分位） |
-| DELTA · 轮 2 | [257] | 1 | -1.75 | 0（已 pop 空——恒空箱） |
+| DELTA · 轮 2 | [257] | 1 | -1.75 | 0（已 pop 空，恒空箱） |
 | DELTA · 轮 3 | [65] | 1 | -1.8 | 0 |
 | CUMULATIVE · 轮 1/2/3 | [256] → [256,257] → [256,257,65] | 1 → 2 → 3（全量） | -0.25 → -1.75 → -1.8 | 恒 3（直读不清空） |
-| FINAL_ONLY · 轮 1/2/3 | 同 CUMULATIVE 全量（精简版走直线；吞中间输出的三道闸是上一章的域——真实引擎在未 finish 时返回 None） | 1 → 2 → 3 | -0.25 → -1.75 → -1.8 | 3 |
+| FINAL_ONLY · 轮 1/2/3 | 同 CUMULATIVE 全量（精简版走直线；吞中间输出的三道闸是上一章的域，真实引擎在未 finish 时返回 None） | 1 → 2 → 3 | -0.25 → -1.75 → -1.8 | 3 |
 
 DELTA 三轮各 1 条、每条恰出现于一帧不重不漏；cumulative 三个模式逐位相同；prompt 账 3 → 0 → 0 一次性。
 
 ## 出口三件套：token、logprob、bytes（站 14）
 
-最后一站，回到 L0 图蓝色 API 带最上层的 OpenAI 门面（L2 章图北排的出门框）。SSE（Server-Sent Events，[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)立过的流式响应协议）帧要出门了，logprobs 得装进 OpenAI 的响应形状。本章要讲透的另一个新概念——bytes 字段——就在这里诞生。先看协议定义：
+最后一站，回到 L0 图蓝色 API 带最上层的 OpenAI 门面（L2 章图北排的出门框）。SSE（Server-Sent Events，[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)立过的流式响应协议）帧要出门了，logprobs 得装进 OpenAI 的响应形状。本章要讲透的另一个新概念（bytes 字段）就在这里诞生。先看协议定义：
 
 ```python
 # vllm/entrypoints/openai/chat_completion/protocol.py:L81-L95
@@ -1348,7 +1348,7 @@ class ChatCompletionLogProbs(OpenAIBaseModel):
     content: list[ChatCompletionLogProbsContent] | None = None
 ```
 
-每个位置一条 `ChatCompletionLogProbsContent`：自己的 token/logprob/bytes，加一个 `top_logprobs` 候选列表（列表里每个元素同款三件套）。门面里没有 rank——第 4 站立的那个扩展字段不进 OpenAI 形状：它只随原生接口的 `CompletionOutput.logprobs`（`Logprob` 三字段对象，站 11 落容器用的那个）露面，留给离线/打分侧消费。装配在两处被调（流式 `serving.py:L587-L600` / 非流式 `serving.py:L885-L895`），先看候选位的构造器：
+每个位置一条 `ChatCompletionLogProbsContent`：自己的 token/logprob/bytes，加一个 `top_logprobs` 候选列表（列表里每个元素同款三件套）。门面里没有 rank。第 4 站立的那个扩展字段不进 OpenAI 形状：它只随原生接口的 `CompletionOutput.logprobs`（`Logprob` 三字段对象，站 11 落容器用的那个）露面，留给离线/打分侧消费。装配在两处被调（流式 `serving.py:L587-L600` / 非流式 `serving.py:L885-L895`），先看候选位的构造器：
 
 ```python
 # vllm/entrypoints/openai/chat_completion/serving.py:L1140-L1165
@@ -1448,11 +1448,11 @@ class ChatCompletionLogProbs(OpenAIBaseModel):
 
 三件套逐个拆开。上面主位循环的分工一眼可见：缺步（容器里没有本位记录）走 `if` 分支现解文本、logprob 落协议默认；正常步走 `else` 分支从容器取记录，候选列表交给 `_get_top_logprobs`——主位与候选位走的是同一套三件套逻辑。
 
-**token 栏（名字）** —— 候选的解码文本，第 10 站修正过的那份。它可能不可靠：byte-fallback 的碎片候选修正后是空串、归属后移。出口有个 `return_as_token_id` 开关，把 token 栏改写成 `token_id:N` 形式（要按 id 对账的下游用）。
+**token 栏（名字）**：候选的解码文本，第 10 站修正过的那份。它可能不可靠：byte-fallback 的碎片候选修正后是空串、归属后移。出口有个 `return_as_token_id` 开关，把 token 栏改写成 `token_id:N` 形式（要按 id 对账的下游用）。
 
-**logprob 栏（分数）** —— L1158 钳底 `max(logprob, -9999.0)`：极小概率的 logprob 可以非常负（13 万词表下 log_softmax 产得出 −100 以下），钳到协议自身的保底哨兵 −9999.0（`ChatCompletionLogProb.logprob` 的默认值就是它）——真 −inf 无法 JSON 编码，天文数字般的负值对下游也没有信息量，统一钳到哨兵既可编码又对齐协议形状。主位同样钳（`_create_chat_logprobs` 的 L1215），还处理「缺步」回退：某位置容器里没有本 token 的记录（`step_top_logprobs` 为 None 或查不到该 id）时现解 token 文本、logprob 用协议默认 −9999.0（`serving.py:L1186-L1202`）——detokenize=False 的请求不缺步：容器照建、记录在（第 9 站），走的是 else 分支、logprob 是真值。正常开了 logprobs 的生成请求同样不会缺步——每步每 token 容器都有记录（第 9 站的装配循环）；这一支是对齐 OpenAI 形状的防御兜底，接住容器与 token 流意外错位的场景。
+**logprob 栏（分数）**：L1158 钳底 `max(logprob, -9999.0)`：极小概率的 logprob 可以非常负（13 万词表下 log_softmax 产得出 −100 以下），钳到协议自身的保底哨兵 −9999.0（`ChatCompletionLogProb.logprob` 的默认值就是它）。真 −inf 无法 JSON 编码，天文数字般的负值对下游也没有信息量，统一钳到哨兵既可编码又对齐协议形状。主位同样钳（`_create_chat_logprobs` 的 L1215），还处理「缺步」回退：某位置容器里没有本 token 的记录（`step_top_logprobs` 为 None 或查不到该 id）时现解 token 文本、logprob 用协议默认 −9999.0（`serving.py:L1186-L1202`）。detokenize=False 的请求不缺步：容器照建、记录在（第 9 站），走的是 else 分支、logprob 是真值。正常开了 logprobs 的生成请求同样不会缺步：每步每 token 容器都有记录（第 9 站的装配循环）；这一支是对齐 OpenAI 形状的防御兜底，接住容器与 token 流意外错位的场景。
 
-**bytes 栏（字节指纹）** —— L1159，`list(token.encode("utf-8"))`：token 文本的 UTF-8 字节序列逐字节列成整数表。**这是三件套里唯一不受修正干扰、能无损还原原文的字段**。为什么这么说：本章第 10 站刚看过，token 文本会因修正而移动归属——「中」的三个 byte token 里前两个的文本是空串、整字归了第三个；文本列读者根本拼不回原文。字节不会撒谎：空串的 bytes=[] 如实告诉你「此候选没有独占字节」，拿到整字的候选 bytes=[228,184,173] 如实标出它凑齐了三个字节；把全位置的 bytes 串起来，正好无损重组成全文的 UTF-8 字节流。OpenAI 官方对这个字段的定位（Cookbook 原话）：「the bytes field also contains the UTF-8 byte values for each output token, which is particularly useful for reproducing emojis and special characters」（[Cookbook](https://developers.openai.com/cookbook/examples/using_logprobs)）——注意这层意思：**OpenAI 自己也要对付多字节 token 的同一坑**，bytes 字段是生态通用的解法，不是 vLLM 的怪癖。空串（`[]`，字节归属后移）与没有文本（`None`，tokenizer 缺席——第 9 站那条支路的出口语义）是两个不同的值，别混。
+**bytes 栏（字节指纹）**：L1159，`list(token.encode("utf-8"))`：token 文本的 UTF-8 字节序列逐字节列成整数表。**这是三件套里唯一不受修正干扰、能无损还原原文的字段**。为什么这么说：本章第 10 站刚看过，token 文本会因修正而移动归属：「中」的三个 byte token 里前两个的文本是空串、整字归了第三个；文本列读者根本拼不回原文。字节不会撒谎：空串的 bytes=[] 如实告诉你「此候选没有独占字节」，拿到整字的候选 bytes=[228,184,173] 如实标出它凑齐了三个字节；把全位置的 bytes 串起来，正好无损重组成全文的 UTF-8 字节流。OpenAI 官方对这个字段的定位（Cookbook 原话）：「the bytes field also contains the UTF-8 byte values for each output token, which is particularly useful for reproducing emojis and special characters」（[Cookbook](https://developers.openai.com/cookbook/examples/using_logprobs)）。注意这层意思：**OpenAI 自己也要对付多字节 token 的同一坑**，bytes 字段是生态通用的解法，不是 vLLM 的怪癖。空串（`[]`，字节归属后移）与没有文本（`None`，tokenizer 缺席，第 9 站那条支路的出口语义）是两个不同的值，别混。
 
 出口形状的完整样子（说明性外部示例，形状按 OpenAI 规范与本仓出口装配，数字为手算示意）：
 
@@ -1474,9 +1474,9 @@ class ChatCompletionLogProbs(OpenAIBaseModel):
 }
 ```
 
-「你」的 UTF-8 是 E4 BD A0 → 十进制 [228, 189, 160]；若某候选是 byte-fallback 拆出的半个字符，修正后它的 token 栏是 ""、bytes=[]——该字节的归属已后移；拿到整字的完成位候选 bytes=[228, 189, 160] 如实标出它独占三个字节。把全位置的 bytes 串起来，仍能无损重组原文——这就是三问最后一问的答案。
+「你」的 UTF-8 是 E4 BD A0 → 十进制 [228, 189, 160]；若某候选是 byte-fallback 拆出的半个字符，修正后它的 token 栏是 ""、bytes=[]，该字节的归属已后移；拿到整字的完成位候选 bytes=[228, 189, 160] 如实标出它独占三个字节。把全位置的 bytes 串起来，仍能无损重组原文——这就是三问最后一问的答案。
 
-`top_logprobs` 的截断在 L1162-L1164。这一刀与站 2 的「装配截断」不是同一刀：装配端截的是**批 max 算宽的列**——按各请求自己的 k 截（站 2/站 11 的账，截完每位置恰 k+1 条、被采样者领头）；出口截的是 **OpenAI 协议的展示条数**——容器整列带过来，协议的候选列表只要 `top_logprobs` 条，按序裁尾。点名册模式（`return_all`）豁免截断、候选全返；`top_logprobs==-1` 全返。
+`top_logprobs` 的截断在 L1162-L1164。这一刀与站 2 的「装配截断」不是同一刀：装配端截的是**批 max 算宽的列**：按各请求自己的 k 截（站 2/站 11 的账，截完每位置恰 k+1 条、被采样者领头）；出口截的是 **OpenAI 协议的展示条数**：容器整列带过来，协议的候选列表只要 `top_logprobs` 条，按序裁尾。点名册模式（`return_all`）豁免截断、候选全返；`top_logprobs==-1` 全返。
 
 实测五组（配套精简版，逐字保真的出口装配；case 1 的输入就是第 10 站修正后的完成位）：
 
@@ -1484,19 +1484,19 @@ class ChatCompletionLogProbs(OpenAIBaseModel):
 | case | 入口数据 | 出口 token / logprob | bytes | 看点 |
 |---|---|---|---|---|
 | case 1 · bytes 字节真相 | step {173:'中'(-0.05), 228:''(-0.25), 256:'hello'(-0.9)}，top_logprobs=1 | '中' / -0.05 | [228, 184, 173] | 修正后归属后移：候选 228 文本是空串 → bytes=[]（该字的字节已归完成 token）；top_logprobs 截断只留 1 个 |
-| case 2 · 钳底 | logprob=-12345.6（极小概率输入） | 'A' / -9999.0 | [65] | max(·, -9999.0)——钳到协议保底哨兵（真 -inf 不可 JSON 编码） |
+| case 2 · 钳底 | logprob=-12345.6（极小概率输入） | 'A' / -9999.0 | [65] | max(·, -9999.0)，钳到协议保底哨兵（真 -inf 不可 JSON 编码） |
 | case 3 · 缺步回退 | step=None（容器该位无记录的构造场景） | ' world' / -9999.0（字段默认） | [32, 119, 111, 114, 108, 100] | 回退 tokenizer.decode(token_id) 现解；logprob 用协议默认 |
 | case 4 · 稀疏 return_all | logprob_token_ids=[173,228,256] 模式 | '中' / -0.05 | [228, 184, 173] | top_logprobs 截断被豁免、3 候选全返：'' 候选 bytes=[]、'hello' bytes=[104, 101, 108, 108, 111] |
-| case 5 · return_as_token_id | return_as_token_id=True | 'token_id:173' / -0.05 | [116, 111, 107, 101, 110, 95, 105, 100, 58, 49, 55, 51] | token 栏以 token_id:N 形式给——bytes 给的是这串文本的字节（非 token 原字节） |
+| case 5 · return_as_token_id | return_as_token_id=True | 'token_id:173' / -0.05 | [116, 111, 107, 101, 110, 95, 105, 100, 58, 49, 55, 51] | token 栏以 token_id:N 形式给，bytes 给的是这串文本的字节（非 token 原字节） |
 
-case 2 的 −12345.6 是构造输入（演示钳底边界）；case 5 提醒一个细节——bytes 永远跟着 **token 栏文本**走（海象赋值 `:=` 让二者同源、不可能失同步），token 栏被改写成 `token_id:173` 时 bytes 就是那串文本的字节。
+case 2 的 −12345.6 是构造输入（演示钳底边界）；case 5 提醒一个细节：bytes 永远跟着 **token 栏文本**走（海象赋值 `:=` 让二者同源、不可能失同步），token 栏被改写成 `token_id:173` 时 bytes 就是那串文本的字节。
 
 ## 总结：logprobs 支路点亮了
 
-本章点亮的是 L0 图上横跨三段的一线——采样出口列里 logprobs 的诞生、ZMQ 带上的同车过线、API 带里的装配与出门——上一章主泳道身旁那条全程并行的邻座。带走三件事：
+本章点亮的是 L0 图上横跨三段的一线（采样出口列里 logprobs 的诞生、ZMQ 带上的同车过线、API 带里的装配与出门），也就是上一章主泳道身旁那条全程并行的邻座。带走三件事：
 
-1. **留底要早：惩罚不扭曲模型意见**。logprobs 在一切采样变换之前对原始 logits 做 log_softmax（NOTE(woosuk) 与 V0 的分道点）；raw 与 processed 两个视角对同一 token 能差出方向性错误（实测同 token 差 0.4681，RL 的 ratio 会差 $`e^{1.8} \approx 6`$ 倍）——v0.27 把「要哪张」做成 logprobs_mode 四态开关，默认 raw。概率住 log 空间的两个硬理由（数值稳定、连乘变累加）贯穿全链：cumulative_logprob 用加法、终值是序列联合概率的对数。
-2. **每个候选独立成词，逼出两套与主泳道不同的算法**。非增量解码（每位置 k+1 次、无状态）换增量法（每 token 1 次、有状态）；U+FFFD 修正回头重解码——横向候选各修各的、纵向前文共用一份、上下文 4 个 token 的上界直接来自 RFC 3629 的 UTF-8 四字节规定；半个字报不了整字就报空串、整字记在完成者头上，字节真相留给 bytes 字段兜底。
-3. **支路的账记在主泳道的班车上**。同一次 D2H、同一条 EngineCoreOutputs（msgpack 钩子给 ndarray/tensor 发原生类型护照）、process_outputs 单循环的第 3 步、同门口出门——logprobs 让班车变重但从不多发一辆；批均一 max（团体餐按最挑食的点菜）与 DELTA 切尾/pop（三态契约的概率投影）都是「搭主泳道的车、按自己的规矩装」的具体形状。容器侧 FlatLogprobs 把 GC 账从 O(位置×候选) 个对象压到常数个——可选维度连存储形状都有自己的取舍。
+1. **留底要早：惩罚不扭曲模型意见**。logprobs 在一切采样变换之前对原始 logits 做 log_softmax（NOTE(woosuk) 与 V0 的分道点）；raw 与 processed 两个视角对同一 token 能差出方向性错误（实测同 token 差 0.4681，RL 的 ratio 会差 $`e^{1.8} \approx 6`$ 倍）。v0.27 把「要哪张」做成 logprobs_mode 四态开关，默认 raw。概率住 log 空间的两个硬理由（数值稳定、连乘变累加）贯穿全链：cumulative_logprob 用加法、终值是序列联合概率的对数。
+2. **每个候选独立成词，逼出两套与主泳道不同的算法**。非增量解码（每位置 k+1 次、无状态）换增量法（每 token 1 次、有状态）；U+FFFD 修正回头重解码：横向候选各修各的、纵向前文共用一份、上下文 4 个 token 的上界直接来自 RFC 3629 的 UTF-8 四字节规定；半个字报不了整字就报空串、整字记在完成者头上，字节真相留给 bytes 字段兜底。
+3. **支路的账记在主泳道的班车上**。同一次 D2H、同一条 EngineCoreOutputs（msgpack 钩子给 ndarray/tensor 发原生类型护照）、process_outputs 单循环的第 3 步、同门口出门——logprobs 让班车变重但从不多发一辆；批均一 max（团体餐按最挑食的点菜）与 DELTA 切尾/pop（三态契约的概率投影）都是「搭主泳道的车、按自己的规矩装」的具体形状。容器侧 FlatLogprobs 把 GC 账从 O(位置×候选) 个对象压到常数个，可选维度连存储形状都有自己的取舍。
 
-上行故事到这里收束：token 维度与概率维度都到齐了，API 进程把能给的都给了。但整本书至今有一半一直是灰的——引擎进程内部，[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)十六站走读只给了五段骨架的那个循环：每拍怎么组批、KV 的账怎么划、被抢占的请求怎么活着回来。下一章把这个循环框整个放大——EngineCore 的逐拍循环，前面所有章在引擎侧留下的「调度器说了算」将第一次有正文。
+上行故事到这里收束：token 维度与概率维度都到齐了，API 进程把能给的都给了。但整本书至今有一半一直是灰的——引擎进程内部，[第 2 章](../../ch02-request-lifecycle/narrative/chapter.md)十六站走读只给了五段骨架的那个循环：每拍怎么组批、KV 的账怎么划、被抢占的请求怎么活着回来。下一章把这个循环框整个放大：EngineCore 的逐拍循环，前面所有章在引擎侧留下的「调度器说了算」将第一次有正文。
