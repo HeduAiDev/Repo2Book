@@ -5,7 +5,7 @@
 『构造期算子层』（站 4，Attention 自注册）与 center ⑧ 拍片『喂图·算子与回放』
 （站 13，set_forward_context 注入）之间的接力展开。架构归属回指 L0/L2：右上角指北小签。
 
-claim：attention 的执行环境三段接力——构造期自注册层表、每拍 thread-local 注入、
+claim：attention 的执行环境三段接力——构造期自注册层表、每拍全局变量注入、
 算子内按 layer_name 取回——模型 forward 签名从此不见 attn_metadata。
 
 数字/引语全部取自 figure_spec.numbers（attention.py:L443-L446 自注册+重名 raise；
@@ -27,7 +27,7 @@ MX = 60
 BXR = 1440
 
 # ---------------- 标题区 ----------------
-lc.text(MX, 34, 'attn_metadata 透传的终结：三段接力把执行环境搬进 thread-local',
+lc.text(MX, 34, 'attn_metadata 透传的终结：三段接力把执行环境搬进模块级全局变量',
         16.5, lc.C_TXT, 'start', True, maxw=980, tag='title')
 lc.text(MX, 58, '构造期每层自注册 → 每拍 runner 注入 → 算子内按 layer_name 现取——模型定义与执行环境解耦，模型文件签名不再被绑架',
         10.5, lc.C_MUTE, 'start', maxw=1010, tag='subtitle')
@@ -52,7 +52,7 @@ def stage(x, no, title, sub, color, fill):
     lc.text(x + SW_ - 12, SY + 16.5, sub, 8, lc.C_FAINT, 'end', maxw=170, tag='stsu' + no)
 
 stage(S1X, '段①', '构造期 · 自注册层表', 'load_model 一次', lc.C_BEAT_S, '#ffffff')
-stage(S2X, '段②', '每拍 · thread-local 注入', 'execute_model 每拍', lc.C_GPU_S, '#ffffff')
+stage(S2X, '段②', '每拍 · 全局变量注入', 'execute_model 每拍', lc.C_GPU_S, '#ffffff')
 stage(S3X, '段③', 'op 内 · 按 layer_name 取回', '前向每层一次', lc.C_BEAT_S, '#ffffff')
 
 # ===== 段① Attention.__init__ → static_forward_context =====
@@ -106,7 +106,7 @@ lc.text(S2X + 34, BCY + 74, 'dp_metadata / is_padding —— 包住 _model_forwa
 
 CHY = SY + 186
 lc.rect(S2X + 20, CHY, SW_ - 40, 120, lc.C_GPU_F, lc.C_GPU_S, rx=7, sw=1.6)
-lc.text(S2X + 34, CHY + 22, 'thread-local 通道：ForwardContext', 9.5, lc.C_GPU_S, 'start',
+lc.text(S2X + 34, CHY + 22, '全局变量通道：ForwardContext', 9.5, lc.C_GPU_S, 'start',
         True, maxw=SW_ - 68, tag='ch:t')
 CHL = ['· attn_metadata（dict / list，speculative 双形态）',
        '· cudagraph_runtime_mode + batch_descriptor（站 15 回放的 key）',

@@ -79,7 +79,7 @@ g.replay()                                         # 一次调用，整串 kerne
 
 第 2 条的供给链[第 18 章](../../ch18-persistent-batch-fixed-addresses/narrative/chapter.md)已经交割：所有输入住进启动时一次分配的持久缓冲，DEBUG 模式下回放前逐个比对 `data_ptr()`（张量的起始内存地址）与捕获时的记录。本章的主线是第 1 条：每拍都在变形的 batch，怎么去匹配一个**有限**的捕获形状集。还有个隐蔽的加深项：录死的不只是 GPU 侧：宿主端算好再传给 kernel 的分支产物也烤在图里。vLLM 源码里的直接证据是查表器的注释：「FULL mode needs exact num_reqs because FA3's scheduler_metadata computation depends on it」（`vllm/v1/cudagraph_dispatcher.py:L199-L202`）：FA3（FlashAttention-3，注意力 kernel 的一种实现）的调度元数据在 CPU 上按请求数算好才传进 kernel，所以整图回放时**连请求个数都必须与捕获时一致**。
 
-而一刀切地「整模型捕一张图」撞上两个死结：其一，attention 写 KV cache，是图外面的副作用，Dynamo 不肯也不能全图捕获；其二，batch 每拍变形，一张固定形状的图覆盖不住。vLLM 的解法是一条组合链，也正是本章的路线图：把 attention 变成图上的**一个不透明节点**、把副作用拆成独立算子（[「让注意力进图」](#让注意力进图)）；在 attention 处**切图**、片内编译、片间接缝 eager（[「在哪切怎么切」](#在哪切怎么切)）；按形状**捕获多张图**、运行期 padding 归一后查表命中（[「查表三出口」](#查表三出口)与[「一拍的完整账」](#一拍的完整账)）。vLLM 自己那台录放机 `CUDAGraphWrapper` 的契约写在 docstring 里（`vllm/compilation/cuda_graph.py:L146-L168`）：它从执行上下文收 mode 与描述子并「blindly trust them」（盲信），不存任何持久缓冲、不拷任何输入；固定地址是上一章 runner 的职责，判责与执行就此分开。句里三个词本章后面才正式立，先各给一句白话占位：mode 是「这拍用什么形态执行」的档位（[「一个参数的总账」](#一个参数的总账)）；执行上下文是每拍挂上当前线程的运行环境载体（[「让注意力进图」](#让注意力进图)）；描述子是描述批形状的查表钥匙（[「查表三出口」](#查表三出口)）。这里先立住的只是契约本身。
+而一刀切地「整模型捕一张图」撞上两个死结：其一，attention 写 KV cache，是图外面的副作用，Dynamo 不肯也不能全图捕获；其二，batch 每拍变形，一张固定形状的图覆盖不住。vLLM 的解法是一条组合链，也正是本章的路线图：把 attention 变成图上的**一个不透明节点**、把副作用拆成独立算子（[「让注意力进图」](#让注意力进图)）；在 attention 处**切图**、片内编译、片间接缝 eager（[「在哪切怎么切」](#在哪切怎么切)）；按形状**捕获多张图**、运行期 padding 归一后查表命中（[「查表三出口」](#查表三出口)与[「一拍的完整账」](#一拍的完整账)）。vLLM 自己那台录放机 `CUDAGraphWrapper` 的契约写在 docstring 里（`vllm/compilation/cuda_graph.py:L146-L168`）：它从执行上下文收 mode 与描述子并「blindly trust them」（盲信），不存任何持久缓冲、不拷任何输入；固定地址是上一章 runner 的职责，判责与执行就此分开。句里三个词本章后面才正式立，先各给一句白话占位：mode 是「这拍用什么形态执行」的档位（[「一个参数的总账」](#一个参数的总账)）；执行上下文是每拍装上模块级全局变量的运行环境载体（[「让注意力进图」](#让注意力进图)）；描述子是描述批形状的查表钥匙（[「查表三出口」](#查表三出口)）。这里先立住的只是契约本身。
 
 ## 一个参数的总账
 
@@ -465,7 +465,26 @@ class ForwardContext:
     # … 省略：ubatch_slices / is_padding（微批与 padding 掩码的扩展字段）…
 ```
 
-字段对号入座：`no_compile_layers` 就是段①那张注册表的拷贝（「不编译层」：这些层的真身藏在算子后面，图里只有算子节点，执行时要按层名找回层实例）；`attn_metadata` / `slot_mapping` 按 layer_name 索引（dict 是常规单批；代码注释里那个 list 双份是 DBO（Dual-Batch Overlap，双批重叠，把一批切成两个微批交替跑的扩展态），[第 3 章](../../ch03-engineargs-to-vllmconfig/narrative/chapter.md)立过这个标签，本章走 dict 路径不展开）；`cudagraph_runtime_mode` 与 `batch_descriptor` 是回放要用的档位与 key（后面两节的主角）。这个对象挂在**线程局部存储**（thread-local）上：Python `threading.local` 的语义是各线程看到各自独立的一份属性空间（官方文档的经典示例：主线程写下 42，另一线程读到空、写下 11，主线程再读仍是 42，跨线程互不可见）。前向开始时，`set_forward_context` 上下文管理器（进出作用域时装上/卸下，代码嵌在[「一拍的完整账」](#一拍的完整账)里）把本拍的这些信息装上当前线程，前向结束自动还原，多层嵌套不串味，多线程各自隔离。
+字段对号入座：`no_compile_layers` 就是段①那张注册表的拷贝（「不编译层」：这些层的真身藏在算子后面，图里只有算子节点，执行时要按层名找回层实例）；`attn_metadata` / `slot_mapping` 按 layer_name 索引（dict 是常规单批；代码注释里那个 list 双份是 DBO（Dual-Batch Overlap，双批重叠，把一批切成两个微批交替跑的扩展态），[第 3 章](../../ch03-engineargs-to-vllmconfig/narrative/chapter.md)立过这个标签，本章走 dict 路径不展开）；`cudagraph_runtime_mode` 与 `batch_descriptor` 是回放要用的档位与 key（后面两节的主角）。这个对象挂在**模块级全局变量**上：`vllm/forward_context.py:L196` 的一行 `_forward_context: ForwardContext | None = None` 是它唯一的家——全文件没有 threading.local（每线程各持一份属性空间的 Python 存储类）、没有 ContextVar（异步任务级隔离的上下文变量），谁来读都是同一份。装上/卸下也不走裸赋值，而是套一层上下文管理器（with 块进出时自动执行附加动作的 Python 惯用法；`@contextmanager` 装饰器把含 `yield` 的函数变成这种对象，`yield` 前的代码在进块时跑、后的在出块时跑）：
+
+```python
+# vllm/forward_context.py:L244-L256
+@contextmanager
+def override_forward_context(forward_context: ForwardContext | None):
+    """A context manager that overrides the current forward context.
+    This is used to override the forward context for a specific
+    forward pass.
+    """
+    global _forward_context
+    prev_context = _forward_context
+    _forward_context = forward_context
+    try:
+        yield
+    finally:
+        _forward_context = prev_context
+```
+
+函数体第一行 `global _forward_context` 声明写的是模块全局而非局部变量；进出作用域的语义全在 try/finally 四行：进作用域，先把旧值存进 `prev_context`、再装上新值；出作用域，无论正常返回还是异常抛出，`finally` 都把旧值装回去。前向开始时，`set_forward_context`（代码嵌在[「一拍的完整账」](#一拍的完整账)里）造出本拍的 `ForwardContext`，转手交给它包住 `_model_forward`。安全性来自 **作用域** 而非线程隔离：段③ 那行 `get_forward_context()` 读的就是这个全局变量，没人把执行环境从签名里递进图，所以只要前向被 `with` 块罩住，图内多深都读得到、出了块自动还原；两层 `with` 嵌套也各存各的 `prev_context`，里层退出回到外层的值，不串味。至于「多个线程各跑一个前向怎么办」——v0.27.1 的默认执行路径上模型前向只在一个线程里跑，这份全局没有第二个写者；真到多线程各持一份的需求，才轮得到 threading.local 出场，vLLM 没用它。
 
 段③，算子内取回：
 
@@ -500,7 +519,7 @@ def get_attention_context(
 
 ![forward context 三段接力](../diagrams/ch19-fig-forward-context-relay.png)
 
-> *图注：三段泳道：左段构造期（层自注册进 `static_forward_context`，重名即 raise），中段每拍（`set_forward_context` 把元数据、图档位、批描述子装上 thread-local、包住模型前向），右段算子内（`get_attention_context` 按层名回查）。新旧对照在最底下：旧设计的元数据透传 vs 新设计的干净签名。代价也标着：不设 context 直接调 attention，当场 assert 崩。*
+> *图注：三段泳道：左段构造期（层自注册进 `static_forward_context`，重名即 raise），中段每拍（`set_forward_context` 把元数据、图档位、批描述子装上模块级全局变量、包住模型前向），右段算子内（`get_attention_context` 按层名回查）。新旧对照在最底下：旧设计的元数据透传 vs 新设计的干净签名。代价也标着：不设 context 直接调 attention，当场 assert 崩。*
 
 **第二半：算子化的前向本体。** `Attention.forward` 现在长这样：
 
@@ -665,7 +684,7 @@ def unified_attention_with_output(
     )
 ```
 
-注意力的计算本体必须**晚于** KV 写（先写盘再读盘，否则读到旧数据）。编译器默认可以重排无依赖的节点，怎么让它不敢重排？把 KV 写的空回执塞进注意力算子的参数表：`del kv_cache_dummy_dep` 一行说明它不参与计算，但「接住它」这个动作在图上造出了一条数据依赖边。注释原话，accepting it creates a data dependency that ensures torch.compile preserves ordering。空回执不搬数据，只搬「先后」。算子体内其余部分就是经 `get_attention_context` 取回执行环境、转调 `impl.forward`，签名里只有一个层名，全章的「进图」到此完成：图上这个节点叫 `vllm::unified_kv_cache_update` 加 `vllm::unified_attention_with_output`，真身藏在 thread-local 上下文里。
+注意力的计算本体必须**晚于** KV 写（先写盘再读盘，否则读到旧数据）。编译器默认可以重排无依赖的节点，怎么让它不敢重排？把 KV 写的空回执塞进注意力算子的参数表：`del kv_cache_dummy_dep` 一行说明它不参与计算，但「接住它」这个动作在图上造出了一条数据依赖边。注释原话，accepting it creates a data dependency that ensures torch.compile preserves ordering。空回执不搬数据，只搬「先后」。算子体内其余部分就是经 `get_attention_context` 取回执行环境、转调 `impl.forward`，签名里只有一个层名，全章的「进图」到此完成：图上这个节点叫 `vllm::unified_kv_cache_update` 加 `vllm::unified_attention_with_output`，真身藏在模块级全局变量的 forward context 里。
 
 **决策四：层名包成 opaque 类型。** 上面签名里的 `layer_name` 在 CUDA 路径走的是 `LayerName`：
 
