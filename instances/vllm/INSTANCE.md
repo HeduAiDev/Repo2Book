@@ -99,3 +99,4 @@ ch04（async-engine，`vllm/v1/engine/`）：
 - 36 章每章开篇均有「本章地图」源码剖面图(diagrams/chapter-map.{py,svg,png}):入口→真实符号走线→出口、§/标题词讲解站牌、底部阅读路线;正文在开篇导航与 hook 段后插图引+选读指引。
 - 门禁:lint_chapter_map --require(徽标↔标题/符号防杜撰/画布预算 宽≤1500 比例≤2.6:1/开篇位置+指引)已进质量闸门;新章由 chapter-pipeline Map 站保证;重编号后重跑受影响章 gen 脚本再渲染(引擎已重写 §号,见补章 SOP §4)。
 - **rsvg-convert 坏桩**(2026-08-29):exit 49 零输出且不报错不写文件(与 python3 WindowsApps 坏桩同族)——画图转 PNG 一律降级 cairosvg(`python -c "import cairosvg;cairosvg.svg2png(url='X.svg',write_to='X.png',scale=2)`,尺寸/字体与 rsvg 一致),渲染后必须字节比对/mtime 验证 PNG 真更新。
+- **真跑模型指定（2026-09-05 用户定）**：文章需要模型数据的实测一律用 **Qwen3.8-27B-FP8**，权重在 `E:\Laboratory\models\Qwen3.8-27B-FP8`（29GB，config+safetensors 齐）——用户明确授权 subagent **只读**该路径加载权重（这是「项目外零读写」的唯一豁免点，仅此目录、仅读）。容器内挂载用（ch13/ch19/ch9 同款 vllm-omni + 本机 GPU RTX PRO 6000 96GB 路线）；tiny 随机权重只许用于无需生产级时长的机制性验证，且须标注。存量影响：ch9 m1_real 为 tiny 16 层 launch-bound 口径，待升级为 27B 真跑（列为回修尾巴）。
