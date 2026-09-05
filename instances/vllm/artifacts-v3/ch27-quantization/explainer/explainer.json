@@ -1,0 +1,510 @@
+{
+ "chapter_id": "ch27-quantization",
+ "chapter_title": "【primer】量化",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "kind": "primer",
+ "trace_environment": "本章为 primer 原理章:implementation/ 是论文忠实的 NumPy 参考实现(arXiv:2210.17323 主 + arXiv:2306.00978 / arXiv:2211.10438 伴读,非 vLLM 源码减法,`python -m pytest tests/` 44 passed)。9 个驱动脚本全部 host `python`(Miniconda 3.11.11, numpy 1.26.4)纯 CPU 实跑,trace_source=run,脚本与原始输出在 explainer/traces/(无 vLLM 包、无 CUDA、无容器)。与 pin 真实运行环境的结构性差异(均就近标注,writer 需挑明):①数值取自 numpy float64——真实 GPU 是 fp16/bf16 权重 + fp32 累加,ulp 级行为不在取证范围;『精确相等』断言为 float64 机器精度级(m06 等价性实测 max|差|=0.0,round 到 12 位);②np.round 为银行家舍入(0.5 取偶)——所有 worked example 选值已避开 0.5 平手点,论文未指定舍入细节、不影响 |误差|≤Δ/2 性质;③PPL/吞吐等模型级数字只能引论文(GPTQ Table 3/Table 6、AWQ Table 2、SmoothQuant Table 1/Fig.10),合成层的 Frobenius 误差只是定性对应物(非线性放大在 PPL 口径远大于线性层口径);④e4m3/e8m0/e2m1 格点为按 OCP FP8/MX 规范的位级枚举(host 无 torch;与 torch.float8_e4m3fn 语义一致:max=448、仅 S.1111.111 为 NaN),vLLM 侧常量(±448、kernel 算力门槛 90/75、group_size=16、优先级表)取自 pin 源码 file:L,非本机运行产出;⑤OBQ 手推件的 Hessian 用 4 条 0/1 校准样本——样本数 < 特征数时 H=2X^TX 奇异,这正是 §4 Step 3 dampening 的存在理由之一(测试 test_cholesky_of_inverse_hessian_survives_rank_deficient_x 有对账)。",
+ "figure_policy": "dossier needs_figure=true 九机制 m01/m02/m03/m04/m05/m06/m07/m08/m10 各配 1 张 figure_spec。本章 primer:无 L2 章图、无站号(FIGURE-SYSTEM §2『primer 章主体改为推导链图』;开篇「你在这里」用 L1-partVI.png 定位,顿悟头图按 ch21 样板另行走 figure-spec)。每张 spec 的 l0_zoom 字段显式回答「它是 L0 哪一块的放大」:统一锚点 = L0 中列『GPU 执行臂』(gpu_column,绿色 C_GPU_S)第三块『模型层 forward + 编译』里的 Linear 层权重——离线量化数学(GPTQ/AWQ/SmoothQuant/FP8/FP4)决定的正是进这块的 qweight/scales 长什么样、每拍 forward 搬多少字节;m10 生命周期图放大整条 GPU 执行臂(GPUModelRunner 构造/装载 + 模型层 forward 消费),配置期门回指 L0 外围。机制图用 l0_common 配色常量(GPU 执行臂恒绿),不引入第二种架构画法。推导链序:①均匀底座(m01)→②粒度谱(m02)→③RTN 之死(m03)→④GPTQ 二阶补偿(m04)→⑤AWQ 放大镜(m05)→⑥SmoothQuant 搬家(m06)→⑦FP8 格点(m07)→⑧两级 scale(m08)→⑨耦合总账(m10)。",
+ "symbol_table": [
+  {
+   "symbol": "\\Delta",
+   "meaning": "量化步长(尺子的刻度间距):除以它、取整、再乘回——所有均匀量化的公共动作;Δ 由被量化对象的绝对最大值定,离群值一进来就被焊死在这个分母里。",
+   "first_use": "SmoothQuant §2 Eq.1(X_bar = round(X/Δ), Δ = max|X|/(2^{N-1}-1))",
+   "source": "arXiv:2211.10438 §2 Eq.1(paper-smoothquant.md:L21);AWQ §3.2 Eq.1 分母改 2^{N-1}(arXiv:2306.00978)——两文各自约定,本章并存示教"
+  },
+  {
+   "symbol": "N",
+   "meaning": "量化位数:每个值存几个 bit(INT4/INT8 的 4 与 8);格点数 2^N、步长 Δ 随 N 指数缩小。",
+   "first_use": "SmoothQuant §2 Eq.1 分母 2^{N-1}-1(N=8)",
+   "source": "arXiv:2211.10438 §2 Eq.1;arXiv:2306.00978 §3.2 Eq.1"
+  },
+  {
+   "symbol": "zp(zero-point)",
+   "meaning": "零点:整数码域里代表实数 0 的那个码——分布整体偏负(如 GPTQ 权重行)或偏正(ReLU 后)时,把网格原点搬过去,两端仍精确落格。",
+   "first_use": "SmoothQuant §2(非对称场景 after ReLU 加零点);GPTQ §5 Setup 的 min-max 网格 zp = qmin - round(xmin/scale)",
+   "source": "arXiv:2211.10438 §2;arXiv:2210.17323 §5 Setup;vLLM 对照 quant_utils.py:L682-L687(maybe_w_zp)"
+  },
+  {
+   "symbol": "q",
+   "meaning": "整数码:round(x/Δ)+zp 落进的整数,反量化 x̂=(q−zp)·Δ;kernel 里存的 qweight 就是一列列 q 打包后的位。",
+   "first_use": "SmoothQuant §2 Eq.1 的 X_bar^{INT8}",
+   "source": "arXiv:2211.10438 §2 Eq.1"
+  },
+  {
+   "symbol": "m_i / m",
+   "meaning": "通道 i 的绝对最大值 / 全张量绝对最大值:有效量化级数 2^N·m_i/m 的分子分母——离群通道的 m 把 m 撑大,普通通道的可用台阶按比值线性缩水(RTN 之死的全部数学)。",
+   "first_use": "SmoothQuant §3 obs.2(the effective quantization levels of channel i is 2^8·m_i/m)",
+   "source": "arXiv:2211.10438 §3 obs.2(paper-smoothquant.md:L32)"
+  },
+  {
+   "symbol": "\\hat{X} / \\hat{W}",
+   "meaning": "平滑后的激活 / 调整后的权重:X 逐通道除以 s、W 逐通道乘以 s 的结果——SmoothQuant 的全部产出,运行期只见它们、不见 s。",
+   "first_use": "SmoothQuant §4 Eq.3(Y = (X·diag(s)^{-1})·(diag(s)·W) = X̂·Ŵ)",
+   "source": "arXiv:2211.10438 §4 Eq.3(paper-smoothquant.md:L56)"
+  },
+  {
+   "symbol": "s / s_j",
+   "meaning": "逐输入通道的缩放因子——AWQ 的『放大镜』与 SmoothQuant 的『搬家系数』是同一记号:激活除以它、权重乘以它,乘法结果严格不变,改变的只是量化发生在哪副网格上。",
+   "first_use": "AWQ §3.2 Eq.2(Q(w·s)·(x/s));SmoothQuant §4 Eq.3",
+   "source": "arXiv:2306.00978 §3.2 Eq.2;arXiv:2211.10438 §4 Eq.3-Eq.4"
+  },
+  {
+   "symbol": "\\Delta^{\\prime}",
+   "meaning": "缩放后的组步长:权重乘 s 之后组内 absmax 重新定出的尺子;AWQ 的三条经验观察之一是单元素放大通常不改组内 max,故 Δ′≈Δ——误差比 (Δ′/Δ)·(1/s) 的分子。",
+   "first_use": "AWQ §3.2 Eq.2(where Δ′ is the new quantization scaler after applying s)",
+   "source": "arXiv:2306.00978 §3.2 Eq.2-Eq.3"
+  },
+  {
+   "symbol": "\\text{RoundErr}(\\cdot)",
+   "meaning": "取整误差 Round(·)−(·):期望恒约 0.25(误差大致均匀分布于 [0,0.5])、与被量化数值大小无关——AWQ 误差比分析的支点:数值放大 s 倍后 RoundErr 期望不变,相对误差自动除以 s。",
+   "first_use": "AWQ §3.2 obs.(1)(RoundErr(·) ~ 0.25)",
+   "source": "arXiv:2306.00978 §3.2 obs.(1)(paper-awq.md:L149)"
+  },
+  {
+   "symbol": "s_X",
+   "meaning": "逐输入通道的平均激活幅度:AWQ 搜索空间 s=s_X^α 的底数——『显著与否看激活、不看权重』的操作化(按权重范数选 ≈ 随机,Table 1)。",
+   "first_use": "AWQ §3.2 Eq.5(s_X is the average magnitude of activation per-channel)",
+   "source": "arXiv:2306.00978 §3.2 Eq.5 + §3.1 Table 1"
+  },
+  {
+   "symbol": "\\alpha",
+   "meaning": "插值指数/迁移强度——两篇论文同字母同思想、不同含义:AWQ 里 s=s_X^α 是搜索空间的一维参数(0=不缩放,1=最激进);SmoothQuant 里 s_j=max|X_j|^α/max|W_j|^{1-α} 控制量化难度从激活搬多少进权重(0=全留激活,1=全推给权重,甜点 0.5)。",
+   "first_use": "AWQ §3.2 Eq.5;SmoothQuant §4 Eq.4",
+   "source": "arXiv:2306.00978 §3.2 Eq.5(网格 20 点);arXiv:2211.10438 §4 Eq.4 + §5.5(OPT/BLOOM 0.5、GLM-130B 0.75)"
+  },
+  {
+   "symbol": "\\mathcal{L}(s)",
+   "meaning": "AWQ 搜索目标:缩放后的量化输出对原输出的偏差范数 ‖Q(W·diag(s))(diag(s)^{-1}X) − WX‖——挑 s 让它最小;α=0 时它就是 RTN 的量化误差。",
+   "first_use": "AWQ §3.2 Eq.4",
+   "source": "arXiv:2306.00978 §3.2 Eq.4-Eq.5"
+  },
+  {
+   "symbol": "W / X(布局约定)",
+   "meaning": "层权重 / 校准数据跑出的层输入——注意两套记法:GPTQ 写层输出 WX(W 为 (out,in),HF Linear 同构)、AWQ/SmoothQuant 写 Y=XW(X 为 (T,C_i));互为转置,读论文须自带翻译(本章参考实现两套并存,docstring 已声明)。",
+   "first_use": "GPTQ §3 Eq.1(argmin ‖WX−ŴX‖²);SmoothQuant §2(Y=X·W)",
+   "source": "arXiv:2210.17323 §3 Eq.1;arXiv:2211.10438 §2"
+  },
+  {
+   "symbol": "H_F = 2X_F X_F^\\top",
+   "meaning": "层重建目标对权重行的 Hessian:只依赖层输入、与权重无关——因此未量化集合 F 对所有行同步,GPTQ 把 OBQ 的逐权重求逆降为逐列一次的合法性来源。",
+   "first_use": "GPTQ §3 Eq.2(Hessian is H_F = 2X_F X_F^T, F = 剩余全精度权重)",
+   "source": "arXiv:2210.17323 §3 Eq.2(paper.md:L42)"
+  },
+  {
+   "symbol": "[H^{-1}]_{qq}",
+   "meaning": "逆 Hessian 的 q 对角元:OBQ 贪心代价 (quant(w_q)−w_q)²/[H^{-1}]_{qq} 的分母——动哪个权重『最便宜』的度量;也是 δ_F 补偿的分母。",
+   "first_use": "GPTQ §3 Eq.2",
+   "source": "arXiv:2210.17323 §3 Eq.2"
+  },
+  {
+   "symbol": "w_q",
+   "meaning": "OBQ 当前贪心选中的权重(代价最小的那个);GPTQ 发现任意固定列序效果相近(§4 Step 1),于是 w_q 退化成『第 j 列全体』。",
+   "first_use": "GPTQ §3 Eq.2 第一式",
+   "source": "arXiv:2210.17323 §3 Eq.2 + §4 Step 1"
+  },
+  {
+   "symbol": "\\delta_F",
+   "meaning": "补偿更新向量:量化一个权重后,对还没量化的集合 F 的一步最优调整(沿逆 Hessian 列的方向摊误差)——『用还没 round 的权重找补』的那个找补。",
+   "first_use": "GPTQ §3 Eq.2 第二式(δ_F = −(w_q−quant(w_q))/[H^{-1}]_{qq} · (H^{-1})_{:,q})",
+   "source": "arXiv:2210.17323 §3 Eq.2"
+  },
+  {
+   "symbol": "F",
+   "meaning": "还没量化的权重下标集合:OBQ 逐权重维护(每行自己的 F);GPTQ 因 H 只认输入,全行共享同一列序,F 对所有行同步、退化为『还没量化的列』。",
+   "first_use": "GPTQ §3 Eq.2(where F denotes the set of remaining full-precision weights)",
+   "source": "arXiv:2210.17323 §3 + §4 Step 1"
+  },
+  {
+   "symbol": "d_row / d_col",
+   "meaning": "权重矩阵的行数(输出维)/列数(输入维):复杂度账 O(d_row·d_col³) → O(max{d_row·d_col², d_col³}) 的两个参数,提速 min{d_row,d_col} 倍。",
+   "first_use": "GPTQ §3 末段(OBQ 的 O(d_row·d_col³) 立方依赖)",
+   "source": "arXiv:2210.17323 §3 + §4 Step 1"
+  },
+  {
+   "symbol": "B",
+   "meaning": "lazy batch 的列块大小(论文 B=128):块内逐列『量化→记误差→即时补偿』,块末把累计误差 E 一次性传播给块外全部剩余列——不减计算量,只把小更新攒成大矩阵乘,治 GPU 计算访存比。",
+   "first_use": "GPTQ §4 Step 2(we apply the algorithm to B=128 columns at a time)+ Algorithm 1 外层循环",
+   "source": "arXiv:2210.17323 §4 Step 2 + Algorithm 1"
+  },
+  {
+   "symbol": "E",
+   "meaning": "Algorithm 1 的块误差矩阵:每列记 (W−Q)/[H^{-1}]_{jj} 攒着,块末一次 E·U 传播(U=Cholesky(H^{-1})^T 的上三角)——lazy 的『账本』。",
+   "first_use": "GPTQ §4 Algorithm 1(E ← 0;E[:,j−i] ← (W[:,j]−Q[:,j])/[H^{-1}]_{jj})",
+   "source": "arXiv:2210.17323 §4 Algorithm 1"
+  },
+  {
+   "symbol": "Q",
+   "meaning": "Algorithm 1 的量化输出矩阵:逐列填入 quant(W)——最终写进检查点 qweight 的就是它(经打包)。",
+   "first_use": "GPTQ §4 Algorithm 1(Q ← 0;Q[:,j] ← quant(W[:,j]))",
+   "source": "arXiv:2210.17323 §4 Algorithm 1"
+  },
+  {
+   "symbol": "\\lambda(dampening)",
+   "meaning": "H 对角线加的小常数(1% 平均对角元):防反复求逆把 H^{-1} 累积误差推成不定阵——Cholesky 重构(Step 3)配合它让 175B 可跑。",
+   "first_use": "GPTQ §4 Step 3(we always choose 1% of the average diagonal value)",
+   "source": "arXiv:2210.17323 §4 Step 3"
+  },
+  {
+   "symbol": "T / C_i / C_o",
+   "meaning": "token 数 / 输入通道维 / 输出通道维:粒度谱的三根轴——scale 挂 T(per-token)或 C_o(权重 per-channel)在 GEMM 外维可行,挂 C_i(激活 per-channel)在缩减维、Tensor Core 不认(SmoothQuant §3 Table 1 灰色行)。",
+   "first_use": "SmoothQuant §2 Figure 3(X ∈ R^{T×C_i}, W ∈ R^{C_i×C_o})",
+   "source": "arXiv:2211.10438 §2 Figure 3 + §3 Table 1;vLLM 对照 GroupShape(quant_utils.py:L69-L71)"
+  },
+  {
+   "symbol": "e4m3 / e8m0 / e2m1",
+   "meaning": "浮点格式名:e=指数位数、m=尾数位数。e4m3(FP8 主力):±448、格点按指数分段;e8m0:纯指数、只能是 2 的幂(块 scale 专用);e2m1(FP4):全部格点 ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}。",
+   "first_use": "本章格式账(vLLM fp8.py weight e4m3 / e8m0fnu scale;modelopt.py NVFP4 e2m1);规范出处不在论文包",
+   "source": "OCP FP8 / Microscaling(MX)规范;vLLM 对照 quant_utils.py:L27-L35(±448)、input_quant_fp8.py:L243-L244(e8m0 取整)、modelopt.py:L1151-L1162(e2m1 打包)"
+  },
+  {
+   "symbol": "QuantKey / ScaleDesc",
+   "meaning": "vLLM v0.27 量化方案的一等值词汇表:冻结 dataclass 把「这是什么量化」(dtype × scale 的 dtype/静态/粒度 [× 二级 scale] × 对称性)变成可相等比较的 key——kernel 选择、CLI shorthand、编译融合开关共用同一套词,粒度/静态动态不再是散文。",
+   "first_use": "本章 m09(vllm/model_executor/layers/quantization/utils/quant_utils.py:L74-L130)",
+   "source": "vllm/model_executor/layers/quantization/utils/quant_utils.py:L74-L130、L133-L156;vllm/config/quantization.py:L25-L35"
+  },
+  {
+   "symbol": "g_idx",
+   "meaning": "act_order(desc_act)检查点里的逐行组索引:量化时行置换的产物——Marlin 装载期还要对它排序(marlin_sort_g_idx),kernel 靠它把重要列排进更早的组。",
+   "first_use": "本章 m04/m11(vLLM 侧 gptq_quantize_weights 的 permute_rows 产物)",
+   "source": "vllm/model_executor/layers/quantization/utils/quant_utils.py:L741-L772;vllm/model_executor/kernels/linear/mixed_precision/marlin.py:L175-L185"
+  }
+ ],
+ "mechanisms": [
+  {
+   "mechanism_id": "ch27-m01",
+   "intuition": "换尺子量同一个东西:量化 = 换一把只有 2^N 个刻度的尺子——先除以步长 Δ 把数搬进刻度编号(整数),读完再乘回 Δ;分布不居中就再记一个零点 zp(0 刻度偏了多少格),网格原点整体平移而间距不变。",
+   "worked_example": {
+    "params": {
+      "对称": "x=[0.9, -0.4, 0.15, -1.0, 0.62, -0.77, 0.3, 0.05], N=4, Δ=max|x|/7=0.1429",
+      "非对称": "x2=[0.0, 0.53, 1.0, 0.73](ReLU 后全非负), N=4, scale=1/15=0.0667, zp=-8",
+      "负偏置对照": "x3=[-2.0, -1.0, 0.45], scale=2.45/15=0.1633, zp=+4(zp 为正,网格原点搬到 -0.6533)",
+      "note": "8 元素无一落在格点上(误差全非 0,非平凡分支);两端值精确落格(absmax 定尺不丢最远点、min-max 网格两端精确映射)"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch27_m01_uniform_base.json",
+    "table": {
+      "columns": ["设置", "i", "x_i", "x_i/Δ", "q 码", "反量化 x̂", "误差 x_i−x̂"],
+      "rows": [
+        ["对称 Δ=0.1429", "1", "0.9", "6.3", "6", "0.8571", "0.0429"],
+        ["对称 Δ=0.1429", "2", "-0.4", "-2.8", "-3", "-0.4286", "0.0286"],
+        ["对称 Δ=0.1429", "3", "0.15", "1.05", "1", "0.1429", "0.0071"],
+        ["对称 Δ=0.1429", "4", "-1.0", "-7.0", "-7", "-1.0", "0.0"],
+        ["对称 Δ=0.1429", "5", "0.62", "4.34", "4", "0.5714", "0.0486"],
+        ["对称 Δ=0.1429", "6", "-0.77", "-5.39", "-5", "-0.7143", "-0.0557"],
+        ["对称 Δ=0.1429", "7", "0.3", "2.1", "2", "0.2857", "0.0143"],
+        ["对称 Δ=0.1429", "8", "0.05", "0.35", "0", "0.0", "0.05"],
+        ["非对称 zp=-8", "—", "0.53", "7.95", "0", "0.5333", "-0.0033"],
+        ["非对称 zp=-8", "—", "1.0", "15.0", "7", "1.0", "0.0"],
+        ["非对称 zp=-8", "—", "0.73", "10.95", "3", "0.7333", "-0.0033"]
+      ]
+    },
+    "table_note": "非对称行的 q = round(x/scale)+zp:xmin=0 映 qmin=-8、xmax=1.0 映 qmax=7(两端精确落格);对称行第 4 个元素 -1.0 恰在格点上(误差 0,对照分支)。全部数值 = traces/ch27_m01_uniform_base.json 原样。"
+   },
+   "invariant": {
+    "claim": "round-to-nearest 的单点量化误差恒 |x−x̂| ≤ Δ/2;对称式下码域永不越界(clip 只是浮点护栏)。",
+    "argument": "任意实数到最近整数的距离 ≤ 1/2——格点上为 0、两格点之间距近端 ≤ 半格,对一切 x 一致成立(不需要归纳);乘回步长得 |err| ≤ Δ/2。越界不可能:对称式 Δ=max|x|/qmax ⇒ |x|/Δ ≤ qmax 恒成立,本例最大码 7=qmax、clip 未触发;非对称式里 zp 是整数平移,不改变间距。实测:8 元素最大 |err|=0.0557 ≤ 0.0714=Δ/2;512 随机值 × N=4/8 两组,最大误差 0.1947 ≤ 0.195、0.0081 ≤ 0.0081(见 trace half_step_bound_check)。"
+   },
+   "quantified": "本例 INT4 对称:Δ=0.1429(步长占满量程 1/7≈14%),误差上界 Δ/2=0.0714;N=8 时同一组值步长缩到 1/127、512 随机值实测最大误差 0.0081——位每加 1,步长近似减半。存储账:4 bit 权重 = FP16 的 1/4 字节(m10 trace:4096×4096 层 33554432→8388608 字节)。分母约定并存:SmoothQuant Eq.1 用 (2^{N-1}−1)=127、AWQ Eq.1 用 2^{N-1}=8——各自论文原文,读代码时 vLLM quantize_weights 的对称分支是前者(SmoothQuant 式)、awq_pack 前的组量化器是后者。",
+   "figure_specs": [
+    {
+     "figure_id": "ch27-fig-uniform-grid",
+     "template": "before-after",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』(gpu_column,绿色 C_GPU_S)第三块『模型层 forward + 编译』里的 Linear 层权重——qweight/scales 里存的整数码与步长就是这副网格;本章是 primer 原理章(开篇定位用 L1-partVI.png),此图属推导链第 1 环:进 kernel 的权重为什么是整数+步长的组合。",
+     "claim": "均匀量化 = 除以 Δ、取整、乘回:对称式 Δ=max|x|/qmax 一把居中尺子,单点误差 ≤ Δ/2;非对称式加 zp=[qmin−round(xmin/scale)] 平移网格原点,xmin/xmax 两端精确落格——INT4 全部可用精度就是这 16 个码。",
+     "numbers": [
+      {"value": "对称 INT4:Δ=0.1429,q 码 [6,-3,1,-7,4,-5,2,0],最大误差 0.0557 ≤ Δ/2=0.0714", "provenance": "traces/ch27_m01_uniform_base.json symmetric_int4"},
+      {"value": "非对称 INT4(ReLU 后):scale=1/15=0.0667,zp=-8,x=0.53→码 0、x=1.0→码 7(两端落格)", "provenance": "traces/ch27_m01_uniform_base.json asymmetric_int4_relu"},
+      {"value": "负偏置分布:x=[-2.0,-1.0,0.45] → scale=0.1633,zp=+4(网格原点搬到 -0.6533)", "provenance": "traces/ch27_m01_uniform_base.json asymmetric_int4_negative_bias"},
+      {"value": "512 随机值统计:N=4 最大误差 0.1947 ≤ 0.195、N=8 最大误差 0.0081 ≤ 0.0081", "provenance": "traces/ch27_m01_uniform_base.json half_step_bound_check"},
+      {"value": "代码对照:vLLM 参考实现 quantize_weights 的对称/非对称两分支(scale=(max−min)/qmax + zp=round(|min|/scale))", "provenance": "vllm/model_executor/layers/quantization/utils/quant_utils.py:L672-L734(dossier embed_excerpts[7])"}
+     ],
+     "caption_draft": "量化的第一课(arXiv:2211.10438 §2 Eq.1):一把尺子有 Δ 和原点两个自由度——对称式用 absmax 定 Δ、原点钉在 0;非对称式(min-max 网格)再用 zp 把原点搬到分布的实际位置。无论哪种,单点误差都不超过半个刻度 Δ/2;INT4 的全部本事就是把连续权重压进 16 个码。vLLM 的 qweight/scales 检查点存的就是右半张图的 q 列与那把 Δ。",
+     "illustrator_notes": "上下两半同一根数轴(before-after):上半对称网格(等距刻度、0 居中),把 x=[0.9,…] 逐点投影到格点、标出误差 ≤ 半格;下半非对称网格(同一间距、原点平移 zp),标 xmin→qmin、xmax→qmax 精确落格。刻度间距用 l0_common 的 C_MUTE/C_TXT;数字全取 traces/ch27_m01_uniform_base.json;不画架构元素,推导链图。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch27-m02",
+   "intuition": "谁跟谁共享一把尺子:per-tensor 全场一把尺(最省、最粗)、per-token 每个 token 一把(尺挂外维)、per-channel 每个输入通道一把(尺挂内维)——离群在哪个轴上,就该给哪个轴发尺子;但激活的尺若挂在内维(GEMM 缩减维),乘加做到一半就要换尺,Tensor Core 不干。",
+   "figure_specs": [
+    {
+     "figure_id": "ch27-fig-granularity-rulers",
+     "template": "layout",
+      "l0_zoom": "放大 L0 中列『GPU 执行臂』(gpu_column,绿色 C_GPU_S)第三块『模型层 forward + 编译』里的 Linear 层输入/权重——QuantKey 的 GroupShape 字段(quant_utils.py:L69-L71/L356-L357)就是给这张图里三把尺子起的正式名字;推导链第 2 环。",
+     "claim": "粒度=共享尺子的范围:本例 token 0 比其他 token 大 100 倍,per-tensor 一把尺下小 token 的码全坍缩(独立码 3 个、误差 0.3358);per-token 各拿各的尺(独立码 11 个、误差 0.0013,好 254 倍)——但激活 per-channel 虽然精度最好却挂在 GEMM 内维,INT8 Tensor Core 不认(SmoothQuant Table 1:OPT-175B 平均准确率 71.6%→32.3%→31.7%→71.4%,仅 per-channel 保住)。",
+     "numbers": [
+      {"value": "per-tensor:小 token 平均|误差|=0.3358、独立码 3 个;per-token:平均|误差|=0.0013、独立码 11 个——比值 254.2 倍", "provenance": "traces/ch27_m02_granularity.json per_tensor/per_token/comparison"},
+      {"value": "per-token 的 4 把尺 Δ=[1.0261, 0.0071, 0.0043, 0.0058](大 token 与小 token 各自定尺)", "provenance": "traces/ch27_m02_granularity.json per_token.deltas_per_token"},
+      {"value": "SmoothQuant §3 Table 1(OPT-175B):FP16 71.6% / INT8 per-tensor 32.3% / per-token 31.7% / per-channel 71.4%(per-channel 保精度但 INT8 GEMM 不可行)", "provenance": "arXiv:2211.10438 §3 Table 1(paper-smoothquant.md:L39-L42;traces/ch27_m02_granularity.json comparison.paper_table1_opt175b_avg_acc 逐字转录)"},
+      {"value": "vLLM 词汇:GroupShape.PER_TENSOR/PER_TOKEN/PER_CHANNEL + (128,128) 块 / (1,128) 逐 token 逐组", "provenance": "vllm/model_executor/layers/quantization/utils/quant_utils.py:L69-L71、L356-L357 注释"},
+      {"value": "组量化的存储代价:group-size 128 ≈ 每 [凑整] 权重 0.15 额外 bit(GPTQ §5)", "provenance": "arXiv:2210.17323 §5(175B 段,g1024≈0.02 extra bits、g128≈0.15 extra bits,paper.md:L314)"}
+     ],
+     "caption_draft": "三种粒度 = 尺子挂在哪根轴上(SmoothQuant §2 Figure 3 的定义):挂外维(T/C_o)的尺能融进 GEMM——算完再统一乘回;挂内维(C_i)的尺精度最好却要打断乘加序列,Tensor Core 不收。所以工程上的可行集是 per-tensor/per-token/分组,而把「想要 per-channel 精度」的欲望引向了 SmoothQuant 的搬家(→ch27-m06)。",
+     "illustrator_notes": "一张 4×4 矩阵(T×C_i,token 0 离群)画三遍并排:三档各用高亮框标「谁共享一把 Δ」(per-tensor 全矩阵一个框 / per-token 每行一个框 / per-channel 每列一个框);旁边标 GEMM 外维/内维的可行/灰色(per-channel 行打灰,引 Table 1)。数字全取 traces/ch27_m02_granularity.json;矩阵着色仅数据语义(值大小),架构内容回指 L0。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch27-m03",
+   "intuition": "一颗老鼠屎坏一锅粥:合唱团里出一个飙高音的,整首歌的音域标记被他撑爆,其余人分到的音域只剩两三个音——离群通道不改别人的值,只改大家共用的那把尺(Δ 的分母 m)。",
+   "worked_example": {
+    "params": {
+      "矩阵": "8 token × 4 通道 INT8 对称量化",
+      "通道 0(离群)": "[70, 63, 77, 66, 59, 72, 68, 74]——逐 token 持续 ~70(SmoothQuant §3 obs.3 的离群模式)",
+      "通道 1-3(普通)": "~1(rng(2) 种子,可复算)",
+      "tensor max m": "77.0(离群通道决定)",
+      "note": "非平凡分支:普通通道在 per-tensor 下真的坍缩(独立码 5 个、值全落在 ±0.61 的倍数上),与 per-channel 对照差 52 倍"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch27_m03_rtn_death.json",
+    "table": {
+      "columns": ["通道 j", "通道 max m_j", "有效级数 256·m_j/m", "per-tensor 平均|误差|", "per-channel 平均|误差|", "per-tensor 独立码数"],
+      "rows": [
+        ["0(离群)", "77.0", "256.0", "0.1102", "0.1102", "8"],
+        ["1(普通)", "1.5", "5.0", "0.131", "0.0021", "5"],
+        ["2(普通)", "2.06", "6.84", "0.217", "0.0034", "5"],
+        ["3(普通)", "2.44", "8.12", "0.1712", "0.0045", "5"]
+      ]
+    },
+    "table_note": "通道 0 两种粒度逐码相同——它自己就是 per-tensor 尺子的定尺者;普通通道坍缩实例(ch1 原始值→per-tensor 反量化):[-0.52, 1.14, -0.55, -0.79, -0.61, 0.19, 0.78, -1.5] → [-0.61, 1.21, -0.61, -0.61, -0.61, 0.0, 0.61, -1.21](traces/ch27_m03_rtn_death.json collapse_demo_channel1)。全部数值 = trace 原样。"
+   },
+   "invariant": {
+    "claim": "per-tensor 下通道 i 的有效级数 = 2^N·m_i/m:普通通道被压到的级数恰好是离群比值的倒数,公式对 m_i 线性。",
+    "argument": "Δ = m/(2^{N-1}-1) 由全张量 absmax m 决定(离群通道贡献);通道 i 的值 |x| ≤ m_i,映射到整数轴后占 [-m_i/Δ, m_i/Δ],可用级数 = 2·m_i/Δ = 2^N·m_i/m(基例:m_i=m ⇒ 256 级,离群通道自身;m_i=m/2 ⇒ 128 级——trace formula_checks 的 77→256、38.5→128 逐值验证)。级数随 m_i 线性缩水、随离群 m 反比恶化:离群 70 倍 ⇒ 普通通道 3.66 级(INT8)/0.229 级(INT4)。"
+   },
+   "quantified": "本例:普通通道有效级数 5.0-8.12(离群 51 倍),per-tensor 误差 0.131-0.217 vs per-channel 0.0021-0.0045,普通通道三列合计差 52 倍;真实模型口径(GPTQ §5 Table 3,OPT-175B Wiki2 PPL):FP16 8.34 → RTN 4bit 10.54(还认字但变傻)→ RTN 3bit 7.3e3(痴呆)——同样 bit 同一副网格,GPTQ 8.37/8.68;SmoothQuant Fig.4:OPT-13B 实测离群通道 >70、逐 token 持续(与合成矩阵同量级)。"
+  , "figure_specs": [
+    {
+     "figure_id": "ch27-fig-outlier-collapse",
+     "template": "before-after",
+     "l0_zoom": "放大 L0『GPU 执行臂』第三块『模型层 forward + 编译』里 Linear 层的输入激活/权重——为什么进 kernel 的整数码会『失真』,病根在权重量化之前;推导链第 3 环(RTN 之死),为 GPTQ/AWQ/SmoothQuant 三味药铺垫。",
+     "claim": "一个 ~70 的离群通道把 per-tensor 的尺子撑爆:普通通道(值 ~1)只剩 5.0-8.12 个有效台阶,8 个原始值 [-0.52, 1.14, …] 坍缩到 ±0.61 的 3 个倍数上;per-channel 一把尺/通道则全部保住(误差 52 倍差距)——『聪明量化』的全部动机。",
+     "numbers": [
+      {"value": "逐通道账:通道 max [77.0, 1.5, 2.06, 2.44] → 有效级数 [256.0, 5.0, 6.84, 8.12];per-tensor/per-channel 误差 [0.1102/0.1102, 0.131/0.0021, 0.217/0.0034, 0.1712/0.0045]", "provenance": "traces/ch27_m03_rtn_death.json per_channel_account"},
+      {"value": "坍缩实例(ch1):[-0.52, 1.14, -0.55, -0.79, -0.61, 0.19, 0.78, -1.5] → per-tensor [-0.61, 1.21, -0.61, -0.61, -0.61, 0.0, 0.61, -1.21](独立码 5 个)vs per-channel [-0.52, 1.15, -0.56, -0.79, -0.6, 0.19, 0.78, -1.5]", "provenance": "traces/ch27_m03_rtn_death.json collapse_demo_channel1"},
+      {"value": "公式自检:2^8·(77/77)=256、2^8·(38.5/77)=128、2^8·(1/70)=3.66、2^4·(1/70)=0.229", "provenance": "traces/ch27_m03_rtn_death.json formula_checks"},
+      {"value": "真实口径:OPT-175B Wiki2 PPL 8.34 → RTN 4bit 10.54 / 3bit 7.3e3(GPTQ 同 bit 存活 8.37/8.68)", "provenance": "arXiv:2210.17323 §5 Table 3(paper.md:L195-L301 表体;traces/ch27_m04_gptq.json scoreboard_8x12.paper_table3 转录)"},
+      {"value": "真实离群证据:OPT-13B 线性层输入若干通道幅度 >70、逐 token 持续(SmoothQuant §3 Figure 4)", "provenance": "arXiv:2211.10438 §3 Figure 4(paper-smoothquant.md:L28 图注;key_figures 已登记)"}
+     ],
+     "caption_draft": "RTN 之死的机制(arXiv:2211.10438 §3 obs.2):有效级数 2^N·m_i/m——离群通道不改别人的值,只改大家共用的 Δ。上排:原始矩阵(通道 0 一柱擎天);中排:per-tensor 量化-反量化后普通通道坍缩到 ±0.61;下排:per-channel 每通道一把尺全部保住。bit 没变、网格形状没变——这就是后文 GPTQ(换 round 方式)、AWQ/SmoothQuant(换尺子)三味药共同的起点。",
+     "illustrator_notes": "三行同宽热图条(before-after):行 1 原始值(ch0 列高亮 59-77,其余 ~±1);行 2 per-tensor 反量化(普通通道只剩 {-0.61,0,0.61,1.21} 的台阶感);行 3 per-channel 反量化(几乎复原)。右侧小条形:逐通道有效级数 256/5.0/6.84/8.12。数字全取 traces/ch27_m03_rtn_death.json;配色用 l0_common 数据色系,不画架构元素。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch27-m04",
+   "intuition": "搬家找补:每装好一个箱子(量化一列)就记下误差,趁后面的箱子还没封口,把误差摊给他们扛——因为箱子之间有相关性(Hessian 记录着),先封的误差可以被后封的位置吸收;lazy batch 是攒账:单笔转账(每列一次全矩阵小更新)太慢,攒 B=128 列月底一次大额转账(E@U 一次矩阵乘)。",
+   "worked_example": {
+    "params": {
+      "权重行": "w=[0.45, -0.2, -0.05, 0.15](1×4)",
+      "校准样本": "4 条 0/1 样本 X(特征 1-2 相关、特征 4 与全体相关)→ H=2X^TX=[[4,2,0,2],[2,4,0,2],[0,0,2,2],[2,2,2,6]] 可手算;样本数<特征数时 H 奇异——dampening 的存在理由",
+      "网格": "per-row min-max(§5 Setup):scale=0.65/15=0.04333, zp=-3,过程开始前固定(GPTQ 与 RTN 同一副网格)",
+      "block_size": "2(4 列两个块,让 lazy batch 结构完整出现;论文 B=128)",
+      "note": "非平凡分支:col 0 的补偿把 col 1 的工作权重从 -0.2 推到 -0.19445,取整决策从 -8 翻成 -7(与 RTN 不同码);块末总账改写 col 2/3"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch27_m04_gptq.json",
+    "table": {
+      "columns": ["轮", "块", "列 j", "量化前工作权重 w_j", "U_jj", "量化码 q_j", "量化实值 ŵ_j", "误差 (w_j−ŵ_j)/U_jj", "本轮后未定格的 W"],
+      "rows": [
+        ["1", "A", "0", "0.45", "0.60637", "7", "0.43333", "0.02749", "[0.43333, -0.19445, -0.05, 0.15]"],
+        ["2", "A", "1", "-0.19445", "0.57172", "-7", "-0.17333", "-0.03693", "[0.43333, -0.17333, -0.05, 0.15]"],
+        ["A 块末", "A", "—", "E=[0.02749, -0.03693]", "—", "—", "—", "—", "[0.43333, -0.17333, -0.04519, 0.1451]"],
+        ["3", "B", "2", "-0.04519", "0.85195", "-4", "-0.04333", "-0.00218", "[0.43333, -0.17333, -0.04333, 0.14448]"],
+        ["4", "B", "3", "0.14448", "0.40689", "0", "0.13", "0.03559", "[0.43333, -0.17333, -0.04333, 0.13]"],
+        ["B 块末", "B", "—", "E=[-0.00218, 0.03559]", "—", "—", "—", "—", "无剩余列,总账空转"]
+      ]
+    },
+    "table_note": "对照:RTN(同一副网格直接取整)码 [7, -8, -4, 0]——GPTQ [7, -7, -4, 0] 与它不同码的只有 col 1(块内即时补偿 -0.2→-0.19445 越过了取整边界);层输出误差 GPTQ 0.001667 vs RTN 0.003978(2.4 倍),而 col 1 的单点误差反而更大(|-0.2-(-0.17333)|=0.02667 vs 0.01667)——二阶补偿优化的是『层输出』不是『单点』。OBQ 贪心序(同一行)=[2, 0, 1, 3]、逐轮代价 [5.1e-05, 0.000869, 0.001161, 0.001252]。全部数值 = traces/ch27_m04_gptq.json 原样。"
+   },
+   "invariant": {
+    "claim": "Algorithm 1 必在 d_col 轮内终止,已量化列此后不再被读;lazy batch 不改变量化结果。",
+    "argument": "终止性:外层列指针 j 每轮 +1 严格单调、循环上界 d_col——有限步必停,每列恰被量化一次。无环:块内补偿只写 j<i2、块末补偿只写列 ≥i2 的剩余区,而已定格列被显式覆写 W[:,j]=q_real(此后无人读它)。lazy 合法性(§4 Step 2 原话):『column i 的最终取整决策只受本列上执行过的更新影响』——推迟对后续列的补偿不改变任何已做的取整;trace 实测 B=8 与 B=3 码逐位相同、Cholesky 路径与朴素逐列路径码逐位相同(w_hat max|diff|=0.0)。"
+   },
+   "quantified": "复杂度账(§4 Step 1):OBQ O(d_row·d_col³) → GPTQ O(max{d_row·d_col², d_col³}),H^{-1} 更新从每权重一次降到每列一次。代入 4096×4096 层:2.8e14 → 6.9e10 FLOPs,提速 4096 倍(= min{d_row,d_col});本例 1×4:8 次更新 → 4 次(8 倍)。真实规模:175B 单卡 A100 约 4 GPU 小时(论文 Abstract/Table 2)。记分板(8×12 合成层,corr=0.95):3-bit RTN 177.5999 vs GPTQ 30.6096(5.8 倍)、4-bit 17.8034 vs 4.1593(4.28 倍)——论文口径 OPT-175B 3-bit RTN 7.3e3 vs GPTQ 8.68。贪心 vs 固定序:1.48 倍内相近(§4 Step 1 『similar』的可跑对应物)。",
+   "figure_specs": [
+    {
+     "figure_id": "ch27-fig-gptq-lazy-batch",
+     "template": "tiling",
+     "l0_zoom": "放大 L0『GPU 执行臂』第三块『模型层 forward + 编译』里 Linear 层权重矩阵的离线加工车间——GPTQ 的全部产出(检查点里的 qweight/scales/g_idx)在此定型,之后 vLLM 只是消费(站 5 换装、站 6 每拍 apply);推导链第 4 环、全章最重一图。",
+     "claim": "lazy batch 的结构(block_size=2 的 1×4 实例):块内逐列『量化→记误差 E→即时补偿块内』,块末 E@U 一次性总账块外——col 0 的误差只即时改写 col 1(取整从 -8 翻成 -7),col 2/3 的改写全部推迟到块末;同一副网格,层输出误差 0.001667 vs RTN 0.003978。",
+     "numbers": [
+      {"value": "块 A:E=[0.02749, -0.03693],块末把 col 2/3 从 [-0.05, 0.15] 改写到 [-0.04519, 0.1451]", "provenance": "traces/ch27_m04_gptq.json gptq_fixed_order_trace.steps"},
+      {"value": "col 1 换码:工作权重 -0.2 →(col 0 补偿)-0.19445 → 码 -7(RTN 是 -8);单点误差 0.02667 反而大于 RTN 的 0.01667,但层输出误差更小", "provenance": "traces/ch27_m04_gptq.json gptq_fixed_order_trace.steps + hand_scoreboard"},
+      {"value": "H=2X^TX=[[4,2,0,2],[2,4,0,2],[0,0,2,2],[2,2,2,6]](4 条 0/1 校准样本,可手算;λ=0.04 dampening)", "provenance": "traces/ch27_m04_gptq.json hand_setup"},
+      {"value": "OBQ 贪心序 [2, 0, 1, 3](每步选 (quant(w)−w)²/[H^{-1}]_{qq} 最小者)vs GPTQ 固定列序 0→3", "provenance": "traces/ch27_m04_gptq.json obq_greedy.greedy_order"},
+      {"value": "等价性对账:B=8 与 B=3 码逐位相同;Cholesky+lazy 与朴素逐列 Eq.2/Eq.3 码逐位相同(w_hat max|diff|=0.0)", "provenance": "traces/ch27_m04_gptq.json equivalence_checks"},
+      {"value": "复杂度:4096×4096 层 OBQ 2.8e14 → GPTQ 6.9e10 FLOPs(4096 倍);175B 约 4 GPU 小时", "provenance": "traces/ch27_m04_gptq.json complexity(公式 arXiv:2210.17323 §4 Step 1;运行时引论文 Abstract)"},
+      {"value": "论文原图对照:GPTQ Figure 2(逐块量化全局图——白色列正在量化、蓝色为待更新剩余权重)", "provenance": "arXiv:2210.17323 §4 Figure 2(paper.md:L54;key_figures 已登记)"}
+     ],
+     "caption_draft": "GPTQ 主循环一图流(arXiv:2210.17323 §4 Algorithm 1):把 W 按列分块(B=128,本例缩到 2),块内白色列逐个『取整→记误差→用还没取整的列找补』,块末把攒的误差账 E 一次性乘 U(Cholesky 上三角)摊给所有剩余列。三步优化各得其所:全行同序(H 只认输入不认权重)把每权重的求逆降到每列一次;lazy batch 把小更新攒成大矩阵乘;Cholesky 替掉反复求逆的数值累积误差。bit 没变、网格没变——变的只是 round 的顺序与找补,OPT-175B 3-bit 从 RTN 的 7.3e3 回到 8.68。",
+     "illustrator_notes": "tiling 模板:一条 1×4 的权重行画成 4 个方块,两个 block 外框(A/B);块内箭头(细,即时)col0→col1;块末箭头(粗,总账)块 A 末尾一次性射向 col2/col3,标 E@U;已被定格的列打勾/灰化。旁边小面板:U 上三角(只标对角 0.60637/0.57172/0.85195/0.40689)+E 账本。数字全取 traces/ch27_m04_gptq.json;结构对照论文 Figure 2(白/蓝列),不复制其样式。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch27-m05",
+   "intuition": "放大镜:重要的字先用放大镜看——权重乘 s=2 放大后落在更大的数上取整(格点相对更密),量完把结果除回 s;乘积一分不变,变的只是『在哪个尺度上取整』。看谁重要,不看字本身大小(权重范数),看它要乘的激活有多大(激活幅度)。",
+   "worked_example": {
+    "params": {
+      "组": "[0.9, 9.9](显著权重 0.9 + 组内定尺者 9.9), N=4, group 量化(Eq.1:Δ=max|w|/2^{N-1})",
+      "s": "2.0(只乘显著通道的权重;激活侧除以 s)",
+      "x": "1.0(单元素贡献 y=w·x,便于手算)",
+      "note": "非平凡分支:Δ′=Δ(0.9×2=1.8 < 9.9,组 max 不变——obs.2 的示范),误差从 0.3375 降到 -0.28125;单点误差比 0.83333(=5/6)≠ 理论比 0.5——差异本身就是 obs.(1)『RoundErr 是期望 0.25 的随机变量』的单点示范"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch27_m05_awq.json",
+    "table": {
+      "columns": ["阶段", "关键数值(全部可在 trace 找到)", "判定/含义"],
+      "rows": [
+        ["不缩放(RTN)", "Δ=1.2375(=9.9/8), 码=1, 反量化=1.2375, 误差=0.3375", "0.9 落在格点 1.2375 附近,误差约四分之一步长"],
+        ["乘 s=2", "w·s=1.8, Δ'=1.2375(不变), Round(w·s/Δ')=1, 贡献=0.61875, 误差=-0.28125", "同一权重在放大 2 倍的网格上取整——严格等价,误差变小"],
+        ["单点误差比", "0.28125/0.3375=0.83333(5/6)", "实测比大于理论比:单点 RoundErr(-0.45455)偏离期望"],
+        ["理论比(期望口径)", "(Δ'/Δ)·(1/s)=0.5", "RoundErr 期望恒 0.25(200000 样本实测均值 0.2502)"],
+        ["Table 2 协议(合成层)", "Δ'≠Δ 比例 0.0547, 平均 Δ'/Δ=1.0202, 平均误差比 0.5101", "论文实测:0.082/1.038/0.519——平均口径 0.519 与理论 0.5 贴合"],
+        ["搜索 α∈[0,1] 网格 20 点", "α*=0.32, L(0)=13.2416, L(α*)=7.197", "内点 α 打败 RTN 1.84 倍;曲线 U 形(α=1 反弹到 15.402)"],
+        ["SIMD 打包", "[0,1,2,3,4,5,6,7]→interleave [0,2,4,6,1,3,5,7]→0x75316420", "GPU 按 w_{0,2,4,6,1,3,5,7} 打包(vLLM awq_pack 同一 interleave)"]
+      ]
+    },
+    "table_note": "论文 Table 2 甜点(s=2:误差比 0.519、PPL 23.54→11.92;s=4:21.2% 通道 Δ'/Δ>1 反噬非显著通道,PPL 反弹 12.36)在 traces/ch27_m05_awq.json table2_protocol_synth.paper_table2_opt67b 逐字转录。全部数值 = trace 原样。"
+   },
+   "invariant": {
+    "claim": "等价缩放严格不改变数学输出:Q(w·s)·(x/s) 与 Q(w)·x 是同一乘法的两条量化路径,误差期望比 = (Δ′/Δ)·(1/s)。",
+    "argument": "推导(Eq.2 逐字):Q(w·s)·(x/s) = Δ′·Round(ws/Δ′)·x·(1/s)——标量乘法结合律保证 w·s·(1/s)·x = w·x 对任意 s 严格成立,等价性无近似。误差差只来自取整:Err(Q(w)x)=Δ·RoundErr(w/Δ)·x、Err(Q(w·s)(x/s))=Δ′·RoundErr(ws/Δ′)·x·(1/s)(Eq.3);代入三条经验观察——RoundErr 期望恒 0.25(与数值大小无关)、单元素放大通常不改组 max(Δ′≈Δ,本例严格相等:1.8<9.9)、Δ 与 x 在 FP16 无量化误差——两式期望之比 =(Δ′/Δ)·(1/s)<1。逆风:非显著通道的误差被 Δ′/Δ 放大(>1 的组占 21.2% @ s=4),故甜点在中间。"
+   },
+   "quantified": "本例:显著权重误差 0.3375→0.28125(单点比 0.83333,平均口径 0.5);合成层 Table 2 协议:Δ′≠Δ 仅 0.0547 的组、平均 Δ′/Δ=1.0202、平均误差比 0.5101(论文 OPT-6.7B:8.2%/1.038/0.519)。搜索:20 点网格 α*=0.32,L 13.2416→7.197(1.84 倍;论文口径 PPL 23.54→11.92,s=4 反弹 12.36)。打包:8 个 4-bit 码 interleave 后压进 0x75316420 一个 32-bit 字——dequant 1 个权重 1 shift+1 AND+1 FMA,打包次序贴 SIMD 位宽(AWQ §4.2)。",
+   "figure_specs": [
+    {
+     "figure_id": "ch27-fig-awq-magnifier",
+     "template": "before-after",
+     "l0_zoom": "放大 L0『GPU 执行臂』第三块『模型层 forward + 编译』里 Linear 层权重的离线加工——AWQ 的 s 早已折进检查点 scales(auto_awq.py:L930-L954 运行期一行都看不见),此图画的是『折进去之前』的数学;推导链第 5 环。",
+     "claim": "给显著权重戴放大镜:同一组 [0.9, 9.9],w=0.9 乘 s=2、激活除 2 后,量化发生在放大后的网格上——误差 0.3375→-0.28125(平均口径减半到 0.5),组 max 不变(Δ′=Δ),乘积严格等价;『显著』按激活幅度选、不按权重范数选(AWQ Table 1:按 W 选≈随机)。",
+     "numbers": [
+      {"value": "手算:Δ=1.2375(9.9/8),未缩放 Q(0.9)=1.2375 误差 0.3375;×s 后 w·s=1.8、Δ'=1.2375、贡献 0.61875、误差 -0.28125;单点比 0.83333 vs 理论 (Δ'/Δ)·(1/s)=0.5", "provenance": "traces/ch27_m05_awq.json hand_example"},
+      {"value": "RoundErr 期望:200000 均匀样本实测均值 0.2502(论文 obs.(1) 0.25)", "provenance": "traces/ch27_m05_awq.json round_err_stats"},
+      {"value": "Table 2(OPT-6.7B):s=[1,1.25,1.5,2,4] → 平均误差比 [1,0.804,0.676,0.519,0.303]、PPL [23.54,12.87,12.48,11.92,12.36](s=4 反弹:21.2% 通道 Δ'/Δ>1)", "provenance": "arXiv:2306.00978 §3.2 Table 2(paper-awq.md:L129-L136;traces/ch27_m05_awq.json table2_protocol_synth.paper_table2_opt67b 逐字转录)"},
+      {"value": "搜索空间:s=s_X^α、α∈[0,1] 网格 20 点(附录);合成层 α*=0.32、L 改善 1.84 倍、U 形曲线", "provenance": "traces/ch27_m05_awq.json search_sweep;grid size 20 出自 arXiv:2306.00978 附录(paper-awq.md:L477)"},
+      {"value": "论文原图对照:AWQ Figure 2(RTN PPL 43.2 → 混合精度 13.0 → AWQ,OPT-6.7B INT3-g128)", "provenance": "arXiv:2306.00978 Figure 2(paper-awq.md:L8 图注;key_figures 已登记)"},
+      {"value": "落地:awq_pack interleave [0,2,4,6,1,3,5,7] 打包 0x75316420——论文 §4.2 与 vLLM quant_utils.py:L880-L899 一字不差", "provenance": "traces/ch27_m05_awq.json simd_pack + vllm/model_executor/layers/quantization/utils/quant_utils.py:L880-L899"}
+     ],
+     "caption_draft": "AWQ 的两板斧(arXiv:2306.00978 §3.1-§3.2):左半,显著通道看激活不看权重(1% 通道保留 FP16 的理想解 PPL 43.2→13.0,但混合精度硬件不友好);右半,等价缩放达到接近的效果且全程 INT——显著权重 ×s、激活 ÷s,RoundErr 期望恒 0.25 而 Δ′≈Δ,相对误差自动除以 s。甜点 s≈2:再大就轮到非显著通道的 Δ′/Δ>1 反噬。s=s_X^α 网格搜索 20 点,一个超参平衡两端。",
+     "illustrator_notes": "before-after 上下两半同一根组内数轴:上半原网格(格点 1.2375 间距,9.9 定尺),w=0.9 与 x 的贡献、误差 0.3375 标红;下半 ×2 后(w·s=1.8 落点、格点相对变密),贡献 0.61875、误差 -0.28125 标绿;两半之间一支双向箭头 ×s(权重侧)/÷s(激活侧)。右上角小面板:Table 2 五行 s 的误差比/PPL 迷你条形。数字全取 traces/ch27_m05_awq.json;不画架构元素。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch27-m06",
+   "intuition": "难度搬家:激活里的离群是烫手山芋—— SmoothQuant 在激活和权重之间乘一对儿 s/1÷s(逐通道),把山芋从激活侧搬到权重侧;乘法结果一分不变,但原本『激活难量化、权重好量化』变成『两边都还行』。搬多少由 α 定:0=不搬(激活自己扛)、1=全搬(权重扛)、0.5=对半。",
+   "worked_example": {
+    "params": {
+      "X": "6 token × 4 通道,通道 0 离群 [70, 63, 77, 66, 59, 72](逐 token 持续,SmoothQuant Fig.4 量级),通道 1-3 ~1",
+      "W": "4×2,行 max=[0.5, 2.0, 1.0, 1.0](平坦分布)",
+      "α": "0.5(s_j=√(max|X_j|/max|W_j|))",
+      "量化器": "W8A8 per-tensor 静态对称(§4:the same quantizer ... per-tensor, static)",
+      "note": "非平凡分支:逐通道 max|X̂_j| 与 max|Ŵ_j| 逐个不同且精确相等(4 通道两两各异);等价性浮点级成立(max|差|=0.0);α 三个锚点误差两两不同"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch27_m06_smoothquant.json",
+    "table": {
+      "columns": ["通道 j", "max|X_j|", "max|W_j|", "s_j=√(max|X_j|/max|W_j|)", "max|X̂_j|", "max|Ŵ_j|"],
+      "rows": [
+        ["0(离群)", "77.0", "0.5", "12.4097", "6.2048", "6.2048"],
+        ["1(普通)", "0.9", "2.0", "0.6708", "1.3416", "1.3416"],
+        ["2(普通)", "1.2", "1.0", "1.0954", "1.0954", "1.0954"],
+        ["3(普通)", "0.8", "1.0", "0.8944", "0.8944", "0.8944"]
+      ]
+    },
+    "table_note": "α=0.5 的配平恒等式:max|X̂_j| == max|Ŵ_j| == √(max|X_j|·max|W_j|)(逐通道验证,max 相对差 0.0);激活通道间差距 96.2 倍 → 6.9 倍。W8A8 误差:α=0 误差 0.4404、α=0.5 误差 0.2326(1.9 倍改善)、α=1 误差 0.2742(激活全平但权重爆:W 行 max 变 [38.5, 1.8, 1.2, 0.8]);9 点扫描最优点 α=0.5(全部在 traces/ch27_m06_smoothquant.json w8a8_errors/migration_ablation)。"
+   },
+   "invariant": {
+    "claim": "平滑严格无损:对任意逐通道 s,X̂·Ŵ == X·W 浮点精确成立——迁移是免费的,难的只是选 s。",
+    "argument": "逐项消去(不需要归纳):X̂·Ŵ 的第 (t,o) 元 = Σ_j (X_{t,j}/s_j)·(s_j·W_{j,o}) = Σ_j X_{t,j}·W_{j,o}——每个求和项里 s_j 与 1/s_j 严格相消,对任意正 s_j 成立;本例实测 max|X̂Ŵ − XW| = 0.0(round 到 12 位,浮点精度级)。α 的两个极端退化亦有恒等式:α=0 ⇒ s_j=1/max|W_j|(只归一权重行,激活离群原封不动);α=1 ⇒ s_j=max|X_j|(激活各通道 max 全等 1.0、离群全推给权重)——恒等式仍成立,坏的是量化误差,不是数学。"
+   },
+   "quantified": "本例:通道 max 差距 96.2 倍 → 6.9 倍;W8A8 per-tensor 误差 0.4404(α=0)→ 0.2326(α=0.5,1.9 倍)vs 0.2742(α=1,权重行 max 爆到 38.5);9 点扫描 argmin=0.5。论文口径:OPT-175B 上 α<0.4 激活难量化、α>0.6 权重难量化,甜点 0.4-0.6(§5.5 Figure 10);OPT/BLOOM 通用 0.5、GLM-130B(离群 ~30% 通道)0.75;运行期零开销——s 离线折进前一层(LayerNorm/Linear 参数),在线多算一次乘法都没有。线性层 Frobenius 口径 ~2 倍;真实 PPL 口径收益远大(W8A8 崩溃 93080 → SmoothQuant-O3 11.17,Table 3,论文数字)。",
+   "figure_specs": [
+    {
+     "figure_id": "ch27-fig-smooth-migration",
+     "template": "before-after",
+     "l0_zoom": "放大 L0『GPU 执行臂』第三块『模型层 forward + 编译』里 Linear 层的输入侧——SmoothQuant 之后进入这块的激活已经是平滑过的 X̂(运行期零开销,图上不应出现任何运行期算子);推导链第 6 环。",
+     "claim": "α=0.5 精确配平:逐通道 s_j=√(max|X_j|/max|W_j|) 使 max|X̂_j|==max|Ŵ_j|(本例 4 通道两两相等:[6.2048, 1.3416, 1.0954, 0.8944]),激活通道间 96.2 倍差距压到 6.9 倍,W8A8 误差 0.4404→0.2326;严格等价(max|X̂Ŵ−XW|=0.0),s 离线折进前一层、运行期零开销。",
+     "numbers": [
+      {"value": "配平表:max|X_j|=[77.0, 0.9, 1.2, 0.8]、max|W_j|=[0.5, 2.0, 1.0, 1.0] → s=[12.4097, 0.6708, 1.0954, 0.8944] → max|X̂_j|=max|Ŵ_j|=[6.2048, 1.3416, 1.0954, 0.8944]", "provenance": "traces/ch27_m06_smoothquant.json alpha_half_table"},
+      {"value": "等价性:max|X̂·Ŵ − X·W| = 0.0(12 位小数;浮点精确)", "provenance": "traces/ch27_m06_smoothquant.json equivalence_check"},
+      {"value": "α 三个锚点:err(α=0)=0.4404(离群留在激活)、err(0.5)=0.2326、err(1)=0.2742(激活全平、W 行 max 爆到 [38.5, 1.8, 1.2, 0.8]);9 点扫描 argmin=0.5", "provenance": "traces/ch27_m06_smoothquant.json w8a8_errors + migration_ablation"},
+      {"value": "论文甜点:OPT-175B α<0.4 激活难量化、α>0.6 权重难量化(§5.5 Figure 10);OPT/BLOOM 0.5、GLM-130B(离群 ~30%)0.75", "provenance": "arXiv:2211.10438 §5.5(paper-smoothquant.md:L505-L507)+ §4(paper-smoothquant.md:L68)"},
+      {"value": "真实收益口径:OPT-175B W8A8 PPL 93080 → SmoothQuant-O3 11.17(FP16 10.99)", "provenance": "arXiv:2211.10438 §5.1 Table 3(paper-smoothquant.md:L94-L101 逐字)"},
+      {"value": "论文原图对照:SmoothQuant Figure 2(搬家直觉图)/Figure 5(α=0.5 主例图)", "provenance": "arXiv:2211.10438 Figure 2(paper-smoothquant.md:L14)/Figure 5(L61;key_figures 已登记 Fig.2)"}
+     ],
+     "caption_draft": "难度守恒,但可以搬家(arXiv:2211.10438 §4):左半,离群通道(77)把激活的 per-tensor 尺子撑爆——这是 m03 的死局;中间一支逐通道的 ÷s_j/×s_j 对偶箭头(数学严格等价,离线折进前一层);右半,X̂ 通道间只剩 6.9 倍、Ŵ 仍平坦,两边都落进 W8A8 的能力圈。α 是搬家力度:0=不搬、1=全搬(激活平了权重爆 [38.5,…])、0.5=对半(OPT/BLOOM 甜点;离群更多的 GLM-130B 要 0.75)。",
+     "illustrator_notes": "before-after 三联:左 X 热图(通道 0 一柱擎天 59-77)+W 平坦热图;中间对偶箭头面板(每通道一行:÷s_j 与 ×s_j,数值取 trace);右 X̂/Ŵ 热图(通道 0 降到 ~6.2)。底部一条 α 数轴标 0/0.5/1 三锚点误差(0.4404/0.2326/0.2742)。数字全取 traces/ch27_m06_smoothquant.json;结构对照论文 Fig.2/Fig.5,不复制其样式。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch27-m07",
+   "intuition": "尺子自己会变疏密:INT 的刻度从左到右等距(一把刚性直尺);FP8(e4m3) 的刻度按 2 的幂分段——每段内 8 个等距刻度,段与段之间步长翻倍:小数区密、大数区疏。离群值天生有大格点可落,普通值保住相对精度,代价是绝对精度不均匀。",
+   "figure_specs": [
+    {
+     "figure_id": "ch27-fig-fp8-grid-vs-int",
+     "template": "layout",
+     "l0_zoom": "放大 L0『GPU 执行臂』第三块『模型层 forward + 编译』里量化 Linear 的权重/激活存取格式——fp8.py 装载的 e4m3 weight + weight_scale(块 scale 可 e8m0)就是这副格点;推导链第 7 环(W8A8 激活侧为什么选 FP8 不选 INT8)。",
+     "claim": "同样 8 bit:INT 等距格点一刀切(铺满 ±448 步长恒 3.5137),FP8 e4m3 按指数分段(段内 8 格、段间倍增,步长 0.001953125→32)——126 个正格点里 55 个在 (0,1)、23 个 ≥64:动态范围换段内精度,且无需 zero-point(amax 对称 scale=448/amax 一路到格点)。",
+     "numbers": [
+      {"value": "e4m3 位型:1+4+3,bias 7,仅 S.1111.111 为 NaN;max=448、min normal=0.015625、min subnormal=0.001953125;正格点 126 个(含符号与 0 共 253 个有限值)", "provenance": "traces/ch27_m07_fp8_format.json bit_layout(按 OCP FP8 规范位级枚举;vLLM get_fp8_min_max 同语义:quant_utils.py:L27-L35)"},
+      {"value": "分段结构:正规段每段 8 个等距格点、段间步长翻倍——[0.5,1) 步长 0.0625、[1,2) 0.125、[2,4) 0.25 … [128,256) 16、[256,448] 32", "provenance": "traces/ch27_m07_fp8_format.json segments"},
+      {"value": "INT8 对照:等距铺满 [-448,448] 步长 3.5137(896/255)", "provenance": "traces/ch27_m07_fp8_format.json int8_contrast"},
+      {"value": "amax 对称示例:x=[1.0, 0.55, -0.3, 0.9, 100.0],scale=448/100=4.48;100.0 精确映到 448,0.55×4.48=2.464 落格 2.5,最大误差 0.008", "provenance": "traces/ch27_m07_fp8_format.json amax_scaling_example"},
+      {"value": "格点密度:正格点 55 个在 (0,1)、23 个 ≥ 64([64,72,80,…,448])", "provenance": "traces/ch27_m07_fp8_format.json density"},
+      {"value": "vLLM 装载:weight e4m3 + per-tensor/128×128 块 scale(weight_scale_inv 命名沿用 DeepSeek,块 scale dtype 可 float8_e8m0fnu)", "provenance": "vllm/model_executor/layers/quantization/fp8.py:L342-L369(dossier embed_excerpts[18]);参考实现 scaled_quantize quant_utils.py:L359-L411"}
+     ],
+     "caption_draft": "INT 等距 vs FP 指数分段(arXiv 无此论文——格式出自 OCP FP8 / NVIDIA《FP8 Formats for Deep Learning》,正文一句带过):把两种格点画在同一根数轴上,INT8 是均匀刻度、e4m3 是『倍增尺』。对 m03 那种离群场景,等距尺普通通道只剩 2-3 级;指数尺的相对间隔处处 ~2^-3——离群有格点、普通值有密度。这是 W8A8 激活侧选 FP8 的格式层理由,也是它不需要 zero-point 的原因(格点自身对称覆盖动态范围)。",
+     "illustrator_notes": "layout:一根长数轴(0 到 448,对数感排版)上画两排刻度:上排 INT8 等距(视觉上远处挤成一团)、下排 e4m3 分段(每段 8 格、间距倍增,高亮 [0.5,1) 与 [256,448] 两段对比);右侧小面板:amax 缩放示例的 5 个数落点。数字全取 traces/ch27_m07_fp8_format.json;不画架构元素。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch27-m08",
+   "intuition": "两级秤:FP4 只有一个指针对(±{0,.5,1,1.5,2,3,4,6}),一把秤称不动整张权重——给每 16 个值配一把小秤(e4m3 块 scale),再配一台总秤(fp32 全局)管所有小秤的量程;e8m0 则是『只会跳挡的秤』:只能停在 2 的幂上,向上取整保不溢出。",
+   "figure_specs": [
+    {
+     "figure_id": "ch27-fig-two-level-scale",
+     "template": "before-after",
+     "l0_zoom": "放大 L0『GPU 执行臂』第三块『模型层 forward + 编译』里量化 Linear 的权重格式——modelopt.py 装载的 NVFP4 三件套(uint8 双打包 weight + e4m3 块 scale + fp32 全局 scale,group_size=16)就是这两级秤;推导链第 8 环,直供 ch28 DSV4 capstone。",
+     "claim": "e2m1 只有 16 个格点(块内动态范围 6/0.5=12):单级全局 scale 下,16 值全 ~0.1 的小块在张量 amax=6 的尺子上全部坍缩到 0(平均误差 0.0983);两级(块 scale e4m3 × 全局 fp32)给小块自带 0.019531 的小尺子,值全落在 4/6 格点(平均误差 0.011,改善 8.9 倍)——e8m0 块 scale 只能取 2 的幂(exp2∘ceil∘log2,平均多花 1.4426/1.4427 倍 scale 换不溢出)。",
+     "numbers": [
+      {"value": "e2m1 全部格点 ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}(16 个编码,min 非零 0.5 / max 6,块内动态范围 12)", "provenance": "traces/ch27_m08_two_level_scale.json e2m1(按 OCP MX 规范位级枚举)"},
+      {"value": "单级 vs 两级:块 A(16 值 0.08-0.118)在全局 scale=1.0 下全坍 0(平均误差 0.0983);块 scale=e4m3(0.019531)下落在 4/6 格点(平均误差 0.011)——8.9 倍", "provenance": "traces/ch27_m08_two_level_scale.json two_level_necessity"},
+      {"value": "e8m0:取整 exp2(ceil(log2(·)))——0.013→0.0156、0.02→0.0312、1.2→2.0、3.0→4.0;对数均匀假设下平均开销因子实测 1.4426 / 理论 1/ln2=1.4427", "provenance": "traces/ch27_m08_two_level_scale.json e8m0 + vllm/model_executor/layers/quantization/input_quant_fp8.py:L243-L244(逐行对应)"},
+      {"value": "NVFP4 装载三件套:两个 e2m1 打包一个 uint8(input 维 //2);每 16 输入元素一个 e4m3 块 scale;input_scale/weight_scale_2 两个 fp32 全局标量;装载期预计算 alpha=两级乘积", "provenance": "vllm/model_executor/layers/quantization/modelopt.py:L1151-L1162(打包)、L1178-L1190(块 scale)、L1013(group_size=16)、L1216-L1219(alpha 预计算)"},
+      {"value": "QuantKey 词汇:ScaleDesc(1,16) 的 scale + kStaticTensorScale 的 scale2 双层描述(kNvfp4Dynamic/kNvfp4Static)", "provenance": "vllm/model_executor/layers/quantization/utils/quant_utils.py:L148-L156(dossier embed_excerpts[10])"},
+      {"value": "分组思想的论文账:group-size 1024≈0.02 额外 bit、g128≈0.15 额外 bit 换 PPL(GPTQ §5)", "provenance": "arXiv:2210.17323 §5(paper.md:L314);GPTQ Table 7:2-bit 下 g128 9.58 → g32 8.94(paper.md:L499-L503)"}
+     ],
+     "caption_draft": "两级 scale 的必要性(格式出自 OCP MX / NVIDIA Blackwell,不在论文包):e2m1 的 16 个格点撑不起一张真实权重的动态范围——单级全局 scale 下,小块的值在尺子上挤不进任何一个非零格点(全坍 0);每 16 值一把 e4m3 小秤 + 一台 fp32 总秤,小块回到可用精度。e8m0 小秤只会停在 2 的幂(向上取整保不溢出,平均多花 44% 量程)——精度与规整的交换。这套词汇(QuantKey 的 scale+scale2)直通 ch28 的 DSV4-Flash FP4 MoE。",
+     "illustrator_notes": "before-after 上下两半:上半单级(一根大尺 0-6,块 A 的 16 个点挤在 0 附近,箭头全坍到 0;块 B 正常);下半两级(块 A 自己的小尺刻度 {0.5..6}、值落在 4/6;旁边画 e4m3 块 scale=0.019531 × fp32 全局的双层结构);右上小面板 e8m0 的 2 的幂挡位与 ceil 取整(0.013→0.0156 等)。数字全取 traces/ch27_m08_two_level_scale.json;不画架构元素。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch27-m10",
+   "intuition": "聪明在工厂、快在店里:GPTQ/AWQ/SmoothQuant 的数学全发生在离线加工厂(产检查点);到了卡上,vLLM 只做三件事——进门查算力(你的卡带不动我的 kernel)、柜台挑 kernel(同一检查点按硬件优先级表现场选)、后厨换包装(把检查点格式重排成 kernel 自己的格式);第四件事在编译间:量化算子选哪条路,标准是整条编译管线更快。",
+   "figure_specs": [
+    {
+     "figure_id": "ch27-fig-quant-lifecycle",
+     "template": "flow",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』(gpu_column,绿色 C_GPU_S)整列——GPUModelRunner(构造/装载)与『模型层 forward + 编译』(每拍消费)串起一副量化权重的运行期全生命周期;配置期算力门在 L0 外围(VllmConfig 装配),图上以入口关卡回指;F10『量化与 kernel 的耦合』(ch19 埋、本章收)的总账图。",
+     "claim": "一副量化权重的生命周期 = 离线数学产网格 + 运行期四重门:①配置期 get_min_capability 算力硬门(门槛来自 kernel:docstring 原话 due to the custom CUDA kernels);②构造期 choose_mp_linear_kernel 按平台优先级表逐个 can_implement——同一 GPTQ 检查点,H100(cap 90)选 Machete(min_cap 90)、A100(cap 80)被拦下落 Marlin(min_cap 75);③装载期 process_weights_after_loading 把检查点格式重排成 kernel 格式;④编译期算子选择(+quant_fp8 强制 / query_quant 刻意普通算子 / fuse_* 开关)——聪明的部分全在离线,运行期只是『按硬件消费网格』。",
+     "numbers": [
+      {"value": "CUDA 混精 kernel 优先级表:CutlassW4A8 > Machete > AllSpark > Marlin > Conch > Exllama > TritonW4A16 > Humming(逐个过 黑名单/算力/can_implement 三道闸,全败 raise 附失败原因清单)", "provenance": "vllm/model_executor/kernels/linear/__init__.py:L411-L439(表)+ L747-L789(循环;traces/ch27_m10_lifecycle.json vllm_gates.gate_2)"},
+      {"value": "同一检查点不同卡:Machete min_capability=90、Marlin min_capability=75 → H100(90)走 Machete、A100(80)走 Marlin", "provenance": "vllm/model_executor/kernels/linear/mixed_precision/machete.py:L26-L27 / marlin.py:L37-L38(traces/ch27_m10_lifecycle.json 同 checkpoint_different_gpu)"},
+      {"value": "带宽账动机:decode 矩阵-向量积算术强度 16/bits——FP16=1、INT8=2、INT4=4(4090 阈值 165 即 memory-bound);4096×4096 层权重字节 33554432→8388608(4 倍)", "provenance": "traces/ch27_m10_lifecycle.json arithmetic_intensity + layer_traffic_4096x4096(公式 arXiv:2306.00978 §4.1)"},
+      {"value": "论文自述:GPTQ §5『almost all of the speedup is due to our kernels(动态反量化矩阵-向量积)』、§6『speedups from reduced memory movement, not computational reductions』;实测 A100 230ms→71ms=3.24×、A6000 589ms→130ms=4.53×", "provenance": "arXiv:2210.17323 §5(paper.md:L483)/§6(L508)/Table 6(L488-L489);traces/ch27_m10_lifecycle.json paper_quotes 逐字"},
+      {"value": "第四重门(编译期,ch19 三影子回收):块状权重强制 +quant_fp8(vllm/config/vllm.py:L1253-L1268,注释自述 On H100 the CUDA kernel is faster);query 量化刻意用普通 torch 算子保融合(attention.py:L514-L524);fuse_norm_quant/fuse_act_quant/fuse_attn_quant 谓词开关(vllm.py:L275-L290)", "provenance": "vllm/config/vllm.py:L1253-L1268 + vllm/model_executor/layers/attention/attention.py:L514-L524 + vllm/config/vllm.py:L275-L290(dossier embed_excerpts[22]/[23];deepread/gpu-exec.json why_chains[7]/[9])"},
+      {"value": "装载期换装窗口:全模型遍历 process_weights_after_loading——Marlin repack/FP8 转置合并 shard scale/NVFP4 alpha 预计算", "provenance": "vllm/model_executor/model_loader/utils.py:L100-L122(dossier embed_excerpts[21])"}
+     ],
+     "caption_draft": "F10 总账:量化与 kernel 的耦合(ch19 埋、ch27 收)。左端离线工厂:GPTQ 二阶补偿/AWQ 放大镜/SmoothQuant 搬家,产出的只是检查点里的 qweight/scales/g_idx。右端 vLLM 运行期四重门:算力门(格式自带门槛,门槛来自它的 kernel)、构造期 kernel 选择(优先级表+can_implement,同一检查点 H100 走 Machete、A100 走 Marlin)、装载期换装(检查点格式≠kernel 格式,Marlin 整包重排)、编译期算子选择(同一个 quant_fp8,块状权重强制手工 kernel、query 量化反向避开——标准都是整条编译管线更快)。速度的来源写在论文里:提速几乎全部来自少搬显存(3.24×/4.53×),不是算得更快。",
+     "illustrator_notes": "flow 模板:横向流水线五站(离线工厂→站1-2 配置(算力门关卡)→站3-4 构造(优先级表柜台:Machete/…/Humming 一排柜台,can_implement 打勾)→站5 装载(repack 换装间)→站6-7 每拍 apply(W4A16/W8A8 两条消费线)+ 站8 编译门),四重门用关卡图标配号;GPU 执行臂各站恒绿(C_GPU_S)、离线工厂用 plain 色、配置期关卡回指 L0。底部一条带宽账小条(强度 1/2/4 vs 165)。数字全取 traces/ch27_m10_lifecycle.json + file:L 出处;站点命名与 dossier stations 对齐。"
+    }
+   ]
+  }
+ ]
+}

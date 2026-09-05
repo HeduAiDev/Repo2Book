@@ -362,7 +362,7 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
 图与表分工：图讲这一拍的动态时序（谁先谁后、谁等谁），下面的表对全场景的静态账（每拍各段耗时与产出）。实测场景：req-A（prompt 3 个 token，`max_tokens=3`）先到，一拍后 req-B（prompt 4 个 token，`max_tokens=2`）赶到。一个请求的一生加一个迟到者，五拍走完（异步版跑同一场景的对照，见「第二拍与第四拍」一节）：
 
 <!-- trace: m1 -->
-| 拍 | ① schedule (ms) | ② 发起 execute_model(non_block=True) (ms) | ③ 掩码·结束时前向已完? | ④a result (ms) | ④b sample_tokens (ms) | ⑤ 记账 (ms) | 批形状→产出 | 拍全程 (ms) |
+| 拍 | ① schedule (ms) | ② 发起 execute_model(non_block=True) (ms) | ③ 掩码·结束时前向已完？ | ④a result (ms) | ④b sample_tokens (ms) | ⑤ 记账 (ms) | 批形状→产出 | 拍全程 (ms) |
 |---|---|---|---|---|---|---|---|---|
 | 1 | 0.070 | 2.516 | 0.001·是 | 0.001 | 0.225 | 0.028 | {req-A:3} prefill→A 得 [7189] | 2.870 |
 | 2 | 0.071 | 2.636 | 0.001·是 | 0.001 | 0.246 | 0.032 | {req-A:1, req-B:4} 混相→A [184]、B [5965] | 3.021 |
@@ -370,7 +370,7 @@ vLLM 三种各用在各自该在的地方。看骨架（[第 1 章](../../ch01-v
 | 4 | 0.023 | 0.242 | 0.001·— | 0.001 | 跳过（④a 拿到非 None 空输出，不调 sample_tokens） | 0.004 | {} flush：total=0 批仍下发（冲刷 finished 名单） | 0.534 |
 | 5 | —（守卫先于①早退） | 零调用 | — | — | — | — | 空转守卫：has_requests()==False，step 返回 ({}, False)（复验拍同 0.005ms 零事件） | 0.006 |
 
-（采样为 temperature=0 的贪婪 argmax。③列的「前向已完?」是 CUDA event 非阻塞查询的结果；拍 3 查出来「否」，就是掩码藏进前向窗口的直接证据。表的「拍全程」是 `step()` 整段墙钟，五段之外还有未单列的段间开销：step 入口守卫、`with` 上下文进出、L608 批量撤单、⑤后的附件挂接与返回——按实测事件时刻，拍 1-3 这部分合计 0.03-0.06ms；拍 4 没有④b 大段，0.26ms 的差值全是它、占比显形。）逐拍读表。拍 1 是 req-A 的 prefill，整拍 3 个 token。值得注意的是②发起就要 2.516ms：在这个 16 层的小模型上，把 kernel 排进 GPU 队列的 CPU 工作比 GPU 真正计算还久，发起段主导整拍（launch-bound，发起主导）；模型越重这个比例越倒过来，见本节末的量级账。
+（采样为 temperature=0 的贪婪 argmax。③列的「前向已完？」是 CUDA event 非阻塞查询的结果；拍 3 查出来「否」，就是掩码藏进前向窗口的直接证据。表的「拍全程」是 `step()` 整段墙钟，五段之外还有未单列的段间开销：step 入口守卫、`with` 上下文进出、L608 批量撤单、⑤后的附件挂接与返回——按实测事件时刻，拍 1-3 这部分合计 0.03-0.06ms；拍 4 没有④b 大段，0.26ms 的差值全是它、占比显形。）逐拍读表。拍 1 是 req-A 的 prefill，整拍 3 个 token。值得注意的是②发起就要 2.516ms：在这个 16 层的小模型上，把 kernel 排进 GPU 队列的 CPU 工作比 GPU 真正计算还久，发起段主导整拍（launch-bound，发起主导）；模型越重这个比例越倒过来，见本节末的量级账。
 
 拍 2 是**混相批**：req-A 逐 token decode（1 个）与 req-B 的 prefill（4 个）同批，这正是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md)「调度器没有 prefill 批与 decode 批之分」的账面证据。拍 3 双双到达长度上限，两个请求同一拍完成、一起释放。拍 4 是个 0-token 的空批，它的存在有讲究：拍 3 里完成的请求要等下一拍的 `schedule()` 把 finished 名单随批下发给 worker 清缓存，所以「完成之后、清账之前」还有一拍。这拍 `has_requests()` 仍为真（已完成未摘除的请求也算数），但批是空的、不碰 GPU：②的调用照走，worker 对 0-token 批走空批早退分支（`vllm/v1/worker/gpu_model_runner.py:L4218-L4233`，注释原话「Return empty ModelRunnerOutput if no work to do」），不发起前向、直接返回非 None 的空结果常量 `EMPTY_MODEL_RUNNER_OUTPUT`。④a 的 `future.result()` 拿到它非 None，④b 的采样整段跳过——表里拍 4 那行④b 列的「跳过」正是这么来的。（配了 KV connector 的部署在这一拍另有走法，交给 KV 传输组件处置，归 Part IV 末章 KVConnector 章。）拍 5 守卫拦下，引擎回到队列上睡觉。
 
