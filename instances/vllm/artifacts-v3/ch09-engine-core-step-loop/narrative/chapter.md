@@ -569,21 +569,21 @@ class ExecuteModelState(NamedTuple):  # L437
 
 一置一清、互斥推进：`execute_model` 入口查旧值非 None 即炸，`sample_tokens` 入口先解包立即置 None，「前向算完、采样欠着」的中间态因此永不重叠，误序被入口防御拦死。掩码应用（`apply_grammar_bitmask`）恰在 `_sample` 之前，这个位置是下一节的全部内容。
 
-### 实测：契约三面各验一手（配套精简版）
+### 实测：worker 面的契约，逐手验（配套精简版）
 
-配套精简版把三面各跑一遍（worker 面、executor 面、异步面；贪婪采样、词表 8；D2H 事件在 host 上用线程事件代行，语义同 `get_output()`「阻塞至拷贝完成」，CUDA 拷贝流本体属执行篇）：
+配套精简版直接驱动 worker，把两段式契约的手感逐手过一遍（贪婪采样、词表 8）。边界先说清：异步调度系统的全貌（batch_queue、延迟一拍收货、`step_with_batch_queue`）归 Part III 末章[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)；本节与下一节只验两段式契约本身，worker 面与 executor 面在同步版里验，异步面只验「发起与等待分离」这一件事。静态账一张（动作、暂存态、返回三列；流程怎么走到下一步，读下面的散文）：
 
 <!-- trace: m3 -->
-| 阶段 | 动作 | execute_model_state | 返回 | 判定 |
-|---|---|---|---|---|
-| ② 第一段 | execute_model(批{'req-1': 3}) | 暂存 10 字段（logits 1×8） | None | 前向算完、采样欠着 |
-| 误用防御 | 再来一次 execute_model | 非 None（上一拍未消费） | RuntimeError：State error（原文即上引源码） | worker 自己炸，不产出错数据 |
-| ④ 第二段 | sample_tokens(None) | 解包→清 None | sampled=[[1]]（argmax=favorite 1） | 掩码位→贪心采样，态已清 |
-| 再次 ② | 消费后再 execute_model（批含新 req-2） | 重新暂存（新批） | None | 合法：sampled=[[1], [2]]（req-1 续 decode + req-2 新入批） |
-| ④ 异步半边 | executor.sample_tokens(non_block=True) | — | AsyncOutputFuture（done=False） | result() 只等 D2H 事件，不等计算 |
-| D2H 完成 | 挂起 0.25s 后事件置位 | — | 置位后 0.142ms 返回；二次 result() 0.008ms | 阻塞期间无返回=True；采样=[[4]] |
+| 动作 | execute_model_state | 返回 |
+|---|---|---|
+| execute_model(批{'req-1': 3}) | 暂存 10 字段（logits 1×8） | None |
+| 再来一次 execute_model | 非 None（上一拍未消费） | RuntimeError：State error |
+| sample_tokens(None) | 解包→清 None | sampled=[[1]]（argmax=favorite 1） |
+| 消费后再 execute_model（批含新 req-2） | 重新暂存（新批） | None |
 
-不变式（**暂存态不变式**）：`execute_model_state` 非 None 当且仅当恰有一拍前向的采样欠着；两次 `execute_model` 之间必恰有一次 `sample_tokens`。基例是初始 None；归纳步就是上面那对入口防御，非空时引擎不可能发起第二拍前向。等待账也顺表可见：异步面事件未置位时 `result()` 阻塞 0.25s 零返回（这 0.25s 是脚本注入的拷贝延迟；真实引擎里这段等待罩不罩住前向余尾，取决于取货时机——当拍发起后立刻取就罩着，batch_queue 版延迟一拍才取、常常已就绪，见下一小节实测），置位后 0.142ms 交出，二次 `result()` 0.008ms（Future 已 done，纯缓存读）。「只等搬运」的真实含义：等的墙钟不短（罩着前向余尾），等的方式便宜（挂起、零 CPU、释放 GIL），且等待排在③之后，亚毫秒只是就绪后的取货价。
+逐手读（配套精简版 host 实测）。**第一手，②暂存**：对批 {'req-1': 3} 调 `execute_model`，worker 把 10 个字段的中间结果暂存进 `ExecuteModelState`（logits 1×8）、返回 None，「前向算完、采样欠着」成立。**第二手，误用防御**：暂存未消费时再来一次 `execute_model`，worker 当场炸出 `RuntimeError: State error: sample_tokens() must be called after execute_model() returns None.`（上引源码原文），不产出错数据。**第三手，④消费**：`sample_tokens(None)` 解包暂存、立即清 None，掩码位之后贪心采样交出 `sampled=[[1]]`（argmax 命中 favorite 1），态已清。**第四手，复用合法**：消费之后再 `execute_model`（批含新 req-2），重新暂存新批、返回 None，合法——随后采样得 `sampled=[[1], [2]]`（req-1 续 decode + req-2 新入批），「一置一清」的循环从这里接上。
+
+不变式（**暂存态不变式**）：`execute_model_state` 非 None 当且仅当恰有一拍前向的采样欠着；两次 `execute_model` 之间必恰有一次 `sample_tokens`。基例是初始 None；归纳步就是上面那对入口防御，非空时引擎不可能发起第二拍前向——四手正好把「置 →（防御）→ 清 → 再置」的合法循环走通一遍。
 
 两段式的故障兜底补一笔：中间态出错时，`step()` 里那个 `log_error_detail` 上下文会连带 `dump_engine_exception` 把两段各自的状态现场倒出来（`core.py:L493-L507`）。「中间态出错归属变模糊」这个代价，用专门的诊断出口把模糊钉回去。
 
@@ -612,7 +612,9 @@ class AsyncOutputFuture(Future):
         return super().result()
 ```
 
-`result()` 惰性调 `async_output.get_output()`：那是在等 D2H 拷贝事件，不是在等计算。真引擎把同一对请求在两版引擎上各跑一遍（「一拍五段」一节的实测环境），「发起与等待分离」直接量了出来：
+`result()` 惰性调 `async_output.get_output()`：那是在等 D2H 拷贝事件，不是在等计算。配套精简版也把这一手演了一遍（host 契约演示：D2H 用线程事件代行，语义同 `get_output()` 的「阻塞至拷贝完成」，CUDA 拷贝流本体属执行篇）。`executor.sample_tokens(non_block=True)` 交回 `AsyncOutputFuture`（done=False）；事件未置位时 `result()` 挂起，脚本注入 0.25s 的拷贝延迟、期间零返回；事件置位后 0.142ms 交出结果（采样 [[4]]），二次 `result()` 只剩 0.008ms（Future 已 done，纯缓存读）。「只等搬运」的真实含义在这里看得分明：等的方式便宜（挂起、零 CPU、释放 GIL）、等待排在③之后，亚毫秒只是就绪后的取货价；至于等的墙钟罩不罩住前向余尾，取决于取货时机——当拍发起后立刻取就罩着，batch_queue 版延迟一拍才取、常常已就绪（下面真引擎的数字正是后者）。
+
+真引擎把同一对请求在两版引擎上各跑一遍（「一拍五段」一节的实测环境），「发起与等待分离」直接量了出来：
 
 - 异步版拍 2 的④ `sample_tokens(non_block=True)` 0.314ms 发起即返回；之后的 `result()` 只等 0.022ms，其中 D2H 事件同步仅 0.012ms。
 - 同一拍的②发起 4.146ms，④等待 0.022ms，差近两个数量级。「提交即拿提货单」不是修辞，是实测。
