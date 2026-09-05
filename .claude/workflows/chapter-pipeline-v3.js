@@ -219,7 +219,7 @@ const dv = await agent(
   '④ mechanisms 完整性（有无漏掉读者必须懂的机制）、needs_figure/needs_worked_example/difficulty 标得对吗？\n' +
   '⑤ subtraction_plan.delete 都安全吗、must_keep 完整吗（有无遗漏读者要学的关键符号）？\n' +
   (PRIMER ? '⑥（PRIMER）确认 dossier.json 顶层有 "kind":"primer"——没有则 sound=false。\n' : '') +
-  '返回 sound（是否可放行）与 problems（具体问题列表）。（rev2 注记：若 dossier 曾按首轮 problems 修订落盘，本轮为修订后重验——逐条独立复核修订处与其波及面，仍按上述全项扫，不复述首轮。rev3：同前，适用任何轮次的修订后重验。）',
+  '返回 sound（是否可放行）与 problems（具体问题列表）。（rev2 注记：若 dossier 曾按首轮 problems 修订落盘，本轮为修订后重验——逐条独立复核修订处与其波及面，仍按上述全项扫，不复述首轮。rev3：同前，适用任何轮次的修订后重验。rev4：同前。rev5：同前。rev6：同前。rev7：同前。rev8：同前。rev9：同前。rev10：同前。rev11：同前。）',
   mo({ schema: VERIFY_SCHEMA, label: 'dossier-verify', phase: 'Dossier', agentType: 'general-purpose' }, 'verify', false)
 )
 if (!dv) return { chapter: CHID, escalated: 'dossier-verify-failed', stage: 'Dossier', note: 'dossier 对抗性自核 agent 失败（限流/崩溃），未核对不得放行' }
@@ -666,7 +666,7 @@ for (let r = 1; r <= 3; r++) {
   if (routed.figIssues.length) reviseThunks.push(async function () {
     const figFix = await agent(
       head('illustrator') +
-      '任务：修复评审 figure-integration 维的阻断项（writer 无权动图，这些只有你能修）。清单（与 figure-requests done 条目同构）：\n' +
+      '任务：修复评审 figure-integration 维的阻断项（writer 无权动图，这些只有你能修）。**对称纪律：你也无权改 narrative/chapter.md**（exp-2026-09-06：ch21 revise 轮图侧修复者越界改正文表行，与并发 writer 险些互踩——正文改动一律留给同轮的 text writer，你只动 diagrams/、素材侧 trace/explainer 数字、与 manifest）。清单（与 figure-requests done 条目同构）：\n' +
       JSON.stringify(toFigRequestItems(routed.figIssues)) +
       '\n逐张强制流程：改 ' + CH + '/diagrams/ 下 gen 脚本 → 重渲染 → 转 PNG → **用 Read 打开 PNG 亲眼看** → 六项自查全真 → 更新 figure-manifest.json 对应条目（blind_review 回写 PENDING 待重盲审）。**禁止即兴加示意数字**（数字须可溯源 explainer/正文）。v3 图系铁律照旧（回指 L0/L1/L2、无第二种架构画法）。完成后自跑 `python3 ' + REPO + '/scripts/lint_diagram_geometry.py ' + CH + '/diagrams/*.svg` 与 `python3 ' + REPO + '/scripts/lint_diagram_scaffolding.py ' + CH + '` 无问题。返回 status/note。' + ESC,
       mo({ schema: STATUS_SCHEMA, label: 'revise-fig r' + r, phase: 'Review', agentType: 'general-purpose' }, 'illustrate', false)
