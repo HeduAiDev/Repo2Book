@@ -1,14 +1,14 @@
 # 第 20 章　【primer】Flash-Attention 数学
 
-上一章把这个 kernel 捕进了 CUDA graph：attention 是留在图外的那对算子之一，被整段录下来、一拍一拍地重放。可它到底在算什么？教科书答案 $\mathrm{softmax}(QK^{\top})V$ 要先写出一张 $`N\times N`$ 的打分表：8K 上下文、一个 head 就是一张 6700 万元素、fp16 下 134MB 的表，写出去、再读回来，GPU 大部分时间在等显存搬数据，不在算。vLLM 的 kernel 从不把这张表写出来：softmax 归一化明明要把一整行 K 的分数全部加起来，kernel 每次却只看得见一小块，而且 K 还散在分页块池里、要经 block_table 寻址。它凭什么算得和教科书逐字不差，还快好几倍？
+上一章把这个 kernel 捕进了 CUDA graph：attention 是留在图外的那对算子之一，被整段录下来、一拍一拍地重放。可它到底在算什么？教科书答案 $`\mathrm{softmax}(QK^{\top})V`$ 要先写出一张 $`N\times N`$ 的打分表：8K 上下文、一个 head 就是一张 6700 万元素、fp16 下 134MB 的表，写出去、再读回来，GPU 大部分时间在等显存搬数据，不在算。vLLM 的 kernel 从不把这张表写出来：softmax 归一化明明要把一整行 K 的分数全部加起来，kernel 每次却只看得见一小块，而且 K 还散在分页块池里、要经 block_table 寻址。它凭什么算得和教科书逐字不差，还快好几倍？
 
 这是 Part V 的第一篇原理章，全书四篇 primer 之一：主角不是某段源码的走读，而是一页数学，以及这页数学在 v0.27.1 源码里的落点。[第 19 章](../../ch19-compile-capture/narrative/chapter.md)讲清了「attention 为什么是图里的不透明算子」（写 KV cache 的副作用 + 动态元数据，逼得它留在 eager 的接缝里），本章掀开这个算子的内部：kernel 的数学。全章一条主线先点破： **softmax 的归一化统计量在一个合并算子 ⊕ 下满足结合律与交换律，所以注意力可以任意切块、任意顺序归并，结果不变** 。⊕ 给了拆分的许可证，显存带宽的账给了拆分的动机；这两条合起来，就是 FlashAttention 全部的秘密。
 
 ## 你在这里
 
-![Part V 导览：GPU 不等 Python（执行管线 ch17-22），本章带「原理」徽标](../diagrams/L1-partV.png)
+![Part V 导览：GPU 不等 Python（执行管线 ch17-22），ch20 是其中唯一的 primer 原理章](../diagrams/L1-partV.png)
 
-> *图注：本章位置看[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 全图中间绿色「GPU 执行臂」列的**模型层**：module tree 里那个 Attention 实现，往下指向算子库。[第 19 章](../../ch19-compile-capture/narrative/chapter.md)刚把这一层捕成 CUDA graph：attention 作为不透明算子留在图外重放。本章打开的正是这个算子节点的内部数学。L1 图上 Part V 的章目录里，ch20 挂着「原理」徽标。本章接在三块已读结构上：[第 19 章](../../ch19-compile-capture/narrative/chapter.md)立的算子化与图捕获（黑盒的来历）、[第 13 章](../../ch13-paged-kv/narrative/chapter.md)立的分页 KV（块池与每请求一张页表，kernel 读的 K/V 就住在这里）、[第 18 章](../../ch18-persistent-batch-fixed-addresses/narrative/chapter.md)立的 query_start_loc 前缀和（kernel 的序列边界入参）。原理章没有站号：正文按推导链编排（显存带宽墙 → online-softmax → 合并算子 ⊕ → tiling 分块 → IO 复杂度账 → FlashAttention-2 → LSE 合并 → cascade → kernel 的调用面），每一节是下一节的前置，按序读最顺。*
+> *图注：本章位置看[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 全图中间绿色「GPU 执行臂」列的**模型层**：就是那块「模型层 forward + 编译」的框，第一条写着「DecoderLayer 拼装 · Attention = 插座（MLA / GQA 变体）」。[第 19 章](../../ch19-compile-capture/narrative/chapter.md)刚把这一层捕成 CUDA graph：attention 作为不透明算子留在图外重放。本章打开的正是这个算子的内部数学。L1 图标题带的章目录一行里，ch20 标着【primer】。本章接在三块已读结构上：[第 19 章](../../ch19-compile-capture/narrative/chapter.md)立的算子化与图捕获（黑盒的来历）、[第 13 章](../../ch13-paged-kv/narrative/chapter.md)立的分页 KV（块池与每请求一张页表，kernel 读的 K/V 就住在这里）、[第 18 章](../../ch18-persistent-batch-fixed-addresses/narrative/chapter.md)立的 query_start_loc 前缀和（kernel 的序列边界入参）。原理章没有站号：正文按推导链编排（显存带宽墙 → online-softmax → 合并算子 ⊕ → tiling 分块 → IO 复杂度账 → FlashAttention-2 → LSE 合并 → cascade → kernel 的调用面），每一节是下一节的前置，按序读最顺。*
 
 读法建议：只想知道「凭什么不写 N×N 还能算对」，直奔[「合并算子 ⊕」](#合并算子-任意分块乱序归并皆精确)和[「tiling」](#tiling把递推装进双循环)两节；关心快多少、为什么快，看[「IO 账」](#io-账数趟数不数乘加)；想知道这套数学在 vLLM 里落在哪些行代码，读[「LSE」](#lse一个标量换一次精确合并)到[「kernel 眼里的 KV」](#kernel-眼里的-kv打平右下对齐穿页表)三节；想跟全程，按序读。
 
@@ -20,11 +20,11 @@
 |---|---|---|
 | $`N`$ / $`d`$ | 序列长度 / 头维度（每个 attention head 的向量长度；GPT-2 为 64、LLaMA 系多为 128），$`Q,K,V\in\mathbb{R}^{N\times d}`$ 的那对形状 | 本文第一节 |
 | $`S`$ / $`P`$ | 打分矩阵 $`S=QK^{\top}`$ 与权重矩阵 $`P=\mathrm{softmax}(S)`$，标准实现里被物化到显存的两张 $`N\times N`$，本章故事要消灭的靶子 | 第一节 |
-| $`M`$（SRAM 容量） | 片上 SRAM 的大小（以元素个数计的硬件常数），块大小与 IO 账的分母都由它定 | tiling 节 |
+| $`M`$（SRAM 容量） | 片上 SRAM 的大小（以元素个数计的硬件常数），块大小与 IO 账的分母都由它定；LSE 节另有一个同字母的合并基准，本章改记 $`M^{\star}`$ 以示区分 | tiling 节 |
 | $`B_r`$ / $`B_c`$ | Q 行块 / K、V 列块的大小，限定片上打分块 $`S_{ij}`$ 至多 $`B_r\times B_c`$ 而非 $`N\times N`$；$`B_c=\lceil M/4d\rceil`$、$`B_r=\min(\lceil M/4d\rceil,d)`$ | tiling 节 |
 | $`T_r`$ / $`T_c`$ | Q 行块数 $`\lceil N/B_r\rceil`$ / KV 列块数 $`\lceil N/B_c\rceil`$，tiling 双循环的层数，$`T_c`$ 就是 Q 被重过几遍的趟数 | tiling 节 |
 | $`m`$（行最大） | 一行分数的逐行最大值，数值稳定的平移基准，先减它再取指数 | online-softmax 节 |
-| $`m_j`$ / $`d_j`$ | online-softmax 的两个 running 状态：扫到第 $`j`$ 个元素为止的最大值，与「折算到当前最大值的指数和」 | online-softmax 节 |
+| $`m_j`$ / $`d_j`$ | online-softmax 的两个 running 状态：扫到第 $`j`$ 个元素为止的最大值，与「折算到当前最大值的指数和」；分母记号 $`d_j`$ 与头维度 $`d`$ 撞名，FA 论文改记 $`\ell`$ | online-softmax 节 |
 | $`e^{m_{j-1}-m_j}`$ | rescale 折算项，旧账折算到新最大值的乘数；最大值没变时等于 1，变大时小于 1 | online-softmax 节 |
 | $`\oplus`$ | 二元合并算子：先取共同最大值、再把两边的账各自折算后相加；满足结合律与交换律 | 合并算子节 |
 | $`S_{ij}`$ | 块打分 $`Q_iK_j^{\top}`$，形状至多 $`B_r\times B_c`$，只在 SRAM 里短暂存在的局部小表 | tiling 节 |
@@ -40,13 +40,13 @@
 
 ## 慢在搬运，不在计算
 
-先给反直觉的结论：标准注意力慢，不是算得多，是搬得多。这一节先把这台「两层存储的天平」立起来。
+先给反直觉的结论：标准注意力慢，不是算得多，是搬得多。这一节先把 GPU 的两级存储立起来。
 
-**两级存储。** GPU 的存储是个「一小快贵 + 一大慢便宜」的两级世界。大而慢的一层是 HBM（high bandwidth memory，焊在 GPU 封装内的高带宽显存，平时说的「显存」就是它）：A100 有 40-80GB，带宽 1.5-2.0TB/s。小而快的一层是片上 SRAM（CUDA 语境里的 shared memory，与寄存器同住芯片内、离计算单元最近）。这里要立一个新词：SM（streaming multiprocessor，流多处理器），GPU 的基本计算单元，一块 A100 上有 108 个；SRAM 就长在每个 SM 里，各 192KB，合计约 20MB，比 HBM 小两千倍以上；带宽估算约 19TB/s（估算口径：NVIDIA 官方不直接标 shared memory 带宽，论文引第三方估算，arXiv:2205.14135 §2.1），快十来倍。快十倍、小两千倍，这就是全部动机的形状：大表装不进 SRAM，写 HBM 又贵。
+**两级存储。** GPU 的存储是个「一小快贵 + 一大慢便宜」的两级世界。大而慢的一层是 HBM（high bandwidth memory，焊在 GPU 封装内的高带宽显存，平时说的「显存」就是它）：A100 有 40-80GB，带宽 1.5-2.0TB/s。小而快的一层是片上 SRAM（CUDA 语境里的 shared memory，与寄存器同住芯片内、离计算单元最近）。这里要立一个新词：SM（streaming multiprocessor，流多处理器），GPU 的基本计算单元，一块 A100 上有 108 个；SRAM 就长在每个 SM 里，各 192KB，合计约 20MB，比 HBM 小约两千到四千倍（40GB 档约 2000 倍、80GB 档约 4000 倍）；带宽估算约 19TB/s（估算口径：NVIDIA 官方不直接标 shared memory 带宽，论文引第三方估算，arXiv:2205.14135 §2.1），快十来倍。带宽差一个数量级、容量差三个数量级，这就是全部动机的形状：大表装不进 SRAM，写 HBM 又贵。
 
 **kernel 的执行模型。** [第 19 章](../../ch19-compile-capture/narrative/chapter.md)立过 kernel（GPU 上跑的一个函数）与 grid/thread block（线程的两级编组）。补两句本章要用的：同一 thread block 的所有线程住在同一个 SM 上，可以经 shared memory 协作；block 之间没有执行顺序保证，不能依赖彼此的结果。每个 kernel 的生命周期就三步：从 HBM 读输入 → 在 SRAM 和寄存器里算 → 把输出写回 HBM。 **kernel 边界就是 HBM 往返边界** ——这句是全章的钥匙：两个相邻 kernel 之间的数据必须走一趟显存往返，边界越少，第一段那道墙越矮。
 
-**算力受限还是访存受限。** 判断一个 kernel 慢在「算不过来」还是「搬不过来」，尺子是算术强度（arithmetic intensity）：每读一字节摊到多少次浮点运算。强度低的是 memory-bound（访存受限），时间由搬数据决定，softmax、mask、dropout 这类逐元素与归约算子全在此列；强度高的是 compute-bound（算力受限），时间由运算决定，大内维的矩阵乘（GEMM，general matrix multiply）在此列（分类框架即 Roofline 模型，[维基](https://en.wikipedia.org/wiki/Roofline_model)）。这笔账在 A100 上差多远：fp16 矩阵乘峰值 312 TFLOP/s，HBM 只有 1.5-2.0TB/s，每字节要摊一百多次浮点运算才吃得满算力。softmax 每元素就几次运算却要整读整写，天生 memory-bound。拿本章的主角算一笔量级（说明性，只看比例）：一张 8K 上下文一个 head 的打分表，8192×8192 = 67108864 个元素，fp16 下 134217728 字节约 134.2MB；物化到 HBM 再读回约 268MB，按 1.5TB/s 走完要约 0.18ms，而表里那些指数与求和本身的计算量只有微秒量级—— **搬运比计算贵两个数量级** 。
+**算力受限还是访存受限。** 判断一个 kernel 慢在「算不过来」还是「搬不过来」，尺子是算术强度（arithmetic intensity）：每读一字节摊到多少次浮点运算。强度低的是 memory-bound（访存受限），时间由搬数据决定，softmax、mask、dropout 这类逐元素与归约（把一串数缩成一个数，如求和、求最大）算子全在此列；强度高的是 compute-bound（算力受限），时间由运算决定，大内维的矩阵乘（GEMM，general matrix multiply）在此列（分类框架即 Roofline 模型，[维基](https://en.wikipedia.org/wiki/Roofline_model)）。这笔账在 A100 上差多远：fp16 矩阵乘峰值 312 TFLOP/s（每秒 312 万亿次浮点运算），HBM 只有 1.5-2.0TB/s，每字节要摊一百多次浮点运算才吃得满算力。softmax 每元素就几次运算却要整读整写，天生 memory-bound。拿本章的主角算一笔量级（说明性，只看比例）：一张 8K 上下文一个 head 的打分表，8192×8192 = 67108864 个元素，fp16 下 134217728 字节约 134.2MB；物化到 HBM 再读回约 268MB，按 1.5TB/s 走完要约 0.18ms，而表里那些指数与求和本身的计算量只有微秒量级—— **搬运比计算贵两个数量级** 。
 
 **标准注意力的三步。** 教科书实现老老实实按定义走（arXiv:2205.14135 §2.2 Algorithm 0）：
 
@@ -63,13 +63,13 @@ softmax 按行做：每行先取指数、再除以该行的指数和，把一串
 3: 从 HBM 按块载入 P, V，算 O = PV，把 O 写回 HBM
 ```
 
-问题就出在两张 $`N\times N`$ 中间矩阵：第 1 步写 S、第 2 步读 S 写 P、第 3 步读 P，两张表各在显存里往返。GPT-2 尺寸（N=1024、d=64，论文原例）两张共 2097152 个元素、fp16 4194304 字节；8K 上下文一个 head 就是两张 134.2MB。访存量 $`\Theta(N^2)`$，而 $`N\gg d`$ 时这正是 wall-clock 的主导项。**旧设计与痛点**到此清楚：三步分立、中间表物化，时间花在 HBM 往返上。
+问题就出在两张 $`N\times N`$ 中间矩阵：第 1 步写 S、第 2 步读 S 写 P、第 3 步读 P，两张表各在显存里往返。GPT-2 尺寸（N=1024、d=64，论文原例）两张共 2097152 个元素、fp16 4194304 字节；8K 上下文一个 head 就是两张 134.2MB。访存量 $`\Theta(N^2)`$，而 $`N\gg d`$ 时这正是实际花的时间（wall-clock）的主导项。**旧设计与痛点**到此清楚：三步分立、中间表物化，时间花在 HBM 往返上。
 
 **kernel fusion 为什么救不了。** memory-bound 算子的常规武器是融合（kernel fusion）：把对同一输入的多个操作写进一个 kernel，数据从 HBM 读一次、变换做完、只写一次回。最小例子（说明性，外部示例）：「softmax 接 dropout」两层逐元素操作，不融合时每元素 4 次访存（读 x、写中间结果、读回、写 y），融合后 2 次。但朴素融合对注意力无效：$`S`$ 和 $`P`$ 是 $`O(N^2)`$ 的中间矩阵，SRAM 装不下，必须落 HBM——融合的边界就是这里。除非根本不物化。
 
 ![慢在搬运不在计算：A100 两级存储与标准注意力 Alg.0 的四次整表搬运；vLLM 主路径一次调用零物化](../diagrams/ch20-fig-bandwidth-wall.png)
 
-> *图注：左栏 A100 两级存储（HBM 40-80GB @ 1.5-2.0TB/s vs 片上 SRAM 每 SM 192KB × 108 = 20736KB @ ~19TB/s，带宽比 9.5-12.67 倍、容量小五个数量级以上）；右栏 Alg.0 三步的四次整表搬运（写 S、读 S、写 P、读 P，每张 8192×8192 = 67108864 元素 ≈ 134.2MB），右下角虚线框是 vLLM 的对照：一次 `flash_attn_varlen_func` 调用、零张 N×N 物化。数字全部实算自参考实现与论文原数字。*
+> *图注：左栏 A100 两级存储（HBM 40-80GB @ 1.5-2.0TB/s vs 片上 SRAM 每 SM 192KB × 108 = 20736KB @ ~19TB/s，带宽比 9.5-12.67 倍、容量小三个数量级，约两千到四千倍）；右栏 Alg.0 三步的四次整表搬运（写 S、读 S、写 P、读 P，每张 8192×8192 = 67108864 元素 ≈ 134.2MB），右下角虚线框是 vLLM 的对照：一次 `flash_attn_varlen_func` 调用、零张 N×N 物化。数字全部实算自参考实现与论文原数字。*
 
 vLLM 主路径的对照就在这一行（全书前十九章一直当黑盒调用的那一行，本章要打开的就是它）：
 
@@ -103,7 +103,7 @@ vLLM 主路径的对照就在这一行（全书前十九章一直当黑盒调用
 
 **直觉一句话**：记账时还不知道全场最大额，就每来一笔先问「是不是新最大」——是，就把旧账全部按新旧最大额之差折算，再记新账；一本账单遍扫完，恰好等于先扫一遍找最大、再扫一遍求和的结果。
 
-**朴素版会溢出。** softmax 输入是一行打分 $`x\in\mathbb{R}^{V}`$（$`V`$ 是向量长度，这里是一行 K 的个数），定义（arXiv:1805.02867 §2 Eq.(1)）：
+**朴素版会溢出。** softmax 输入是一行打分 $`x\in\mathbb{R}^{V}`$（$`V`$ 是向量长度，这里是一行 K 的个数；沿用 online-softmax 原文记法，别与价值矩阵 $`V`$ 混淆），定义（arXiv:1805.02867 §2 Eq.(1)）：
 
 ```math
 y_i=\frac{e^{x_i}}{\sum_{j=1}^{V}e^{x_j}}
@@ -117,7 +117,7 @@ y_i=\frac{e^{x_i-m_V}}{\sum_{j=1}^{V}e^{x_j-m_V}},\qquad m_V=\max_k x_k
 
 代价是三遍扫描（arXiv:1805.02867 §2 Algorithm 2）：第一遍求 $`m_V`$，第二遍求分母，第三遍才算 $`y_i`$，每元素 4 次访存。多出来的那趟访存不是小事：softmax 是 memory-bound，访存就是时间。但真正的麻烦在别处： **要先看完整行拿到全局最大值，才敢算任何一项** ——这句话钉死了算法的串行性：拿不到整行，就开不了工。本章开头那个问题（kernel 每次只看得见一小块分数，凭什么算整行的 softmax）卡的就是这里。
 
-**online-softmax：单遍。** 洞见来自 2018 年 NVIDIA 两位工程师的一篇短文（Milakov & Gimelshein，[arXiv:1805.02867](https://arxiv.org/abs/1805.02867)），动机还不是注意力，是机器翻译输出层几万维词表上的 softmax。他们发现 $`m`$ 和分母可以在**同一遍**里维护（§3 Algorithm 3）：
+**online-softmax：单遍。** 这个想法来自 2018 年 NVIDIA 两位工程师的一篇短文（Milakov & Gimelshein，[arXiv:1805.02867](https://arxiv.org/abs/1805.02867)），动机还不是注意力，是机器翻译输出层几万维词表上的 softmax。他们发现 $`m`$ 和分母 $`d`$（这个 $`d`$ 与头维度无关、纯是分母记号，FA 论文后来改记 $`\ell`$，本节按原文）可以在**同一遍**里维护（§3 Algorithm 3）：
 
 ```text
 # arXiv:1805.02867 §3 Algorithm 3（伪代码，按论文逐行）
@@ -173,7 +173,7 @@ def online_softmax_stats(x):
 d_j=d_{j-1}\,e^{m_{j-1}-m_j}+e^{x_j-m_j}=\sum_{k\le j}e^{x_k-m_j}
 ```
 
-折算因子恰把旧账的每一项平移到新基准 $`m_j`$ 上，新账仍是「已见元素相对当前最大值的指数和」。不变式每轮保持，末轮就是 safe 版的分母（Theorem 1，arXiv:1805.02867 §3）。界也顺手有了：每项 $`e^{x_k-m_j}\le 1`$ 且最大项 = 1，故 $`1\le d_j\le j`$。论文算过，32 位浮点的 $`d`$ 能扛 $`1.7\times 10^{37}`$ 个元素不溢出。
+折算因子恰把旧账的每一项平移到新基准 $`m_j`$ 上，新账仍是「已见元素相对当前最大值的指数和」。不变式每轮保持，末轮就是 safe 版的分母（Theorem 1，arXiv:1805.02867 §3）。界也顺手有了：每项 $`e^{x_k-m_j}\le 1`$ 且最大项 = 1，故 $`1\le d_j\le j`$。论文算过，32 位浮点的分母 $`d`$ 能扛 $`1.7\times 10^{37}`$ 个元素不溢出。
 
 ![online-softmax 单遍递推：x=[1,3,2,5,4] 五轮，两次折算 0.1353、两次白折算 1.0；末值与三遍法恒等](../diagrams/ch20-fig-online-softmax-recurrence.png)
 
@@ -199,7 +199,7 @@ d_j=d_{j-1}\,e^{m_{j-1}-m_j}+e^{x_j-m_j}=\sum_{k\le j}e^{x_k-m_j}
 \begin{bmatrix}m_i\\d_i\end{bmatrix}\oplus\begin{bmatrix}m_j\\d_j\end{bmatrix}=\begin{bmatrix}\max(m_i,m_j)\\[2pt]d_i\,e^{m_i-m'}+d_j\,e^{m_j-m'}\end{bmatrix},\qquad m'=\max(m_i,m_j)
 ```
 
-从左到右顺序应用这条链，等价于逐元素跑 Alg.3 的 line 1-6。论文接着声明（原文）："The operation ⊕ is associative … It is also commutative"：**结合律**（可任意加括号分块，并行求值）加**交换律**（可乱序归并），并自述为简洁起见略去了证明。证明其实是被一行换元吃掉的，值得正文给出： **把每个可达状态 $`(m,d)`$ 与一个多重集一一对应：$`m=\max(S)`$、$`d=\sum_{x\in S}e^{x-m}`$，即「S 的规范摘要」；⊕ 在这个换元下就是多重集并集** 。单元素块对应 $`\{x_i\}`$；两个摘要合并，新基准取两边最大者的较大值、两笔账各自折算后相加，恰好是并集在新基准下的和。并集满足结合律与交换律，⊕ 亦然；Alg.3 的逐元素递推只是这条链的一种加括号方式（每步只并一个元素），末值恒等即 Theorem 1。
+从左到右顺序应用这条链，等价于逐元素跑 Alg.3 的 line 1-6。论文接着声明（原文）："The operation ⊕ is associative … It is also commutative"：**结合律**（可任意加括号分块，并行求值）加**交换律**（可乱序归并），并自述为简洁起见略去了证明。证明其实是被一行换元吃掉的，值得正文给出： **把每个可达状态 $`(m,d)`$ 看成分数多重集 $`\mathcal{S}`$（元素可重复的集合）的规范摘要：$`m=\max(\mathcal{S})`$、$`d=\sum_{x\in\mathcal{S}}e^{x-m}`$。摘要是多对一的（不同账本可以有同一份摘要），但 ⊕ 在摘要层面恰好实现多重集并集** 。单元素块对应 $`\{x_i\}`$；两个摘要合并，新基准取两边最大者的较大值、两笔账各自折算后相加，得到的正是并集的摘要。并集满足结合律与交换律，这条性质经由上面的对应原样传给 ⊕；Alg.3 的逐元素递推只是这条链的一种加括号方式（每步只并一个元素），末值恒等即 Theorem 1。
 
 **四条路径实测**（沿用 $`x=[1,3,2,5,4]`$；分块方案 A = [1,3]\|[2,5]\|[4] 顺序归并，另有乱序与换括号两条对照）：
 
@@ -218,9 +218,9 @@ d_j=d_{j-1}\,e^{m_{j-1}-m_j}+e^{x_j-m_j}=\sum_{k\le j}e^{x_k-m_j}
 
 ## tiling：把递推装进双循环
 
-**直觉一句话**：走楼梯式记账：每搬一小块 K/V 上 SRAM，就把手上那份「部分注意力」先折算到新最大值、再累加这一块的贡献；桌面上始终只有 $`B_r\times B_c`$ 的草稿，从不需要铺开 $`N\times N`$ 的整张表。
+**直觉一句话**：一格一格递推记账：每搬一小块 K/V 上 SRAM，就把手上那份「部分注意力」先折算到新最大值、再累加这一块的贡献；桌面上始终只有 $`B_r\times B_c`$ 的草稿，从不需要铺开 $`N\times N`$ 的整张表。
 
-tiling（分块）本身是两级存储下的祖传手艺：数据装不进快存，就按块切分循环，块大小由快存容量反推。GEMM 世界里 GotoBLAS 把「分块加打包让操作数常驻缓存」做成了工业标准（[Goto & van de Geijn 2008](https://www.cs.utexas.edu/~pingali/CSE392/2011sp/lectures/a12-goto.pdf)）；「两级存储上算法至少要搬运多少数据」甚至有专门的下界理论（Hong & Kung 1981 的红蓝卵石博弈，[链接](https://www.semanticscholar.org/paper/3e69317455f7db9b1325239c6f6f52cbe29a5491)），FlashAttention 的 IO 账正是这套分析法的当代应用。但分块 GEMM 人人会，注意力卡在一处： **softmax 的分母要对一整行 K 求和，「块里只见局部、归一化要全局」，看似矛盾** ——上一节的递推正是解开它的钥匙。所以 FlashAttention（arXiv:2205.14135 §3.1 Algorithm 1）是三件套：tiling（结构）+ online-softmax（数学）+ 单 kernel 融合（工程）。块大小由 SRAM 容量反推（Alg.1 line 1）：$`B_c=\lceil M/4d\rceil`$、$`B_r=\min(\lceil M/4d\rceil,d)`$，除 4 是因为 Q、K、V 多块要在片上并存。
+tiling（分块）本身是两级存储下的祖传手艺：数据装不进快存，就按块切分循环，块大小由快存容量反推。GEMM 世界里 GotoBLAS 把「分块加打包让操作数常驻缓存」做成了工业标准（[Goto & van de Geijn 2008](https://www.cs.utexas.edu/~pingali/CSE392/2011sp/lectures/a12-goto.pdf)）；「两级存储上算法至少要搬运多少数据」甚至有专门的下界理论（Hong & Kung 1981 的红蓝卵石博弈，[链接](https://www.semanticscholar.org/paper/3e69317455f7db9b1325239c6f6f52cbe29a5491)），FlashAttention 的 IO 账正是这套分析法的当代应用。但分块 GEMM 人人会，注意力卡在一处： **softmax 的分母要对一整行 K 求和，「块里只见局部、归一化要全局」，看似矛盾** ——上一节的递推正是解开它的钥匙。所以 FlashAttention（arXiv:2205.14135 §3.1 Algorithm 1）是三件套：tiling（结构）+ online-softmax（数学）+ 单 kernel 融合（工程）。块大小由 SRAM 容量反推（Alg.1 line 1）：$`B_c=\lceil M/4d\rceil`$、$`B_r=\min(\lceil M/4d\rceil,d)`$。分母里的 4，通行读法是 $`Q_i`$、$`K_j`$、$`V_j`$、$`O_i`$ 四份片上缓冲（各约 $`B\times d`$ 个元素）要同时驻留（Alg.1 line 8 连 $`O_i`$ 一起载入）；论文没明说这个常数，附录 C 只给了三条量级约束（$`B_cd=O(M)`$、$`B_rd=O(M)`$、$`B_rB_c=O(M)`$）。$`B_r`$ 封顶到 $`d`$ 倒是有出处：行块自己要驻留给出 $`M/d`$ 上限，打分块 $`S_{ij}`$ 也要驻留给出 $`M/B_c`$ 上限，而 $`B_c=\Theta(M/d)`$ 时后者就是 $`\Theta(d)`$；附录 C 推出的正是 $`B_r=\Theta(\min(M/d,d))`$，line 1 的 min(·,d) 就是两条约束取小。
 
 算法主体（外层遍历 KV 列块 $`j`$、内层遍历 Q 行块 $`i`$，初版 FA 的循环序，FA-2 会把它对调）：
 
@@ -233,7 +233,7 @@ tiling（分块）本身是两级存储下的祖传手艺：数据装不进快�
 13: 写回 ℓ ← ℓ_new，m ← m_new
 ```
 
-line 11 就是 online-softmax 的 $`d_j`$ 递推原样搬来（FA 论文把分母记作 $`\ell`$，与 online-softmax 论文的 $`d`$ 异名同义）；line 12 是它长在输出上的形态。写成公式：
+line 11 就是 ⊕ 的两块合并：online-softmax 单元素递推（Alg.3 line 5）搬到块上的形态，新来的不再是单个元素 $`e^{x_j-m}`$，而是整块的账：本块最大 $`\tilde m_{ij}`$、本块指数和 $`\tilde\ell_{ij}`$，各自折算到新基准再相加。FA 论文把分母记作 $`\ell`$，与 online-softmax 论文的 $`d`$ 异名同义；line 12 是它长在输出上的形态。写成公式：
 
 ```math
 m_i^{\mathrm{new}}=\max(m_i,\tilde m_{ij}),\qquad \ell_i^{\mathrm{new}}=e^{m_i-m_i^{\mathrm{new}}}\ell_i+e^{\tilde m_{ij}-m_i^{\mathrm{new}}}\tilde\ell_{ij}
@@ -269,7 +269,7 @@ line 12 里有两个容易略过的乘子。$`e^{m_i-m_i^{\mathrm{new}}}`$ 是�
 
 ![重绘自 arXiv:2205.14135 Fig.1：外层沿 K、V 列块、内层沿 Q 行块搬进 SRAM，N×N（虚线框）从不物化，GPT-2 上注意力本体 7.6× 加速](../diagrams/paper-fig-1.png)
 
-> *图注：论文的标志性配图。左：内存层级金字塔（GPU 计算 SM×108 的 SRAM 约 20MB @ 约 19TB/s → HBM 40GB @ 1.5TB/s → 主存（CPU RAM）12.8GB/s、容量逾 1TB，数字逐字取自论文 §2.1），外层循环（红）沿 K、V 列块搬进 SRAM、内层（蓝）沿 Q 行块，虚线框标出从不落 HBM 的 $`N\times N`$ 中间量，输出写回 HBM；右：GPT-2 注意力本体实测：PyTorch 标准实现五段 kernel（Matmul/Mask/Softmax/Dropout/Matmul）合计 16.8 ms，FlashAttention 单段融合 kernel 2.2 ms，7.6×（论文 Fig.1 原数字）。*
+> *图注：论文的标志性配图。左：内存层级金字塔（GPU 计算 SM×108 的 SRAM 约 20MB @ 约 19TB/s → HBM 40GB @ 1.5TB/s → 主存（CPU RAM）12.8GB/s、容量逾 1TB；前两层数字逐字取自论文 §2.1，主存一行只在 Fig.1 原图上标注），外层循环（红）沿 K、V 列块搬进 SRAM、内层（蓝）沿 Q 行块，虚线框标出从不落 HBM 的 $`N\times N`$ 中间量，输出写回 HBM；右：GPT-2 注意力本体实测：PyTorch 标准实现五段 kernel（Matmul/Mask/Softmax/Dropout/Matmul）合计 16.8 ms，FlashAttention 单段融合 kernel 2.2 ms，7.6×（论文 Fig.1 原数字）。*
 
 **精确性与代价，两条都摆在明处。** Theorem 1（arXiv:2205.14135 §3.1）：Algorithm 1 的输出**精确等于** $`\mathrm{softmax}(QK^{\top})V`$，不是近似，没有误差项；FLOP 仍是 $`O(N^2d)`$（算力一点没省），额外内存只有 $`O(N)`$（存 $`(m,\ell)`$ 统计量）。省的是两张 $`N\times N`$ 的显存与往返，量在下一节记。两点补充各一段带过：其一，训练要 backward，标准做法把 $`P`$ 存下来供反向用；FlashAttention 反过来只存 $`(O,m,\ell)`$，反向时在片上**重算** $`S`$、$`P`$。多花了 FLOP 反而更快，因为重算跑在 SRAM、读表要跑 HBM（论文 §3.1 Recomputation；推理不碰 backward，记住这个反直觉结论即可）。其二，tiling 让「两次矩阵乘 + softmax + 掩码 + dropout」全部融进**一个** CUDA kernel，中间量不出片上存储——这就是「一次 `flash_attn_varlen_func` 调用 = 一个融合 kernel」的来源。
 
@@ -277,7 +277,7 @@ line 12 里有两个容易略过的乘子。$`e^{m_i-m_i^{\mathrm{new}}}`$ 是�
 
 ## IO 账：数趟数，不数乘加
 
-**直觉一句话**：标准版把两张 $`N\times N`$ 大桌搬进搬出三次；FA 把 K、V 各搬一次，再把轻的 Q、O 与统计量来回搬 $`\lceil N/B_c\rceil`$ 趟。块越大趟数越少，但 SRAM 只有那么大，再大下去算力反而成了瓶颈。
+**直觉一句话**：标准版三步流水，两张 $`N\times N`$ 大表被整表搬运四回（写 S、读 S、写 P、读 P）；FA 把 K、V 各搬一次，再把轻的 Q、O 与统计量来回搬 $`\lceil N/B_c\rceil`$ 趟。块越大趟数越少，但 SRAM 只有那么大，再大下去算力反而成了瓶颈。
 
 论文把这笔账立成了定理（arXiv:2205.14135 §3.2 Theorem 2）：
 
@@ -298,15 +298,15 @@ line 12 里有两个容易略过的乘子。$`e^{m_i-m_i^{\mathrm{new}}}`$ 是�
 | FlashAttention | 128 | 8 | 131072 + 8×200704 | 1736704 | 2.566 | 0（免物化） |
 | FlashAttention | 256 | 4 | 131072 + 4×200704 | 933888 | 4.7719 | 0（免物化） |
 
-读法：标准三步各 1179648、2097152、1179648（读 QK 写 S、读 S 写 P、读 P 读 V 写 O），合计 4456448 次元素访问；FA 把 K、V 各搬恰好一遍（131072），再把 Q、O、ℓ、m 这套轻量（每趟 200704 = 3Nd+4N）来回搬 $`T_c`$ 趟。$`B_c`$ 从 64 翻到 256，趟数 16→8→4，访问严格递减。但这条路有双重封顶：块再大装不进 SRAM；论文实测（Fig.2 中图）$`B_c`$ 超过 256 后收益封顶，算力接了瓶颈，工程上 FA-2 就取 $`\{64,128\}`$。内存脚印是另一笔：标准版物化 2097152 个元素（fp16 4194304 字节），FA 额外只要 $`(m,\ell)`$ 共 2048 个元素（4096 字节）——差三个数量级，这就是「显存占用从二次降到线性」的实感。
+读法：标准三步各 1179648、2097152、1179648（读 QK 写 S、读 S 写 P、读 P 读 V 写 O），合计 4456448 次元素访问；FA 把 K、V 各搬恰好一遍（131072），再把 Q、O、ℓ、m 这套轻量（每趟 200704 = 3Nd+4N）来回搬 $`T_c`$ 趟。$`B_c`$ 从 64 翻到 256，趟数 16→8→4，访问严格递减。渐近比值 $`M/d^2`$（按 M≈100KB＝51200 个 fp16 元素、d=64 计约 12.5）要到长序列才兑现：N=1024 的元素级精确账里，两边的常数与低阶项（标准版 $`4N^2+4Nd`$，FA 每趟 $`3Nd+4N`$ 还要乘趟数、$`B_c`$ 又封顶 256）都还占着大头，表里比值最大只到 4.77。但这条路有双重封顶：块再大装不进 SRAM；论文实测（Fig.2 中图）$`B_c`$ 超过 256 后收益封顶，算力接了瓶颈，工程上 FA-2 就取 $`\{64,128\}`$（arXiv:2307.08691 §3.3 Tuning block sizes 段）。内存脚印是另一笔：标准版物化 2097152 个元素（fp16 4194304 字节），FA 额外只要 $`(m,\ell)`$ 共 2048 个元素（4096 字节）——差三个数量级，这就是「显存占用从二次降到线性」的实感。
 
 ![IO 账：同一条 HBM 通道上两种搬法的趟数差；B_c 越大趟数越少，双重封顶](../diagrams/ch20-fig-io-accounting.png)
 
-> *图注：左右同一条形刻度（380px = 4456448）。左：标准三步的红色粗条与两张 N×N 方块；右：FA 一趟 KV 细条加每趟 200704 的循环箭头，三行绿条 3342336/1736704/933888 严格递减，比值 1.3333/2.566/4.7719；底部内存脚印对照（2097152 元素 vs 2048 元素）与 Prop.3 下界条。数字全部实算自参考实现。*
+> *图注：左右同一条形刻度（满刻度 = 4456448 次元素访问）。左：标准三步的红色粗条与两张 N×N 方块；右：FA 一趟 KV 细条加每趟 200704 的循环箭头，三行绿条 3342336/1736704/933888 严格递减，比值 1.3333/2.566/4.7719；底部内存脚印对照（2097152 元素 vs 2048 元素）与 Prop.3 下界条。数字全部实算自参考实现。*
 
 ![重绘自 arXiv:2205.14135 Fig.2：GPT-2 medium 实测，HBM 访存量而非 FLOP 数决定 runtime；分块 Bc 越大越快、超过 256 后封顶](../diagrams/paper-fig-2.png)
 
-> *图注：论文的三联实测图（GPT-2 medium：N=1024、d=64、16 heads、batch 64，A100）。左联在原文里就是一张前向+反向账单表（照实重绘、数字逐字）：FlashAttention 因反向重算 GFLOPs 反而更多（75.2 vs 66.6，多 13%），HBM 读写却省一个量级（4.4GB vs 40.3GB，即论文 §1 的「最多省 9×」），runtime 反超（7.3ms vs 41.7ms，快 5.7×），这正是「时间的主宰是搬运不是计算」的直接实证；中：分块 $`B_c`$ 增大、HBM 访问与前向耗时同步下降，超过 256 后收益封顶、瓶颈转给算力（§3.2 原文）；右：block-sparse 变体非零块占比越少（越稀疏）、相对 dense FlashAttention 的提速越高，与稀疏度成比例（seq 4K）。中/右曲线按原图趋势与刻度示意重绘（逐点数值论文未印）。*
+> *图注：论文的三联实测图（GPT-2 medium：N=1024、d=64、16 heads、batch 64，A100）。左联在原文里就是一张前向+反向账单表（照实重绘、数字照录原图标注）：FlashAttention 因反向重算 GFLOPs 反而更多（75.2 vs 66.6，多 13%），HBM 读写却省一个量级（4.4GB vs 40.3GB，即论文 §1 的「最多省 9×」），runtime 反超（7.3ms vs 41.7ms，快 5.7×），这正是「时间的主宰是搬运不是计算」的直接实证；中：分块 $`B_c`$ 增大、HBM 访问与前向耗时同步下降，超过 256 后收益封顶、瓶颈转给算力（§3.2 原文）；右：block-sparse 变体非零块占比越少（越稀疏）、相对 dense FlashAttention 的提速越高，与稀疏度成比例（seq 4K）。中/右曲线按原图趋势与刻度示意重绘（逐点数值论文未印）。*
 
 还有一句理论上的收尾（Proposition 3，§3.2）：对 $`M\in[d,Nd]`$ 全域，**不存在** HBM 访问渐进更少的精确注意力算法：$`M=\Theta(Nd)`$ 时输入输出本身就逼着任何算法至少 $`\Omega(Nd)`$ 次访问。FA 的 $`\Theta(N^2d^2/M)`$ 在这个意义上最优，没有更聪明的精确算法躲在后面。工程侧这笔账也有化身：FA3 的 host 侧 `get_scheduler_metadata`（vllm/vllm_flash_attn/flash_attn_interface.py:L122-L173）就是 tile 与 split 的计账函数：数学里的 $`B_c`$、$`T_c`$，在代码里变成了 host 算好递给 kernel 的调度元数据。
 
@@ -318,17 +318,17 @@ line 12 里有两个容易略过的乘子。$`e^{m_i-m_i^{\mathrm{new}}}`$ 是�
 
 **(1) 循环序对调。** 初版外层遍历 KV 列块、内层遍历 Q 行块；FA-2 反过来，**外层遍历 Q 行块**：每个 Q 行块从头干到尾，行块之间互不依赖（论文 §3.2 的原话是 embarrassingly parallel），可以分给不同 thread block 沿序列长度并行。长序列、小 batch 时（并行维度 batch×heads 不够喂满 108 个 SM），这一改让 occupancy（占用率：SM 上活跃 warp 的比例；warp 是 32 线程一组的调度单位）直接上来。论文还诚实记了出处：循环序对调最早是 Phil Tillet 在 Triton 实现里先做的。
 
-**(2) 推迟归一化。** 初版每处理一个 KV 块都要除一次 $`\ell`$（tiling 节挂过账）；FA-2 让中间 $`O`$ 保持**未归一化**，收尾只除一次。省的是 non-matmul FLOP（非矩阵乘浮点运算，softmax、除法、指数这类，跑在通用计算单元上）：A100 上 fp16 矩阵乘峰值 312 TFLOPs/s，非矩阵乘只有 19.5 TFLOPs/s，**每条非矩阵乘指令贵 16 倍**（论文 §3.1 原话 "each non-matmul FLOP is 16× more expensive"）。
+**(2) 推迟归一化。** 初版每处理一个 KV 块都要除一次 $`\ell`$（tiling 节挂过账）；FA-2 让中间 $`O`$ 保持**未归一化**，收尾只除一次。省的是 non-matmul FLOP（非矩阵乘浮点运算，softmax、除法、指数这类，跑在通用计算单元上）：A100 上 fp16 矩阵乘峰值 312 TFLOPs/s，非矩阵乘 FP32 只有 19.5 TFLOPs/s，**每条非矩阵乘指令贵 16 倍**（论文 §3.1 原话 "each non-matmul FLOP is 16× more expensive"）。
 
 **(3) 只存一个标量。** 初版存 $`(m,\ell)`$ 两个统计量；FA-2 只存 logsumexp $`L=m+\log(\ell)`$ 一个（§3.1.1 Tweak 2 原话：不必同时存 max 与指数和，只需要 logsumexp）。vLLM `flash_attn_varlen_func` 开 `return_softmax_lse=True` 吐出来的正是这个 $`L`$——下一节的主角。
 
 ```text
-# arXiv:2307.08691 §3.1 Algorithm 1 核心行（伪代码，按论文；省略 end for 与写回行）
+# arXiv:2307.08691 §3.1 Algorithm 1 核心行（伪代码，按论文；省略载入 K/V、end for 与写回行）
 3:  for 1 ≤ i ≤ T_r:                       ← 外层换成了 Q 行块
-4:      载入 Q_i，片上初始化 O_i=0, ℓ_i=0, m_i=−∞
+4-5:    载入 Q_i；片上初始化 O_i=0, ℓ_i=0, m_i=−∞
 6:      for 1 ≤ j ≤ T_c:
 8:          片上算 S_i^{(j)} = Q_i K_j^T
-9:          m^{(j)} = max(m^{(j-1)}, rowmax(S))，P̃ = exp(S − m^{(j)})
+9:          m^{(j)} = max(m^{(j-1)}, rowmax(S))，P̃ = exp(S − m^{(j)})，ℓ^{(j)} = e^{m^{(j−1)}−m^{(j)}}·ℓ^{(j−1)} + rowsum(P̃)
 10:         O^{(j)} = e^{m^{(j-1)}−m^{(j)}}·O^{(j-1)} + P̃·V_j     ← 中间不除 ℓ
 12:     O_i = O^{(T_c)} / ℓ^{(T_c)}          ← 收尾只除一次
 13:     L_i = m^{(T_c)} + log(ℓ^{(T_c)})     ← 只存这一个标量
@@ -339,7 +339,7 @@ line 12 里有两个容易略过的乘子。$`e^{m_i-m_i^{\mathrm{new}}}`$ 是�
 
 ![FA 与 FA-2 的循环序对照：外层对调 + 因果整块跳过 64→36](../diagrams/ch20-fig-fa2-loop-order.png)
 
-> *图注：左格盘 FA 序（外层 KV 列块，64 块全访问，每块除一次 ℓ）；中间虚线「循环序对调」；右格盘 FA-2 序（外层 Q 行块，行间无箭头 = 零通信，收尾只除一次），因果掩码的整块跳过用红叉标出：N=64、块 8 时右上三角 28 块整块跳过、只访 36 块（1.7778 倍；N=8、块 2 时 16→10，1.6 倍；两版输出对标准注意力 allclose，参考实现计数）。底部三签：16× 差价（312 vs 19.5 TFLOPs/s）、$`L=m+\log\ell`$ 与 return_softmax_lse、约 2× 实测（230 TFLOPs/s = 73% 峰值）。*
+> *图注：左格盘 FA 序（外层 KV 列块，64 块全访问，每块除一次 ℓ；左盘画的是不施因果掩码的循环序对照：整块跳过与循环序正交，配因果掩码时两序同样能跳上三角块，1.7778 倍是掩码跳过本身的收益、不是循环序对调的）；中间虚线「循环序对调」；右格盘 FA-2 序（外层 Q 行块，行间无箭头 = 零通信，收尾只除一次），因果掩码的整块跳过用红叉标出：N=64、块 8 时右上三角 28 块整块跳过、只访 36 块（1.7778 倍；N=8、块 2 时 16→10，1.6 倍；两版输出对标准注意力 allclose，参考实现计数）。底部三签：16× 差价（fp16 矩阵乘 312 vs 非矩阵乘 FP32 19.5 TFLOPs/s）、$`L=m+\log\ell`$ 与 return_softmax_lse、约 2× 实测（230 TFLOPs/s = 73% 峰值）。*
 
 因果掩码（causal mask：第 $`i`$ 个 query 只准看位置 $`\le i`$ 的 key，未来位置置 $`-\infty`$）在块世界里还有一份免费红利（论文 §3.1 Causal masking）：整列块在行块右侧的直接跳过（大约省一半工作量，实测 1.7-1.8×、N 趋大逼近 2×），对角线只落在一个块上、只需对这一个块施加逐元素掩码。warp 分工（thread block 内部的 32 线程小组）也从 split-K 改成 split-Q：split-K 让各 warp 各算一段再跨组相加、逼着 warp 反复读写 shared memory 同步；split-Q 让每个 warp 认领一段 Q 行各自算完，组间零通信。细节见论文 §3.3 与下图。
 
@@ -351,7 +351,7 @@ line 12 里有两个容易略过的乘子。$`e^{m_i-m_i^{\mathrm{new}}}`$ 是�
 
 > *图注：A100 80GB SXM、head_dim=64、含因果掩码（原图 Fig.4c 子面板），前向+反向吞吐（TFLOPs/s）随序列长度 512→16k，五种实现同场、30 根柱值照录原图：标准 PyTorch 只有 15→18、16k 处物化 $`N\times N`$ 直接 OOM；FlashAttention 58→97；FA-2 88→171（16k 处 171/97 ≈ 1.8×）。底部三签是论文 §4 口径：FA-2 比 FA 快 1.7-3.0×、比标准实现 3-10×、最高 230 TFLOPs/s = 73% 理论峰值（端到端训练 225 TFLOPs/s = 72% 利用率）；230 出自论文全配置综合，本面板最高柱是 16k 处 FA-2 的 171。*
 
-**版本族一瞥。** FlashAttention 不是一篇论文定终身，是一族随 GPU 代际演进的 kernel：FA-2 是任何 Tensor Core GPU 都能跑的通用款；FA-3（[arXiv:2407.08608](https://arxiv.org/abs/2407.08608)）专为 Hopper（H100）设计，warp-specialization 让矩阵乘与 TMA 数据搬运异步重叠、FP8（8 位浮点低精度格式）配合非相干处理，比 FA-2 快 1.5-2.0×；FA-4（[arXiv:2603.05451](https://arxiv.org/abs/2603.05451)）专为 Blackwell（B200）设计，用 CuTE-DSL（Python 嵌入式 kernel DSL）重排流水线、以软件模拟指数与条件化 softmax 重缩放削减非矩阵乘运算，专治新一代硬件「Tensor Core 吞吐翻倍、其余单元没跟上」的非对称配比。**三代数学骨架从未变过**：分块、online-softmax、从不物化 N×N、LSE 存档与合并，全是你本章读到的这套。vLLM 把三家都收进了自带包（`vllm.vllm_flash_attn`），构造期按显卡代际决议：
+**版本族一瞥。** 这三处榨取的代价也诚实：全部贴着 A100 的硬件形态做，换一代 GPU 就得重写 kernel。FA-2 论文 §5 列的近期计划头一条就是「为 H100 再优化一轮、用上新硬件特性（TMA、第四代 Tensor Core、FP8）」；后面这串 FA-3/FA-4，正是这笔代价的账单。FlashAttention 于是不是一篇论文定终身，而是一族随 GPU 代际演进的 kernel：FA-2 是任何 Tensor Core GPU 都能跑的通用款；FA-3（[arXiv:2407.08608](https://arxiv.org/abs/2407.08608)）专为 Hopper（H100）设计，warp-specialization（warp 分工特化：不同 warp 各认领一件事）让矩阵乘与 TMA（Tensor Memory Accelerator，Hopper 起的异步搬运单元）的数据搬运异步重叠、FP8（8 位浮点低精度格式）配合非相干处理（给 Q、K 同乘一个随机正交矩阵、把离群值摊平，让 FP8 精度可用），比 FA-2 快 1.5-2.0×；FA-4（[arXiv:2603.05451](https://arxiv.org/abs/2603.05451)）专为 Blackwell（B200）设计，用 CuTE-DSL（Python 嵌入式 kernel DSL）重排流水线、以软件模拟指数与条件化 softmax 重缩放削减非矩阵乘运算，专治新一代硬件「Tensor Core 吞吐翻倍、其余单元没跟上」的非对称配比。**三代数学骨架从未变过**：分块、online-softmax、从不物化 N×N、LSE 存档与合并，全是你本章读到的这套。vLLM 把三家都收进了自带包（`vllm.vllm_flash_attn`），构造期按显卡代际决议：
 
 ```python
 # vllm/v1/attention/backends/fa_utils.py:L163-L171 · FlashAttentionCuTeDSLCompileSpec.get_flash_attn_version（版本决议）
@@ -404,14 +404,14 @@ config 可覆写（`attention_config.flash_attn_version`，L176-L181），后面
 
 段 A 是 $`x=[0,0]`$、段 B 是 $`x=[2,0]`$：分开各算、按公式合并，与直接对拼接向量 $`[0,0,2,0]`$ 一口气算，结果逐位相同。
 
-**两段注意力怎么缝。** 设一段注意力的 KV 被拆成两截，各算出部分输出与各自的 lse：$`(O_a,l_a)`$、$`(O_b,l_b)`$（FA-2 形态下 $`O`$ 已除以自己的 $`\ell`$，是「只看本段 KV」的精确注意力输出）。合并公式与 tiling 节的递推同构，只是搬到了对数域（⊕ 在 $`(\mathrm{lse},O)`$ 上的第三副面孔）：
+**两段注意力怎么缝。** 设一段注意力的 KV 被拆成两截，各算出部分输出与各自的 lse：$`(O_a,l_a)`$、$`(O_b,l_b)`$。小写 $`l`$ 就是 FA-2 行尾吐出的那个 $`L`$（logsumexp 的惯用小写；与指数和 $`\ell`$ 形近，不是同一个量）。FA-2 形态下 $`O`$ 已除以自己的 $`\ell`$，是「只看本段 KV」的精确注意力输出。合并公式与 tiling 节的递推同构，只是搬到了对数域（⊕ 在 $`(\mathrm{lse},O)`$ 上的第三副面孔；稳定化基准记 $`M^{\star}`$，加星是为了不与 SRAM 容量的 $`M`$ 撞名）：
 
 ```math
-M=\max(l_a,l_b),\qquad w_a=\frac{e^{l_a-M}}{e^{l_a-M}+e^{l_b-M}},\qquad O=w_aO_a+w_bO_b
+M^{\star}=\max(l_a,l_b),\qquad w_a=\frac{e^{l_a-M^{\star}}}{e^{l_a-M^{\star}}+e^{l_b-M^{\star}}},\qquad O=w_aO_a+w_bO_b
 ```
 
 ```math
-l_{\mathrm{merge}}=\log\!\left(e^{l_a-M}+e^{l_b-M}\right)+M
+l_{\mathrm{merge}}=\log\!\left(e^{l_a-M^{\star}}+e^{l_b-M^{\star}}\right)+M^{\star}
 ```
 
 直觉：$`e^{\mathrm{lse}}`$ 恰是本段全部指数质量（softmax 分母），权重 $`w_a`$ 就是「A 段的归一化质量占总盘子的比例」：两段谁的质量大谁话事，与谁前谁后无关；合并出的 $`l_{\mathrm{merge}}`$ 是一张新收据，可以继续并下一段。正确性一句话（承重）：$`e^{l_a}O_a`$ 恢复的正是 A 段的未归一化加权和，两段相加、除以总质量 $`e^{l_a}+e^{l_b}`$，就是「对拼接 KV 一次性做 softmax」——逐项相同，代数恒等。
@@ -473,7 +473,7 @@ def merge_attn_states(
     p_lse = float("-inf") if p_lse == float("inf") else p_lse   # L275
     s_lse = float("-inf") if s_lse == float("inf") else s_lse   # L276
 
-    max_lse = tl.maximum(p_lse, s_lse)                           # L278 取稳定化基准 M
+    max_lse = tl.maximum(p_lse, s_lse)                           # L278 取稳定化基准 M*
     p_lse = p_lse - max_lse                                      # L279
     s_lse = s_lse - max_lse                                      # L280
     p_se = tl.exp(p_lse)                                         # L282 e^(lse−max) ≤ 1，不溢出
@@ -493,7 +493,7 @@ def merge_attn_states(
     # … 省略：双空（max_lse == −inf）时置 0 防 0/0=NaN 的护栏一行 …
 ```
 
-对照公式读：`max_lse` 是 $`M`$，两个 `tl.exp` 保证底数不超过 1（与 safe softmax 减 max 同一招），`p_scale` 与 `s_scale` 是 $`w_a`$ 与 $`w_b`$，L318 就是合并公式本身。三处工程细节值得记：FA2 对空序列返回 inf、FA3 返回 −inf，kernel 先做 inf→−inf 归一（L275-L276，注释原话就挂在代码里）；两边全空的角落（$`0/0`$ 会得 NaN）显式置 0；NOTE(woosuk) 那三行是数值稳定纪律：**先算比值再乘输出**，不要拿 $`e^{\mathrm{lse}-M}`$ 直接乘大矩阵。
+对照公式读：`max_lse` 是 $`M^{\star}`$，两个 `tl.exp` 保证底数不超过 1（与 safe softmax 减 max 同一招），`p_scale` 与 `s_scale` 是 $`w_a`$ 与 $`w_b`$，L318 就是合并公式本身。三处工程细节值得记：FA2 对空序列返回 inf、FA3 返回 −inf，kernel 先做 inf→−inf 归一（L275-L276，注释原话就挂在代码里）；两边全空的角落（$`0/0`$ 会得 NaN）显式置 0；NOTE(woosuk) 那三行是数值稳定纪律：**先算比值再乘输出**，不要拿 $`e^{\mathrm{lse}-M^{\star}}`$ 直接乘大矩阵。
 
 **split-KV：同一钥匙的第二扇门。** decode 时每个 query 只有 1 个 token，注意力退化成向量乘矩阵，原版 FA 的并行维度只剩 batch×heads：batch=1 时 A100 的 108 个 SM 几乎全闲着。FlashDecoding（[PyTorch 博客 2023-10](https://pytorch.org/blog/flash-decoding/)）的三步解法：把 KV 序列切成小块，各块并行各算各的 $`(O,\mathrm{lse})`$，最后一个廉价的归约 kernel 用 LSE 合并，数学就是本节的 ⊕，结果精确无近似（博客微基准：A100、batch 1、seq 64K，注意力本体从 2300.6µs 到 64.4µs）。vLLM 的调用面早给这条路留了参数：主路径那次调用里的 `num_splits`（flash_attn.py:L1062）就是 split 数，0 交给 kernel 自决。所以这套「softmax 可以迭代地算」的性质在两个层级同时使用：块内（tiling 递推）与块间（LSE 归并）。分布式场景同理：上下文并行把一条长序列切段分卡，跨卡归约走的还是 LSE（vllm/v1/attention/backends/flash_attn.py 里 DCP 变体的 `cp_lse_ag_out_rs` 等路径，登记不展开）。
 
@@ -565,7 +565,7 @@ def use_cascade_attention(
     merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)   # L1690
 ```
 
-三个形状决策都能绑回本章：前缀段 `causal=False` 且 `block_table[:1]`（批内所有 query 看的是同一段共享 KV，页表取第 0 行就够）；后缀段 `causal=True` 且页表列切片 `block_table[:, num_common_kv_blocks:]` 跳过共享块（[第 13 章](../../ch13-paged-kv/narrative/chapter.md)立的每请求一张页表，在这里被纵向切了一刀）；两段都 `return_softmax_lse=True`，末行 `merge_attn_states` 收口，就是上一节逐行读过的那十来行。省多少算一笔（说明性）：两条请求各 7/6 个 key、共享前缀 4 个，朴素全扫 13 个 key 元素，cascade 只要 4（前缀一遍）+3+2（各自后缀）= 9 个，省 4 个、比例 0.3077；一般式 $`R`$ 条请求共享 $`P`$ token 前缀，省 $`P\cdot(R-1)`$ 份重复扫描。共享越长、请求越多越赚，这正是决策门槛要筛的量。注意 cascade 是**注意力读侧**的复用；调度侧把共享前缀的物理块直接租给多条请求（块级共享、免复制）是[第 15 章](../../ch15-prefix-caching/narrative/chapter.md)前缀缓存的事，两层各管一段，互不替代。
+三个形状决策都能绑回本章：前缀段 `causal=False` 且 `block_table[:1]`（批内所有 query 看的是同一段共享 KV，页表取第 0 行就够）；后缀段 `causal=True` 且页表列切片 `block_table[:, num_common_kv_blocks:]` 跳过共享块（[第 13 章](../../ch13-paged-kv/narrative/chapter.md)立的每请求一张页表，在这里被纵向切了一刀）；两段都 `return_softmax_lse=True`，末行 `merge_attn_states` 收口，就是上一节逐行读过的那十来行。省多少算一笔（说明性）：两条请求各 7/6 个 key、共享前缀 4 个，朴素全扫 13 个 key 元素，cascade 只要 4（前缀一遍）+3+2（各自后缀）= 9 个，省 4 个、比例 0.3077；一般式 $`R`$ 条请求共享 $`p`$ 个 token 前缀（前缀长度记小写 $`p`$，免与权重矩阵 $`P`$ 撞名），省 $`p\cdot(R-1)`$ 份重复扫描。共享越长、请求越多越赚，这正是决策门槛要筛的量。注意 cascade 是**注意力读侧**的复用；调度侧把共享前缀的物理块直接租给多条请求（块级共享、免复制）是[第 15 章](../../ch15-prefix-caching/narrative/chapter.md)前缀缓存的事，两层各管一段，互不替代。
 
 ![cascade attention：共享前缀一次算完全批复用，后缀各算各的，LSE 合并缝回](../diagrams/ch20-fig-cascade-attention.png)
 
@@ -577,7 +577,7 @@ def use_cascade_attention(
 
 数学讲完，最后把 vLLM 调用面的几个约定拆开：这批形状契约决定了「整批 prefill 与 decode 一次吃下」和「K 在分页块池里也能算」。
 
-**varlen 打平。** 推理一拍里，prefill 上千 token 与 decode 1 个 token 混批。按 padding 对齐到最长序列，每条 decode 白算上千行；varlen（variable-length，变长打包）的约定是把全批 query **首尾相接打平**成一条 `(total, nheads, headdim)` 的张量，再配一张 `cu_seqlens_q`（cumulative sequence lengths，累积序列边界：`batch+1` 个元素的 int32 前缀和，第 b 条序列占打平向量的第 b 到 b+1 段）切出每条序列。引擎侧的供给就一行接驳（[第 18 章](../../ch18-persistent-batch-fixed-addresses/narrative/chapter.md)立的 query_start_loc 正是这张前缀和）：
+**varlen 打平。** 推理一拍里，prefill 上千 token 与 decode 1 个 token 混批。按 padding 对齐到最长序列，每条 decode 白算上千行——prefill 是 1024 token 时就是白算 1023 行；varlen（variable-length，变长打包）的约定是把全批 query **首尾相接打平**成一条 `(total, nheads, headdim)` 的张量，再配一张 `cu_seqlens_q`（cumulative sequence lengths，累积序列边界：`batch+1` 个元素的 int32 前缀和，第 b 条序列占打平向量的第 b 到 b+1 段）切出每条序列。引擎侧的供给就一行接驳（[第 18 章](../../ch18-persistent-batch-fixed-addresses/narrative/chapter.md)立的 query_start_loc 正是这张前缀和）：
 
 ```python
 # vllm/v1/attention/backends/flash_attn.py:L929-L935 · FlashAttentionImpl.forward 元数据接驳（非 cascade 主路径）
@@ -601,9 +601,9 @@ seqlen_q=2, seqlen_k=5:          seqlen_q=5, seqlen_k=2:
                                      1 1
 ```
 
-左例里第一条 query 只准回看前 4 个 key；右例里前三行全零（这三条 query 的位置早于所有 key，一个都看不见），全零行的输出为零。写成一行就是：query 行 $`r`$ 的全序列位置是 $`r+\mathrm{offset}`$（offset 由两长相减定），保留条件 $`c\le r+\mathrm{offset}`$。妙处在于 decode：query 只有 1 个 token、KV 有 $`N`$ 个时，唯一的 query 行天然落在最右列、看见完整历史。所以长 query 的 prefill 与单 token 的 decode 能共用同一个 varlen kernel、一次调用吃下整批，cascade 后缀段也只需按请求给各自的 offset。
+左例里第一条 query 只准回看前 4 个 key；右例里前三行全零（这三条 query 的位置早于所有 key，一个都看不见），全零行的输出为零。写成一行就是：query 行 $`r`$ 的全序列位置是 $`r+\mathrm{offset}`$（offset 由两长相减定），保留条件 $`c\le r+\mathrm{offset}`$。妙处在于 decode：query 只有 1 个 token、KV 有 $`N`$ 个时，唯一的 query 行天然落在最底部、与最后一个 key 同位，看见完整历史。所以长 query 的 prefill 与单 token 的 decode 能共用同一个 varlen kernel、一次调用吃下整批，cascade 后缀段也只需按请求给各自的 offset。
 
-**softmax_scale 与三断言。** 打分的缩放因子默认 $`1/\sqrt{\mathrm{headdim}}`$（L285-L286：`softmax_scale = q.shape[-1] ** (-0.5)`）。本章玩具例显式传 1.0 是为心算，默认语义是它；不缩放的话大 $`d`$ 下点积方差随 $`d`$ 涨、softmax 会饱和。接口层的形状契约钉成三条断言（L270-L278）：`cu_seqlens_k` 与 `seqused_k` 二选一；**带 `block_table`（分页 KV）必须给 `seqused_k`**：片在池里，长度按请求给，这条就是「分页读取」的接口级表达：
+**softmax_scale 与三断言。** 打分的缩放因子默认 $`1/\sqrt{\mathrm{headdim}}`$（L285-L286：`softmax_scale = q.shape[-1] ** (-0.5)`）。本章玩具例显式传 1.0 是为心算，默认语义是它；不缩放的话大 $`d`$ 下点积方差随 $`d`$ 涨、softmax 会饱和（分布退化成几乎只挑最大项）。接口层的形状契约钉成三条断言（L270-L278）：`cu_seqlens_k` 与 `seqused_k` 二选一；**带 `block_table`（分页 KV）必须给 `seqused_k`**：片在池里，长度按请求给，这条就是「分页读取」的接口级表达：
 
 ```python
 # vllm/vllm_flash_attn/flash_attn_interface.py:L270-L278 · flash_attn_varlen_func 分页契约三断言
@@ -630,7 +630,7 @@ seqlen_q=2, seqlen_k=5:          seqlen_q=5, seqlen_k=2:
 
 ## 总结：黑盒从此透明
 
-回到 L0 图：本章点亮的是绿色「GPU 执行臂」列模型层里、attention 实现往算子库指下去的那一格。[第 19 章](../../ch19-compile-capture/narrative/chapter.md)把它捕成 CUDA graph 里的不透明算子，现在这个节点内部是透明的：它跑的是 online-softmax 的分块递推，加减乘除全在片上，$`N\times N`$ 的 $`S`$、$`P`$ 从不落地。开篇的问题有了完整答案，压在一条主线上： **⊕ 满足结合律与交换律，softmax 统计量可任意分块、乱序归并** ；动机是另一笔账：注意力慢在 HBM 往返，不在算力。带四件事走：
+回到 L0 图：本章点亮的是绿色「GPU 执行臂」列模型层框里「Attention = 插座」的那一项。[第 19 章](../../ch19-compile-capture/narrative/chapter.md)把它捕成 CUDA graph 里的不透明算子，现在这个节点内部是透明的：它跑的是 online-softmax 的分块递推，加减乘除全在片上，$`N\times N`$ 的 $`S`$、$`P`$ 从不落地。开篇的问题有了完整答案，压在一条主线上： **⊕ 满足结合律与交换律，softmax 统计量可任意分块、乱序归并** ；动机是另一笔账：注意力慢在 HBM 往返，不在算力。带四件事走：
 
 1. **一张许可证** ：⊕ 把「先折算到公共基准、再并账」做成可结合可交换的运算，状态是多重集的规范摘要：single-pass 递推、tiling 更新 $`(m,\ell,O)`$、LSE 合并 $`(\mathrm{lse},O)`$，全是它换状态对的同一副面孔（arXiv:1805.02867 §3.1 Eq.(3)-(4)）。
 2. **一笔账** ：标准实现访存 $`\Theta(Nd+N^2)`$、还要物化两张 $`N\times N`$；FA 降到 $`\Theta(N^2d^2/M)`$、额外内存 $`O(N)`$，且在这道墙上没有渐进更省的精确算法（Thm.2 与 Prop.3，arXiv:2205.14135 §3.2）。FLOP 一点没省——省的是搬运。
@@ -639,4 +639,4 @@ seqlen_q=2, seqlen_k=5:          seqlen_q=5, seqlen_k=2:
 
 一条界线也值得带走：凡拆 **KV 轴**的（cascade、split-KV、跨卡归约），非请 ⊕ 出场合并不可；[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)的 chunked prefill 拆的是 **query 轴**：因果掩码下逐行本就独立，连合并都不需要。分得清这两种拆分，注意力世界的「拆」就全在你手里了。
 
-下一块已经挂好钩子：本章只打开了一个后端的内部，而 vLLM 桌上摆着不止一个注意力后端：FlashAttention、FlashInfer、Triton 变体，还有 MLA 这类换掉数学本身的变体。优先级表怎么排、validate 不过怎么回退、逐 KV 组怎么混布不同的后端，是紧接着那章《注意力后端》的全部戏；再往后，[第 22 章](../../ch22-slot-mapping-block-table/narrative/chapter.md)会把本章两处一笔带过的 slot_mapping 与 block_table 的 GPU 端换算整章结清。数学先铺完路，机器接着上场。
+下一块已经挂好钩子：本章只打开了一个后端的内部，而 vLLM 桌上摆着不止一个注意力后端：FlashAttention、FlashInfer、Triton 变体，还有 MLA 这类换掉数学本身的变体。优先级表怎么排、validate 不过怎么回退、逐 KV 组怎么混布不同的后端，是紧接着那章《注意力后端》要讲的全部内容；再往后，[第 22 章](../../ch22-slot-mapping-block-table/narrative/chapter.md)会把本章两处一笔带过的 slot_mapping 与 block_table 的 GPU 端换算整章结清。数学先铺完路，接下来轮到机器。

@@ -1,0 +1,200 @@
+{
+  "chapter": "ch20-flash-attention-math",
+  "note": "introduces 三项（online softmax / tiling / LSE）各有一张主卡（#1/#2/#3）；OS/硬件底座词按非常识另产三张（#4 内存层级 / #5 memory-bound 与算术强度 / #6 kernel 与融合）；#7 split-KV 与 LSE 合并的工业谱系（含 vLLM docstring 自引的 arXiv:2501.01005 = FlashInfer 论文的身份核实）；#8/#9 复用 v2 已查透条目（FA 版本族、Triton），FA 族已按 2026-08-29 重核修订。v2 的 Sarathi/Sarathi-Serve/DeepSpeed-FastGen 三张调度卡本章不需要（chunked prefill 本体在 ch10，dossier 亦标注『v3 是否引用由 writer 定』）——如 writer 决定引 paper-chunked.md 谱系，可回 v2 concepts.json 拷取。‖2026-08-29 二次复核记录（researcher 重入，逐条抽验承重断言）：本地论文包核毕 #1/#2/#3/#5/#6 的论文侧断言（1.3×/5×、Welford 灵感句、⊕ 结合律『omit the proofs』、Tweak 2 原话、312 vs 19.5 的 16×、A100 §2.1 数字）；上网复核全过——FA-3/FA-4/FlashInfer/FA-2/online-softmax 五个 arXiv 摘要页、FlashDecoding 博客全文（8×/50×/<1%/2300.6µs vs 64.4µs/≥2.2/三步表述/log-sum-exp 标量）、Hopper 博客四项 H100 数字、Hopper 调优指南 228KB 口径、A100 白皮书 192KB 原句（PDF 机读失败、经检索核实原话，另有 H100 白皮书 256 vs 192 交叉印证）、DGX B200 官方页（1440GB/64TB/s 合计）、CUDA 编程指南四条原句、Welford 引文（ar5iv 抓到论文参考文献表 [18] 条目原文 = Welford 1962, Technometrics 4(3):419-420）；Triton 的 openai.com 页今日 403、以 GitHub README 补核（MAPL2019 Tillet/Kung/Cox）。零断言落空，无需降级任何 confidence。",
+  "concepts": [
+    {
+      "id": "online-softmax",
+      "term": "online softmax（在线/单遍 softmax）",
+      "kind": "external_concept",
+      "one_line": "2018 年 NVIDIA 两位工程师提出的单遍 softmax 技巧：不求先看全向量，边扫边维护两个数——运行最大值 m 和不断被『折算到新基准』的分母 d；FlashAttention 的分块 softmax 直接由它长出来。",
+      "what_it_is": "softmax 定义 y_i = e^{x_i} / Σ_j e^{x_j}，麻烦在分母：要么先溢出（naive 直接对大数取 exp，e^1000 即 inf），要么得把向量看三遍（safe 版：先扫一遍求全局 max，再扫一遍求 Σe^{x−max}，第三遍才写 y）。online softmax 的观察是：max 和分母可以在**同一遍**里维护——每来一个新元素 x_j，先更新 m_j = max(m_{j-1}, x_j)，再把**旧分母按新旧 max 之差折算** d_j = d_{j-1}·e^{m_{j-1}−m_j} + e^{x_j−m_j}，然后才加新项。直觉一句话：记账时还不知道全局最大值，就每遇到一个新最大值、把旧账全部折算到新基准。数值上可证 1 ≤ d_j ≤ j，永不溢出。它把 softmax 的访存从每元素 4 次降到 3 次——softmax 本身是 memory-bound（见 #5），所以省访存就是省时间。",
+      "background": "来龙去脉三段。(1) 出处：Maxim Milakov 与 Natalia Gimelshein（NVIDIA）2018 年的技术报告『Online normalizer calculation for softmax』（arXiv:1805.02867），动机**不是注意力**而是机器翻译输出层的词表 softmax（几万维大向量）+ TopK 的融合，V100 实测 softmax 提速 1.3×、softmax+TopK 融合达 5×；报告明说灵感来自 Welford 1962 年的『在线方差算法』（ Technometrics 4(3):419-420，单遍维护 running mean 与修正平方和的同一套『先折算旧账再加新项』模式——这套模式在流式统计里叫 online algorithm，这就是名字里 online 的含义）。(2) 并行化形态：同报告 §3.1 把 (m,d) 抽象成状态、定义二元算子 ⊕（新 m = max(m_i,m_j)，新 d = 两者各按到新 max 的差 rescale 后相加），并声明 ⊕ 满足**结合律**（→ 可任意加括号分块，并行计算）与**交换律**（→ 可乱序归并）——论文自己省略了证明。这正是『结合律使归约可并行』的老原理：两个线程各算一半的和再相加之所以正确，靠的就是 + 的结合律；⊕ 之于 (m,d)，正如 + 之于标量。(3) 走向注意力：FlashAttention（2022）把这套递推从『一个向量』推广到『Q 的一行 × K 的一个块』，并让**输出 O 本身也参与递推**（旧 O 同样按 e^{旧max−新max} 缩放后累加）——这是从『算 softmax 快一点』到『整段注意力免物化』的惊险一跃。",
+      "example": "手算 x = [1, 2, 3]（可用纸笔复核）：初始 m_0=−∞, d_0=0。j=1: m_1=1, d_1=0·e^{−∞}+e^{1−1}=1。j=2: m_2=2, d_2=1·e^{1−2}+e^{2−2}=e^{−1}+1≈1.3679。j=3: m_3=3, d_3=1.3679·e^{2−3}+e^{3−3}≈1.3679×0.3679+1≈1.5032。对照 safe 三遍法：Σe^{x−3}=e^{−2}+e^{−1}+e^0≈1.5032——**逐位相等**。最终 softmax = [e^{−2}, e^{−1}, e^0]/1.5032 ≈ [0.090, 0.245, 0.665]。⊕ 两块合并同法：把 [1] 与 [2,3] 各自算出 (m,d) 再 ⊕，结果不变——这就是 vLLM merge_attn_states 合并两段注意力的全部数学前身。",
+      "links": [
+        "https://arxiv.org/abs/1805.02867",
+        "https://github.com/NVIDIA/online-softmax",
+        "https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/1805.02867", "note": "抓取摘要页（2026-08-29）：Milakov & Gimelshein，均 NVIDIA，v1 2018-05-08。"},
+        {"url": "instances/vllm/book/papers/ch24-primer-flash-attention/paper-online-softmax.md", "note": "本章论文包内全文读毕（2026-08-29）：Alg.1-3、Thm.1（末值恒等+1≤d_j≤j 界）、§3 末句『Inspiration came from the numerically stable variance calculation online algorithm』、§3.1 Eq.3-4 与结合律/交换律声明、§5 V100 基准 1.3×/5×。"},
+        {"url": "https://ar5iv.labs.arxiv.org/html/1805.02867", "note": "ar5iv 版参考文献表（2026-08-29 抓取）：[18] 条目原文『B. P. Welford. Note on a method for calculating corrected sums of squares and products. Technometrics, 4(3):419–420, 1962.』——论文正文『see [18]』的指向一手闭环（本地 md 丢了参考文献表，靠此补链）。"},
+        {"url": "https://www.tandfonline.com/doi/abs/10.1080/00401706.1962.10490022", "note": "Welford 1962 原文页（2026-08-29 访问 403）；引文条目改经 ar5iv 版参考文献表与 Wikipedia『Algorithms for calculating variance』双重核实：Technometrics 4(3):419-420。"}
+      ],
+      "confidence": "high",
+      "writer_note": "本章正文会完整推导（dossier 站 m02/m03），这张卡只供背景与出处：首现处建议一句话点明『2018 年 NVIDIA 为词表 softmax 所创、灵感来自 Welford 在线方差、名字里的 online 是流式单遍之意』即可，算法细节全部交给正文；⊕ 的结合律=『归约可并行』的老原理，可点一句帮读者建立『为什么敢乱序合并』的信心。"
+    },
+    {
+      "id": "tiling",
+      "term": "tiling（分块/切块计算）",
+      "kind": "external_concept",
+      "one_line": "把大矩阵切成『恰好装得进快存储器』的小块（tile），搬一块、算一块、只把最终结果写回慢存储——从 BLAS 到 GPU kernel 的祖传手艺；FlashAttention 的革命不在用了 tiling，而在 tiling 了『看似必须看全行』的 softmax。",
+      "what_it_is": "任何『慢而大 + 快而小』的两级存储体系下做矩阵运算的通用策略：数据装不进快存，就按块切分循环——每块中间数据待在快存（GPU 上即 SRAM：shared memory + 寄存器）里算完，绝不把中间矩阵写回慢存（HBM）。块大小由快存容量反推（FA 论文 Alg.1：B_c = ⌈M/(4d)⌉，M 是 SRAM 大小、d 是头维，除 4 是因为 K/V/Q 等多块要并存）。要害是：分块 GEMM 人人都会，但 softmax 的分母要对一整行 K 求和，『块里只见局部、归一化要全局』看似矛盾——靠 online softmax 递推（#1）才解开；所以 FA = tiling（结构）+ online softmax（数学）+ 单 kernel 融合（#6）三件套。⚠️ 名字撞车（本章必须澄清，dossier 站 m10 已点名）：kernel 的 **tile**（按 SRAM 容量/算力切的计算块，管 HBM→SRAM 搬运粒度）≠ vLLM KV cache 的 **block**（16 token 一页的池块，管块池寻址，ch13）——两者粒度独立、互不知晓。",
+      "background": "血统三支。(1) 理论：Hong & Kung 1981（STOC）的『红蓝卵石博弈』（I/O complexity: The red-blue pebble game）首次给『两级存储上算法的 I/O 往返』立了下界框架——蓝卵石=快存、红卵石=慢存，一个算法至少要在两级之间搬运多少数据可以被证明；FA 论文 Thm.2 的 Θ(N²d²/M) IO 账及 Prop.3 的匹配下界，正是这套分析法的当代应用（论文 Appendix A 自述『draw the most direct connection to the literature of analyzing I/O complexity』）。(2) 工程：2000 年代 GotoBLAS 把『分块+打包（pack）让操作数常驻 L2/L1』做成高性能 GEMM 的工业标准——Goto & van de Geijn『Anatomy of High-Performance Matrix Multiplication』（ACM TOMS 2008）是这一系的经典文献；CPU 上的 cache blocking 与 GPU 上的 threadblock tiling 同宗。(3) 注意力：2022 年 FA 论文 Fig.1 左图（外层沿 K/V 块、内层沿 Q 块）即 tiling 在注意力上的定型，N×N 中间矩阵（虚线框）从此『dotted box 不落 HBM』。",
+      "example": "规模感两笔。(1) GEMM：C = A·B，A/B 各 4096×4096 fp16（各 32MB）。naive 逐元素算时每个 C 元素都要从 HBM 反复拉整行 A 整列 B；切成 128×128 的 tile 后，每个 A tile 载入 SRAM 可与 32 个 B tile 复用相乘，HBM 流量近似降为 1/32 阶——tile 越大复用越多，但上限是 SRAM 容量。(2) FA 的块尺寸账（论文口径）：SRAM M≈100KB、d=64 → B_c=⌈M/(4d)⌉ 约数百行；论文 Fig.2 中图实测 B_c 超过 256 后运行时间收益封顶（算力接瓶颈）、再大根本装不进 SRAM——『块大小=访存与算力的调节旋钮』。",
+      "links": [
+        "https://www.cs.utexas.edu/~pingali/CSE392/2011sp/lectures/a12-goto.pdf",
+        "https://www.semanticscholar.org/paper/I-O-complexity%253A-The-red-blue-pebble-game-Hong-Kung/3e69317455f7db9b1325239c6f6f52cbe29a5491",
+        "https://arxiv.org/abs/2205.14135"
+      ],
+      "sources": [
+        {"url": "https://www.cs.utexas.edu/~pingali/CSE392/2011sp/lectures/a12-goto.pdf", "note": "Goto & van de Geijn 2008 ACM TOMS 34(3) Art.12 论文 PDF（UT Austin 镜像，经检索核实，2026-08-29）：分块+pack 围绕 cache 层级的高性能 GEMM。"},
+        {"url": "https://www.semanticscholar.org/paper/I-O-complexity%253A-The-red-blue-pebble-game-Hong-Kung/3e69317455f7db9b1325239c6f6f52cbe29a5491", "note": "Hong & Kung 1981 STOC 论文页（经检索核实，2026-08-29）：红蓝卵石博弈与 I/O 复杂度下界。"},
+        {"url": "instances/vllm/book/papers/ch24-primer-flash-attention/paper.md", "note": "FA 论文本地全文（2026-08-29 读毕）：Alg.1 分块尺寸 L128-L132、Thm.2/Prop.3、Appendix A IO-aware 血统自述、Fig.2 中图块大小 tradeoff。"}
+      ],
+      "confidence": "high",
+      "writer_note": "本章是 tiling 的首现处，必须讲透『块大小由 SRAM 容量反推』与『tiling 之所以可能是借了 online softmax 的递推』这两点；红蓝卵石/GotoBLAS 的血统一句带过即可（给链接）；**tile≠KV cache block 的撞车澄清建议放在分页读取一节（m10）**，卡里备好了现成表述。"
+    },
+    {
+      "id": "lse-logsumexp",
+      "term": "LSE（log-sum-exp，对数和指数）",
+      "kind": "external_concept",
+      "one_line": "LSE(x) = log Σ e^{x_i}——softmax 那个分母取了对数的形态：数值上是『平滑版 max』，代数上有一条金子般的性质——两段各自算 LSE 就能精确合并，这让『分块算、最后合』与『两段各算一半再合』成为可能；FA-2 起 kernel 只存它一个数。",
+      "what_it_is": "三件事。(1) **稳定算**：naive 的 Σe^{x_i} 对大输入直接 inf，标准解法是减 max：LSE(x) = m + log Σ e^{x_i − m}（m = max x），这正是 safe softmax 的对数化身影；scipy.special.logsumexp / torch.logsumexp 都这么实现，Higham 等系统研究过其浮点误差（Blanchard, Higham & Higham 2021）。(2) **夹逼**：max ≤ LSE ≤ max + log n——它是把 max 软化的版本，n 个相差悬殊的数里 LSE 几乎就等于最大者，故常被当 smooth-max 用。(3) **可合并（本章的命根）**：LSE([a; b]) = log(e^{LSE(a)} + e^{LSE(b)})——先把两段各自算完，再按这条公式合并，与一口气对拼接后的大向量算 LSE **逐位相等**。于是注意力可以拆成任意段（前缀/后缀、KV 各 split、各卡），每段带一个标量 LSE 回来合并。FA-2 的 Tweak 2 原话：不必同时存 max m 与 Σexp ℓ 两个统计量，只需 L = m + log(ℓ)——vLLM flash_attn_varlen_func 里 return_softmax_lse=True 吐出的就是每行的 L，cascade attention 的两段合并、DCP 跨卡归约全靠它。",
+      "background": "log-sum-exp trick 是数值分析的老常识（max-shift 消溢出），每个科学计算库都有一个 logsumexp；2021 年 Blanchard/Higham/Higham（arXiv:1909.03469，IMA J. Numer. Anal.）还专门研究过它与 softmax 的舍入误差与更优的 shift 选择。进入注意力史：(1) FA-1（2022）为 backward 重算存的是 (ℓ, m) 两个统计量；(2) FA-2（2023-07）指出只需 L = m + log ℓ 一个（对数域打包）；(3) 工业界随即把 LSE 升格为**跨 kernel 合并的接口语言**——FlashDecoding（PyTorch 博客 2023-10）用它做 split 间的 reduction，FlashInfer 论文（arXiv:2501.01005，MLSys 2025）§2.2 给出 LSE rescaling 合并的成文表述（vLLM merge_attn_states 的 docstring 自引的正是这一节）。『一个标量换一次精确合并』是 LSE 在推理系统里的角色。",
+      "example": "两个可纸笔复核的小例。(1) 稳定算：x = [1000, 1001]，naive Σe^x = inf；稳定式 m=1001，LSE = 1001 + log(e^{−1} + 1) ≈ 1001.31——没有溢出。(2) 合并：段 A x=[0,0] → LSE_A = log 2 ≈ 0.693；段 B x=[2,0] → LSE_B = log(e²+1) ≈ 2.127；合并 LSE = log(e^{0.693} + e^{2.127}) = log(2 + 8.389) ≈ 2.341。对照直接对拼接向量 [0,0,2,0] 算：log(1+1+e²+1) = log(10.389) ≈ 2.341——**相等**。合并权重（merge kernel 的口径）：w_A = e^{LSE_A}/(e^{LSE_A}+e^{LSE_B}) = 2/10.389 ≈ 0.19，w_B = 8.389/10.389 ≈ 0.81（实现时以 max 稳定化：分子分母同乘 e^{−max}，数值不变），即『段 B 的归一化质量占八成』，O = w_A·O_A + w_B·O_B。",
+      "links": [
+        "https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.logsumexp.html",
+        "https://arxiv.org/abs/1909.03469",
+        "https://arxiv.org/abs/2307.08691"
+      ],
+      "sources": [
+        {"url": "https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.logsumexp.html", "note": "抓取（2026-08-29）：定义 log of the sum of exponentials、等价 np.log(np.sum(np.exp(a))) 且『calculated in a numerically more stable way』。"},
+        {"url": "https://arxiv.org/abs/1909.03469", "note": "经检索核实（2026-08-29）：Blanchard, Higham & Higham『Accurate Computation of the Log-Sum-Exp and Softmax Functions』，IMA J. Numer. Anal. 2021。注意曾误记为 1909.03430（那是篇金融论文），正确 ID 为 1909.03469。"},
+        {"url": "instances/vllm/book/papers/ch24-primer-flash-attention/paper-fa2.md", "note": "FA-2 论文本地文件（2026-08-29 grep/读）：Tweak 2 原话『We do not have to save both the max and the sum of exponentials…only need to store the logsumexp L = m + log(ℓ)』、Alg.1 L13/L17。"},
+        {"url": "https://arxiv.org/abs/2307.08691", "note": "抓取摘要页（2026-08-29）：Tri Dao 单作者，2023-07-17。"}
+      ],
+      "confidence": "high",
+      "writer_note": "LSE 是本章三个 introduces 里最『接口化』的一个：正文讲透定义+稳定算+合并恒等式（配上面合并小例，数字现成），FA-2 只存 L 一句话（m06 已安排）；『LSE=跨 kernel 合并的接口语言』这个定位留给 merge_attn_states/cascade 一节自然浮现，不必提前剧透。"
+    },
+    {
+      "id": "gpu-memory-hierarchy",
+      "term": "GPU 内存层级：HBM vs 片上 SRAM",
+      "kind": "external_concept",
+      "one_line": "GPU 存储器是『一小快贵 + 一大慢便宜』的两级世界：片上 SRAM 每个 SM 只有几百 KB 但快约一个数量级，HBM 显存几十 GB 但慢——本章一切优化都是在这道鸿沟上做文章。",
+      "what_it_is": "从慢到快四级：HBM（显存，GPU 主存）→ L2 cache → 每 SM 的 shared memory + L1（论文语境笼统叫『SRAM』，广义含寄存器）→ 寄存器。容量与带宽互为倒数：A100 有 40-80GB HBM @ 1.5-2.0TB/s，同时只有 108 个 SM、每 SM 192KB 的 SRAM（合计约 20MB，比 HBM 小两千倍），带宽估算约 19TB/s（论文引第三方估算）——快十倍、小两千倍，这就是 FA 的全部动机：N×N 中间矩阵既装不进 SRAM、写 HBM 又贵，所以『切块进去算、别写出来』。代际对照（供锚定『今天的硬件』）：H100/Hopper——132 SM、每 SM 256KB（可配 shared memory 上限 228KB）、L2 50MB、80GB HBM3 官方口径『over 3 TB/s』；B200/Blackwell——HBM3e 带宽约 8TB/s（NVIDIA DGX B200 页 8 卡合计 64TB/s 可反推）、单卡 192GB。趋势：HBM 带宽每代翻倍，但 SRAM 容量增长慢得多——鸿沟在变大不是变小。",
+      "background": "HBM（High Bandwidth Memory）是焊在 GPU 封装内的堆叠 DRAM（与 CPU 那种插条内存相对），用 3D 堆叠换超宽总线；『片上 SRAM』则与 CPU 的 L1/cache 同族，是 SM 内的静态存储器，物理上与计算单元同住。『算力增速超内存带宽增速』（memory wall）是体系结构的老论断，FA 论文 §2.1 引了三篇文献立论：深度学习算子日益被访存而非算力卡住，所以『利用快 SRAM 变得越来越重要』。论文里那句『SRAM 带宽估计约 19TB/s』是**估算值**（引 A100 白皮书等），NVIDIA 官方从不直接标 shared memory 带宽——正文引用时保留『估算』口径更诚实。",
+      "example": "把 8K 上下文一个 head 的 S=QK^T 表放进层级里感受一下：8192² ≈ 6700 万元素，fp16 下 134MB——是单个 SM SRAM（192KB）的约 700 倍、超过全片 SRAM 总和（约 20MB）的 6 倍，只能物化到 HBM。而 128 行 × 64 维的 K 块只有 16KB，SRAM 里能同时放下好几块——『大表装不下、小块随便放』，tiling 的必要性就在这两个数字的对比里。",
+      "links": [
+        "https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf",
+        "https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/",
+        "https://www.nvidia.com/en-us/data-center/dgx-b200/"
+      ],
+      "sources": [
+        {"url": "https://images.nvidia.com/aem-dam/en-zz/Solutions/data-center/nvidia-ampere-architecture-whitepaper.pdf", "note": "A100 白皮书（2026-08-29 复核）：PDF 机器抓取只回二进制，但精确原句经检索核实『The combined capacity of the L1 data cache and shared memory is 192 KB/SM in A100 versus 128 KB/SM in V100』；H100 白皮书另交叉印证『256 KB/SM in H100 versus 192 KB/SM in A100』；HotChips 2020 幻灯片同口径：108 SM、40MB L2、~1.56TB/s HBM2。"},
+        {"url": "https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/", "note": "抓取（2026-08-29）原句：『132 SMs per GPU』『256 KB of combined shared memory and L1 data cache, 1.33x larger than A100』『A 50 MB L2 cache』『80 GB (five stacks) of fast HBM3…delivering over 3 TB/sec』（1.33×192≈256，与 A100 数字互恰）；Hopper 调优指南 228KB 口径亦核实（2026-08-29 检索原话：shared memory capacities『…196 and 228 KB per SM』，docs.nvidia.com/cuda/hopper-tuning-guide）。"},
+        {"url": "https://www.nvidia.com/en-us/data-center/dgx-b200/", "note": "DGX B200 官方页（经检索核实，2026-08-29）：8 卡 HBM3e 合计 64TB/s → 单卡 8TB/s；B200 单卡 192GB 为多源一致口径（DGX 上每卡可用 180GB）。B200 的每 SM shared memory 容量无官方数据表，正文勿引。"},
+        {"url": "instances/vllm/book/papers/ch24-primer-flash-attention/paper.md", "note": "FA 论文 §2.1（2026-08-29 读毕）：A100 40-80GB HBM @1.5-2.0TB/s、108 SM × 192KB SRAM、带宽估算约 19TB/s、memory wall 文献引注。"}
+      ],
+      "confidence": "high（A100/H100 数字一手核实；B200 带宽为官方页反推、容量多源一致；B200 每 SM SRAM 未核实不写）",
+      "writer_note": "这是本章读者的硬件底座卡，首现处（内存带宽墙一节）值得给全 A100 数字对比+134MB vs 192KB 的例子；H100/B200 数字仅供『今天』锚定一句，别展开成硬件手册；『19TB/s 是估算值』这个口径提醒 writer 引用时带『估算』二字。"
+    },
+    {
+      "id": "memory-bound-compute-bound",
+      "term": "memory-bound vs compute-bound 与算术强度（Roofline 模型）",
+      "kind": "external_concept",
+      "one_line": "判断一个 kernel 慢在『算不过来』还是『数据搬不过来』的标准是算术强度——每字节访存摊到多少次浮点运算；softmax 天生 memory-bound，大 GEMM 天生 compute-bound，这道分野解释了 FA 论文的核心反直觉：FLOP 少不等于快。",
+      "what_it_is": "算术强度 I = FLOP 数 / 访存字节数。Roofline 模型（Williams, Waterman & Patterson, CACM 2009）把可达性能写成 P = min(峰值算力, I × 峰值带宽)——画在对数坐标上是一条斜线接一条水平线，交点叫**脊点** I* = 峰值算力/峰值带宽。I < I* 是 memory-bound（时间由搬数据决定），I > I* 是 compute-bound（时间由算决定）。A100 的量级：fp16 Tensor Core 峰值 312 TFLOP/s、HBM 1.5-2.0TB/s → 脊点约 150-200 FLOP/byte。大内维 GEMM 每读一个字节能摊上几百次乘加（compute-bound，右侧）；elementwise/归约类（激活、dropout、softmax、norm）每元素就几次运算却要整读整写（I≈1 量级，memory-bound，左侧）。注意第二层屋顶：FA-2 论文给过对照，A100 上 Tensor Core matmul 峰值 312 TFLOP/s 而**非 matmul 运算只有 19.5 TFLOP/s（差 16 倍）**——即使在 compute-bound 区，也要把非 matmul 的除法/指数压到最少。",
+      "background": "Roofline 出自伯克利（Williams/Waterman/Patterson，CACM 2009），原为多核 CPU 提出，后被 GPU/深度学习社区沿用为算子分类的第一把尺子。FA 论文开篇的论战对象正是『只减 FLOP 的近似注意力』：稀疏/低秩方法把计算量降到近线性，却常换不来 wall-clock 提升——因为标准注意力的瓶颈本来就不在 FLOP 而在 HBM 往返（memory-bound 一侧），砍计算砍不到点上。『IO-aware 算法』谱系（数据库 join、图像处理、数值线性代数，论文 §1/Appendix A 自引）是这套思维的前辈：先把『时间花在搬』认出来，再重新设计算法绕开搬运。这也预演了后续 vLLM 世界的常识——decode 阶段的注意力（GEMV 形态）是 memory-bound、prefill 的大 GEMM 才吃算力，两类负载要用不同手段。",
+      "example": "用 8K 上下文一笔账感受『墙在哪』：一张 S 表（8192²，fp16 134MB）物化到 HBM 再读回 ≈ 268MB @ 1.5TB/s ≈ 0.18ms；而其中 softmax 本身的计算量只有约数亿 FLOP @ 312 TFLOP/s ≈ 微秒量级——**搬运时间比计算时间高两个数量级**。这就是『标准注意力三步曲（写 S、读 S 写 P、读 P）每一拍都在给 HBM 打工』的定量注脚，也是 FlashAttention 免物化后实测快 7.6×（论文 Fig.1 右）的来源。",
+      "links": [
+        "https://en.wikipedia.org/wiki/Roofline_model",
+        "https://dl.acm.org/doi/pdf/10.1145/1498765.1498785",
+        "https://arxiv.org/abs/2205.14135"
+      ],
+      "sources": [
+        {"url": "https://en.wikipedia.org/wiki/Roofline_model", "note": "抓取（2026-08-29）：P = min(π, β·I)、脊点 I = π/β、Williams/Waterman/Patterson CACM 2009。"},
+        {"url": "https://dl.acm.org/doi/pdf/10.1145/1498765.1498785", "note": "Roofline 原论文（经检索核实，2026-08-29）：CACM 52(4), 2009。"},
+        {"url": "instances/vllm/book/papers/ch24-primer-flash-attention/paper.md 及 paper-fa2.md", "note": "FA §1（近似注意力不减 wall-clock 的归因）与 §2.1（算术强度/compute-bound/memory-bound/kernel fusion 定义）+ FA-2 §3.1（312 vs 19.5 TFLOP/s、16× 之差），2026-08-29 读毕。"}
+      ],
+      "confidence": "high",
+      "writer_note": "首现处在『慢在搬运不在计算』一节（m01），给公式 I=FLOP/byte + 脊点概念 + 268MB/0.18ms 这笔账就够；roofline 之名可点（给链接），312 vs 19.5 的 16× 留给 FA-2 一节（m06）再放，别在一节里堆满。"
+    },
+    {
+      "id": "cuda-kernel-and-fusion",
+      "term": "CUDA kernel 与 kernel fusion（融合）",
+      "kind": "external_concept",
+      "one_line": "kernel 是一次从 CPU 发射、在 GPU 上由成千上万线程并行执行的函数实例；fusion 是把原本各自读写显存的连续小操作合并进一个 kernel，让中间结果留在片上——softmax 这类 memory-bound 算子的祖传提速法，而 FlashAttention 是它的极致形态：整个注意力融成一个 kernel 且不物化任何大中间矩阵。",
+      "what_it_is": "执行模型（CUDA 官方口径）：host 发起 kernel launch，GPU 上组成一个 **grid**，grid 由大量 **thread block** 组成，block 被调度到各 **SM**（streaming multiprocessor）上——同一 block 的所有线程住在同一个 SM、可经 **shared memory** 协作；block 之间**没有执行顺序保证**、不能依赖彼此的结果。两个别名与一个派生词本章会撞见：CUDA 文档里 thread block 也叫 **CTA**（cooperative thread array）；恰好把全部 SM 铺满一轮的一批 block 叫一个 **wave**（波）——vLLM cascade 决策注释里的『CTA waves』（flash_attn.py:L1574-L1593：cascade_ctas/cascade_waves = cdiv(CTA 数, num_sms)）说的就是『两种拆法各要几波 CTA』，波数少的空转少。每个 kernel 的生命周期是：从 HBM 读输入 → 在 SRAM/寄存器里算 → 把输出写回 HBM。因此两个**相邻 kernel** 之间的数据必须走一趟 HBM 往返——fusion 就是消除这趟往返：把对同一输入的多个操作（matmul→softmax→dropout→matmul）写进一个 kernel，数据从 HBM 读一次、变换全部做完、只写一次回。对 memory-bound 算子，访存减半就是近乎减半的时间。朴素 fusion 的两条边界（FA 论文 §2.1）：训练时中间值仍要写 HBM 存给 backward，白融；编译器只会自动融 elementwise，对中间结果是 O(N²) 矩阵的注意力，不物化才是唯一解。vLLM 的现实形态：主路径一次 flash_attn_varlen_func = 一个融合 kernel（站 5）；merge_attn_states 是第二个 kernel——合并时两段的部分输出仍要落 HBM 再合并，这就是融合的边界与代价。",
+      "background": "fusion 谱系：编译器自动融合 elementwise（PyTorch/TVM/XLA 各有实现）→ 手工 mega-kernel（FA、persistent matmul）→ 用更高层 DSL 写 mega-kernel（Triton/CuTe-DSL，见 #8/#9）。FA 论文 §5『Limitations』自己点破这套方案的痛：每支持一种新注意力变体（mask、sliding window、alibi）都要改 CUDA kernel、且不跨 GPU 架构可移植——『要是有能从 PyTorch 级描述编译出 IO-aware 实现的方法就好了』，这个愿望正是后来 Triton 与 CuTe-DSL 兴起的历史位置。对本章还有一层：为什么『一个 kernel』这么重要——kernel 边界=HBM 往返边界，边界越少，本章 #4/#5 的墙越矮。",
+      "example": "最小对比：y = dropout(softmax(x))，x 为 N 元向量。不融合：kernel A 读 x、算 softmax、写 P 到 HBM；kernel B 读 P、做 dropout、写 y——每元素 4 次访存（读 x、写 P、读 P、写 y）。融合后一个 kernel：读 x、算完两步、写 y——每元素 2 次访存，直接省一半。online-softmax 论文的 softmax+TopK 融合（5× 提速）与 FA 的『两次 GEMM + softmax 一体化』是同一思想在两个尺度上的应用。",
+      "links": [
+        "https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html",
+        "https://arxiv.org/abs/2205.14135",
+        "https://openai.com/index/triton/"
+      ],
+      "sources": [
+        {"url": "https://docs.nvidia.com/cuda/cuda-programming-guide/01-introduction/programming-model.html", "note": "抓取 CUDA 编程指南 Programming Model 节（2026-08-29）原句：kernel 定义、『All threads of a thread block are executed in a single SM』、shared memory 由 block/cluster 内线程共享、『blocks…may be executed in any order』。"},
+        {"url": "instances/vllm/book/papers/ch24-primer-flash-attention/paper.md", "note": "FA 论文 §2.1（Execution Model/Kernel fusion 两段，2026-08-29 读毕）：kernel 从 HBM 载入到寄存器/SRAM 计算写回；fusion 的两条边界；§5 limitations 的『每个变体都要写新 CUDA kernel』自述。"}
+      ],
+      "confidence": "high",
+      "writer_note": "kernel/grid/thread block/SM/shared memory 这组词本章会反复出现，首现处（讲『融成一个 kernel』之前）用两三句立好最小模型即可，别写成 CUDA 教程；CTA/wave 两个别名不必首现就讲，到 cascade 决策（m08）引 vLLM 注释『CTA 波数』时括注一句即可；『kernel 边界=HBM 往返边界』这句是读者带走的钥匙；FA 论文 limitations 的痛→Triton/CuTe-DSL 的历史伏笔可点一句，链接交 #8/#9。"
+    },
+    {
+      "id": "split-kv-lse-merge",
+      "term": "split-KV / FlashDecoding 与 LSE 合并的工业谱系",
+      "kind": "external_concept",
+      "one_line": "decode 时并行维度只剩 batch×heads、喂不饱 GPU 的上百个 SM，于是把一条 KV 序列切成几段并行各算部分 (O, LSE)，再用 LSE 精确合并——PyTorch 博客 2023 年把它叫响为 Flash-Decoding，vLLM 的 num_splits、cascade、DCP 归约全是这条线的变体。",
+      "what_it_is": "问题：decode 每个 query 只有 1 个 token，注意力退化为向量×矩阵（GEMV），原版 FA 只沿 batch×heads×query 块并行——batch=1 时 A100 的 108 个 SM 只用了不到 1%（博客原话）。解法三步（博客原表述）：(1) 把 KV 序列切成小块；(2) 各块并行用 FlashAttention 算，**每行每 split 额外写一个标量——注意力的 log-sum-exp**；(3) 一个 reduction kernel 用 LSE 缩放各 split 的贡献、合并成最终输出。数学上就是 ⊕ 算子的多次应用（#1），结果精确无近似——『softmax 可以迭代地算』这一性质在两个层级同时使用（块内 + 跨块）。FA-2 论文把同一机制作为序列维并行的手段（其 num_splits 参数），flash-attn 库自 v2.2 起内置。vLLM 侧：flash_attn_varlen_func 的 num_splits 参数、cascade attention 的前缀/后缀两段合并、DCP 上下文并行的跨卡 LSE 归约，全部建立在这条恒等式上。",
+      "background": "谱系四站。(1) 思想源头：FlashDecoding 2023-10 以 PyTorch 博客形式发布（无独立论文；署名 Tri Dao/Daniel Haziza/Francisco Massa/Grigory Sizov，Stanford CRFM 同周另发姊妹篇 crfm.stanford.edu/2023/10/12/flashdecoding.html），实测 CodeLlama-34B 长序列生成最高 8× 提速、注意力本体最高 50×（A100 batch=1 seq=64k：FA 2300.6µs vs FD 64.4µs）。(2) 同期论文化：FA-2（2023-07）的序列维并行 + split-KV 已覆盖训练向动机。(3) 成文表述：FlashInfer 论文（Ye 等，arXiv:2501.01005，MLSys 2025，注意力 kernel 库，已集成进 SGLang/vLLM/MLC）§2.2 给出 LSE rescaling 合并的规范表述——**vLLM merge_attn_states 的 docstring 自引的就是这一节**（本章 dossier 站 m07/m09 已锚定）。(4) vLLM 工程化：cascade 决策启发式里『与 FlashDecoding 的 CTA 波数粗模型』的对比，本质是在『拆前缀复用』（cascade，省的是重复计算）与『拆序列并行』（split-KV，赚的是 SM 占用）两类拆法间选波数更少的——拆法不同，合并数学是同一条。",
+      "example": "波数感受：1 请求 × 1 head × 65K 上下文，在 132 SM 的 H100 上不拆 = 1 个 CTA 占 1 个 SM、其余 131 个闲着；split-KV 取 S=128 → 128 个 CTA 几乎铺满整卡，代价只是一次廉价的合并 kernel（每 token 每头 S 个 LSE 标量的归约）。这正是博客微基准里 FD 在 seq=65536 仍保持 ~64µs 近常数时间的原因——序列再长，只要 split 数铺满 SM，时间不再随长度线性涨。",
+      "links": [
+        "https://pytorch.org/blog/flash-decoding/",
+        "https://arxiv.org/abs/2501.01005",
+        "https://arxiv.org/abs/2307.08691"
+      ],
+      "sources": [
+        {"url": "https://pytorch.org/blog/flash-decoding/", "note": "抓取全文（2026-08-29 复核）：三步表述、每 split 写一个 log-sum-exp 的原话（『the log-sum-exp of the attention values』）、『used at 2 levels: within splits… and across splits』、A100 108 SM/batch=1 利用率 <1%、8×/50× 数字、微基准表（64k: 2300.6µs vs 64.4µs）、flash-attn ≥2.2 内置；页脚致谢含 Stanford CRFM 一行。"},
+        {"url": "https://arxiv.org/abs/2501.01005", "note": "抓取（2026-08-29 复核）：确认该 ID = FlashInfer（Zihao Ye/Lequn Chen/Ruihang Lai 等，2025-01-02 提交 v1，MLSys 2025 收录），即 vLLM merge_attn_states docstring 所引论文；摘要确认『integrated into leading LLM serving frameworks like SGLang, vLLM and MLC-Engine』（§2.2 的 LSE 合并细节在正文，摘要未展开）。"},
+        {"url": "instances/vllm/book/papers/ch24-primer-flash-attention/paper-fa2.md", "note": "FA-2 §3.2（2026-08-29 读毕）：外层序列维并行『embarrassingly parallel』、split-KV 机制。"}
+      ],
+      "confidence": "high",
+      "writer_note": "本章只在 cascade 决策（m08）和 merge_attn_states（m07）处需要这条谱系：正文点『FlashDecoding = 沿 KV 长度维再切一刀 + LSE 归约（PyTorch 博客 2023-10）』一句即可；**arXiv:2501.01005 = FlashInfer 论文（MLSys 2025）这个身份值得正文注明**——vLLM docstring 自引它，读者搜得到的正式出处；FlashInfer 作为竞争后端的全面对比是 ch21 的领地，本章勿越界。"
+    },
+    {
+      "id": "flashattention-version-family",
+      "term": "FlashAttention 版本族：FA-2 / FA-3 / FA-4",
+      "kind": "competing_set",
+      "one_line": "FlashAttention 不是一篇论文定终身，而是一族随 GPU 硬件代际演进的 kernel——FA-2 打底通用，FA-3 吃透 Hopper 的异步能力，FA-4 吃透 Blackwell 的非对称算力配比；数学骨架（分块 + online-softmax + 从不物化 N×N）三代从未变过。",
+      "what_it_is": "三代数学骨架一致（都是 online-softmax 分块递推），但工程实现按 GPU 代际重新设计，专啃当代硬件新给的能力。FA-2（arXiv:2307.08691，Tri Dao，2023-07）是本章详细推导的『通用款』：循环序对调（外层 Q 行块）+ 推迟归一化 + 只存 logsumexp L，任何支持 Tensor Core 的 GPU 都能跑。FA-3（arXiv:2407.08608，Jay Shah、Ganesh Bikshandi、Tri Dao 等，NVIDIA+Princeton，2024-07）专为 Hopper（H100）设计，三招：warp-specialization 让 Tensor Core 计算与 TMA 数据搬运异步重叠、把逐块 matmul 与 softmax 交错执行、用 FP8 低精度配合非相干处理（incoherent processing）降量化误差——H100 上比 FA-2 快 1.5-2.0×，FP16 达 740 TFLOPs/s（75% 利用率，FA-2 只有 35%），FP8 近 1.2 PFLOPs/s。FA-4（arXiv:2603.05451，Ted Zadouri、Markus Hoehnerbach、Tri Dao 等，2026-03）专为 Blackwell（B200/GB200）设计，应对『非对称硬件放大』（Tensor Core 吞吐翻倍、shared memory 带宽与指数运算单元却几乎不涨），用 CuTe-DSL（纯 Python 嵌入式 DSL，编译比 C++ 模板快 20-30×）重排流水线、以软件模拟的指数运算与条件化 softmax 重缩放削减非 matmul 操作——B200 上 BF16 达 1613 TFLOPs/s（71% 利用率），比 cuDNN 9.13 快至 1.3×。",
+      "background": "FlashAttention 系列由 Tri Dao 主导（FA-1 2022 Stanford → FA-2 2023 → FA-3 2024 与 NVIDIA 合作 → FA-4 2026），一路紧跟 NVIDIA GPU 代际（Ampere→Hopper→Blackwell）——每代新增的异步引擎与低精度支持都催生一次工程重做，但『分块 + online-softmax + 从不物化 N×N + LSE 存档/合并』的数学地基从未变过，这正是本章『论文数学』与『今天在跑的代码』的关系：FA-2 的 Alg.1 就是 vLLM 所用 kernel 的算法骨架，FA-3/FA-4 是同一骨架在两代新硬件上的工程翻新。vLLM 把三家都收进自带包（vllm.vllm_flash_attn），运行时按 SM 代际决议（本章站 2 的 get_flash_attn_version；后端之间的选择是 ch21 的主题——两级选择别混）。",
+      "alternatives": [
+        {"name": "FA-2（arXiv:2307.08691）", "distinctive": "通用款：循环序对调 + 推迟归一化 + 只存 logsumexp，任何 Tensor Core GPU 可跑", "when_to_choose": "非 Hopper/Blackwell 硬件的默认回退款；本章逐行推导的正是它"},
+        {"name": "FA-3（arXiv:2407.08608）", "distinctive": "warp-specialization 异步重叠 Tensor Core 与 TMA 搬运 + matmul/softmax 交错 + FP8（含非相干处理）", "when_to_choose": "Hopper（H100）硬件，吃透异步执行，比 FA-2 快 1.5-2.0×"},
+        {"name": "FA-4（arXiv:2603.05451）", "distinctive": "CuTe-DSL 重排流水线，软件模拟 exp + 条件化 softmax 重缩放削减非 matmul 运算，专治 Tensor Core/其余单元算力比失衡", "when_to_choose": "Blackwell（B200/GB200）硬件，补偿新一代硬件的非对称算力配比"}
+      ],
+      "links": [
+        "https://arxiv.org/abs/2307.08691",
+        "https://arxiv.org/abs/2407.08608",
+        "https://arxiv.org/abs/2603.05451",
+        "https://github.com/Dao-AILab/flash-attention"
+      ],
+      "sources": [
+        {"url": "https://arxiv.org/abs/2407.08608", "note": "抓取摘要页（2026-08-29 复核）：作者 Shah/Bikshandi/Zhang/Thakkar/Ramani/Dao，2024-07-11，三项技术、1.5-2.0×、740 TFLOPs/s(75%)、FP8 ~1.2 PFLOPs/s、FA-2 在 H100 仅 35% 利用率。"},
+        {"url": "https://arxiv.org/abs/2603.05451", "note": "抓取摘要页（2026-08-29 复核）：标题 Algorithm and Kernel Pipelining Co-Design for Asymmetric Hardware Scaling，2026-03-05，B200/GB200、CuTe-DSL（编译快 20-30×）、software-emulated exponential + conditional softmax rescaling、1613 TFLOPs/s（71%）、较 cuDNN 9.13 至 1.3×。"},
+        {"url": "https://arxiv.org/abs/2307.08691", "note": "抓取摘要页（2026-08-29）：Tri Dao 单作者 2023-07-17，~2× over FA、50-73% 理论峰值。"},
+        {"url": "instances/vllm/book/papers/ch24-primer-flash-attention/paper.md", "note": "FA-1 本地全文（2026-08-29 读毕）：血统源头（Ampere 时代，CUDA 实现、15%/3×/2.4× 训练提速）。"}
+      ],
+      "confidence": "high",
+      "writer_note": "本章 m11 只『一瞥』：一句『Hopper 优先 FA3、Blackwell 优先 FA4、其余回退 FA2，三代数学骨架一致只换工程』足够；FA-3/FA-4 的 warp/TMA/CuTe-DSL 细节点到链接即可，深入对比是 ch21 后端章的活。较 v2 卡修订：FA-4 表述从『FMA 多项式近似』校准为今日摘要原话『software-emulated exponential + conditional softmax rescaling』。"
+    },
+    {
+      "id": "triton-language",
+      "term": "Triton（GPU 内核编程语言）",
+      "kind": "external_project",
+      "one_line": "OpenAI 2021 年发布的 Python 化 GPU kernel 编程语言与编译器，让人不写 CUDA C++ 也能写出高性能内核；本章 ⊕ 算子的落地现场 merge_attn_states 的 Triton 版内核就是用它写的。",
+      "what_it_is": "Triton 让开发者用接近 Python 的语法在『tile（分块）』这一层描述计算，编译器自动处理线程索引、shared memory 管理、warp 级同步这些原本要手写 CUDA 才能碰的底层细节。官方例子：一个不到 25 行的 FP16 矩阵乘 kernel，性能就能打平 cuBLAS。它是 PyTorch 2.x torch.compile 默认的下层生成语言；对本章而言，vLLM 的 merge_attn_states 有 CUDA 自定义 kernel 与 Triton 回退两个实现（按平台/dtype/headdim 分派），⊕ 合并的那段 Triton 代码（tl.load/tl.exp/tl.maximum 级别的十来行）正是本章数学的最直白翻译——比 CUDA C++ 可读得多，这也正是选 Triton 写它的理由之一。",
+      "background": "由 Philippe Tillet 创建、2021 年 7 月由 OpenAI 开源发布，定位在『CUDA C++ 的极致性能』与『纯 Python 的可及性』之间找折中——研究者不需要 GPU 专家背景也能试验新算子。这与 FA 论文 §5 limitations 的痛点无缝衔接（『每个新注意力变体都要手写新 CUDA kernel』）：Triton 与 FA-4 所用的 CuTe-DSL 同属『高层 DSL 写 IO-aware kernel』一代方案；vLLM 生态大量算子（包括 PagedAttention 变体、merge kernel）都选它实现。（此条目自 v2 ch24 研究复用，出处 2026-07-24 已核；本章 anchor 到 v0.27.1 的 triton_merge_attn_states.py。)",
+      "links": [
+        "https://openai.com/index/triton/",
+        "https://github.com/triton-lang/triton"
+      ],
+      "sources": [
+        {"url": "https://openai.com/index/triton/", "note": "OpenAI 官方发布文章（2026-07-24 核实，v2 复用）：定位、2021 年发布、25 行打平 cuBLAS 的例子。2026-08-29 复核时该页 403，未能重抓；『2021/25 行』两断言仍以 v2 核实记录为准。"},
+        {"url": "https://github.com/triton-lang/triton", "note": "官方仓库（2026-07-24 核实，v2 复用；2026-08-29 复抓 README）：『a language and compiler for writing highly efficient custom Deep-Learning primitives』『write fast code at higher productivity than CUDA』；README 链向 MAPL2019 论文『Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations』（Tillet/Kung/Cox）——创建者血统一手确认。"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文读到 merge_attn_states 的 Triton 实现时括注一句『Triton = OpenAI 的 Python 化 GPU kernel 语言』即可；本章只借它的十来行代码当 ⊕ 的直白翻译，语言的深入留给 ch22（Triton GPU 端换算是那章主角之一）。"
+    }
+  ]
+}

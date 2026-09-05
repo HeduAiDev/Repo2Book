@@ -1,0 +1,600 @@
+{
+ "chapter_id": "ch20-flash-attention-math",
+ "chapter_title": "【primer】Flash-Attention 数学",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "kind": "primer",
+ "trace_environment": "本章为 primer 原理章:implementation/ 是论文忠实的 NumPy 参考实现(arXiv:1805.02867 / arXiv:2205.14135 / arXiv:2307.08691 三文,非 vLLM 源码减法,`python -m pytest tests/` 46 passed)。7 个驱动脚本全部 host `python`(Miniconda 3.11.11)纯 CPU 实跑,trace_source=run,脚本与原始输出在 explainer/traces/(无 vLLM 包、无 CUDA、无容器)。与 pin 真实运行环境的结构性差异(均就近标注,writer 需挑明):①数值取自 numpy float64——真实 GPU kernel 是 fp16/bf16 输入+fp32 累加,其 ulp 级数值行为不在本章取证范围;『精确相等』断言均为 float64 机器精度级(max|差| 4.4e-16~8.9e-16,见各 trace 的 *_diff_full 字段),Theorem 1 的『精确』是实数语义;②『HBM 访问』由 hbm_accesses_* 对 Algorithm 0/1 逐行元素级记账(可复算),非 profiler 实测;③A100 内存层级常量逐字取自论文(paper.md:L45),非本机硬件;④玩具例 softmax_scale 显式传 1.0 便于心算——pin 默认 1/sqrt(headdim)(vllm/vllm_flash_attn/flash_attn_interface.py:L285-L286),m07 的 query_offset 语义与 vLLM causal 右下对齐一致(docstring L224-L234 两原例)。",
+ "figure_policy": "dossier needs_figure=true 八机制 m01/m02/m04/m05/m06/m07/m08/m10 各配 1 张 figure_spec。本章 primer:无 L2 章图、无站号(FIGURE-SYSTEM §2『primer 章主体改为推导链图,顿悟头图风格沿 ch21 样板』)。每张 spec 的 l0_zoom 字段显式回答「它是 L0 哪一块的放大」:统一锚点 = L0 中列『GPU 执行臂』(gpu_column,绿色 C_GPU_S)第三块『模型层 forward + 编译』里 Attention 插座内的 attention kernel——即 ch19 捕进 CUDA graph 的那个不透明算子节点的内部(dossier hook)。推导链序:①带宽墙(m01)→②online-softmax 单遍递推(m02)→③⊕ 结合律(m03,无图)→④tiling 免物化(m04)→⑤IO 账(m05)→⑥FA-2 三改(m06)→⑦LSE 合并(m07)→⑧cascade 落地(m08);支线:分页 KV 读取(m10)= kernel 读侧穿过 A 列块池的页表,架构归属回指 L0。机制图用 l0_common 配色常量(GPU 执行臂恒绿),不引入第二种架构画法;vLLM 调用面图的架构内容回指 L0(ch19 L2 已含站 3『unified_attention_with_output 进图』即本章入口)。",
+ "symbol_table": [
+  {
+   "symbol": "N",
+   "meaning": "序列长度——一段 token 数;决定打分矩阵 S 是 N×N 的那个 N(N≫d 时 N² 项主导访存)。",
+   "first_use": "Alg.0 line 0『Q,K,V ∈ R^{N×d}』(arXiv:2205.14135 §2.2 开篇公式)",
+   "source": "arXiv:2205.14135 §2.2(§2.2 原例 N=1024)"
+  },
+  {
+   "symbol": "d",
+   "meaning": "头维度——每个 attention head 的向量长度(GPT-2 为 64、LLaMA 系多为 128);它既进 IO 账 Θ(N²d²/M) 又决定 softmax_scale 默认 1/sqrt(d)。",
+   "first_use": "Alg.0 line 0(arXiv:2205.14135 §2.2;§2.2 原例 d=64)",
+   "source": "arXiv:2205.14135 §2.2"
+  },
+  {
+   "symbol": "M",
+   "meaning": "片上 SRAM 的容量(以元素个数计的硬件常数,A100 每 SM 192KB)——块大小由它定(Bc=⌈M/4d⌉),IO 账的分母也是它。注意与 ⊕ 合并时取的 max 记号无关(撞名不同物)。",
+   "first_use": "Alg.1 line 0『on-chip SRAM of size M』",
+   "source": "arXiv:2205.14135 §3.1 Alg.1 line 0 + §3.2 Thm.2"
+  },
+  {
+   "symbol": "B_r",
+   "meaning": "Q 行块大小——一次搬上 SRAM 参与计算的 Q 子块行数;与 B_c 搭配限定片上打分块 S_ij 形状恰为 B_r×B_c 而非 N×N。B_r=min(⌈M/4d⌉,d)。",
+   "first_use": "Alg.1 line 1(arXiv:2205.14135 §3.1)",
+   "source": "arXiv:2205.14135 §3.1 Alg.1 line 1"
+  },
+  {
+   "symbol": "B_c",
+   "meaning": "K/V 列块大小——一次搬上 SRAM 的 K(和 V)子块行数(=打分块的列数);B_c=⌈M/4d⌉,工程上 FA-2 按 d 与 SMEM 取 {64,128}。",
+   "first_use": "Alg.1 line 1(arXiv:2205.14135 §3.1)",
+   "source": "arXiv:2205.14135 §3.1 Alg.1 line 1;arXiv:2307.08691 §3.2"
+  },
+  {
+   "symbol": "T_r / T_c",
+   "meaning": "Q 行块数 ⌈N/B_r⌉ 与 KV 列块数 ⌈N/B_c⌉——tiling 双循环的内外层次数;T_c 就是 Q 要被重过几遍的『遍数』,IO 账的主角。",
+   "first_use": "Alg.1 line 3(arXiv:2205.14135 §3.1)",
+   "source": "arXiv:2205.14135 §3.1 Alg.1 line 3"
+  },
+  {
+   "symbol": "m(x)",
+   "meaning": "一行分数的逐行最大值——softmax 数值稳定的平移基准:先减它,指数最大项恰为 1,不再上溢。",
+   "first_use": "§3.1 softmax 分解式 m(x):=max_i x_i(f(x)/ℓ(x) 同一组定义)",
+   "source": "arXiv:2205.14135 §3.1"
+  },
+  {
+   "symbol": "f(x)",
+   "meaning": "减完 max 的指数向量 [e^{x_1−m(x)},…,e^{x_B−m(x)}]——softmax 的分子;最大项=1,其余∈(0,1]。",
+   "first_use": "§3.1 softmax 分解式",
+   "source": "arXiv:2205.14135 §3.1"
+  },
+  {
+   "symbol": "ℓ(x)",
+   "meaning": "f(x) 的行和——softmax 的分母;FA 论文里 ℓ 同时是 tiling 递推的 running 状态(与 online-softmax 论文的 d 同一角色)。",
+   "first_use": "§3.1 softmax 分解式;Alg.1 line 10-11 作递推状态",
+   "source": "arXiv:2205.14135 §3.1"
+  },
+  {
+   "symbol": "m_j / d_j",
+   "meaning": "online-softmax 单遍递推的两个状态:扫到第 j 个元素为止的 running max,与『折算到当前 max 的指数和』。与 FA 论文的 (m_i,ℓ_i) 是同一对东西换了字母——两文异名同义,读者必须自带翻译。",
+   "first_use": "arXiv:1805.02867 §3 Algorithm 3 line 1-2 初始化(m_0=−∞,d_0=0)",
+   "source": "arXiv:1805.02867 §3 Alg.3 + Thm.1"
+  },
+  {
+   "symbol": "V(online-softmax 论文)",
+   "meaning": "向量长度(输入元素个数),Alg.1-3 的循环上界——注意与注意力的价值矩阵 V 撞名:凡写下标 V(如 m_V、d_V)指『扫完 V 个元素之后』,不是价值矩阵。",
+   "first_use": "arXiv:1805.02867 §2 Algorithm 1『for j ← 1,V』",
+   "source": "arXiv:1805.02867 §2"
+  },
+  {
+   "symbol": "⊕",
+   "meaning": "二元合并算子:[m_i;d_i]⊕[m_j;d_j]=[max(m_i,m_j); 两边各自折算到新 max 后相加]。它本质是『两堆账并到同一基准』,满足结合律+交换律——所以 softmax 归一化可任意分块、乱序归并,结果逐位不变。tiling 与 merge_attn_states 的合法性都从它来。",
+   "first_use": "arXiv:1805.02867 §3.1 Eq.(3) 链式展开与 Eq.(4) 定义",
+   "source": "arXiv:1805.02867 §3.1 Eq.(3)-(4)"
+  },
+  {
+   "symbol": "e^{m_{j-1}−m_j}",
+   "meaning": "rescale 折算项——旧账折算到新 max 的乘数:新最大值没变时=1(白折算),变大时<1(把旧账整体缩到新基准)。『记账时不知道全局最大,每来一个新最大就把旧账全部折算』的那一下。",
+   "first_use": "arXiv:1805.02867 §3 Alg.3 line 5(d_j ← d_{j-1}·e^{m_{j-1}−m_j} + e^{x_j−m_j})",
+   "source": "arXiv:1805.02867 §3 Alg.3 line 5"
+  },
+  {
+   "symbol": "S / P",
+   "meaning": "打分矩阵 S=QK^T 与权重矩阵 P=softmax(S)——标准实现里被物化到 HBM 的两张 N×N;『慢在搬运不在计算』的靶子,本章整个故事要消灭的就是这两张表的显存往返。",
+   "first_use": "arXiv:2205.14135 §2.2 首个注意力公式(S,P,O 三连)",
+   "source": "arXiv:2205.14135 §2.2 + Alg.0"
+  },
+  {
+   "symbol": "S_ij",
+   "meaning": "块打分 Q_iK_j^T ∈ R^{B_r×B_c}——只在 SRAM 里短暂存在的局部小表,最大也就 B_r×B_c;FA 全程从不拥有整张 N×N。",
+   "first_use": "Alg.1 line 9(arXiv:2205.14135 §3.1)",
+   "source": "arXiv:2205.14135 §3.1 Alg.1 line 9"
+  },
+  {
+   "symbol": "m̃_ij / P̃_ij / ℓ̃_ij",
+   "meaning": "(i,j) 块的局部统计:本块行最大、本块指数矩阵、本块行和——波浪号=「这一块的、还没合并的账」;随后经 ⊕ 并进 running (m_i,ℓ_i)。",
+   "first_use": "Alg.1 line 10(arXiv:2205.14135 §3.1)",
+   "source": "arXiv:2205.14135 §3.1 Alg.1 line 10"
+  },
+  {
+   "symbol": "m_i^{new} / ℓ_i^{new}",
+   "meaning": "行块 i 的 running 状态更新到新全局 max 之后的值:ℓ_new = e^{m_i−m_new}·ℓ_i + e^{m̃−m_new}·ℓ̃——正是 online-softmax 递推 d_j 换到矩阵上的形态。",
+   "first_use": "Alg.1 line 11(arXiv:2205.14135 §3.1)",
+   "source": "arXiv:2205.14135 §3.1 Alg.1 line 11"
+  },
+  {
+   "symbol": "O^{(j)}",
+   "meaning": "FA-2 的未归一化输出累加器:中间不除 ℓ,每来一块把旧账按 e^{m^{(j-1)}−m^{(j)}} 折算再累加 P̃V,收尾才除一次(Tweak 1)——省的是 A100 上贵 16 倍的非矩阵乘 FLOP。",
+   "first_use": "FA-2 Alg.1 line 5 初始化 / line 10 累加(arXiv:2307.08691 §3.1.1)",
+   "source": "arXiv:2307.08691 §3.1.1 Alg.1(Tweak 1)"
+  },
+  {
+   "symbol": "L = m + log(ℓ)",
+   "meaning": "logsumexp——把 (m,ℓ) 两个统计量压成一个标量(Tweak 2);vLLM flash_attn_varlen_func 的 return_softmax_lse 返回的正是它,是 cascade 拆段与一切合并操作的通用货币。",
+   "first_use": "FA-2 §3.1.1 Tweak 2『We only need to store the logsumexp L』",
+   "source": "arXiv:2307.08691 §3.1.1 Tweak 2;vllm/vllm_flash_attn/flash_attn_interface.py:L264-L268"
+  },
+  {
+   "symbol": "lse",
+   "meaning": "工程界对 logsumexp 的称呼(vLLM docstring: log of the softmax normalization factor)——每段部分注意力各带一个标量 lse,两段合并靠它算权重。",
+   "first_use": "vllm/vllm_flash_attn/flash_attn_interface.py:L264-L268 docstring『softmax_lse … log of the softmax normalization factor』",
+   "source": "vllm/vllm_flash_attn/flash_attn_interface.py:L264-L268"
+  },
+  {
+   "symbol": "p_se / s_se / out_se",
+   "meaning": "vLLM Triton merge kernel 的中间量:两段 lse 折算到 max_lse 之后的指数质量 e^{lse−max}(各≤1)与二者之和;合并权重=p_se/out_se——直观是『两段 softmax 归一化质量各占总盘子的比例』。",
+   "first_use": "vllm/v1/attention/ops/triton_merge_attn_states.py:L278-L290(p_se/s_se/out_se 逐行)",
+   "source": "vllm/v1/attention/ops/triton_merge_attn_states.py:L259-L322"
+  },
+  {
+   "symbol": "softmax_scale",
+   "meaning": "分数缩放因子,点积先乘它再进 softmax——默认 1/sqrt(headdim)(论文 τ『typically 1/sqrt(d)』);不缩放会让大 d 下点积方差随 d 增长、softmax 饱和。",
+   "first_use": "vllm/vllm_flash_attn/flash_attn_interface.py:L285-L286(默认值)",
+   "source": "arXiv:2205.14135 Appendix B.3(τ)+ vllm/vllm_flash_attn/flash_attn_interface.py:L285-L286"
+  },
+  {
+   "symbol": "query_offset",
+   "meaning": "因果掩码的右下对齐平移量:query 行 r 的全序列位置 = r + query_offset,keep[r,c] ⟺ c ≤ r+offset——decode 的 seqlen_q=1 落在最右列、prefill/decode 才能共用同一个 kernel。",
+   "first_use": "vllm/vllm_flash_attn/flash_attn_interface.py:L224-L234 docstring 两掩码原例(seqlen_q=2/seqlen_k=5 与 seqlen_q=5/seqlen_k=2)",
+   "source": "vllm/vllm_flash_attn/flash_attn_interface.py:L218-L269 docstring"
+  }
+ ],
+ "mechanisms": [
+  {
+   "mechanism_id": "ch20-m01",
+   "intuition": "softmax 行归一化要把一整行分数全部加起来,像图书馆必须把整页借齐才能点数;标准实现干脆把整页复印两遍(S、P 两张 N×N 表)摊在桌上(HBM)再拿起来算——桌子又大又慢(40-80GB @ 1.5-2.0TB/s),手边的小桌布(SRAM,192KB @ ~19TB/s)又小又快:时间都花在搬纸上,不在点数上。",
+   "figure_specs": [
+    {
+     "figure_id": "ch20-fig-bandwidth-wall",
+     "template": "flow",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』(gpu_column,绿色列)第三块『模型层 forward + 编译』内 Attention 插座里的 attention kernel——ch19 捕进 CUDA graph 的那个不透明算子节点的内部(dossier hook)。primer 推导链图第 ① 环:内存层级 → 为什么慢在搬运不在计算。",
+     "claim": "标准注意力 Alg.0 三步把 S=QK^T、P=softmax(S) 两张 N×N 写出 HBM 再读回,wall-clock 被 HBM 访存支配(SRAM 比 HBM 快 9.5-12.67 倍);同一份数学,vLLM 主路径一次 flash_attn_varlen_func 调用零张 N×N 物化。",
+     "numbers": [
+      {
+       "value": "A100 内存层级:HBM 40-80GB @ 1.5-2.0TB/s vs 片上 SRAM 每 SM 192KB × 108 个 @ ~19TB/s(带宽比 9.5-12.67 倍,总 SRAM 才 20736KB)",
+       "provenance": "traces/ch20_m01_materialization.json a100_memory_hierarchy_paper(论文原数字逐字:arXiv:2205.14135 §2.1, paper.md:L45)"
+      },
+      {
+       "value": "8K 上下文一个 head:一张表 8192×8192 = 67108864 元素(约 6700 万),fp16 下 134217728 字节≈134.2MB;S、P 两张共 134217728 元素、268435456 字节",
+       "provenance": "traces/ch20_m01_materialization.json N8192_one_head(materialized_intermediate_elements 实算)"
+      },
+      {
+       "value": "GPT-2 尺寸(N=1024, d=64):两张表 2097152 元素、fp16 4194304 字节",
+       "provenance": "traces/ch20_m01_materialization.json N1024_gpt2;尺寸原例 arXiv:2205.14135 §2.2(paper.md:L68 'for GPT2, N=1024 and d=64')"
+      },
+      {
+       "value": "对照物:vLLM 主路径一次 flash_attn_varlen_func 调用 = 一个融合 kernel,物化 N×N 表 0 张",
+       "provenance": "traces/ch20_m01_materialization.json vllm_call_site_contrast + vllm/v1/attention/backends/flash_attn.py:L1041-L1066(dossier embed_excerpts[15])"
+      },
+      {
+       "value": "算术强度判据:大内维 GEMM 是 compute-bound,softmax 本尊(elementwise/reduction)是 memory-bound——kernel fusion 是 memory-bound 的常规武器,但朴素融合救不了注意力:中间结果太大必须落 HBM,除非不物化",
+       "provenance": "arXiv:2205.14135 §2.1(paper.md:L49-L56,dossier theory[0])"
+      }
+     ],
+     "caption_draft": "慢在搬运不在计算(arXiv:2205.14135 §2.1-2.2):A100 上 SRAM 比 HBM 快约一个数量级(19 vs 1.5-2.0TB/s)却小三个数量级(合计 192KB×108=20736KB vs 40-80GB,约 2000-4000 倍);标准注意力的三步实现把 S、P 两张 N×N 写出再读回——8K 上下文一个 head 就是两张 134MB 的表在显存里往返,wall-clock 被 HBM 带宽卡死。vLLM 调用面(flash_attn.py:L1041-L1066)一次调用零物化:这正是本章要讲清的 kernel 的内部。",
+     "illustrator_notes": "左右双栏 flow:左栏 GPU 内存层级竖剖(HBM 大水池 vs 108 个 SRAM 小格,带宽/容量数字上标);右栏 Alg.0 三步流水(Q,K → [写 S 67108864 元素] → HBM → [读 S 写 P] → HBM → [读 P,V] → O),两次 HBM 往返用粗箭头强调;右下角虚线对照『vLLM 一次调用:S/P 只在 SRAM 以块存在,0 张落 HBM』。配色用 l0_common(GPU 绿为主角色色);数字全部取自 traces/ch20_m01_materialization.json。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch20-m02",
+   "intuition": "记账时不知道全场最大额,就每来一笔先问『是不是新最大』:是,就把旧账全部按新旧最大额之差折算(e^{旧max−新max},新最大额更大所以折算因子<1,旧账缩水到新基准),再记新账——一本账单遍扫完,恰好等于先扫一遍找最大值、再扫一遍求和的 safe softmax 分母。",
+   "worked_example": {
+    "params": {
+     "输入向量 x": "[1, 3, 2, 5, 4](5 个一位数,读者可心算;max 两次上移:j=2 时 1→3、j=4 时 3→5,各触发一次非平凡折算 e^{-2}=0.1353;j=3、j=5 max 不变,折算=1,对照分支)",
+     "三版对照": "naive(两遍,无平移,会溢出)→ safe(三遍,减 max)→ online(单遍,running (m,d))",
+     "溢出演示": "x=[1000, 1001] 在 float64 上 e^1000=inf,naive 得 inf/inf=nan;safe/online 先减 max=1001,最大项 e^0=1 不溢出",
+     "访存账": "safe 三遍=每元素 4 次访存,online 单遍=每元素 3 次(arXiv:1805.02867 §2-§3 原话)"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch20_m02_online_softmax.json",
+    "table": {
+     "columns": ["轮 j", "来访 x_j", "旧 max m_{j-1}", "新 max m_j", "折算项 e^{m_{j-1}-m_j}", "旧账折算后 d_{j-1}×折算", "新项 e^{x_j-m_j}", "新账 d_j", "界 1≤d_j≤j"],
+     "rows": [
+      ["1", "1", "−∞(初始 m_0)", "1.0", "—(首步无旧账)", "0", "1.0", "1.0", "✓(1≤1.0≤1)"],
+      ["2", "3", "1.0", "3.0", "0.1353", "0.1353", "1.0", "1.1353", "✓(1≤1.1353≤2)"],
+      ["3", "2", "3.0", "3.0", "1.0(max 未变,白折算)", "1.1353", "0.3679", "1.5032", "✓(1≤1.5032≤3)"],
+      ["4", "5", "3.0", "5.0", "0.1353", "0.2034", "1.0", "1.2034", "✓(1≤1.2034≤4)"],
+      ["5", "4", "5.0", "5.0", "1.0(max 未变)", "1.2034", "0.3679", "1.5713", "✓(1≤1.5713≤5)"],
+      ["末值核验", "safe 三遍法", "m_V=5.0", "d_V=1.5713", "online 末值恒等(Thm.1)", "y_i=e^{x_i−m_V}/d_V", "三版 y 逐项相同", "max|差|=0.0", "溢出对照 x=[1000,1001]:naive→nan;safe/online→0.2689/0.7311"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "单遍递推的末值 (m_V, d_V) 与三遍 safe softmax 恒等(Theorem 1),且全程 1≤d_j≤j 不溢出。",
+    "argument": "归纳:记 S_j={x_1..x_j}。基例 j=1:m_1=x_1,d_1=e^0=1=Σ_{k≤1}e^{x_k−m_1}。归纳步:若 d_{j-1}=Σ_{k<j}e^{x_k−m_{j-1}},则 d_j=d_{j-1}·e^{m_{j-1}−m_j}+e^{x_j−m_j}=Σ_{k≤j}e^{x_k−m_j}——旧账每一项恰好折算到新基准。末态即 safe softmax 的分母。界:每项 e^{x_k−m_j}≤1(因 m_j≥x_k)且最大项=1,故 1≤d_j≤|S_j|=j;单调量 m_j 不减;循环 j=1..V 有限步终止。"
+   },
+   "quantified": "本例 V=5:两处非平凡折算(0.1353=e^{-2})都把旧账缩水到 13.53%;safe 每元素 4 次访存 vs online 3 次——一行 8192 个分数的 decode 行,softmax 归一化统计从 32768 次元素访问降到 24576 次(省 25%,arXiv:1805.02867 §3 原话 'from 4 down to 3');更重要的是 d_j≤j 的界保证 32 位浮点能处理 1.7×10^37 个元素不溢出(论文 §3 数值界)。",
+   "figure_specs": [
+    {
+     "figure_id": "ch20-fig-online-softmax-recurrence",
+     "template": "state-table",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』(gpu_column 绿列)第三块『模型层 forward + 编译』内 attention kernel 的数学内部。primer 推导链图第 ② 环:kernel 每次只看得见一小块分数,却要算整行 softmax 的分母——地基就是这张单遍递推表。",
+     "claim": "running (m_j,d_j) 单遍递推:每来一个新元素,旧账先按 e^{旧max−新max} 折算到新基准再累加新项——末值与三遍 safe softmax 恒等(Theorem 1),5 元素实例可整表心算核验。",
+     "numbers": [
+      {
+       "value": "5 轮递推全表:j=1..5,折算项 0.1353/1.0/0.1353/1.0,新项 1.0/1.0/0.3679/1.0/0.3679,新账 1.0/1.1353/1.5032/1.2034/1.5713",
+       "provenance": "traces/ch20_m02_online_softmax.json online_recurrence.steps"
+      },
+      {
+       "value": "三版末值恒等:naive=safe=online=[0.0117, 0.0861, 0.0317, 0.6364, 0.2341],max|差|=0.0",
+       "provenance": "traces/ch20_m02_online_softmax.json three_versions"
+      },
+      {
+       "value": "溢出对照:x=[1000,1001] 上 naive 得 [nan, nan](e^1000=inf,inf/inf),safe/online 得 [0.2689, 0.7311]",
+       "provenance": "traces/ch20_m02_online_softmax.json overflow_demo"
+      },
+      {
+       "value": "遍数账:safe 3 遍/每元素 4 次访存 → online 统计量 1 遍/每元素 3 次",
+       "provenance": "traces/ch20_m02_online_softmax.json safe_softmax_stats + online_softmax_stats_meta(arXiv:1805.02867 §2-§3 原话)"
+      },
+      {
+       "value": "vLLM 落地照应:merge kernel 的 max_lse 稳定化(triton_merge_attn_states.py:L278-L284)是同一数学在 log 域的化身",
+       "provenance": "vllm/v1/attention/ops/triton_merge_attn_states.py:L259-L284(dossier embed_excerpts[19] / ch20-m02 source_anchors)"
+      }
+     ],
+     "caption_draft": "单遍算出 softmax 分母(arXiv:1805.02867 §3 Alg.3):naive 两遍会溢出(e^1000=inf),safe 减 max 稳定但要三遍;online 把『找最大』与『求和』融合成一遍——每来一个新最大,旧账按 e^{旧max−新max} 折算(本例两次 0.1353=e^{-2})。5 元素实例末值 (m,d)=(5.0,1.5713) 与三遍法逐位相同;这一页数学就是 FlashAttention 分块 softmax 的地基,vLLM merge kernel 的 max_lse 稳定化是它换到 log 域的同一招。",
+     "illustrator_notes": "主体=六列状态表(轮次/来访/旧max→新max/折算项/旧账折算/新账),两行折算事件(0.1353)用高亮底色+放大镜标注『旧账缩水』,两行=1.0 标注『白折算』;表下三条小条带:naive 溢出([nan,nan])、三版末值恒等、4→3 次访存。数字全部取自 traces/ch20_m02_online_softmax.json。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch20-m03",
+   "intuition": "⊕ 不是加法,是『并集』:每个状态 (m,d) 是一堆指数账目的规范摘要(以 m 为基准的总额),两个状态合并就是把两堆账先折算到同一基准再并账——并账天然满足结合律和交换律,所以怎么分块、按什么顺序合并,末账都一模一样。",
+   "worked_example": {
+    "params": {
+     "输入": "x=[1, 3, 2, 5, 4](与 m02 同一向量,衔接递推直觉)",
+     "分块方案 A": "[1,3] | [2,5] | [4],顺序归并 ((b1⊕b2)⊕b3)——Eq.(3) 从左到右",
+     "乱序对照": "(b3⊕b2)⊕b1——交换律;换括号对照:[1,3,2] | [5,4]——结合律",
+     "论文声明": "arXiv:1805.02867 §3.1 'The operation ⊕ is associative … also commutative'(论文自述省略证明,这里以数值实例验证;不变量给证明骨架)"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch20_m03_merge_op.json",
+    "table": {
+     "columns": ["归并路径", "局部状态 (m,d)", "合并步骤", "末态 (m,d)", "与顺序单遍相等?"],
+     "rows": [
+      ["基准:顺序单遍(不分块)", "逐元素 5 步递推(m02 表)", "—", "(5.0, 1.5713)", "—(基准)"],
+      ["分块 A 顺序归并 (b1⊕b2)⊕b3", "(3.0,1.1353)、(5.0,1.0498)、(4.0,1.0)", "(3.0,1.1353)⊕(5.0,1.0498)→(5.0,1.2034);⊕(4.0,1.0)→(5.0,1.5713)", "(5.0, 1.5713)", "✓(差 0.0)"],
+      ["乱序归并 (b3⊕b2)⊕b1", "同上三块,顺序颠倒", "(4.0,1.0)⊕(5.0,1.0498)→(5.0,1.4177);⊕(3.0,1.1353)→(5.0,1.5713)", "(5.0, 1.5713)", "✓(差 0.0)"],
+      ["换括号 [1,3,2] | [5,4]", "(3.0,1.5032)、(5.0,1.3679)", "(3.0,1.5032)⊕(5.0,1.3679)→(5.0,1.5713)", "(5.0, 1.5713)", "✓(差 0.0)"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "⊕ 满足结合律与交换律;任何分块方式、任何归并顺序的末值都等于一遍顺序递推的末值(实跑 4 条路径差 0.0)。",
+    "argument": "关键换元:每个可达状态 (m,d) 与一个多重集 S 一一对应——m=max(S),d=Σ_{x∈S}e^{x−m}(同一 S 只有一个规范摘要)。基例:单元素块 {x} ↦ (x, 1)。归纳步:⊕((m_i,d_i),(m_j,d_j)) 的 m'=max(S_i∪S_j)、d' 恰为并集在新基准下的和——即 ⊕ 就是多重集并集换了记号。并集满足结合律+交换律 ⇒ ⊕ 亦然;末值恒等即 m02 的 Theorem 1 递推恒等式。"
+   },
+   "quantified": "3 块 2 次合并 = 5 步顺序递推的同一末态 (5.0,1.5713);乱序与顺序的中间态各不相同(1.4177 vs 1.2034)而末态相同——并行分块、乱序归并不改变结果的实感来源;2 条请求共享前缀时(vLLM cascade)靠的就是这条:前缀段与后缀段任意先后算、再 ⊕,仍与一口气算逐位相等。",
+   "writer_note": "无图机制(FIGURE-SYSTEM:Eq.3 链式展开值得正文画成小图的话,由 writer 以行内推导呈现,不另立 figure-spec)。建议正文给『状态=多重集摘要』这一句换元——它就是被论文省略的证明本体。"
+  },
+  {
+   "mechanism_id": "ch20-m04",
+   "intuition": "走楼梯式算账:每搬一小块 K/V 上 SRAM,就把手上那份『部分注意力』先折算到新最大值、再累加这一块的贡献——桌面上始终只有 2×2 的草稿,从不需要铺开 4×4 的整张表;走完所有块,手里的答案就是教科书 softmax(QK^T)V。",
+   "worked_example": {
+    "params": {
+     "N": "4(token),d=2,分块 B_r=B_c=2(T_r=T_c=2,2×2 分块)",
+     "Q": "[[1,0],[0,1],[1,1],[2,0]]",
+     "K": "[[1,0],[0,1],[1,1],[0,2]]",
+     "V": "[[1,2],[3,4],[5,6],[7,8]]",
+     "softmax_scale": "显式传 1.0(默认 1/sqrt(d)=1/sqrt(2) 会引入无理数中间值;默认语义在 m09 讲,pin 出处 flash_attn_interface.py:L285-L286)",
+     "循环序": "外层 KV 列块 j(Alg.1 line 5)、内层 Q 行块 i(line 7)——原始 FA 序;FA-2 对调见 m06",
+     "非退化性": "行1/行2 的 max 在第二个 KV 块从 1.0 上移到 2.0,折算 e^{-1}=0.3679(两行真实折算事件);行0/行3 max 不变(白折算对照)"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch20_m04_fa_tiling.json",
+    "table": {
+     "columns": ["块步 (j,i)", "query 行", "旧 m → 新 m", "折算 e^{旧−新}", "ℓ_new", "O 行(该步写回,已归一化)", "与只看已见 KV 的朴素版 max|差|"],
+     "rows": [
+      ["(0,0) 块 S=[[1,0],[0,1]]", "行0", "−∞→1.0(首块初始化)", "—(旧账为 0)", "1.3679", "[1.5379, 2.5379]", "0.0"],
+      ["(0,0)", "行1", "−∞→1.0", "—", "1.3679", "[2.4621, 3.4621]", "0.0"],
+      ["(0,1) 块 S=[[1,1],[2,0]]", "行2", "−∞→1.0", "—", "2.0", "[2.0, 3.0]", "0.0"],
+      ["(0,1)", "行3", "−∞→2.0", "—", "1.1353", "[1.2384, 2.2384]", "0.0"],
+      ["(1,0) 块 S=[[1,0],[1,2]]", "行0", "1.0→1.0", "1.0(max 未变)", "2.7358", "[3.5379, 4.5379]", "0.0"],
+      ["(1,0)", "行1", "1.0→2.0", "0.3679(旧账缩水)", "1.8711", "[5.3864, 6.3864]", "0.0"],
+      ["(1,1) 块 S=[[2,2],[2,0]]", "行2", "1.0→2.0", "0.3679", "2.7358", "[4.9242, 5.9242]", "0.0"],
+      ["(1,1)", "行3", "2.0→2.0", "1.0", "2.2707", "[3.2384, 4.2384]", "0.0"],
+      ["终验(全部块完)", "4 行", "—", "—", "—", "FA_O 与 standard_O 逐行相同", "0.0(机器精度级求和顺序差)"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "每处理完一个 (j,i) 块,该行块的 O 恰为『只看已见过的 K/V(前 kv_end 个)』的朴素注意力输出(『至今为止的正确答案』);片上打分块形状至多 B_r×B_c=2×2,整张 4×4 的 S/P 从未存在;终值精确等于 softmax(QK^T)V(Theorem 1)。",
+    "argument": "沿块列 j 归纳:基例 j=0 即第一块的局部 softmax(实跑核验差 0.0)。归纳步 = m02 的 d_j 恒等式在输出端的化身:旧 O 按 e^{m−m_new} 折算、新块贡献 e^{m̃−m_new}P̃V 累加、除以 ℓ_new 还原归一化——running (m_i,ℓ_i,O_i) 始终是已见 KV 集合的规范摘要(m03 的多重集换元),换新块=并集。物化上界:实跑记录的 S 块最大形状=(2,2)(return_max_block_shape),从未创建 4×4;外层 T_c=2 × 内层 T_r=2 共 4 步,有限终止。"
+   },
+   "quantified": "2×2 分块 4 步递推,每步片上打分块至多 2×2=4 元素 vs 整表 4×4=16 元素;两处真实折算事件 0.3679=e^{-1}(行1、行2 的旧账缩水到 36.79%);终值与朴素注意力 max|差|=0.0(float64 求和顺序差 8.88e-16 级,trace max_abs_diff_full)。Theorem 1 的量化面:FLOP 仍是 O(N²d)(没有省算力),省的是两张 N×N 的显存与往返——省的量在 m05 记账。",
+   "figure_specs": [
+    {
+     "figure_id": "ch20-fig-fa-tiling",
+     "template": "tiling",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』(gpu_column 绿列)第三块『模型层 forward + 编译』内 attention kernel 的循环内部。primer 推导链图第 ④ 环:把 m02 的单遍递推装进双循环——SRAM 里的 2×2 小表与永不落地的 N×N 大表同框对照。",
+     "claim": "FA tiling:外层搬 KV 块、内层过 Q 块,片上只存在 B_r×B_c=2×2 的 S_ij 与局部 softmax,running (m,ℓ,O) 逐块折算-累加——4×4 的 S/P 整表从头到尾不存在,输出却与朴素实现逐位相同(Theorem 1)。",
+     "numbers": [
+      {
+       "value": "2×2 分块下片上最大块形状=(2,2),整表应为(4,4)——实跑 return_max_block_shape 断言",
+       "provenance": "traces/ch20_m04_fa_tiling.json max_S_block_shape_ever_created"
+      },
+      {
+       "value": "折算事件:(1,0) 步行1 与 (1,1) 步行2 均为 m 1.0→2.0、折算 0.3679、ℓ 1.3679→1.8711(行1)",
+       "provenance": "traces/ch20_m04_fa_tiling.json tiling_steps[2].rows[1] / tiling_steps[3].rows[0]"
+      },
+      {
+       "value": "每步『至今为止的正确答案』:4 个块步的 O 与朴素版(只看已见 KV)max|差|全部 0.0;终值 FA_O=standard_O 逐行相同",
+       "provenance": "traces/ch20_m04_fa_tiling.json per_step_correctness_checks + final"
+      },
+      {
+       "value": "算法出处:Alg.1 line 9-13(S_ij 片上算→局部 (m̃,P̃,ℓ̃)→running 更新→O 折算累加写回);line 1 块尺寸 Bc=⌈M/4d⌉、Br=min(⌈M/4d⌉,d)",
+       "provenance": "arXiv:2205.14135 §3.1 Algorithm 1(dossier embed_excerpts[4], paper.md:L128-L162)"
+      },
+      {
+       "value": "vLLM 对照:flash_attention_forward 的参考实现即 implementation/flash_attention.py:L104-L185(带 trace 参数逐步记快照)",
+       "provenance": "instances/vllm/artifacts-v3/ch20-flash-attention-math/implementation/flash_attention.py:L104-L185(# PAPER: §3.1 Algorithm 1 lines 2-16 + Theorem 1)"
+      }
+     ],
+     "caption_draft": "免物化的走法(arXiv:2205.14135 §3.1 Alg.1):Q/K/V 切块进 SRAM,外层 KV 列块、内层 Q 行块;每个 (i,j) 块在片上算 S_ij(至多 2×2)、局部 softmax,再把 running (m,ℓ,O) 折算-累加到新全局 max——旧 O 乘 e^{旧max−新max}(本例 0.3679)再加新块贡献。S/P 两张 N×N 从不落 HBM、整个注意力融成一个 kernel;Theorem 1 保证任意合法分块输出精确等于 softmax(QK^T)V(实跑逐行核验差 0.0)。",
+     "illustrator_notes": "主体 tiling 网格:左侧 4×4 的大格盘(S/P 整表)以虚影呈现并打叉『从未存在』;右侧同尺寸格盘上是双循环动画式分解——外层 j 沿列推进(KV 块着色)、内层 i 沿行(Q 块),当前 (j,i) 高亮为 2×2 实心小块+片上三件套标注 (m̃,P̃,ℓ̃)→(m,ℓ,O 折算 0.3679)。底部一条 4 步时间线对应表 rows。数字全部取自 traces/ch20_m04_fa_tiling.json。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch20-m05",
+   "intuition": "搬家的账要算趟数:标准版把两张 N×N 大桌子搬进搬出三次;FA 只把 K/V 各搬一次,再把轻的 Q/O/统计量来回搬 ⌈N/B_c⌉ 趟——块越大趟数越少,但桌布(SRAM)就那么大,再大下去算力反而成了瓶颈。",
+   "worked_example": {
+    "params": {
+     "N": "1024,d=64(GPT-2 头维原例,arXiv:2205.14135 §2.2 'for GPT2, N=1024 and d=64')",
+     "B_c 扫描": "64 / 128 / 256——T_c=⌈N/B_c⌉ = 16 / 8 / 4 趟,B_c 每翻倍趟数减半",
+     "计数口径": "元素级精确计数(非 Θ 记号):Alg.0 三步各读/写;FA 侧外层每 j 搬一次 K_j,V_j(合计恰好整个 K,V 各一遍)+ 每遍重过 Q,O,ℓ,m",
+     "块尺寸规则": "论文 Alg.1 line 1:Bc=⌈M/4d⌉;M≈100KB(按 fp16 元素计 51200)时代入 Bc=200——工程上 FA-2 取 {64,128}(视 d 与 SMEM,arXiv:2307.08691 §3.2)"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch20_m05_io_accounting.json",
+    "table": {
+     "columns": ["实现版本", "B_c", "KV 过手趟数 T_c", "逐步访存(元素)", "HBM 访问总计(元素)", "标准:该版", "物化 N×N 表(元素)"],
+     "rows": [
+      ["标准 Alg.0(三步)", "—", "3 步各读写整表", "1179648 + 2097152 + 1179648", "4456448", "—(基准)", "2097152(S、P 各一张)"],
+      ["FlashAttention", "64", "16", "131072 + 16×200704", "3342336", "1.3333", "0(免物化)"],
+      ["FlashAttention", "128", "8", "131072 + 8×200704", "1736704", "2.566", "0(免物化)"],
+      ["FlashAttention", "256", "4", "131072 + 4×200704", "933888", "4.7719", "0(免物化)"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "在放得进 SRAM 的范围内,B_c 增大 → HBM 访问严格减少(实跑 3342336>1736704>933888);标准版被 Ω(N²) 的两张 N×N 物化顶住下不来;Prop.3:对 M∈[d,Nd] 全域,不存在 o(N²d²/M) 的精确注意力算法——FA 渐进最优。",
+    "argument": "单调量:T_c=⌈N/B_c⌉ 随 B_c 单调不增,而每遍搬运量(3Nd+4N 个元素:读 Q,O,ℓ,m 再写回)与 B_c 无关 → 总访问 = 2Nd + T_c·(3Nd+4N) 随 B_c 单调不增。标准版下界:softmax 行归一化需要整行分数,朴素实现无处安放只能物化两张 N×N,读写至少各一遍 → Ω(N²)。Θ 记号对账:B_c=Θ(M/4d) 代入,趟数 Θ(Nd/M) × 每趟 Θ(Nd) = Θ(N²d²/M)(Thm.2 证明骨架)。Prop.3 归约到 M=Θ(Nd) 时任何算法必须 Ω(Nd) 访问。"
+   },
+   "quantified": "N=1024、d=64:B_c=128 时标准版是 FA 的 2.566 倍访存;额外内存 2×1024=2048 个统计元素(m,ℓ) vs 2097152 元素的两张表(约 1024 倍差);B_c 64→128→256,趟数 16→8→4、访存 3342336→1736704→933888——但论文 Fig.2 中图实测 B_c>256 后收益封顶(算力成瓶颈),块再大也放不进 SRAM。",
+   "figure_specs": [
+    {
+     "figure_id": "ch20-fig-io-accounting",
+     "template": "before-after",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』(gpu_column 绿列)第三块『模型层 forward + 编译』内 attention kernel 的访存账。primer 推导链图第 ⑤ 环:同一段 HBM↔SRAM 通道上,两种搬法的趟数差。",
+     "claim": "N=1024、d=64 的精确元素级记账:标准 Alg.0 三步 4456448 次访存+物化 2097152 元素;FA 一趟 KV+T_c 趟轻统计量,B_c=128 时 1736704 次(标准:FA=2.566)、B_c=256 时 933888 次(4.7719)——块越大趟数越少,但受 SRAM 容量与算力双重封顶。",
+     "numbers": [
+      {
+       "value": "标准三步账:读 QK 写 S 1179648 + 读写 S/P 2097152 + 读 PV 写 O 1179648 = 4456448 元素;两张 N×N 物化 2097152 元素",
+       "provenance": "traces/ch20_m05_io_accounting.json standard_attention(hbm_accesses_standard 按 Alg.0 逐行计数)"
+      },
+      {
+       "value": "FA 扫描账:B_c=64/128/256 → 趟数 16/8/4,外层 KV 恰一遍 131072,每趟 200704,总计 3342336/1736704/933888;比值 1.3333/2.566/4.7719",
+       "provenance": "traces/ch20_m05_io_accounting.json flash_sweep(hbm_accesses_flash 按 Alg.1 逐行计数)"
+      },
+      {
+       "value": "单调性实跑断言:B_c 64→128→256 访问严格递减(monotone_more_Bc_less_access=true)",
+       "provenance": "traces/ch20_m05_io_accounting.json monotone_more_Bc_less_access"
+      },
+      {
+       "value": "内存脚印对照:标准物化 fp16 4194304 字节 vs FA 额外统计量 m,ℓ 共 2048 元素/4096 字节(Theorem 1 的 O(N) 额外内存)",
+       "provenance": "traces/ch20_m05_io_accounting.json memory_footprint_N1024"
+      },
+      {
+       "value": "定理与下界:Thm.2 Θ(Nd+N²) vs Θ(N²d²M^{-1});Prop.3 对 M∈[d,Nd] 无渐进更优;块大小封顶实测见 FA 论文 Fig.2 中图(B_c>256 收益封顶)",
+       "provenance": "arXiv:2205.14135 §3.2 Theorem 2 + Proposition 3(paper.md:L174-L190,dossier embed_excerpts[5])"
+      },
+      {
+       "value": "工程化身:FA3 的 host 侧 get_scheduler_metadata(flash_attn_interface.py:L122-L173、builder L515-L541)就是 tile/split 计账的落地——数学与工程对上",
+       "provenance": "vllm/vllm_flash_attn/flash_attn_interface.py:L122-L173 + vllm/v1/attention/backends/flash_attn.py:L515-L541(dossier ch20-m05 note)"
+      }
+     ],
+     "caption_draft": "为什么快:数趟数不数算力(arXiv:2205.14135 §3.2 Thm.2)。N=1024、d=64 元素级精算:标准实现三步 4456448 次访存、还要物化两张共 2097152 元素的 N×N;FA 只把 K/V 各搬一遍(131072),再把轻的 Q/O/ℓ/m 来回搬 ⌈N/B_c⌉ 趟——B_c=128 时 1736704 次(2.566 倍差)、256 时 933888 次(4.7719 倍)。B_c 再大受 SRAM 容量与算力双重封顶;Prop.3 证明这个 Θ(N²d²/M) 在 M∈[d,Nd] 全域渐进最优,没有更聪明的精确算法。",
+     "illustrator_notes": "左右 before/after:左=标准版三条粗 HBM 通道(三步各读写整表,两张 N×N 方块堆在 HBM 侧,总计 4456448);右=FA 一条粗通道(K/V 一遍)+ 细通道循环箭头标趟数(B_c=64/128/256 三行对比条:16/8/4 趟,总访问条形递减)。底部内存脚印小条:2097152 元素 vs 2048 元素。数字全部取自 traces/ch20_m05_io_accounting.json。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch20-m06",
+   "intuition": "同一份数学、两种排班表:FA 让每个 KV 工位等所有 Q 小组轮流上门;FA-2 让每个 Q 小组承包自己的行块从头干到尾——小组之间零通信,长序列小 batch 时 GPU 上的工位(线程块)全开,还能顺手把因果线右上方整块没活的格子直接划掉。",
+   "figure_specs": [
+    {
+     "figure_id": "ch20-fig-fa2-loop-order",
+     "template": "before-after",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』(gpu_column 绿列)第三块『模型层 forward + 编译』内 attention kernel 的调度形态。primer 推导链图第 ⑥ 环:今天 vLLM 真正在跑的 kernel(FA2/FA3/FA4)即 FA-2 变体——论文数学与在跑代码的接口。",
+     "claim": "FA-2 三处工程榨取同一份数学:(1) 循环序对调,外层 Q 行块跨线程块并行;(2) O 中间不除 ℓ、收尾只除一次——避开 A100 上贵 16 倍的非矩阵乘 FLOP;(3) 只存 logsumexp L=m+log(ℓ) 一个统计量(vLLM return_softmax_lse 拿到的正是它);外加因果掩码整块跳过(1.6-1.78 倍工作量红利)。",
+     "numbers": [
+      {
+       "value": "non-matmul 差价:A100 FP16/BF16 matmul 312 TFLOPs/s vs 非 matmul FP32 19.5 TFLOPs/s——每个非矩阵乘 FLOP 贵 16 倍",
+       "provenance": "arXiv:2307.08691 §3.1(paper-fa2.md:L126,dossier theory[5])"
+      },
+      {
+       "value": "因果整块跳过实测(参考实现计数):N=8、B=2 时 16 块全访问 vs FA-2 只访 10 块(1.6 倍);N=64、B=8 时 64 vs 36(1.7778 倍)——已进入论文 1.7-1.8 倍区间,N→∞ 趋近 2 倍;两版输出对标准注意力 allclose",
+       "provenance": "traces/ch20_m06_causal_blocks.json cases + paper_reference(arXiv:2307.08691 §3.1.1 Causal masking, paper-fa2.md:L207)"
+      },
+      {
+       "value": "Tweak 2 原话:不必同时存 max 与 sum,只需 logsumexp L^{(j)}=m^{(j)}+log(ℓ^{(j)})——vLLM flash_attn_varlen_func 的 return_softmax_lse 返回的正是它",
+       "provenance": "arXiv:2307.08691 §3.1.1 Tweak 2(paper-fa2.md:L146-L147,dossier embed_excerpts[7])+ vllm/vllm_flash_attn/flash_attn_interface.py:L264-L268"
+      },
+      {
+       "value": "综合收益:FA-2 约 2 倍于 FA(前向 1.3-1.5 倍于 Triton 版;对标准实现最高 10 倍),A100 上达 230 TFLOPs/s(73% 理论峰值)",
+       "provenance": "arXiv:2307.08691 §3.3/§4(paper-fa2.md:L319、L325)"
+      },
+      {
+       "value": "warp 分工一句话:split-K → split-Q,免 shared-memory 通信(§3.3);FA-2 line 10 的缩放方向按论文自身不变式修正(旧账乘 e^{m^{(j-1)}−m^{(j)}} 折算,原文印刷有误)——见 impl-notes『FA-2 line 10 方向修正』",
+       "provenance": "arXiv:2307.08691 §3.3 + implementation/flash_attention.py:L188-L200 docstring + impl-notes.md『取舍与实现说明』"
+      }
+     ],
+     "caption_draft": "同一份数学的三处工程榨取(arXiv:2307.08691 §3.1-3.3):(1) 循环序对调——外层改 Q 行块,行块间 embarrassingly parallel,长序列小 batch 也能占满 108 个 SM;(2) 中间 O 保持未归一化、收尾只除一次 ℓ——A100 上非矩阵乘 FLOP 贵 16 倍(312 vs 19.5 TFLOPs/s),省掉的是每块一次的除法;(3) 只存 logsumexp L=m+log(ℓ)——vLLM return_softmax_lse 拿到的就是它,cascade 与一切合并的通用货币。因果掩码再送整块跳过(实测 1.6-1.78 倍工作量差,趋近 2 倍)。现代 kernel(vLLM 的 FA2/FA3/FA4)即此变体。",
+     "illustrator_notes": "左右 before/after 双格盘:左=FA(外层 KV 列块着色推进,Q 小组排队上门,每步除 ℓ 的小图标);右=FA-2(外层 Q 行块着色,行块各自承包、相互无箭头=零通信,收尾单次除 ℓ;右上三角块打叉=因果跳过,标注 64→36)。下方三条小签:16× 差价(312 vs 19.5)、L=m+log ℓ、约 2 倍实测。数字出处 traces/ch20_m06_causal_blocks.json + paper-fa2.md:L126/L207。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch20-m07",
+   "intuition": "两段注意力各交一份『摘要』(部分输出+一个标量 lse);合并时先比谁的摘要总盘子大(max_lse 稳定化),再按各自占总盘子的比例加权平均——这个比例恰是两段 softmax 归一化质量的占比,所以缝回来的结果与一口气算完全相同。",
+   "worked_example": {
+    "params": {
+     "场景": "2 条请求共享 4 token 前缀,各带私有后缀(A 3 token、B 2 token),各取最后 2 个 token 作 query——vLLM cascade 的数学形状:前缀段 causal=False 一次调用算全批(vLLM: block_table[:1]),后缀段 causal=True + query_offset 右下对齐(vLLM: block_table[:, num_common_kv_blocks:])",
+     "K_前缀": "[[1,0],[0,1],[1,1],[2,0]],V_前缀=[[1,2],[3,4],[5,6],[7,8]]",
+     "K_后缀A": "[[0,1],[1,0],[1,2]],V_后缀A=[[2,0],[0,3],[1,1]]",
+     "K_后缀B": "[[1,1],[0,2]],V_后缀B=[[4,2],[2,1]]",
+     "query": "q_A=[[1,1],[0,1]](全局位置 5,6)、q_B=[[2,0],[1,1]](全局位置 4,5);后缀段 query_offset:A=1、B=0;一次性参照 offset:A=5、B=4",
+     "softmax_scale": "1.0(同 m04,便于心算)",
+     "非退化性": "四行的两段 lse 均不相等→权重非 50/50(0.7881/0.2119 等);A 行1 后缀 lse 反超前缀(2.4076>2.0064)→后缀权重 0.599 更大——『谁的归一化质量大谁话事』"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch20_m07_lse_merge.json",
+    "table": {
+     "columns": ["请求行", "前缀段 lse", "后缀段 lse", "max_lse", "p_se", "s_se", "out_se", "前缀权重", "后缀权重", "合并 lse(=一次性 lse)", "合并 O[0](=一次性 O[0])"],
+     "rows": [
+      ["A 行0", "3.0064", "1.6931", "3.0064", "1.0", "0.2689", "1.2689", "0.7881", "0.2119", "3.2446", "4.0925"],
+      ["A 行1", "2.0064", "2.4076", "2.4076", "0.6695", "1.0", "1.6695", "0.401", "0.599", "2.9201", "2.2957"],
+      ["B 行0", "4.2539", "2.0", "4.2539", "1.0", "0.105", "1.105", "0.905", "0.095", "4.3537", "5.9034"],
+      ["B 行1", "3.0064", "2.6931", "3.0064", "1.0", "0.7311", "1.7311", "0.5777", "0.4223", "3.5551", "4.1116"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "合并后的 (O, 合并 lse) 与对拼接 KV 一次性做 softmax 注意力逐位等价(实跑 4 行 O 与 lse 差均 0.0);两段权重之和恒为 1。",
+    "argument": "换元到指数质量:每段 lse_x = m_x + log Σe^{S_x−m_x} = log(Σ_{x∈段} e^S),即该段全部指数质量的对数。max=max(lse_a,lse_b) 稳定化后 out_se = e^{lse_a−max}+e^{lse_b−max} = Σ_{全行}e^{S−max} → 合并 lse=log(out_se)+max 即全行 logsumexp。权重 e^{lse_x−max}/out_se 恰为该段指数质量占比(和=1),加权 O = Σe^{S−max}V / Σe^{S−max}——与一次性 softmax(QK^T)V 逐项相同。基例:一段为空(lse=−inf)时该段权重 0,退化为另一段;⊕ 结合律保证多段可继续合并(vLLM 空段约定 lse=−inf、双空护栏输出 0)。"
+   },
+   "quantified": "四行权重对 (0.7881,0.2119)/(0.401,0.599)/(0.905,0.095)/(0.5777,0.4223),和均为 1;A 行1 后缀 lse 反超(2.4076>2.0064)时后缀权重升到 0.599——权重跟着归一化质量走,不认『前缀』名分;合并 lse 与一次性 lse 四行全等(3.2446/2.9201/4.3537/3.5551),O 差 0.0。工程含义:两段调用各带 return_softmax_lse=True 再 merge_attn_states,等价于把长 KV 的 softmax 拆开算——cascade 与 split-KV 的正确性根基。",
+   "figure_specs": [
+    {
+     "figure_id": "ch20-fig-lse-merge",
+     "template": "flow",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』(gpu_column 绿列)第三块『模型层 forward + 编译』内 attention kernel 之后的合并 kernel——数学从论文走进 vLLM 源码的落点(vllm/v1/attention/ops/triton_merge_attn_states.py)。primer 推导链图第 ⑦ 环:⊕ 在 (lse,output) 表示上的作用。",
+     "claim": "两段部分注意力 (O_a,lse_a)、(O_b,lse_b) 经六步合并——max_lse 稳定化→e^{lse−max}→out_se=Σ→权重=占比→加权 O→合并 lse=log(out_se)+max_lse——与对拼接 KV 一次性 softmax 逐位相等;vLLM Triton kernel 逐 (token,head) 即此六步,变量名一一对应。",
+     "numbers": [
+      {
+       "value": "四行合并账:权重对 0.7881/0.2119、0.401/0.599、0.905/0.095、0.5777/0.4223(和=1);合并 lse 与一次性 lse 全等 3.2446/2.9201/4.3537/3.5551;O 差 0.0",
+       "provenance": "traces/ch20_m07_lse_merge.json merge_rows(merge_lse_states 实跑)"
+      },
+      {
+       "value": "反超行:A 行1 前缀 lse 2.0064 < 后缀 lse 2.4076 → 后缀权重 0.599——权重=归一化质量占比,不是位置名分",
+       "provenance": "traces/ch20_m07_lse_merge.json merge_rows[1]"
+      },
+      {
+       "value": "Triton kernel 六步原文:max_lse=maximum → p_se/s_se=e^{lse−max} → out_se=Σ → p_scale=p_se/out_se → out=p_out*p_scale+s_out*s_scale → out_lse=log(out_se)+max_lse;NOTE(woosuk) 先算 scale 再乘 output 的数值稳定纪律",
+       "provenance": "vllm/v1/attention/ops/triton_merge_attn_states.py:L259-L322(dossier embed_excerpts[19])"
+      },
+      {
+       "value": "空段工程细节:FA2 对空序列返回 inf、FA3 返回 −inf,kernel 先做 inf→−inf 归一(L270-L276);双空(max_lse=−inf)护栏置 0、合并 lse 保持 −inf(L319-L322)",
+       "provenance": "vllm/v1/attention/ops/triton_merge_attn_states.py:L270-L276、L319-L322(dossier theory[6]/m07 note)"
+      },
+      {
+       "value": "docstring 自引出处:merge_attn_states 分派器 docstring 自引 arXiv:2501.01005 §2.2 的 LSE rescaling 方法(split-KV 合并,不在论文包内,数学同 Eq.4)",
+       "provenance": "vllm/v1/attention/ops/merge_attn_states.py:L9-L22(dossier embed_excerpts[17])"
+      }
+     ],
+     "caption_draft": "LSE 合并:两段注意力缝成一个(vllm/v1/attention/ops/triton_merge_attn_states.py:L259-L322):每段只多带一个标量 lse=log(softmax 分母对数);合并六步——先 max_lse 稳定化(两个 e^{lse−max} 都≤1,不溢出,与 safe softmax 减 max 同一招),再算各自占比当权重、加权平均输出,最后 log(out_se)+max_lse 得合并 lse 可供继续合并。实测 4 行(权重 0.7881/0.2119 等,和恒 1)与对拼接 KV 一次性算逐位相等——cascade 注意力与 split-KV 的正确性都在这一页。",
+     "illustrator_notes": "横向 flow:左两入口框(前缀段 (O,lse) / 后缀段 (O,lse),各标 lse 数值)→ 中间六步竖排小步条(max_lse→p_se/s_se→out_se→权重占比→加权 O→合并 lse,右侧平行画 vLLM Triton 变量名 p_scale/s_scale/out_lse 对齐)→ 右出口(合并 O + 合并 lse,与『一次性』框 diff=0)。底部小注:空段 lse=−inf 权重自然 0;双空护栏输出 0。数字全部取自 traces/ch20_m07_lse_merge.json。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch20-m08",
+   "intuition": "同一个系统提示词被全批请求各算一遍是白干:把共享前缀单独算一次、全批复用,每条请求只算自己的尾巴,再用 LSE 合并缝回去——『值不值得拆』是工程启发式(阈值+粗性能模型),『拆了精确』是 m07 的数学,两条线要分开讲。",
+   "figure_specs": [
+    {
+     "figure_id": "ch20-fig-cascade-attention",
+     "template": "tiling",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』(gpu_column 绿列)第三块『模型层 forward + 编译』内 attention 的稀有路径分支(cascade 分流在 FlashAttentionImpl.forward L1069-L1095)——与 A 列『BlockPool + 前缀缓存』块(前缀共享的账本来源)隔列呼应。primer 推导链图第 ⑧ 环:m07 的合并数学在 vLLM 的真实调用现场。",
+     "claim": "cascade attention 把『共享前缀+私有后缀』拆两段各带 LSE 再 merge_attn_states 合并:前缀段 causal=False + block_table[:1] 一次算完全批复用,后缀段 causal=True + block_table[:, num_common_kv_blocks:] 各算各的——2 请求示例键扫描 9/13(省 0.3077),拆分是否值得由启发式定(共享前缀<256 token 直接不拆),拆分正确性由 ⊕ 结合律保证。",
+     "numbers": [
+      {
+       "value": "决策阈值:common_prefix_len < 256 直接 return False(NOTE(woosuk): This is the common case,要尽早返回);≥256 token 且 ≥8 条请求才值得拆;另有与 FlashDecoding 的 CTA 波数粗模型比较",
+       "provenance": "vllm/v1/attention/backends/flash_attn.py:L1531-L1551(dossier embed_excerpts[16])+ L1572-L1596(dossier station 8)"
+      },
+      {
+       "value": "两段调用形状:前缀段 causal=False + block_table[:1] + return_softmax_lse=True;后缀段 causal=True + block_table[:, num_common_kv_blocks:] + return_softmax_lse=True;末行 merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)",
+       "provenance": "vllm/v1/attention/backends/flash_attn.py:L1638-L1690(dossier embed_excerpts[15])"
+      },
+      {
+       "value": "use_cascade 开关:common_prefix_len > 0(由 _compute_cascade_attn_prefix_lens 先行算出传 build())",
+       "provenance": "vllm/v1/attention/backends/flash_attn.py:L543 + vllm/v1/worker/gpu_model_runner.py:L4255-L4263(dossier data_flow[2])"
+      },
+      {
+       "value": "收益量化(2 请求示例):全扫 13 个键元素(7+6) vs cascade 9 个(4+3+2),省 4 个、比例 0.3077;一般式 R 条请求共享前缀 P:省 P·(R-1)/Σ(P+S_i)",
+       "provenance": "traces/ch20_m07_lse_merge.json prefix_reuse_accounting"
+      },
+      {
+       "value": "合并数学出处:merge_attn_states docstring 自引 arXiv:2501.01005 §2.2;两段末态逐位等于一次性(4 行差 0.0)",
+       "provenance": "vllm/v1/attention/ops/merge_attn_states.py:L9-L22 + traces/ch20_m07_lse_merge.json merge_rows"
+      }
+     ],
+     "caption_draft": "共享前缀只算一遍(vllm/v1/attention/backends/flash_attn.py:L1521-L1690):多条请求共享长 system prompt 时,cascade 把注意力拆成前缀段(block_table[:1]、causal=False,全批共用一次计算)与各请求私有后缀段(causal=True、各自页表切片),两段都 return_softmax_lse=True,最后 merge_attn_states 按 LSE 占比缝合——精确性来自 ⊕ 结合律,与一次性算逐位相等。值不值得拆是另一件事:共享前缀不足 256 token 或请求不足 8 条时启发式直接放弃(NOTE(woosuk):不拆才是常见情形)。示例账:2 请求 4+3/4+2 键,扫描量 9/13。",
+     "illustrator_notes": "主体 tiling:上方一条共享前缀色带(4 token,标 block_table[:1],一次计算后向下发多条复用箭头)+ 下方两条请求泳道(A:3 token 后缀;B:2 token 后缀,各标 block_table[:, num_common_kv_blocks:]);每条泳道末尾 (O,lse) 小票 → 汇入右侧 merge_attn_states 框(标 max_lse→权重→加权)→ 出 output。左下小框:决策门槛(<256 token / <8 请求 → 不拆,标 NOTE(woosuk) 早退)。数字出处 traces/ch20_m07_lse_merge.json + flash_attn.py:L1531-L1551。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch20-m09",
+   "intuition": "一批拼车旅客(prefill 千 token 与 decode 1 token)不想按最长车厢坐:打平成一条 total_q 的流水线,每人只报自己的起止站(cu_seqlens_q 前缀和),座位零浪费;因果掩码贴在注意力矩阵右下角——1 个 token 的 decode 天然落在最右列,和 prefill 同车不同座,一个 kernel 全吃下。",
+   "writer_note": "本机制无 worked_example/figure 要求(dossier needs_* 均 false),素材为 writer 备查:(1) varlen 形状契约 q/k/v=(total, nheads, headdim)、cu_seqlens_q=(batch+1,) int32(flash_attn_interface.py:L176-L217 形参面,L240-L249 docstring);(2) causal 右下对齐两原例(seqlen_q=2/seqlen_k=5 的掩码 1 1 1 1 0 / 1 1 1 1 1;seqlen_q=5/seqlen_k=2 前三行全零输出为零)——L224-L234,测试逐格锁定;(3) 分页契约三断言(cu_seqlens_k 与 seqused_k 二选一;带 block_table 必须 seqused_k)L270-L278;(4) softmax_scale 默认 1/sqrt(headdim) L285-L286——本章玩具例显式传 1.0 便于心算,writer 行文须挑明默认值不是 1;(5) 引擎侧接驳:cu_seqlens_q=query_start_loc(ch18 前缀和)、seqused_k=seq_lens、block_table(ch13 页表)——flash_attn.py:L929-L935;(6) 回指:后端如何被选上归 ch21。",
+   "quantified": "混批收益的感受数字:decode 1 token 与 prefill 1024 token 若按 padding 对齐,每条 decode 白算 1023 行;varlen 打平后 total_q=实际 token 数,零 padding 行。",
+   "invariant": {
+    "claim": "causal 右下对齐下,任意 (seqlen_q, seqlen_k) 组合的掩码语义自洽:query 行 r 的全序列位置=r+query_offset,keep[r,c] ⟺ c ≤ r+offset;decode 的 seqlen_q=1 对 seqlen_k=N 天然落在最右列。",
+    "argument": "纯定义核对:右下对齐即『最后一条 query 与最后一条 key 同位置』;行 r 位置 = (n_k − n_q) + r,故 keep 条件等价于 c ≤ (n_k−n_q)+r。n_q=1 时 r=0、条件为 c ≤ n_k−1 = 全部可见——decode 看见完整历史;全零行(位置早于所有 key)输出为 0、lse=−inf(空段约定,与 m07 护卫一致)。"
+   }
+  },
+  {
+   "mechanism_id": "ch20-m10",
+   "intuition": "论文里 K/V 是连续一卷胶片;vLLM 里它被剪成 16 token 一页、散在块池货架上——kernel 拿着每请求一张页表(block_table)逐页取片。注意名字撞车:SRAM tile 的『块』按容量/算力切(B_c 个 token 一搬),页池的『块』按 16 token 一页寻址,两个粒度互不相干。",
+   "figure_specs": [
+    {
+     "figure_id": "ch20-fig-paged-kv-read",
+     "template": "layout",
+     "l0_zoom": "放大 L0 中列『GPU 执行臂』(gpu_column 绿列)『模型层 forward + 编译』块与 A 列『BlockPool + 前缀缓存』块(青,C_KV_S)的交界——kernel 读侧穿过页表取分页 KV;写侧(slot_mapping scatter)归 ch19/ch22。primer 推导链支线:论文的连续 K,V ∈ R^{N×d} 在 vLLM 的真实形态。",
+     "claim": "论文假设连续的 K/V,在 vLLM 是『块池 + 每请求页表』:kernel 沿 block_table 逐块取 KV(slot=块号×block_size+pos%block_size);接口契约『带 block_table 必须 seqused_k』;tiling 的 KV 块(SRAM 容量切)与 KV cache 的页块(16 token 一页)是两个粒度的两种『块』,名字撞车须主动澄清。",
+     "numbers": [
+      {
+       "value": "页粒度:DEFAULT_BLOCK_SIZE=16(vllm/config/cache.py:L47);FA 后端要求 kernel block_size 是 16 的倍数(flash_attn.py:L82-L84)",
+       "provenance": "vllm/config/cache.py:L47 + vllm/v1/attention/backends/flash_attn.py:L82-L84(dossier why_chains[3].cost + key_classes FlashAttentionBackend)"
+      },
+      {
+       "value": "槽位换算:slot = block_table[req][pos // block_size] * block_size + pos % block_size(GPU 上由 Triton kernel _compute_slot_mapping_kernel 算)",
+       "provenance": "vllm/v1/worker/block_table.py:L430-L440(dossier why_chains[3].solution;deepread/memory-kv.json why_chains[0])"
+      },
+      {
+       "value": "接口契约:assert block_table is None or seqused_k is not None——『K 在块池里、长度按请求给』(flash_attn_interface.py:L270-L278 三断言之一)",
+       "provenance": "vllm/vllm_flash_attn/flash_attn_interface.py:L270-L278(dossier embed_excerpts[13])"
+      },
+      {
+       "value": "块池事实:整块 KV 显存切成 num_gpu_blocks 个等大 block 的池(block_pool.py:L175-L181),论文类比原话『blocks as pages, tokens as bytes, requests as processes』;尾部最多浪费 block_size-1=15 个 token 位",
+       "provenance": "arXiv:2309.06180 §2.2(PagedAttention,归 ch13 已讲;dossier why_chains[3])——本章只引用不重讲"
+      },
+      {
+       "value": "名字撞车对照:tiling 的 B_c(论文 Alg.1 line 1,由 SRAM 容量 M 定,工程 {64,128})vs 页块 16 token(池寻址粒度)——HBM→SRAM 按前者搬、池内寻址按后者走,粒度独立",
+       "provenance": "arXiv:2205.14135 §3.1 Alg.1 line 1 + vllm/config/cache.py:L47(dossier ch20-m10 note)"
+      }
+     ],
+     "caption_draft": "kernel 的 K/V 不在连续显存里(vllm/vllm_flash_attn/flash_attn_interface.py:L270-L278 + vllm/v1/worker/block_table.py:L430-L440):FA 论文的连续 K,V 在 vLLM 被分页成 16 token 一块的池,每请求一张 block_table,kernel 沿页表逐块取片(槽位=块号×16+页内偏移)。所以接口才有那条断言:带 block_table 就必须给 seqused_k——片在池里,长度按请求给。也别被『块』字骗了:SRAM tile 的块(B_c=64/128,按容量切)与页池的块(16 token,按池粒度切)是两个互不相干的粒度。",
+     "illustrator_notes": "上下两层 layout:上层『块池』横排货架(等大 16 token 页块,标 block_size=16;几块标 NULL_BLOCK_ID=padding 行);下层每请求一张页表条(block_table 行,格子填块号)+ 箭头穿到池中对应块;右侧 kernel 框内再画 SRAM tile(标 B_c=64/128,由 M 定)——两种『块』用不同框色并排对比+名字撞车警示签。接口断言原文小签:block_table ⟹ seqused_k。写侧(slot_mapping)只画一条虚线箭头标『归 ch19/ch22』。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch20-m11",
+   "intuition": "同一个 FA 后端内部还分三代引擎:Hopper(SM90)派 FA3、Blackwell(SM100+)派 FA4、其余派 FA2——构造期一次决议,后面一长串能力回退(alibi/头维/TMEM 不满足就降级)。这是同一 backend 内的版本选择;ch21 讲的优先级表是 backend 之间的选择,两级选择别混为一谈。",
+   "writer_note": "一瞥即可(dossier difficulty=supporting),素材备查:(1) 版本决议 device_capability.major==9→FA3、==10→FA4(暂限 SM100)、else→FA2,config attention_config.flash_attn_version 可覆写(fa_utils.py:L158-L181,dossier embed_excerpts[9]);(2) FA4 是 v0.27 新成员(CuTE-DSL);接口层三分发 torch.ops._vllm_fa2_C(L317-L342)/_vllm_fa3_C(L343-L387)/CuTE-DSL(L388-L427)(flash_attn_interface.py:L298-L427);(3) 与 ch21 的分工:本章=同一 backend 内版本选择,ch21=backend 间选择(优先级表+validate 回退)。给 writer 的衔接句素材:『论文数学是同一份,跑它的引擎按显卡代际换新』。",
+   "quantified": "版本矩阵三条默认路由:SM90→FA3、SM100+→FA4、其余→FA2;工程块尺寸习惯 {64,128}×{64,128}(arXiv:2307.08691 §3.2)。",
+   "invariant": {
+    "claim": "无论路由到 FA2/FA3/FA4,前向数学都是本章同一份(online-softmax tiling + FA-2 形态);版本间差异在调度/精度/TMEM 利用,不在算法正确性层面。",
+    "argument": "三分发入口(flash_attn_interface.py:L298-L427)共享同一形参面与同一语义契约(docstring L218-L269);FA-3/FA-4 论文层面的改动是 warp 调度/TMA/低精度,softmax 归一化的数学约束(⊕ 结合律)不变——m02-m07 的推导对三者全部适用。"
+   }
+  }
+ ]
+}

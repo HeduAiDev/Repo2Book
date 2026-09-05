@@ -1,0 +1,671 @@
+{
+  "kind": "primer",
+  "chapter_id": "ch20",
+  "chapter_kind": "primer",
+  "part": "V",
+  "title": "【primer】Flash-Attention 数学",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "note_on_kind": "primer 原理章：实现是论文忠实的小型参考实现（非 subtract-only），替代门禁=lint_paper_grounding（lint_fidelity 不跑）。真相源=论文包（FA arXiv:2205.14135 + online-softmax arXiv:1805.02867 + FA-2 arXiv:2307.08691）+ vLLM 落地代码双源；subtraction_plan 留空对象。本章是 v3 第一篇 primer（ch21 将按样板哲学验收）。",
+  "papers": {
+    "fa": {
+      "id": "arXiv:2205.14135",
+      "title": "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness",
+      "file": "book/papers/ch24-primer-flash-attention/paper.md"
+    },
+    "online_softmax": {
+      "id": "arXiv:1805.02867",
+      "title": "Online normalizer calculation for softmax",
+      "file": "book/papers/ch24-primer-flash-attention/paper-online-softmax.md"
+    },
+    "fa2": {
+      "id": "arXiv:2307.08691",
+      "title": "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning",
+      "file": "book/papers/ch24-primer-flash-attention/paper-fa2.md"
+    },
+    "chunked": {
+      "id": "arXiv:2308.16369 + arXiv:2403.02310 + arXiv:2401.08671",
+      "title": "chunked prefill 调度谱系要点摘录（Sarathi/Sarathi-Serve/DeepSpeed-FastGen）",
+      "file": "book/papers/ch24-primer-flash-attention/paper-chunked.md",
+      "note": "v2 曾用于『连合并都不需要的拆分』对照节；v3 是否引用由 writer 定（chunked prefill 本体在 ch10 已讲）"
+    }
+  },
+  "hook_suggestion": "ch19 刚把这个 kernel 捕进 CUDA graph 整段回放——可它到底在算什么？教科书答案 softmax(QK^T)V 要先写出一张 N×N 的分数表：8K 上下文、一个 head 就是一张 6700 万元素、fp16 下 134MB 的表，写出去再读回来，GPU 大部分时间在等 HBM 搬数据而不是在算。vLLM 的 kernel 从不把这张表写出来：softmax 归一化明明要把一整行 K 的分数全部加起来，kernel 每次只看得见一小块、而且 K 还散在分页块池里要经 block_table 寻址——它凭什么算得和教科书逐字不差，还快好几倍？",
+  "one_line": "注意力慢在 HBM 往返、不在算力：标准实现把 S=QK^T 与 P=softmax(S) 两张 N×N 矩阵物化到显存再读回，访存 Θ(N²) 主导 wall-clock。online-softmax 把 softmax 归一化因子改成单遍可递推的 running (m,d)——每来一块新分数，先把旧账按 exp(旧max−新max) 折算再累加；⊕ 算子的结合律/交换律保证任意分块、乱序合并都精确。FlashAttention 据此把 Q/K/V 切块载入 SRAM、滚动更新 (m,ℓ,O)，N×N 永不落 HBM、整个注意力融成一个 kernel，HBM 访问降到 Θ(N²d²/M)；FA-2 再调转循环序（外层 Q 行块）、中间不除 ℓ、只存 logsumexp L=m+log(ℓ)。落到 vLLM：flash_attn_varlen_func（varlen 打平 + cu_seqlens 前缀和 + block_table 分页读 KV）与 merge_attn_states（LSE 合并，cascade 共享前缀的地基）。",
+  "scope_note": "Part V 第 4 章、全书第 4 篇 primer：夹在 ch19（编译与捕获——attention 被捕成 CUDA graph 里的不透明节点）与 ch21（注意力后端——优先级表/validate 回退/逐 KV 组混布）之间。本章打开 ch19 留下的黑盒：那个被反复回放的 kernel 内部在算什么数学。消费：ch13 分页 KV（depends_on=[13]，块池/页表概念必须已立）。供给：ch21 消费本章数学（『优先级表选出的后端』内部即本章内容）；ch22 回收 F7（slot_mapping/block_table 的 GPU 端换算）。in-scope：内存带宽墙 → naive/safe/online softmax 三级演进 → ⊕ 算子 → tiling 免物化 → IO 复杂度账 → FA-2 三改 → LSE 合并（merge_attn_states/cascade 落地）→ varlen/分页调用面 → FA2/3/4 版本族一瞥。out-of-scope：backward/recomputation（一段带过——推理读者只需知道『重算比读表快』这个反直觉结论）、block-sparse 扩展（一段带过）、FA3/FA4 kernel 内部调度细节（warp/TMA——一句话展望即可）、MLA（ch24/25）、FlashInfer/Triton 等其他后端（ch21）、DCP 上下文并行的 LSE 归约（cp_lse_ag_out_rs/dcp_a2a_lse_reduce，flash_attn.py:L823-L828——扩展态登记不展开）、paper-chunked.md 谱系摘录（v2 §九素材，v3 引用与否由 writer 定）。",
+  "code_spine": [
+    "vllm/model_executor/layers/attention/attention.py:L488-L582  Attention 插座：forward 调 torch.ops.vllm.unified_attention_with_output（L574-L581）——ch19 捕进图的不透明算子，本章黑盒的入口",
+    "vllm/model_executor/layers/attention/attention.py:L732-L772  get_attention_context：op 内按 layer_name 从 ForwardContext 取 metadata/kv_cache/slot_mapping",
+    "vllm/v1/attention/backends/flash_attn.py:L838-L1096  FlashAttentionImpl.forward：eager 接缝纪律（L880-L887）+ KV 张量切分（L905）+ 元数据接驳（L929-L935）+ 主路径单次调用（L1041-L1066）+ cascade 分流（L1069-L1095）",
+    "vllm/v1/attention/backends/flash_attn.py:L1098-L1132  do_kv_cache_update：KV 写独立于 attention（forward_includes_kv_cache_update=False，L86）——本章只讲读侧",
+    "vllm/v1/attention/backends/fa_utils.py:L21-L70  平台 import：CUDA→vllm.vllm_flash_attn / XPU→xpu_ops / ROCm→upstream 或 aiter",
+    "vllm/v1/attention/backends/fa_utils.py:L140-L282  get_flash_attn_version：SM90→FA3、SM100+→FA4、其余→FA2 + 能力回退链",
+    "vllm/vllm_flash_attn/flash_attn_interface.py:L176-L430  flash_attn_varlen_func：varlen+分页+causal+LSE 的形参面与 FA2/3/4 分发（FA2 torch.ops._vllm_fa2_C L317-L342 / FA3 L343-L387 / FA4 CuTE-DSL L388-L427）",
+    "vllm/v1/attention/backends/flash_attn.py:L1521-L1596  use_cascade_attention 决策：≥256 token/≥8 请求阈值 + 与 FlashDecoding 的 CTA 波数粗模型",
+    "vllm/v1/attention/backends/flash_attn.py:L1599-L1690  cascade_attention：前缀段(causal=False)+后缀段(causal=True) 各带 LSE + merge",
+    "vllm/v1/attention/ops/merge_attn_states.py:L9-L111  merge_attn_states 分派（CUDA kernel / Triton；docstring 自引 arXiv:2501.01005 §2.2）",
+    "vllm/v1/attention/ops/triton_merge_attn_states.py:L126-L336  Triton merge kernel：⊕ 算子的落地实现（核心支路 L257-L322）"
+  ],
+  "stations": [
+    {
+      "n": 1,
+      "where": "vllm/v1/attention/backends/fa_utils.py:L21-L70",
+      "what": "【导入期】平台 import：CUDA→vllm.vllm_flash_attn（vLLM 自带 FA2/FA3/FA4 全家桶）、XPU→xpu_ops、ROCm→upstream flash-attn/aiter——vLLM 把 FA kernel 当黑盒 import（L350-L378 探活）。论文数学在黑盒里，本章要打开的就是它。"
+    },
+    {
+      "n": 2,
+      "where": "vllm/v1/attention/backends/fa_utils.py:L140-L282",
+      "what": "【构造期】FA 版本决议 get_flash_attn_version：SM90(Hopper)→FA3、SM100+(Blackwell)→FA4、其余→FA2（L163-L171），config 可覆写（L176-L181），随后一长串能力回退（alibi/sinks/head_size/TMEM 上限，L183-L270）——『现代 kernel 谱系』的版本矩阵。"
+    },
+    {
+      "n": 3,
+      "where": "vllm/model_executor/layers/attention/attention.py:L488-L582",
+      "what": "【每拍·插座】Attention.forward 不收 metadata 参数，调 torch.ops.vllm.unified_attention_with_output（L574-L581）——ch19 捕进 CUDA graph 的那个不透明算子；op 内 get_attention_context（L732-L772）从 ForwardContext 按 layer_name 取 metadata/kv_cache/slot_mapping，转 backend.impl.forward。"
+    },
+    {
+      "n": 4,
+      "where": "vllm/v1/attention/backends/flash_attn.py:L838-L935",
+      "what": "【每拍·后端 forward】piecewise 接缝 eager 的 CPU 纪律（NOTE(woosuk) L880-L887：连 view/slice 都要省）；KV cache 张量 transpose+split 出 key_cache/value_cache（L905）；非 cascade 主路径接驳元数据——cu_seqlens_q=query_start_loc、seqused_k=seq_lens、block_table（L929-L935）。"
+    },
+    {
+      "n": 5,
+      "where": "vllm/v1/attention/backends/flash_attn.py:L1041-L1066",
+      "what": "【每拍·主路径】整批 prefill+decode 一次 flash_attn_varlen_func 吃下：q/k/v/out 切片 + cu_seqlens_q/seqused_k + softmax_scale + causal + block_table + fa_version——全书此前当黑盒调用的那一行。"
+    },
+    {
+      "n": 6,
+      "where": "vllm/vllm_flash_attn/flash_attn_interface.py:L176-L430",
+      "what": "【kernel Python 入口】varlen 打平（q (total_q,nheads,headdim) + cu_seqlens_q 前缀和切序列）+ 分页契约三断言（L270-L278：带 block_table 必须 seqused_k）+ causal 右下对齐（L224-L234 docstring）+ softmax_scale 默认 1/sqrt(headdim)（L285-L286）+ return_softmax_lse 吐 L（L264-L268、L430）；fa_version 分发 FA2/FA3/FA4（L298-L427）。"
+    },
+    {
+      "n": 7,
+      "where": "arXiv:1805.02867 Alg.3/Eq.4 → arXiv:2205.14135 Alg.1 → arXiv:2307.08691 Alg.1（数学主体，非 vLLM 源码）",
+      "what": "【kernel 内部】online-softmax 递推维护 running (m,ℓ,O)：S_ij=Q_iK_j^T 在 SRAM 算、局部 softmax、旧 O 按 exp(旧max−新max) 缩放后累加 P̃V；S/P 永不落 HBM；FA-2 外层改 Q 行块、收尾才除 ℓ、只存 L=m+log(ℓ)。数学站序：naive→safe→online（Alg.3）→⊕ 结合律（Eq.4）→tiling（FA Alg.1）→IO 账（Thm.2）→FA-2（Alg.1）。"
+    },
+    {
+      "n": 8,
+      "where": "vllm/v1/attention/backends/flash_attn.py:L1521-L1596 + L1599-L1690",
+      "what": "【每拍·稀有路径】cascade：use_cascade_attention 决策（共享前缀 ≥256 token 且 ≥8 条请求才值得，L1538-L1551；与 FlashDecoding 的 CTA 波数粗模型 L1572-L1596）；cascade_attention 前缀段（causal=False、block_table[:1]）+ 后缀段（causal=True、block_table[:, num_common_kv_blocks:]）各带 LSE。"
+    },
+    {
+      "n": 9,
+      "where": "vllm/v1/attention/ops/merge_attn_states.py:L9-L111 → vllm/v1/attention/ops/triton_merge_attn_states.py:L259-L322",
+      "what": "【LSE 回程·⊕ 落地】merge_attn_states 分派（CUDA 自定义 kernel / Triton 回退，docstring 自引 arXiv:2501.01005 §2.2）；Triton kernel 逐 (token,head)：max_lse 稳定化 → e^{lse−max} → out_se=Σ → 权重=占比 → out=加权合并 → 合并 lse=log(out_se)+max_lse——论文数学在 vLLM 的最终落点，cascade 与 DCP 的公共地基。"
+    }
+  ],
+  "stations_note": "站号 = 一层注意力的调用路径 + 论文数学主体：站 1-2 构造/导入期（平台 import、FA 版本决议），站 3-6 每拍调用路径（插座→后端 forward→主路径调用→接口与 kernel 入口），站 7 kernel 内部（论文数学，非源码），站 8-9 LSE 回程（cascade 稀有路径、⊕ 合并落地）。衔接：ch19 站『unified_attention_with_output 进图』=本章站 3 的入侧；ch21（后端选择器）承接站 1-2 的版本决议并升格为 backend 间选择；ch22（slot_mapping/block_table）承接站 4 的 block_table 接驳并回收 F7。primer 章无 L2-spec，此账本喂正文「你在这里」。",
+  "key_classes": [
+    {
+      "name": "flash_attn_varlen_func",
+      "file": "vllm/vllm_flash_attn/flash_attn_interface.py",
+      "responsibility": "FA 前向 kernel 的 Python 入口（L176-L430）：varlen 打平 + cu_seqlens_q 前缀和 + seqused_k/block_table 分页 + causal 右下对齐 + return_softmax_lse 吐 L + fa_version 分发 FA2/FA3/FA4。本章掀开的黑盒就是它的内部。"
+    },
+    {
+      "name": "FlashAttentionImpl",
+      "file": "vllm/v1/attention/backends/flash_attn.py",
+      "responsibility": "FA 后端实现（L743-L1378）：forward 主路径一次调用吃整批（L1041-L1066）、cascade 分流（L1069-L1095）、DCP 变体（L1134-L1308）、do_kv_cache_update 独立写 KV（L1098-L1132，reshape_and_cache_flash）。"
+    },
+    {
+      "name": "FlashAttentionBackend",
+      "file": "vllm/v1/attention/backends/flash_attn.py",
+      "responsibility": "后端类（L72-L239）：supported_dtypes fp16/bf16、kernel block_size 必须 16 的倍数（L82-L84）、forward_includes_kv_cache_update=False（L86——KV 写与 attention 是两个 op，ch19 已讲其图影响）。"
+    },
+    {
+      "name": "FlashAttentionMetadataBuilder",
+      "file": "vllm/v1/attention/backends/flash_attn.py",
+      "responsibility": "元数据构建器（L333-L741）：build() 把 query_start_loc/seq_lens/block_table 包进 FlashAttentionMetadata；FA3 AOT scheduler_metadata（L515-L541）；cascade 前缀切分（L617-L641）；full cudagraph 下 scheduler_metadata 尾部清零（L652-L660）。"
+    },
+    {
+      "name": "FlashAttentionMetadata",
+      "file": "vllm/v1/attention/backends/flash_attn.py",
+      "responsibility": "后端元数据 dataclass（L242-L299）：num_actual_tokens/query_start_loc/seq_lens/block_table/slot_mapping + cascade 字段（use_cascade/common_prefix_len/cu_prefix_query_lens/prefix_kv_lens/suffix_kv_lens）+ causal。"
+    },
+    {
+      "name": "cascade_attention / use_cascade_attention",
+      "file": "vllm/v1/attention/backends/flash_attn.py",
+      "responsibility": "共享前缀优化（L1521-L1690）：决策启发式（阈值 256/8 + FlashDecoding CTA 波数粗模型）+ 前缀/后缀两段各带 LSE 再合并——LSE 合并的真实调用现场。"
+    },
+    {
+      "name": "merge_attn_states（分派器）",
+      "file": "vllm/v1/attention/ops/merge_attn_states.py",
+      "responsibility": "⊕ 合并的调度入口（L9-L111）：docstring 自引 arXiv:2501.01005 §2.2；按平台/dtype/headdim 分派 CUDA 自定义 kernel 或 Triton。"
+    },
+    {
+      "name": "merge_attn_states_kernel（Triton）",
+      "file": "vllm/v1/attention/ops/triton_merge_attn_states.py",
+      "responsibility": "⊕ 的落地实现（L185-L336）：逐 (token,head) 以 max_lse 稳定化、e^{lse−max} 权重加权合并两段部分输出、可选输出合并 LSE；mask_empty_context（L12-L55）清空 chunk 边界。"
+    },
+    {
+      "name": "get_flash_attn_version",
+      "file": "vllm/v1/attention/backends/fa_utils.py",
+      "responsibility": "FA 版本决议（L140-L282）：SM 代际→FA3/FA4/FA2 + config 覆写 + alibi/sinks/head_size/TMEM 能力回退链；is_flash_attn_varlen_func_available（L350-L378）平台探活。"
+    },
+    {
+      "name": "reshape_and_cache_flash",
+      "file": "vllm/v1/attention/backends/fa_utils.py（import）/ flash_attn.py:do_kv_cache_update 调用",
+      "responsibility": "KV 写侧 kernel 的入口（flash_attn.py:L1123-L1132）：按 slot_mapping scatter 写块池——与本章读侧（kernel 沿 block_table 读）成对；写侧细节归 ch19/ch22。"
+    },
+    {
+      "name": "Attention（插座）",
+      "file": "vllm/model_executor/layers/attention/attention.py",
+      "responsibility": "模型层注意力插座（forward L488-L582 / get_attention_context L732-L772 / unified_attention_with_output L819-L846）：本章只作入口引用，算子化机制是 ch19 的内容，后端选择是 ch21 的内容。"
+    }
+  ],
+  "data_flow": [
+    {
+      "step": "上游·每拍注意力调用入口（引 deepread/gpu-exec.json data_flow 第 5 步）",
+      "detail": "set_forward_context(attn_metadata, cudagraph_runtime_mode, batch_descriptor, slot_mapping)（gpu_model_runner.py:L4432-L4449）内 _model_forward（L4450-L4456）：model(...) 编译图执行；每个 Attention 层调 torch.ops.vllm.unified_attention_with_output（attention.py:L574-L581），op 内 get_attention_context（attention.py:L732-L772）取 metadata → backend.impl.forward（flash_attn.py:L880 起，paged KV gather + attention kernel）。"
+    },
+    {
+      "step": "KV 写在 attention 之外（引 deepread/gpu-exec.json why_chains[8]『注意力=不透明自定义算子』cost 段）",
+      "detail": "FA 后端 forward_includes_kv_cache_update=False（flash_attn.py:L86）——KV 写是独立算子 unified_kv_cache_update（attention.py:L775-L814），FA 侧 do_kv_cache_update 调 reshape_and_cache_flash 按 slot_mapping scatter 写（flash_attn.py:L1098-L1132）；本章只讲读侧：attention kernel 照 block_table 读 KV。"
+    },
+    {
+      "step": "元数据从哪来（引 deepread/gpu-exec.json data_flow 第 4d 步 + deepread/memory-kv.json data_flow [GPU] 段）",
+      "detail": "_build_attention_metadata（gpu_model_runner.py:L4378-L4392）逐 KV cache 组调 builder.build() 产出 FlashAttentionMetadata；query_start_loc 尾部填非递减值（gpu_model_runner.py:L2073-L2078，注释原话 kernels like FlashAttention requires that——本章 kernel 的形状契约反噬引擎侧）、block_table 尾行 NULL_BLOCK_ID（L2338-L2341）；common_prefix_len 由 _compute_cascade_attn_prefix_lens（L4255-L4263）先行算出传 build() 定 use_cascade（flash_attn.py:L543 use_cascade = common_prefix_len > 0）。"
+    },
+    {
+      "step": "本章 FA 落点链（dossier 自建：站 4-6）",
+      "detail": "FlashAttentionImpl.forward 切 KV 张量（L905）→ 主路径接驳元数据（L929-L935）→ flash_attn_varlen_func(q[:num_actual_tokens], key_cache, value_cache, out, cu_seqlens_q, seqused_k, softmax_scale, causal, block_table, fa_version, …)（L1041-L1066）→ 接口内 FA2/3/4 分发（flash_attn_interface.py:L298-L427）→ 单个融合 kernel 内部跑论文数学（站 7）→ 默认只回 out；return_softmax_lse=True 才回 (out, softmax_lse)（L430）。"
+    },
+    {
+      "step": "LSE 回程与合并（dossier 自建：站 8-9）",
+      "detail": "cascade/DCP 路径两段各得 (partial_output, lse)（flash_attn.py:L1639-L1687；DCP 变体 L1247-L1299 同用 return_softmax_lse=True）→ merge_attn_states 分派（merge_attn_states.py:L80-L111）→ Triton kernel max_lse 稳定化合并（triton_merge_attn_states.py:L259-L322）→ 写回 output（可选 output_lse）。DCP 上下文并行的 LSE 归约（cp_lse_ag_out_rs/dcp_a2a_lse_reduce，flash_attn.py:L823-L828）同是 ⊕ 的应用——扩展态，登记不展开。"
+    }
+  ],
+  "why_chains": [
+    {
+      "decision": "注意力=不透明自定义算子：layer_name 进图、metadata 走 thread-local forward context",
+      "old_design": "v0/v1 早期：attention 层 forward 直接调 kernel，attn_metadata 作为参数从 model.forward 一路透传（污染所有模型 forward 签名）；torch.compile 遇动态控制流+外部副作用（写 KV cache）无法全图捕获。forward context 机制 2024-10-03 才引入（9aaf14c62 \"[misc] add forward context for attention (#9029)\"，git diff-filter=A 实证 forward_context.py 生日）。",
+      "pain": "(1) metadata 透传把『执行环境』泄漏进『模型定义』——每个模型文件的 forward 签名都被引擎内部结构绑架；(2) 想用 torch.compile 就必须让 attention 变成图里的一个节点。",
+      "solution": "0f8cafe2d \"[Kernel] unified_attention for Attention.forward (#11967)\"（2025-01-13）确立算子化。Attention.__init__ 把自己注册进 compilation_config.static_forward_context[prefix]（vllm/model_executor/layers/attention/attention.py:L443-L446，重名即 raise L444-L445）；forward（L488-L582）只调 out-variant 算子：预分配 output（L531）、QKV reshape 在 op 外做以省 op 内 CPU 开销（L533-L541 NOTE(woosuk) \"We do this outside the custom op to minimize the CPU overheads\"）；CUDA 系平台走 torch.ops.vllm.unified_attention_with_output（L574-L581），非 opaque 平台直调 Python 函数（L543-L561；分叉开关 use_direct_call = not current_platform.opaque_attention_op() L437-L441）。算子实现 unified_attention_with_output（L817-L846）经 get_attention_context（L732-L772）从 ForwardContext 按 layer_name 取 attn_metadata/kv_cache/slot_mapping（ForwardContext 由 execute_model 的 set_forward_context 每拍设置：forward_context.py:L259-L344，执行期锚 gpu_model_runner.py:L4432-L4449；no_compile_layers 字段即 static_forward_context 的拷贝 forward_context.py:L229-L231）。KV 写拆成独立算子 unified_kv_cache_update（L775-L814），其返回的空张量作为 dummy 数据依赖传入 attention 算子保序（L829-L832 \"accepting it creates a data dependency that ensures torch.compile preserves ordering\"）。fake_impl 让 Dynamo 可 trace（L801-L806、L849-L859）。v0.27 演进：layer_name 字符串用 LayerName opaque 类型包一层（vllm/utils/torch_utils.py:L845-L870——\"torch.compile lifts it as a graph input instead of baking it as a constant. This avoids per-layer recompilation for custom ops that accept layer name strings\"，_encode/_resolve L879-L885），旧方案 fast_moe_cold_start 的 ForwardContext 列表弹出法仍并存（forward_context.py:L160-L186）。",
+      "cost": "隐式全局状态：不设 forward context 直接调 attention 即 assert 崩（forward_context.py:L199-L205）；调用栈只见 op 名不见层名，profiler 需专门映射；forward_includes_kv_cache_update 语义分叉（vllm/v1/attention/backend.py:L67 默认 True，FlashAttentionBackend 改 False flash_attn.py:L86）——即 CUDA 上 KV 写与 attention 是两个 op 各多一次 dispatch，且 v0.27 起 execute_model 要按 has_separate_kv_update 决定 slot_mapping 用 padded 维度（gpu_model_runner.py:L4307-L4317）。",
+      "source_card": "deepread/gpu-exec.json why_chains[8]（注意力=不透明自定义算子）"
+    },
+    {
+      "decision": "异步调度：调度下一拍与执行当前拍完全重叠，采样 token 不落 CPU（『GPU 不等 Python』的旗舰落地）",
+      "old_design": "同步调度：schedule()（CPU）→ execute_model（GPU）→ 等结果回 CPU → update_from_output → 下一拍 schedule。GPU 在 CPU 准备下一批的整段时间空转；decode 小 batch 一拍 GPU 计算量极小，整拍时长被 CPU 端（Python 调度 + 输入准备 + bookkeeping 的 D2H sync）支配。",
+      "pain": "『GPU 等 Python』是 vLLM 一整条 PR 线的靶子（git log 实证）：98f47f2a40 \"[V1] Optimize the CPU overheads in FlashAttention custom op (#10733)\"（2024-11-28）、3b61cb450d \"[V1] Further reduce CPU overheads in flash-attn (#10989)\"（2024-12-09）、dae6896977 \"[Perf] Reduce MLA CPU overheads in V1 (#14384)\"（2025-03-06，两周后 revert ca7a2d5f28——说明这条战线有多脆弱）——全在砍『kernel 之间那点 Python 时间』。CommonAttentionMetadata 两个 deprecated 属性的措辞即纪律成文：\"Prefer using device seq_lens directly to avoid implicit H<>D sync which breaks full async scheduling\"（vllm/v1/attention/backend.py:L506-L530）。落地里程碑：d4d309409 \"Implement Async Scheduling (#19970)\"（2025-07-14）→ cee182b29 \"[Perf][V1] Fully overlap model execution (#23569)\"（2025-09-05）→ fafe76b4a \"Zero-bubble async scheduling + spec decoding (#32951)\"（2026-03-23）。v0.27 新增运行期纠察：VLLM_GPU_SYNC_CHECK 在 warmup 完成后开启（gpu_worker.py:L846-L848 enable_gpu_sync_check），execute_model/sample_tokens 被 @with_gpu_sync_check 包住（L1010-L1019），任何 CPU<->GPU sync 直接抛 \"GPU<->CPU sync detected - avoid it or wrap with gpu_sync_allowed()\"（vllm/utils/gpu_sync_debug.py:L9-L17）——纪律从注释升级为运行期 tripwire。",
+      "solution": "三件套。(1) 采样 token 留 GPU：_bookkeeping_sync 异步分支不把 sampled_token_ids 拉回 CPU，缓存在 input_batch.prev_sampled_token_ids（gpu_model_runner.py:L3797-L3813，注释 \"Cache the sampled tokens on the GPU and avoid CPU sync\"），CPU 侧 token_ids_cpu 行只写占位 -1（L3821-L3842）；下一拍 _prepare_input_ids（L1784-L1913）用 GPU 张量直接写 input_ids.gpu——common-case 优化是单 slice 直拷（L1868-L1877），否则按 index scatter（L1879-L1891），spec draft token 再补一轮 scatter（L1893-L1913）。(2) 异步输出：AsyncGPUModelRunnerOutput（L259-L350）在专用 async_output_copy_stream 上 wait_stream(default) 后 non_blocking D2H + event record（L286-L306；event 用 blocking=True 的 sleep 语义而非自旋——L741-L743 注释 \"under TP contention that spin can balloon and make the rank a straggler\"）；uniproc 的 AsyncOutputFuture 延迟到 result() 才 get_output()→event.synchronize（uniproc_executor.py:L26-L42）；routed_experts 异步路径必须 clone 出私有快照防 copy stream 读到撕裂数据（L4794-L4818，注释 \"Without clones, the copy stream would read torn data\"）。(3) 乐观假设+延迟纠偏：seq_lens 用乐观值（假定上拍 draft 全接受，L2081-L2090 optimistic_seq_lens_cpu），spec decode 纠偏回调 correct_spec_decode_token_counts 推迟到 forward 发起之后执行（入队 L1380-L1388、执行 L4530-L4533，注释 \"Now the batch has been launched we can wait for corrections ... without breaking async scheduling\"）；GPU 侧 update_num_computed_tokens_for_batch_change kernel 用上拍 valid_sampled_token_count_gpu 修正 num_computed_tokens（L2152-L2173，kernel 定义 vllm/v1/spec_decode/utils.py:566）。pinned buffer 防踩协议：synchronize_input_prep contextmanager 等上拍 prepare_inputs_event（L3864-L3877）。",
+      "cost": "状态机复杂度暴涨：需要 prev_req_id_to_index/prev_positions/discard_request_mask/optimistic_seq_lens_cpu 等一整套『上一拍』影子状态（_update_states 膨胀到 ~375 行）；调度器必须盲调度（看不到上拍真实结果），错了要在 GPU 端纠；PP 场景要把采样 token 从末段 GPU 广播回首段（_pp_broadcast_prev_sampled_token_ids L4842-L4859 + _pp_receive_prev_sampled_token_ids_to_input_batch L4859）；异步路径输出张量的数据所有权延迟到 event.synchronize 之后才可读（契约见 get_output L308-L314）。",
+      "source_card": "deepread/gpu-exec.json why_chains[5]（异步调度/CPU overhead 战线）"
+    },
+    {
+      "decision": "CUDA Graph 捕获回放：按 BatchDescriptor 查表命中，实际 batch padding 到捕获形状",
+      "old_design": "eager 每拍重新 launch 全部 kernel（Python dispatch + cudaLaunchKernel × 每层数十次）。v0 已有按 batch size 捕获的 cudagraph；v1 的重做核心是显式 dispatch 协议（74f441f4b \"Allow full cudagraph with separate attention routines (#20059)\" 2025-08-15 引入 cudagraph_dispatcher.py，git diff-filter=A 实证），2025-09-23 24fab45d9 \"Change default CUDAGraphMode from PIECEWISE to FULL_AND_PIECEWISE (#25444)\" 把默认档位升到混合模式。",
+      "pain": "为什么形状必须精确匹配（本质）：CUDA graph 录的是『对这块固定地址的显存执行这串 kernel launch』——kernel 的 grid/block 配置、指针、乃至宿主端分支（如 FA3 的 scheduler_metadata 计算）都在捕获时烤死在图里；replay 不会重新读取张量的 shape 元数据。形状或地址变了，图执行的就是错误的工作量/错误的数据。所以回放命中条件 = BatchDescriptor 全等 AND 输入张量地址不变。",
+      "solution": "(a) key 与查表：frozen dataclass BatchDescriptor(num_tokens/num_reqs/uniform/has_lora/num_active_loras)（vllm/forward_context.py:L29-L58）；CudagraphDispatcher（vllm/v1/cudagraph_dispatcher.py:L15）预计算 bs→padded 尺寸表（L72-L91，并对 compile_sizes 做『不得被 padding 改写』校验 L93-L109）、initialize_cudagraph_keys 生成全部合法 key（L166-L233；FULL 档要求 num_reqs 精确——注释 \"FULL mode needs exact num_reqs because FA3's scheduler_metadata computation depends on it\" L199-L202；PIECEWISE 放宽 num_reqs=None L201-L203）、dispatch 每拍查表返回 (mode, batch_desc)（L235-L324：先查 FULL 精确 key、再查 PIECEWISE relaxed key、都 miss 落 NONE）。(b) 捕获/回放：CUDAGraphWrapper（vllm/compilation/cuda_graph.py:L145）以 BatchDescriptor 为 key；捕获走共享 graph pool（L200、L303-L317 set_graph_pool_id），输出弱引用省显存（L325-L336）；回放前 DEBUG 模式逐 data_ptr 断言与捕获时一致（L346-L355 \"Input addresses for cudagraphs are different during replay\"）；wrapper 盲信 forward context 传来的 runtime_mode/descriptor（L240-L254 \"blindly trust them for cudagraph dispatching\"——判责在上游 dispatcher）。(c) 运行期 dispatch：_determine_batch_execution_and_padding（gpu_model_runner.py:L3932-L4044）每拍算 (cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, cudagraph_stats)（dispatch_cudagraph 内联闭包 L3977-L3989，cascade attn / encoder 输入时禁 FULL L3987-L3989），经 set_forward_context 传给 wrapper（L4432-L4449）。(d) padding 配套四件套全在 runner：query_start_loc 尾部填非递减值（L2073-L2078，注释 \"kernels like FlashAttention requires that\"）、block_table 尾行填 NULL_BLOCK_ID（L2338-L2341，注释 \"Block 0 is reserved for padding\"）、slot_mapping 尾部填 -1（L4128-L4130，让 KV 写 kernel 跳过写）、positions 尾部清零（L3663-L3664）。(e) 捕获编排：capture_model（L6813-L6918）从大到小捕（get_capture_descs 降序 L6876-L6884；dispatcher 侧同序 L326-L350 \"sorted largest-first for memory efficiency\"）；_warmup_and_capture 先 warmup 数次 eager（mode=NONE）再 is_graph_capturing=True 捕一次（L6920-L6966）；捕获后 set_cudagraph_capturing_enabled(False) 让任何意外捕获直接报错（L6895-L6900）。(f) DP 一致性：coordinate_batch_across_dp 让各 DP rank 对 padded 尺寸达成一致后 re-dispatch（L4004-L4027——DP rank 的 cudagraph key 不一致会让集合通信挂死）。(g) 观测：CUDAGraphStat num_paddings（L4029-L4036）+ CUDAGraphLogging 汇总表（cuda_graph.py:L40-L124）。(h) 顶层档位：v0.27 新增 -O0..-O3 optimization_level 预设（vllm/config/vllm.py:L230-L327，默认 O2 = FULL_AND_PIECEWISE + 各融合 pass 按硬件启用 L292-L315），读者入口被大幅简化。",
+      "cost": "(1) 启动：\"This usually takes 5~20 seconds\"（gpu_model_runner.py:L6912-L6913 官方自述）；(2) 显存：图池独占，capture 前后 mem_get_info 差值即代价（L6911），默认经 profile_cudagraph_memory（L6645 起，用临时池预捕全部形状估显存）计入 KV cache 预算——VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS 默认 1（envs.py:L2018-L2020），等价 util 提示日志 gpu_worker.py:L568-L605；(3) 算力浪费：bs=9 pad 到 16 白算 7 行 decode（decode 便宜所以可接受，CUDAGraphStat 的 num_paddings 可观测）；(4) 一切输入必须写回捕获时的固定 buffer——这是 CpuGpuBuffer/持久批次整条设计链的下游约束，设计间环环相扣。",
+      "source_card": "deepread/gpu-exec.json why_chains[10]（CUDA Graph 捕获回放——形状全等的本质）"
+    },
+    {
+      "decision": "分页 KV：固定大小 block 池 + 每请求一张逻辑块表（PagedAttention 的虚拟内存类比）",
+      "old_design": "vLLM 之前的服务系统（FasterTransformer/Orca）按请求最大长度一次性预分配连续显存。vLLM 论文原话「they pre-allocate a contiguous chunk of memory with the request's maximum length (e.g., 2048 tokens)」（arXiv:2309.06180 §2.2）。浪费三源：内部碎片（实际输出远短于 max_len）、外部碎片（要求连续，释放留洞）、冗余复制（beam/parallel sampling 的共享前缀各存一份）。",
+      "pain": "有效 KV 显存利用率被卡死：论文实测「only 20.4% - 38.2% of the KV cache memory is used to store the actual token states in the existing systems」（§5.2，Alpaca/ShareGPT 真实 trace；注意是 38.2 不是流传的 38.3）。显存浪费直接压 batch size → 吞吐被卡；论文报告分页后同延迟下吞吐 2-4×。",
+      "solution": "整块 KV 显存切成 num_gpu_blocks 个等大 block 的池（vllm/v1/core/block_pool.py:L175-L181，blocks 数组一次预构）；每个请求每组建一张逻辑块表 req_to_blocks（vllm/v1/core/single_type_kv_cache_manager.py:L97）；物理槽位由 token 位置在 GPU 上换算：slot = block_table[req][pos // block_size] * block_size + pos % block_size（vllm/v1/worker/block_table.py:L430-L440 Triton kernel _compute_slot_mapping_kernel）。块按需分配，单请求浪费 < 1 个 block。论文类比原话「blocks as pages, tokens as bytes, requests as processes」。",
+      "cost": "① 注意力 kernel 必须穿过块表间接寻址（PagedAttention/FlashAttention 变体），比连续读复杂；② 尾部最多浪费 block_size-1 个 token 位（默认 block_size=16，vllm/config/cache.py:L47 DEFAULT_BLOCK_SIZE）；③ 调度器与 GPU 各持一份真相，block_id 是唯一共享键，两侧必须严格同步（见契约）。",
+      "source_card": "deepread/memory-kv.json why_chains[0]（分页 KV——kernel 穿过块表间接寻址的代价）"
+    }
+  ],
+  "embed_excerpts": [
+    {
+      "path": "arXiv:1805.02867 §3 Algorithm 3",
+      "lines": "Alg.3 L1-L9 (paper-online-softmax.md:L93-L109)",
+      "what": "online-softmax 本体：单遍同时维护 running max m 与 rescaled running sum d——每来一个新元素，先把旧 d 按 exp(m_{j-1}-m_j) 折算到新 max，再加新项。这就是 FlashAttention 分块 softmax 的数学地基。",
+      "code": "1:$m_{0}\\leftarrow{- \\infty}$\n2:$d_{0}\\leftarrow 0$\n3:for $j\\leftarrow{1,V}$ do\n4:     $m_{j}\\leftarrow{\\max\\left( m_{j - 1},x_{j} \\right)}$\n5:     $d_{j}\\leftarrow{{d_{j - 1} \\times e^{m_{j - 1} - m_{j}}} + e^{x_{j} - m_{j}}}$\n6:end for\n7:for $i\\leftarrow{1,V}$ do\n8:     $y_{i}\\leftarrow\\frac{e^{x_{i} - m_{V}}}{d_{V}}$\n9:end for",
+      "elide": [
+        "原文行距间的空行（L94/L96/L98/…）"
+      ]
+    },
+    {
+      "path": "arXiv:1805.02867 §3.1",
+      "lines": "Eq.3-Eq.4 + 结合律/交换律声明 (paper-online-softmax.md:L141-L172)",
+      "what": "⊕ 算子定义：把 (max,sum) 抽象为二元算子（Eq.3 链式展开、Eq.4 定义），论文声明其满足结合律+交换律 → softmax 归一化可任意分块/并行/乱序归并——tiling 与 merge_attn_states 的合法性来源。",
+      "code": "| | | | |\n| | $$\\begin{bmatrix}\n       m_{V} \\\\\n       d_{V} \\\\\n       \\end{bmatrix} = {\\begin{bmatrix}\n       x_{1} \\\\\n       1 \\\\\n       \\end{bmatrix}\\hspace{0pt}{\\oplus{\\begin{bmatrix}\n       x_{2} \\\\\n       1 \\\\\n       \\end{bmatrix}\\hspace{0pt}{\\oplus{\\ldots\\hspace{0pt}{\\oplus\\begin{bmatrix}\n       x_{V} \\\\\n       1 \\\\\n       \\end{bmatrix}}}}}}}$$ | | (3) |\nwhere ${x_{i},m_{V},d_{V}} \\in {\\mathbb{R}}$. The binary operation $\\oplus:{{{\\mathbb{R}}^{2} \\times {\\mathbb{R}}^{2}}\\rightarrow{\\mathbb{R}}^{2}}$ is defined as:\n| | $${\\begin{bmatrix}\n       m_{i} \\\\\n       d_{i} \\\\\n       \\end{bmatrix}\\hspace{0pt}{\\oplus\\begin{bmatrix}\n       m_{j} \\\\\n       d_{j} \\\\\n       \\end{bmatrix}}} = \\begin{bmatrix}\n       {\\max\\left( m_{i},m_{j} \\right)} \\\\\n       {{d_{i} \\times e^{m_{i} - {\\max{(m_{i},m_{j})}}}} + {d_{j} \\times e^{m_{j} - {\\max{(m_{i},m_{j})}}}}} \\\\\n       \\end{bmatrix}$$ | | (4) |\nApplying (3) sequentially from left to right is equivalent to running lines 1-6 of the algorithm 3. The operation $\\oplus$ is associative, which enables parallel evaluation of (3). It is also commutative, which provides the flexibility needed to make parallel implementations more efficient. We omit the proofs for these two statements for brevity.",
+      "elide": [
+        "markdown 表格边框行（pandoc 转换产物，L142/L159-L160 等）与空行（L156/L158/L171）"
+      ]
+    },
+    {
+      "path": "arXiv:2205.14135 §2.2 Algorithm 0",
+      "lines": "Alg.0 L0-L4 (paper.md:L74-L84)",
+      "what": "标准注意力实现三步：S=QK^T 写 HBM → 读回算 P=softmax(S) 写 HBM → 读回乘 V——两张 N×N 矩阵的显存往返，就是『慢在搬运不在计算』的靶子。",
+      "code": "0:  Matrices ${\\mathbf{Q},\\mathbf{K},\\mathbf{V}} \\in {\\mathbb{R}}^{N \\times d}$ in HBM.\n1:   Load $\\mathbf{Q},\\mathbf{K}$ by blocks from HBM, compute $\\mathbf{S} = {\\mathbf{Q}\\mathbf{K}}^{\\top}$, write $\\mathbf{S}$ to HBM.\n2:   Read $\\mathbf{S}$ from HBM, compute $\\mathbf{P} = {{softmax}\\hspace{0pt}{(\\mathbf{S})}}$, write $\\mathbf{P}$ to HBM.\n3:   Load $\\mathbf{P}$ and $\\mathbf{V}$ by blocks from HBM, compute $\\mathbf{O} = {\\mathbf{P}\\mathbf{V}}$, write $\\mathbf{O}$ to HBM.\n4:  Return $\\mathbf{O}$.",
+      "elide": [
+        "空行（L75/L77/L79/L81/L83）"
+      ]
+    },
+    {
+      "path": "arXiv:2205.14135 §2.1",
+      "lines": "L45 (paper.md:L45)",
+      "what": "A100 内存层级数字：HBM 40-80GB@1.5-2.0TB/s vs 每.SM 192KB SRAM×108@~19TB/s——带宽差一个数量级、容量差多个数量级；『算力增速超内存增速 → 访存日益成为瓶颈』的论断出处。",
+      "code": "GPU Memory Hierarchy. The GPU memory hierarchy (Fig. 1 left) comprises multiple forms of memory of different sizes and speeds, with smaller memory being faster. As an example, the A100 GPU has 40-80GB of high bandwidth memory (HBM) with bandwidth 1.5-2.0TB/s and 192KB of on-chip SRAM per each of 108 streaming multiprocessors with bandwidth estimated around 19TB/s [45, 44]. The on-chip SRAM is an order of magnitude faster than HBM but many orders of magnitude smaller in size. As compute has gotten faster relative to memory speed [61, 62, 63], operations are increasingly bottlenecked by memory (HBM) accesses. Thus exploiting fast SRAM becomes more important.",
+      "elide": []
+    },
+    {
+      "path": "arXiv:2205.14135 §3.1 Algorithm 1",
+      "lines": "Alg.1 L9-L13 (paper.md:L148-L156)",
+      "what": "FlashAttention forward 递推核心：S_ij=Q_iK_j^T 在 SRAM 里算 → 局部 softmax (m̃,P̃,ℓ̃) → running (m_i,ℓ_i) 用 exp(旧max−新max) 折算更新 → O_i 缩放累加 P̃V——S/P 两张 N×N 从不落 HBM。",
+      "code": "9:         On chip, compute $\\mathbf{S}_{i\\hspace{0pt}j} = {\\mathbf{Q}_{i}\\hspace{0pt}\\mathbf{K}_{j}^{T}} \\in {\\mathbb{R}}^{B_{r} \\times B_{c}}$.\n10:         On chip, compute ${\\overset{\\sim}{m}}_{i\\hspace{0pt}j} = {{rowmax}\\hspace{0pt}{(\\mathbf{S}_{i\\hspace{0pt}j})}} \\in {\\mathbb{R}}^{B_{r}}$, ${\\overset{\\sim}{\\mathbf{P}}}_{i\\hspace{0pt}j} = {\\exp{({\\mathbf{S}_{i\\hspace{0pt}j} - {\\overset{\\sim}{m}}_{i\\hspace{0pt}j}})}} \\in {\\mathbb{R}}^{B_{r} \\times B_{c}}$ (pointwise), ${\\overset{\\sim}{\\ell}}_{i\\hspace{0pt}j} = {{rowsum}\\hspace{0pt}{({\\overset{\\sim}{\\mathbf{P}}}_{i\\hspace{0pt}j})}} \\in {\\mathbb{R}}^{B_{r}}$.\n11:        On chip, compute $m_{i}^{new} = {\\max{(m_{i},{\\overset{\\sim}{m}}_{i\\hspace{0pt}j})}} \\in {\\mathbb{R}}^{B_{r}}$, $\\ell_{i}^{new} = {{e^{m_{i} - m_{i}^{new}}\\hspace{0pt}\\ell_{i}} + {e^{{\\overset{\\sim}{m}}_{i\\hspace{0pt}j} - m_{i}^{new}}\\hspace{0pt}{\\overset{\\sim}{\\ell}}_{i\\hspace{0pt}j}}} \\in {\\mathbb{R}}^{B_{r}}$.\n12:         Write $\\mathbf{O}_{i}\\leftarrow{{diag}\\hspace{0pt}{(\\ell_{i}^{new})}^{- 1}\\hspace{0pt}{({{{diag}\\hspace{0pt}{(\\ell_{i})}\\hspace{0pt}e^{m_{i} - m_{i}^{new}}\\hspace{0pt}\\mathbf{O}_{i}} + {e^{{\\overset{\\sim}{m}}_{i\\hspace{0pt}j} - m_{i}^{new}}\\hspace{0pt}{\\overset{\\sim}{\\mathbf{P}}}_{i\\hspace{0pt}j}\\hspace{0pt}\\mathbf{V}_{j}}})}}$ to HBM.\n13:        Write $\\ell_{i}\\leftarrow\\ell_{i}^{new}$, $m_{i}\\leftarrow m_{i}^{new}$ to HBM.",
+      "elide": [
+        "Alg.1 L0-L8 的分块尺寸/初始化/load 脚手架（L128-L146，访存脚手架由图讲）与空行（L149/L151/L153/L155）"
+      ]
+    },
+    {
+      "path": "arXiv:2205.14135 §3.2",
+      "lines": "Theorem 2 + 证明骨架 (paper.md:L174-L180)",
+      "what": "IO 复杂度账：标准注意力 Θ(Nd+N²) vs FlashAttention Θ(N²d²M⁻¹) HBM 访问；证明骨架=SRAM 装 Θ(M) 的 KV 块 → Nd/M 遍 × 每遍 Θ(Nd) 元素。",
+      "code": "###### Theorem 2.\nLet $N$ be the sequence length, $d$ be the head dimension, and $M$ be size of SRAM with $d \\leq M \\leq {N\\hspace{0pt}d}$. Standard attention (Algorithm ) requires $\\Theta\\hspace{0pt}{({{N\\hspace{0pt}d} + N^{2}})}$ HBM accesses, while FlashAttention (Algorithm 1) requires $\\Theta\\hspace{0pt}{({N^{2}\\hspace{0pt}d^{2}\\hspace{0pt}M^{- 1}})}$ HBM accesses.\nThe main idea of the proof is that given the SRAM size of $M$, we can load blocks of $\\mathbf{K},\\mathbf{V}$ of size $\\Theta\\hspace{0pt}{(M)}$ each (Algorithm 1 line 6). For each block of $\\mathbf{K}$ and $\\mathbf{V}$, we iterate over all blocks of $\\mathbf{Q}$ (Algorithm 1 line 8) to compute the intermediate values, resulting in $\\Theta\\hspace{0pt}{({N\\hspace{0pt}d\\hspace{0pt}M^{- 1}})}$ passes over $\\mathbf{Q}$. Each pass loads $\\Theta\\hspace{0pt}{({N\\hspace{0pt}d})}$ elements, which amounts to $\\Theta\\hspace{0pt}{({N^{2}\\hspace{0pt}d^{2}\\hspace{0pt}M^{- 1}})}$ HBM accesses. We similarly prove that the backward pass of standard attention requires $\\Theta\\hspace{0pt}{({{N\\hspace{0pt}d} + N^{2}})}$ HBM accesses while the backward pass of FlashAttention requires $\\Theta\\hspace{0pt}{({N^{2}\\hspace{0pt}d^{2}\\hspace{0pt}M^{- 1}})}$ HBM accesses (Appendix B).",
+      "elide": [
+        "空行（L175/L177-L179）与 backward 同构段（L180 句尾 Appendix B 指引）"
+      ]
+    },
+    {
+      "path": "arXiv:2307.08691 §3.1 Algorithm 1",
+      "lines": "Alg.1 L3-L17 (paper-fa2.md:L172-L200)",
+      "what": "FA-2 forward：外层遍历 Q 行块（跨 thread block 沿序列长度并行）、内层 KV 列块；O 中间保持未归一化、收尾 diag(ℓ)^{-1} 只除一次；只存 logsumexp L=m+log(ℓ)——现代 kernel（vLLM 所用）即此变体。",
+      "code": "3:  for $1 \\leq i \\leq T_{r}$ do\n4:      Load $\\mathbf{Q}_{i}$ from HBM to on-chip SRAM.\n5:      On chip, initialize ${\\mathbf{O}_{i}^{(0)} = {(0)}_{B_{r} \\times d} \\in {\\mathbb{R}}^{B_{r} \\times d}},{\\ell_{i}^{(0)} = {(0)}_{B_{r}} \\in {\\mathbb{R}}^{B_{r}}},{m_{i}^{(0)} = {({- \\infty})}_{B_{r}} \\in {\\mathbb{R}}^{B_{r}}}$.\n6:     for $1 \\leq j \\leq T_{c}$ do\n7:         Load $\\mathbf{K}_{j},\\mathbf{V}_{j}$ from HBM to on-chip SRAM.\n8:         On chip, compute $\\mathbf{S}_{i}^{(j)} = {\\mathbf{Q}_{i}\\hspace{0pt}\\mathbf{K}_{j}^{T}} \\in {\\mathbb{R}}^{B_{r} \\times B_{c}}$.\n9:         On chip, compute $m_{i}^{(j)} = {\\max\\hspace{0pt}{(m_{i}^{({j - 1})},{{rowmax}\\hspace{0pt}{(\\mathbf{S}_{i}^{(j)})}})}} \\in {\\mathbb{R}}^{B_{r}}$, ${\\overset{\\sim}{\\mathbf{P}}}_{i}^{(j)} = {\\exp{({\\mathbf{S}_{i}^{(j)} - m_{i}^{(j)}})}} \\in {\\mathbb{R}}^{B_{r} \\times B_{c}}$ (pointwise), $\\ell_{i}^{(j)} = {{e^{m_{i}^{j - 1} - m_{i}^{(j)}}\\hspace{0pt}\\ell_{i}^{({j - 1})}} + {{rowsum}\\hspace{0pt}{({\\overset{\\sim}{\\mathbf{P}}}_{i}^{(j)})}}} \\in {\\mathbb{R}}^{B_{r}}$.\n10:         On chip, compute $\\mathbf{O}_{i}^{(j)} = {{{diag}\\hspace{0pt}{(e^{m_{i}^{({j - 1})} - m_{i}^{(j)}})}^{- 1}\\hspace{0pt}\\mathbf{O}_{i}^{({j - 1})}} + {{\\overset{\\sim}{\\mathbf{P}}}_{i}^{(j)}\\hspace{0pt}\\mathbf{V}_{j}}}$.\n12:     On chip, compute $\\mathbf{O}_{i} = {{diag}\\hspace{0pt}{(\\ell_{i}^{(T_{c})})}^{- 1}\\hspace{0pt}\\mathbf{O}_{i}^{(T_{c})}}$.\n13:     On chip, compute $L_{i} = {m_{i}^{(T_{c})} + {\\log{(\\ell_{i}^{(T_{c})})}}}$.\n17:  Return the output $\\mathbf{O}$ and the logsumexp $L$.",
+      "elide": [
+        "end for 与 Write to HBM 行（L188/L194/L196/L198）、空行"
+      ]
+    },
+    {
+      "path": "arXiv:2307.08691 §3.1.1",
+      "lines": "Tweak 2 (paper-fa2.md:L146-L147)",
+      "what": "logsumexp 改造原话：不必同时存 max 与 sum，只需 L=m+log(ℓ)——vLLM 的 return_softmax_lse 拿到的正是这个 L，cascade/合并都靠它。",
+      "code": "2. 2.\n    We do not have to save both the max $m^{(j)}$ and the sum of exponentials $\\ell^{(j)}$ for the backward pass. We only need to store the logsumexp $L^{(j)} = {m^{(j)} + {\\log{(\\ell^{(j)})}}}$.",
+      "elide": []
+    },
+    {
+      "path": "arXiv:2307.08691 §2.3.1",
+      "lines": "两块 online softmax 表 (paper-fa2.md:L96-L107)",
+      "what": "两块合并的最干净推导：块 1 局部 (m¹,ℓ¹,O¹)，块 2 来了以后 m²=max、ℓ²=e^{m¹−m²}ℓ¹+…、O²=e^{m¹−m²}O¹+…——与 FA 论文 Alg.1 同一数学的『两块特写』，merge_attn_states 的教科书原型。",
+      "code": "Online softmax instead computes “local” softmax with respect to each block and rescale to get the right output at the end:\n| | | | |\n| | $m^{(1)}$ | $= {{rowmax}\\hspace{0pt}{(\\mathbf{S}^{(1)})}} \\in {\\mathbb{R}}^{B_{r}}$ | |\n| | $\\ell^{(1)}$ | $= {{rowsum}\\hspace{0pt}{(e^{\\mathbf{S}^{(1)} - m^{(1)}})}} \\in {\\mathbb{R}}^{B_{r}}$ | |\n| | ${\\overset{\\sim}{\\mathbf{P}}}^{(1)}$ | $= {{diag}\\hspace{0pt}{(\\ell^{(1)})}^{- 1}\\hspace{0pt}e^{\\mathbf{S}^{(1)} - m^{(1)}}} \\in {\\mathbb{R}}^{B_{r} \\times B_{c}}$ | |\n| | $\\mathbf{O}^{(1)}$ | $= {{\\overset{\\sim}{\\mathbf{P}}}^{(1)}\\hspace{0pt}\\mathbf{V}^{(1)}} = {{diag}\\hspace{0pt}{(\\ell^{(1)})}^{- 1}\\hspace{0pt}e^{\\mathbf{S}^{(1)} - m^{(1)}}\\hspace{0pt}\\mathbf{V}^{(1)}} \\in {\\mathbb{R}}^{B_{r} \\times d}$ | |\n| | $m^{(2)}$ | $= {\\max{(m^{(1)},{{rowmax}\\hspace{0pt}{(\\mathbf{S}^{(2)})}})}} = m$ | |\n| | $\\ell^{(2)}$ | $= {{e^{m^{(1)} - m^{(2)}}\\hspace{0pt}\\ell^{(1)}} + {{rowsum}\\hspace{0pt}{(e^{\\mathbf{S}^{(2)} - m^{(2)}})}}} = {{{rowsum}\\hspace{0pt}{(e^{\\mathbf{S}^{(1)} - m})}} + {{rowsum}\\hspace{0pt}{(e^{\\mathbf{S}^{(2)} - m})}}} = \\ell$ | |\n| | ${\\overset{\\sim}{\\mathbf{P}}}^{(2)}$ | $= {{diag}\\hspace{0pt}{(\\ell^{(2)})}^{- 1}\\hspace{0pt}e^{\\mathbf{S}^{(2)} - m^{(2)}}}$ | |\n| | $\\mathbf{O}^{(2)}$ | ${= {{{diag}\\hspace{0pt}{({\\ell^{(1)}/\\ell^{(2)}})}^{- 1}\\hspace{0pt}\\mathbf{O}^{(1)}} + {{\\overset{\\sim}{\\mathbf{P}}}^{(2)}\\hspace{0pt}\\mathbf{V}^{(2)}}} = {{{diag}\\hspace{0pt}{(\\ell^{(2)})}^{- 1}\\hspace{0pt}e^{s^{(1)} - m}\\hspace{0pt}\\mathbf{V}^{(1)}} + {{diag}\\hspace{0pt}{(\\ell^{(2)})}^{- 1}\\hspace{0pt}e^{s^{(2)} - m}\\hspace{0pt}\\mathbf{V}^{(2)}}} = \\mathbf{O}}.$ | |",
+      "elide": [
+        "表格边框行（L97/L99）、空行（L108-L109）"
+      ]
+    },
+    {
+      "path": "vllm/v1/attention/backends/fa_utils.py",
+      "lines": "L21-L36",
+      "what": "平台 import 期：CUDA 走 vllm.vllm_flash_attn（vLLM 自带的 FA2/FA3/FA4 全家桶），XPU 走 xpu_ops——vLLM 不自研 FA 前向 kernel，当黑盒 import；本章要打开的黑盒就是这个 import 背后的算法。",
+      "code": "if current_platform.is_cuda():\n    from vllm._custom_ops import reshape_and_cache_flash\n    from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]\n        compile_flash_attn_varlen_func_from_specs,\n        flash_attn_varlen_func,\n        get_scheduler_metadata,\n    )\n\nelif current_platform.is_xpu():\n    from vllm import _custom_ops as ops\n    from vllm._xpu_ops import xpu_ops\n\n    reshape_and_cache_flash = ops.reshape_and_cache_flash\n    flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func  # type: ignore[assignment]\n    compile_flash_attn_varlen_func_from_specs = None  # type: ignore[assignment]\n    get_scheduler_metadata = xpu_ops.get_scheduler_metadata  # type: ignore[assignment]",
+      "elide": [
+        "ROCm 分支（L37-L70，aiter/upstream flash-attn 的 import 与 stub）——同型平台分支"
+      ]
+    },
+    {
+      "path": "vllm/v1/attention/backends/fa_utils.py",
+      "lines": "L158-L181",
+      "what": "FA 版本决议核心：SM90(Hopper)→FA3、SM100+(Blackwell)→FA4、其余→FA2；attention_config.flash_attn_version 可覆写——『现代 kernel 谱系』的版本矩阵入口（后续 L183-L270 还有一长串能力回退）。",
+      "code": "        device_capability = current_platform.get_device_capability()\n\n        assert device_capability is not None\n\n        # 1. default version depending on platform\n        if device_capability.major == 9 and is_fa_version_supported(3):\n            # Hopper (SM90): prefer FA3\n            fa_version = 3\n        elif device_capability.major == 10 and is_fa_version_supported(4):\n            # Blackwell (SM100+, restrict to SM100 for now): prefer FA4\n            fa_version = 4\n        else:\n            # Fallback to FA2\n            fa_version = 2\n\n        # 2. override if passed by environment or config\n        from vllm.config import get_current_vllm_config_or_none\n\n        vllm_config = get_current_vllm_config_or_none()\n        if (\n            vllm_config is not None\n            and vllm_config.attention_config.flash_attn_version is not None\n        ):\n            fa_version = vllm_config.attention_config.flash_attn_version",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L880-L910",
+      "what": "后端 forward 的两条开篇纪律：(1) NOTE(woosuk)——piecewise CUDA graph 下本方法在 eager 跑，连 view/slice 都出奇地慢，任何改动都要 benchmark；(2) KV cache 张量 (B,H,N,2D) transpose+split 出 key_cache/value_cache——kernel 读的不是连续 K/V。",
+      "code": "        # IMPORTANT!\n        # NOTE(woosuk): With piece-wise CUDA graphs, this method is executed in\n        # eager-mode PyTorch. Thus, we need to be careful about any CPU overhead\n        # in this method. For example, `view` and `slice` (or `[:n]`) operations\n        # are surprisingly slow even in the case they do not invoke any GPU ops.\n        # Minimize the PyTorch ops in this method as much as possible.\n        # Whenever making a change in this method, please benchmark the\n        # performance to make sure it does not introduce any overhead.\n\n        num_actual_tokens = attn_metadata.num_actual_tokens\n        # … 省略：encoder-only 分支（L891-L902，编码器注意力无 KV cache，走 _forward_encoder_attention）…\n        # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))\n        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)",
+      "elide": [
+        "encoder-only 分支（L891-L902）与中间 FP8 view/量化旁路（L906-L922）"
+      ]
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L929-L935",
+      "what": "元数据接驳（非 cascade 主路径）：cu_seqlens_q=query_start_loc（ch18 的前缀和）、seqused_k=seq_lens、max_seqlen、block_table（ch13 的页表）、scheduler_metadata——引擎侧概念在这里一一变成 kernel 入参。",
+      "code": "        if not attn_metadata.use_cascade:\n            cu_seqlens_q = attn_metadata.query_start_loc\n            seqused_k = attn_metadata.seq_lens\n            max_seqlen_q = attn_metadata.max_query_len\n            max_seqlen_k = attn_metadata.max_seq_len\n            block_table = attn_metadata.block_table\n            scheduler_metadata = attn_metadata.scheduler_metadata",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L1041-L1066",
+      "what": "非 cascade 主路径：整批 prefill+decode 一次 flash_attn_varlen_func 吃下——全书此前当黑盒调用的那一行，本章的论文数学就是它的内部；一次调用=一个融合 kernel=零 N×N 物化。",
+      "code": "                flash_attn_varlen_func(\n                    q=query[:num_actual_tokens],\n                    k=key_cache,\n                    v=value_cache,\n                    out=output[:num_actual_tokens],\n                    cu_seqlens_q=cu_seqlens_q,\n                    max_seqlen_q=max_seqlen_q,\n                    seqused_k=seqused_k,\n                    max_seqlen_k=max_seqlen_k,\n                    softmax_scale=self.scale,\n                    causal=causal,\n                    alibi_slopes=self.alibi_slopes,\n                    window_size=sliding_window_size,\n                    block_table=block_table,\n                    softcap=self.logits_soft_cap,\n                    scheduler_metadata=scheduler_metadata,\n                    fa_version=self.vllm_flash_attn_version,\n                    q_descale=q_descale,\n                    k_descale=k_descale,\n                    v_descale=v_descale,\n                    dynamic_causal=dynamic_causal,\n                    num_splits=attn_metadata.max_num_splits,\n                    s_aux=self.sinks,\n                    mask_mod=rswa_mask_mod_fn or mm_mask_mod,\n                    aux_tensors=rswa_aux or mm_aux,\n                )",
+      "elide": []
+    },
+    {
+      "path": "vllm/vllm_flash_attn/flash_attn_interface.py",
+      "lines": "L176-L217",
+      "what": "flash_attn_varlen_func 形参面：varlen 四件套（q/k/v+max_seqlen_q+cu_seqlens_q）、分页（seqused_k+block_table）、因果（causal）、滑窗（window_size）、LSE 开关（return_softmax_lse）、FA3/FA4 专属参数、版本选择器（fa_version）。",
+      "code": "def flash_attn_varlen_func(\n    q,\n    k,\n    v,\n    max_seqlen_q,\n    cu_seqlens_q,\n    max_seqlen_k,\n    cu_seqlens_k=None,  # only used for non-paged prefill\n    seqused_k=None,\n    q_v=None,\n    dropout_p=0.0,\n    softmax_scale=None,\n    causal=False,\n    window_size: list[int] | None = None,\n    softcap=0.0,  # 0.0 means deactivated\n    alibi_slopes=None,\n    deterministic=False,\n    return_attn_probs=False,\n    block_table=None,\n    return_softmax_lse=False,\n    out=None,\n    # FA3 Only\n    scheduler_metadata=None,\n    q_descale=None,\n    k_descale=None,\n    v_descale=None,\n    num_splits: int = 0,\n    # FA4 Only\n    output_scale=None,\n    # Version selector\n    fa_version: int = DEFAULT_FA_VERSION,\n    s_aux=None,\n    cp_world_size=1,\n    cp_rank=0,\n    cp_tot_seqused_k=None,\n    # FA4 only\n    mask_mod=None,\n    block_sparse_tensors=None,\n    aux_tensors=None,\n    aux_tensor_leading_dims=None,\n    dynamic_causal: \"torch.Tensor | None\" = None,\n):",
+      "elide": []
+    },
+    {
+      "path": "vllm/vllm_flash_attn/flash_attn_interface.py",
+      "lines": "L218-L269",
+      "what": "语义契约 docstring：causal 右下对齐的两个掩码例子（seqlen_q=2 vs seqlen_q=5——decode 的 seqlen_q=1 天然落在最右列）、varlen 形状与 cu_seqlens 定义、Return 段 softmax_lse=logsumexp（log of the softmax normalization factor）。",
+      "code": "    \"\"\"dropout_p should be set to 0.0 during evaluation\n    # … 省略：MQA/GQA 支持说明（L219-L223）…\n    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.\n    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:\n        1 1 1 1 0\n        1 1 1 1 1\n    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:\n        0 0\n        0 0\n        0 0\n        1 0\n        1 1\n    If the row of the mask is all zero, the output will be zero.\n    If window_size != (-1, -1), implements sliding window local attention. Query at position i\n    will only attend to keys between\n    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.\n    Arguments:\n        q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.\n        k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.\n        v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.\n        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths\n           of the sequences in the batch, used to index into q.\n        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths\n           of the sequences in the batch, used to index into kv.\n        max_seqlen_q: int. Maximum query sequence length in the batch.\n        max_seqlen_k: int. Maximum key sequence length in the batch.\n        # … 省略：dropout_p/softmax_scale/causal/softcap/alibi 等参数逐条说明（L250-L263）…\n    Return:\n        out: (total, nheads, headdim).\n        softmax_lse [optional, if return_softmax_lse=True]: (nheads, total_q_seqlen). The\n            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax\n            normalization factor).\n    \"\"\"",
+      "elide": [
+        "MQA/GQA 支持说明（L219-L223）",
+        "dropout/softmax_scale/softcap/alibi/deterministic/return_attn_probs 参数逐条说明（L250-L263）"
+      ]
+    },
+    {
+      "path": "vllm/vllm_flash_attn/flash_attn_interface.py",
+      "lines": "L270-L278",
+      "what": "分页契约三断言：cu_seqlens_k 与 seqused_k 二选一；带 block_table（分页 KV）必须 seqused_k——『K 在块池里、长度按请求给』的接口级约束。",
+      "code": "    assert cu_seqlens_k is not None or seqused_k is not None, (\n        \"cu_seqlens_k or seqused_k must be provided\"\n    )\n    assert cu_seqlens_k is None or seqused_k is None, (\n        \"cu_seqlens_k and seqused_k cannot be provided at the same time\"\n    )\n    assert block_table is None or seqused_k is not None, (\n        \"seqused_k must be provided if block_table is provided\"\n    )",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/attention/attention.py",
+      "lines": "L533-L582",
+      "what": "Attention 插座（ch19 已讲算子化，这里只作入口）：reshape 在 custom op 外做（NOTE(woosuk)：最小化非 CUDA-graph 区的 CPU 开销）；opaque 平台走 torch.ops.vllm.unified_attention_with_output——被 ch19 捕进 CUDA graph 的那个不透明算子；KV 写是独立算子 unified_kv_cache_update，其返回值作为 dummy 数据依赖保序。",
+      "code": "        # Reshape the query, key, and value tensors.\n        # NOTE(woosuk): We do this outside the custom op to minimize the\n        # CPU overheads from the non-CUDA-graph regions.\n        query = query.view(-1, self.num_heads, self.head_size)\n        output = output.view(-1, self.num_heads, self.head_size_v)\n        if key is not None:\n            key = key.view(-1, self.num_kv_heads, self.head_size)\n        if value is not None:\n            value = value.view(-1, self.num_kv_heads, self.head_size_v)\n        kv_cache_dummy_dep = None\n        # … 省略：use_direct_call 非 opaque 平台直调分支（L543-L561，unified_attention_with_output 直调 Python 函数）…\n        else:\n            # Skip this if sharing KV cache with an earlier attention layer.\n            encoded = _encode_layer_name(self.layer_name)\n            if (\n                not self.attn_backend.forward_includes_kv_cache_update\n                and self.kv_sharing_target_layer_name is None\n                and key is not None\n                and value is not None\n            ):\n                kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(\n                    key, value, encoded\n                )\n            torch.ops.vllm.unified_attention_with_output(\n                query,\n                key,\n                value,\n                output,\n                encoded,\n                kv_cache_dummy_dep=kv_cache_dummy_dep,\n            )\n        return output.view(-1, hidden_size)",
+      "elide": [
+        "use_direct_call 直调分支（L543-L561）——同一调用的非 opaque 形态"
+      ]
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L1638-L1690",
+      "what": "cascade 两段调用现场：前缀段 causal=False + block_table[:1]（批内所有 query 都看整段共享前缀）、后缀段 causal=True + block_table[:, num_common_kv_blocks:]（各自私有 KV）；两段都 return_softmax_lse=True，最后 merge_attn_states 合并——前缀只算一遍被全批复用。",
+      "code": "    # Process shared prefix.\n    prefix_output, prefix_lse = flash_attn_varlen_func(\n        q=query,\n        k=key_cache,\n        v=value_cache,\n        cu_seqlens_q=cu_prefix_query_lens,\n        seqused_k=prefix_kv_lens,\n        max_seqlen_q=num_tokens,\n        max_seqlen_k=common_prefix_len,\n        softmax_scale=softmax_scale,\n        causal=False,\n        window_size=list(sliding_window),\n        block_table=block_table[:1],\n        softcap=logits_soft_cap,\n        return_softmax_lse=True,\n        # … 省略：scheduler_metadata/fa_version/q·k·v_descale/s_aux/num_splits 旁路参数（L1653-L1664）…\n    # Process suffix per query.\n    suffix_output, suffix_lse = flash_attn_varlen_func(\n        q=query,\n        k=key_cache,\n        v=value_cache,\n        cu_seqlens_q=cu_query_lens,\n        seqused_k=suffix_kv_lens,\n        max_seqlen_q=max_query_len,\n        max_seqlen_k=max_kv_len - common_prefix_len,\n        softmax_scale=softmax_scale,\n        causal=True,\n        window_size=list(sliding_window),\n        block_table=block_table[:, num_common_kv_blocks:],\n        softcap=logits_soft_cap,\n        return_softmax_lse=True,\n        # … 省略：同前缀段的调度/量化参数（L1681-L1686）…\n    )\n    # Merge prefix and suffix outputs, and store the result in output.\n    merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)",
+      "elide": [
+        "descale_shape 计算（L1663-L1665）与两段的 scheduler_metadata/fa_version/descale/s_aux/num_splits 参数行（L1653-L1662、L1681-L1686）——FP8/调度的外围"
+      ]
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L1531-L1543",
+      "what": "cascade 决策的『早退』风格：docstring 明说这是启发式；共享前缀 <256 token 直接 False（NOTE(woosuk)：这是常见情形，要尽早返回）——工程上『值得不值得拆』与数学上『拆了是否精确』是两件事，本章数学保证后者。",
+      "code": ") -> bool:\n    \"\"\"Decide whether to use cascade attention.\n\n    This function 1) checks whether cascade attention is supported with the\n    given configuration, and 2) heuristically decides whether using cascade\n    attention can improve performance.\n    \"\"\"\n    # Too short common prefix. Probably not worth using cascade attention.\n    # We use an arbitrary threshold of 256 tokens. TODO: Tune this threshold.\n    # NOTE(woosuk): This is the common case. We should return False as soon as\n    # possible to avoid any unnecessary computation.\n    if common_prefix_len < 256:\n        return False",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/attention/ops/merge_attn_states.py",
+      "lines": "L9-L22",
+      "what": "merge_attn_states 分派器头部：vLLM 源码自引 arXiv:2501.01005 §2.2 的 LSE rescaling 方法——⊕ 合并的落地现场直接挂着论文出处。",
+      "code": "def merge_attn_states(\n    output: torch.Tensor,\n    prefix_output: torch.Tensor,\n    prefix_lse: torch.Tensor,\n    suffix_output: torch.Tensor,\n    suffix_lse: torch.Tensor,\n    output_lse: torch.Tensor | None = None,\n    prefill_tokens_with_context: int | None = None,\n    output_scale: torch.Tensor | None = None,\n) -> None:\n    \"\"\"Merge partial attention outputs from prefix (KV cache) and suffix\n    (new tokens) into a single output tensor using the log-sum-exp (LSE)\n    rescaling method described in section 2.2 of\n    https://www.arxiv.org/pdf/2501.01005.",
+      "elide": [
+        "docstring 其余参数说明（L23-L47）与 CUDA 前置校验（L49-L79）不在本 excerpt 范围"
+      ]
+    },
+    {
+      "path": "vllm/v1/attention/ops/merge_attn_states.py",
+      "lines": "L80-L111",
+      "what": "CUDA/Triton 分派：CUDA 且 dtype（fp32/half/bf16）与 headdim（128b 打包约束：fp32 整除 4 / half 整除 8）满足时走 _custom_ops 的 CUDA kernel，否则回退 Triton。",
+      "code": "    if (\n        current_platform.is_cuda()\n        and supported_dtypes(prefix_output)\n        and supported_headdim(prefix_output)\n    ):\n        from vllm._custom_ops import merge_attn_states\n\n        return merge_attn_states(\n            output,\n            prefix_output,\n            prefix_lse,\n            suffix_output,\n            suffix_lse,\n            output_lse,\n            prefill_tokens_with_context,\n            output_scale,\n        )\n    else:\n        from vllm.v1.attention.ops.triton_merge_attn_states import (\n            merge_attn_states,\n        )\n\n        return merge_attn_states(\n            output,\n            prefix_output,\n            prefix_lse,\n            suffix_output,\n            suffix_lse,\n            output_lse,\n            prefill_tokens_with_context,\n            output_scale,\n        )",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/attention/ops/triton_merge_attn_states.py",
+      "lines": "L257-L322",
+      "what": "⊕ 落地 kernel 主体（有 context 的 token 走合并支路）：载入两段 lse → FA2/FA3 的 inf→-inf 归一 → max_lse 稳定化 → p_se/s_se=e^{lse−max} → out_se=Σ → 可选 out_lse=log(out_se)+max_lse → p_scale/s_scale=归一化质量占比 → out=加权合并 → 双空（max_lse=-inf）护栏置零。NOTE(woosuk)：先算 scale 再乘 output 的数值稳定纪律。",
+      "code": "    # For tokens with context (token_idx < prefill_tokens_with_context),\n    # perform normal merge operation\n    p_lse = tl.load(\n        prefix_lse\n        + head_idx * prefix_lse_head_stride\n        + token_idx * prefix_lse_token_stride\n    )\n    s_lse = tl.load(\n        suffix_lse\n        + head_idx * suffix_lse_head_stride\n        + token_idx * suffix_lse_token_stride\n    )\n\n    # FA2 and FA3 have different behavior for when the sum-exp is 0, this namely\n    # arises with 0 len seqlens. FA3 returns -inf here while FA2 returns inf.\n    # If we see an inf assume FA2 and convert inf to -inf for consistency\n    # and correctness. Inf generally doesn't make sense in this context outside\n    # of undefined-behavior/FA2-case, so I think this a safe assumption.\n    p_lse = float(\"-inf\") if p_lse == float(\"inf\") else p_lse\n    s_lse = float(\"-inf\") if s_lse == float(\"inf\") else s_lse\n\n    max_lse = tl.maximum(p_lse, s_lse)\n    p_lse = p_lse - max_lse\n    s_lse = s_lse - max_lse\n    # Will reuse precomputed Exp values for scale factor computation.\n    p_se = tl.exp(p_lse)\n    s_se = tl.exp(s_lse)\n    out_se = p_se + s_se\n\n    if OUTPUT_LSE:\n        out_lse = tl.log(out_se) + max_lse\n        # Both sides empty (max_lse == -inf) => undefined merge; keep -inf so\n        # downstream merges continue to treat the token as empty.\n        out_lse = tl.where(max_lse == float(\"-inf\"), float(\"-inf\"), out_lse)\n        tl.store(\n            output_lse\n            + head_idx * output_lse_head_stride\n            + token_idx * output_lse_token_stride,\n            out_lse,\n        )\n\n    p_out = tl.load(\n        prefix_output\n        + token_idx * num_heads * prefix_head_stride\n        + head_idx * prefix_head_stride\n        + head_arange,\n        mask=head_mask,\n    )\n    s_out = tl.load(\n        suffix_output\n        + token_idx * num_heads * prefix_head_stride\n        + head_idx * prefix_head_stride\n        + head_arange,\n        mask=head_mask,\n    )\n\n    # NOTE(woosuk): Be careful with the numerical stability.\n    # We should compute the scale first, and then multiply it with the output.\n    # Do not multiply the output with tl.exp(p_lse) or tl.exp(s_lse) directly.\n    p_scale = p_se / out_se\n    s_scale = s_se / out_se\n    out = p_out * p_scale + s_out * s_scale\n    # If both sides are empty (max_lse == -inf) the scales are 0/0 = NaN; emit\n    # zeros rather than NaN. Callers with empty chunks (see mask_empty_context)\n    # zero those inputs, so this only guards the fully-undefined corner.\n    out = tl.where(max_lse == float(\"-inf\"), 0.0, out)",
+      "elide": []
+    }
+  ],
+  "theory": [
+    {
+      "topic": "内存层级与算术强度：为什么慢在搬运不在计算",
+      "content": "GPU 内存层级：小而快 vs 大而慢（A100：HBM 40-80GB@1.5-2.0TB/s，SRAM 192KB/SM×108@~19TB/s）。算术强度=FLOP/字节：大内维 GEMM 是 compute-bound，elementwise/reduction（softmax 本尊）是 memory-bound。标准注意力 Alg.0 三步把 S=QK^T、P=softmax(S) 两张 N×N 物化到 HBM 再读回——访存 Θ(N²)（N≫d 时主导）+ Θ(N²) 显存。数值感受：8K 上下文一个 head 的 S 表 67M 元素、fp16 134MB。kernel fusion 是 memory-bound 的常规武器，但朴素融合救不了注意力：中间结果太大必须落 HBM——除非不物化。",
+      "papers": [
+        "arXiv:2205.14135 §2.1-2.2"
+      ]
+    },
+    {
+      "topic": "naive→safe→online softmax：三遍到单遍",
+      "content": "naive（2 遍访问）会溢出；safe softmax 减 max（3 遍：求 max、求 Σexp、算 y）；online（Alg.3）单遍同时维护 running m_j 与 rescaled d_j：d_j = d_{j-1}·e^{m_{j-1}−m_j} + e^{x_j−m_j}——旧账按新旧 max 之差折算。归纳法证明末值 m_V=max、d_V=Σexp(x−m_V) 与三遍法恒等（Thm.1）；数值界 1≤d_j≤j 保证不溢出。直觉：『记账时不知道全局最大，就每来一个新最大把旧账全部折算到新基准』。",
+      "papers": [
+        "arXiv:1805.02867 §2-3, Thm.1"
+      ]
+    },
+    {
+      "topic": "⊕ 算子的结合律与交换律：分块合并的合法性",
+      "content": "把 (m,d) 视为状态、⊕ 为二元算子（Eq.4）：新 max=max(m_i,m_j)，新 d=各自 d 按到新 max 的差 rescale 后相加。⊕ 满足结合律（可任意括号分块）+交换律（可乱序归并）——所以 softmax 归一化可按任意块序并行计算再合并，且结果与一次算完逐位相等。这是 FlashAttention tiling 与 vLLM merge_attn_states（两段 LSE 合并）共同的合法性根据。",
+      "papers": [
+        "arXiv:1805.02867 §3.1 Eq.3-4"
+      ]
+    },
+    {
+      "topic": "tiling 免物化与精确性",
+      "content": "把 Q/K/V 切块载入 SRAM：外层遍历 KV 块、内层遍历 Q 块（原始 FA 序）；每个 (i,j) 块局部算 S_ij、局部 softmax（m̃,P̃,ℓ̃），再用 online-softmax 递推把 running (m_i,ℓ_i,O_i) 更新到新全局 max——O_i 每步按 e^{旧max−新max} 缩放旧值再加 e^{m̃−m_new}·P̃V。全程 S/P 只存在于 SRAM、从不落 HBM；整个注意力融成一个 CUDA kernel（matrix multiply→softmax→（可选 mask/dropout）→matrix multiply 不出片上内存）。Thm.1：输出精确等于 softmax(QK^T)V（无近似），O(N²d) FLOP、O(N) 额外内存。backward 靠存 (O,ℓ,m) 重算 S/P（recomputation）——比从 HBM 读 N×N 更快，推理读者知道这个反直觉结论即可。",
+      "papers": [
+        "arXiv:2205.14135 §3.1 Alg.1, Thm.1",
+        "arXiv:2205.14135 Appendix B"
+      ]
+    },
+    {
+      "topic": "IO 复杂度账与下界",
+      "content": "Thm.2：标准注意力 Θ(Nd+N²) HBM 访问 vs FlashAttention Θ(N²d²M⁻¹)。骨架：SRAM 大小 M 每次装 Θ(M) 的 KV 块共 Θ(Nd/M) 块，每块要过全部 Q（Θ(Nd)）→ Θ(N²d²/M)。d=64-128、M≈100KB 时 d²≪M，故少一个接近 M/d² 的因子（论文实测最高 9×，Fig.2）。Prop.3 下界：对 [d,Nd] 内所有 M，不存在 o(N²d²/M) 的精确注意力算法——FA 在此意义下渐进最优。块大小 tradeoff：块越大访存越少，但超 SRAM 且过大后算力成瓶颈（Fig.2 中图：Bc>256 后收益封顶）。",
+      "papers": [
+        "arXiv:2205.14135 §3.2 Thm.2, Prop.3"
+      ]
+    },
+    {
+      "topic": "FA-2：同一份数学的三处工程榨取",
+      "content": "(1) 循环序对调——外层改遍历 Q 行块：行块可跨 thread block 沿序列长度并行（长序列 batch 小时 occupancy 上来），Q 块间独立无需通信；(2) 中间 O 保持未归一化，收尾 diag(ℓ)^{-1} 只除一次——non-matmul FLOP 大减（A100 matmul 吞吐 312 vs non-matmul 19.5 TFLOPs/s ≈ 16×，论文原话 each non-matmul FLOP is 16x more expensive）；(3) 只存 logsumexp L=m+log(ℓ) 一个统计量而非 (m,ℓ) 两个。warp 分工从 split-K 改 split-Q 免 shared-memory 通信。综合约 2× 于 FA（Fig.4）。vLLM return_softmax_lse 返回的正是 L。",
+      "papers": [
+        "arXiv:2307.08691 §3.1-3.3"
+      ]
+    },
+    {
+      "topic": "LSE 合并：⊕ 在 (lse, output) 上的作用",
+      "content": "两段注意力各返回未归一化的部分输出与 lse=log Σexp：max=max(lse_a,lse_b) 稳定化后，权重 w_a=e^{lse_a−max}/(e^{lse_a−max}+e^{lse_b−max})（两段 softmax 归一化质量的占比），O=w_a·O_a+w_b·O_b，合并 lse=log(Σe^{lse−max})+max。与一次性对拼接 KV 做 softmax 逐位相等——vLLM merge_attn_states 即此实现（Triton kernel L259-L322），支撑 cascade attention 与 split-KV；vLLM 源码 docstring 自引 arXiv:2501.01005 §2.2。工程细节：FA2/FA3 对空序列 lse 的 inf/−inf 差异归一（L270-L276）、双空护栏（L319-L322）、先算 scale 再乘 output 的稳定纪律（NOTE(woosuk) L313-L315）。",
+      "papers": [
+        "arXiv:1805.02867 §3.1 Eq.4",
+        "arXiv:2307.08691 §2.3.1",
+        "arXiv:2501.01005 §2.2（vLLM 源码自引，不在论文包内）"
+      ]
+    },
+    {
+      "topic": "causal 右下对齐：prefill 与 decode 共用一个 kernel",
+      "content": "causal 掩码对齐到注意力矩阵右下角：seqlen_q=2、seqlen_k=5 时第一行只看前 4 个 key（1 1 1 1 0）；seqlen_q=5、seqlen_k=2 时前三行全零（输出为零）。decode 的 seqlen_q=1 对 seqlen_k=N 天然落在最右列——所以整批 prefill（长 query）+decode（1 token query）能用同一个 varlen kernel 一次吃下。块级 causal 红利：整列块在行块右侧的直接跳过（约 1.7-1.8×）、每个行块只需对 1 个对角块施加掩码（FA-2 论文 §3.1 Causal masking）。",
+      "papers": [
+        "arXiv:2307.08691 §3.1 Causal masking",
+        "vllm/vllm_flash_attn/flash_attn_interface.py:L224-L234（docstring 原例）"
+      ]
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "ch20-m01",
+      "name": "标准注意力的内存带宽墙：物化两张 N×N 与 memory-bound",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/attention/backends/flash_attn.py:L1041-L1066"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:2205.14135",
+        "sections": [
+          "§2.1 Hardware Performance",
+          "§2.2 Standard Attention Implementation",
+          "Algorithm 0"
+        ]
+      },
+      "note": "读者认知起点：先立『慢在搬运不在计算』的反直觉论断。图素材：GPU 内存层级（SRAM 192KB@~19TB/s vs HBM 40-80GB@1.5-2.0TB/s，paper.md:L45 原数字）+ 标准 Alg.0 三步各读写 N×N 的往返账。worked example 素材：8K 上下文一张 S 表 67M 元素 fp16 134MB。代码对照物：L1041 一次调用=零物化。"
+    },
+    {
+      "id": "ch20-m02",
+      "name": "online-softmax 单遍递推：running (m,d) 与 rescale 项",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/v1/attention/ops/triton_merge_attn_states.py:L259-L284"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:1805.02867",
+        "sections": [
+          "§2 Algorithms 1-2",
+          "§3 Algorithm 3",
+          "Theorem 1"
+        ]
+      },
+      "note": "数值推演主战场：小向量（5 元素）手算 naive(2 遍)→safe(3 遍)→online(1 遍)，验证末值恒等；rescale 项 e^{m_{j-1}-m_j} 的直觉=『旧账折算到新最大值』。writer 三层递进：为什么减 max（溢出）→为什么三遍（max 和 Σ 不能一次算）→单遍怎么做到（折算）。落地照应：merge kernel 的 max_lse 稳定化（triton L278-L284）就是同一数学在 log 域的化身。"
+    },
+    {
+      "id": "ch20-m03",
+      "name": "⊕ 合并算子：结合律+交换律 → 任意分块/乱序归并皆精确",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/v1/attention/ops/triton_merge_attn_states.py:L259-L322"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:1805.02867",
+        "sections": [
+          "§3.1 Eq.3",
+          "§3.1 Eq.4"
+        ]
+      },
+      "note": "把 (m,d) 抽象成状态、⊕ 为二元算子；结合律→可任意括号分块、交换律→可乱序归并（论文自己省略了证明，正文用两块实例直接验证即可）。worked example：两块乱序合并=顺序遍历=一次性 softmax（配 paper-fa2.md:L96-L107 两块表）。Eq.3 的链式展开值得正文里画成小图。tiling 与 merge_attn_states 的合法性都从这条来。"
+    },
+    {
+      "id": "ch20-m04",
+      "name": "FlashAttention tiling 免物化：running (m,ℓ,O) 的缩放-累加递推",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/vllm_flash_attn/flash_attn_interface.py:L176-L217",
+        "vllm/v1/attention/backends/flash_attn.py:L1041-L1066"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "prereq": "ch19",
+      "paper_origin": {
+        "paper": "arXiv:2205.14135",
+        "sections": [
+          "§3.1 Algorithm 1",
+          "Theorem 1"
+        ]
+      },
+      "note": "核心算法：Q/K/V 切块进 SRAM，外层 KV 块内层 Q 块（原始 FA 序）；每 (i,j) 块局部 softmax 后把 running (m_i,ℓ_i,O_i) 更新到新全局 max——O_i 旧值按 e^{旧max−新max} 缩放再加 e^{m̃−m_new}P̃V；S/P 从不落 HBM、融成单 kernel；Thm.1 精确无近似。图：tiling 双循环 + O_i 的 rescale-accumulate。worked example：2×2 分块跑完 O_i 递推，对照朴素 softmax(QK^T)V 逐位相等。"
+    },
+    {
+      "id": "ch20-m05",
+      "name": "IO 复杂度账：Θ(Nd+N²) vs Θ(N²d²/M) 与下界",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/vllm_flash_attn/flash_attn_interface.py:L122-L173",
+        "vllm/v1/attention/backends/flash_attn.py:L1041-L1066"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:2205.14135",
+        "sections": [
+          "§3.2 Theorem 2",
+          "Proposition 3"
+        ]
+      },
+      "note": "量化『为什么快』：Thm.2 推导骨架（每块 KV 过全部 Q → Nd/M 遍 × Nd 元素）；worked example 代入 N=1024、d=64、M≈100KB 算访问次数之比；Prop.3 下界一句话（[d,Nd] 全域无算法渐进更优）；块大小 tradeoff（Fig.2 中图：Bc>256 后算力成瓶颈）。FA3 的 host 侧 get_scheduler_metadata（interface L121-L173、builder L515-L541）就是 tile/split 计账的工程化身——数学与工程在这里对上。"
+    },
+    {
+      "id": "ch20-m06",
+      "name": "FA-2 三改：循环序对调 + 未归一化 O + logsumexp L（一节带过）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/vllm_flash_attn/flash_attn_interface.py:L264-L268",
+        "vllm/v1/attention/backends/fa_utils.py:L158-L171"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "paper_origin": {
+        "paper": "arXiv:2307.08691",
+        "sections": [
+          "§3.1 Algorithm 1",
+          "§3.1.1 Forward pass",
+          "§3.2 Parallelism",
+          "§3.3 Work Partitioning"
+        ]
+      },
+      "note": "一节带过：(1) 外层改 Q 行块→序列长度维并行（长序列 occupancy）；(2) O 收尾才除 ℓ→non-matmul FLOP 减（A100 上 16× 差价）；(3) 只存 L=m+log ℓ——vLLM return_softmax_lse 拿到的正是它（L264-L268 docstring）；warp 分工 split-K→split-Q 一句话。图：FA vs FA-2 循环序对照。现代 kernel（vLLM 所用）即此变体——这是『论文数学』与『今天在跑的代码』的接口。"
+    },
+    {
+      "id": "ch20-m07",
+      "name": "LSE 合并 merge_attn_states：⊕ 在 (lse, output) 上落地",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/v1/attention/ops/merge_attn_states.py:L9-L111",
+        "vllm/v1/attention/ops/triton_merge_attn_states.py:L185-L336"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin": {
+        "paper": "arXiv:1805.02867",
+        "sections": [
+          "§3.1 Eq.4"
+        ]
+      },
+      "note": "两段各 (O_partial, lse)：max_lse 稳定化 → e^{lse−max} → out_se=Σ → 权重=占比 → out=加权合并 → 合并 lse=log(out_se)+max_lse；与一次性对拼接 KV 做 softmax 逐位相等。vLLM 源码 docstring 自引 arXiv:2501.01005 §2.2（split-KV 合并，不在论文包内，数学同 Eq.4）。工程亮点：FA2/FA3 空 seq 的 inf/−inf 归一（L270-L276）、双空护栏（L319-L322）、先算 scale 再乘 output（NOTE(woosuk) L313-L315）。worked example：两段部分 softmax 合并=对合并 KV 一次性 softmax。"
+    },
+    {
+      "id": "ch20-m08",
+      "name": "cascade attention：共享前缀拆两段 + LSE 合并（落地）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/attention/backends/flash_attn.py:L1521-L1596",
+        "vllm/v1/attention/backends/flash_attn.py:L1599-L1690"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "paper_origin_note": "vLLM 推理期落地优化，无独立论文；数学基础=online-softmax ⊕ 合并（见 ch20-m07，merge_attn_states docstring 自引 arXiv:2501.01005 §2.2）。",
+      "note": "把 LSE 合并放进真实调用现场：多请求共享长 system prompt 时前缀只算一遍被全批复用；决策启发式（共享前缀 ≥256 token、≥8 条请求、alibi/滑窗不支持、与 FlashDecoding 的 CTA 波数粗性能模型）本身是好素材——『值不值得拆』是工程判断、『拆了精确』是数学保证，两条线分开讲。前缀段 causal=False+block_table[:1]、后缀段 causal=True+block_table[:, num_common_kv_blocks:]。"
+    },
+    {
+      "id": "ch20-m09",
+      "name": "flash_attn_varlen_func 调用面：varlen 打平与因果右下对齐",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/vllm_flash_attn/flash_attn_interface.py:L176-L269",
+        "vllm/v1/attention/backends/flash_attn.py:L929-L935"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core",
+      "paper_origin_note": "工程接口面（varlen 打包/前缀和切序列/因果对齐/LSE 开关的形参语义），非论文算法本体；kernel 内部算法由 FA/FA-2 论文覆盖（见 ch20-m04/ch20-m06）。",
+      "note": "落地主线：q/k/v (total,nheads,headdim) varlen 打平（为何优于 padding：prefill 千 token 与 decode 1 token 混批不浪费算力）+ cu_seqlens_q 前缀和（=引擎侧 query_start_loc）+ seqused_k=seq_lens + causal 右下对齐（decode seqlen_q=1 对 seqlen_k=N 为什么天然成立——prefill/decode 同一 kernel）+ softmax_scale 默认 1/sqrt(headdim)（L285-L286）。回指：后端如何被选上见 ch21。"
+    },
+    {
+      "id": "ch20-m10",
+      "name": "paged KV 读取：kernel 沿 block_table 取分散的 K/V",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/vllm_flash_attn/flash_attn_interface.py:L270-L278",
+        "vllm/v1/attention/backends/flash_attn.py:L929-L935"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "prereq": "ch13",
+      "paper_origin_note": "PagedAttention 论文（arXiv:2309.06180）归 ch13 已讲；FA/FA-2 论文假设 K/V 连续——分页读取（block_table 进 kernel）是 vLLM 侧扩展，无本章论文条目。",
+      "note": "论文的连续 K,V ∈ R^{N×d} 在 vLLM 里是块池+每请求页表：kernel 沿 block_table 逐块取 KV——ch13 分页在 kernel 侧的对应物。主动澄清名字撞车：『tiling 的 KV 块』（按 SRAM 容量/算力切的 kernel tile）≠『KV cache 的 block』（16 token 一页的池块）——HBM→SRAM 搬运按前者、池内寻址按后者，两者粒度独立。接口契约：带 block_table 必须 seqused_k（L276-L278 断言）。前接 ch13 页表、后接 ch22 slot_mapping（F7 回收）。"
+    },
+    {
+      "id": "ch20-m11",
+      "name": "FA2/FA3/FA4 版本族：SM 代际决议与能力回退（一瞥）",
+      "kind": "config",
+      "source_anchors": [
+        "vllm/v1/attention/backends/fa_utils.py:L21-L70",
+        "vllm/v1/attention/backends/fa_utils.py:L140-L282",
+        "vllm/vllm_flash_attn/flash_attn_interface.py:L298-L427"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting",
+      "paper_origin_note": "工程版本矩阵（FA2/FA3/FA4 按 SM 代际分配+回退），非论文内容；FA-2 论文（arXiv:2307.08691）是现代 kernel 谱系的直系源头（见 ch20-m06）。",
+      "note": "一瞥即可：SM90→FA3、SM100+→FA4、其余 FA2（fa_utils L163-L171），FA4 是 v0.27 新成员（CuTE-DSL）；接口层 torch.ops._vllm_fa2_C / _vllm_fa3_C / cute._flash_attn_fwd 三分发。为 ch21 作铺垫：那里是 backend 间选择（优先级表+validate 回退），这里是同一 backend 内版本选择——两级选择别混。"
+    }
+  ],
+  "subtraction_plan": {},
+  "foreshadow_due": {
+    "source": "v3 真相源 = book/cartography/pedagogy-plan.json foreshadows（bible arc-map 是 v2 章号旧账，不跑 bible.py due）",
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "本章无应埋/应回收项（pedagogy-plan 无 planted=20 或 paid=20 的条目）。相关性备注：(1) F7『block_table 间接寻址』（planted 13 → paid 22）本章以『kernel 沿 block_table 读分页 KV』（ch20-m10）的形态被读者再次看见——路过加固，不是回收点；(2) ch13 notes 所写『伏笔埋：block_table → ch20/22』与 F7 paid=22 口径一致；(3) 本章 introduces（online softmax/tiling/LSE）是 ch21『消费 ch20 数学』的直接前置，ch21 depends_on=[19,20]。"
+  },
+  "l2_spec": "本章无 L2-spec（primer 章无 L2/无站号图）：开篇「你在这里」用 L1-partV.png（Part 图）作定位；顿悟头图按 ch21 样板另行走 explainer figure-spec（2026-08-29 任务指令）。stations 账本仍供正文「你在这里」与 reviewer 对账使用。",
+  "key_figures_note": "论文包 meta.json 已登记 key_figures 4 张（FA Fig.1 tiling 免物化标志图 / FA Fig.2 IO 实测三联 / FA2 Fig.3 warp 分工 / FA2 Fig.4 2× 实测柱状）——2026-07-14 素材账已复核，无需补登记。注意 target_section 字段仍是 v2 章节名（『四、推导之三…』『五、FlashAttention-2…』），Explain/Illustrate 站落到 v3 章节结构时需重指向：FA Fig.1/2 → 本章 tiling 与 IO 账节（ch20-m01/m04/m05）；FA2 Fig.3/4 → FA-2 一节带过（ch20-m06）。"
+}
