@@ -219,7 +219,7 @@ const dv = await agent(
   '④ mechanisms 完整性（有无漏掉读者必须懂的机制）、needs_figure/needs_worked_example/difficulty 标得对吗？\n' +
   '⑤ subtraction_plan.delete 都安全吗、must_keep 完整吗（有无遗漏读者要学的关键符号）？\n' +
   (PRIMER ? '⑥（PRIMER）确认 dossier.json 顶层有 "kind":"primer"——没有则 sound=false。\n' : '') +
-  '返回 sound（是否可放行）与 problems（具体问题列表）。（rev2 注记：若 dossier 曾按首轮 problems 修订落盘，本轮为修订后重验——逐条独立复核修订处与其波及面，仍按上述全项扫，不复述首轮。rev3：同前，适用任何轮次的修订后重验。rev4：同前。rev5：同前。rev6：同前。rev7：同前。rev8：同前。rev9：同前。rev10：同前。rev11：同前。）',
+  '返回 sound（是否可放行）与 problems（具体问题列表）。（rev2 注记：若 dossier 曾按首轮 problems 修订落盘，本轮为修订后重验——逐条独立复核修订处与其波及面，仍按上述全项扫，不复述首轮。rev3：同前，适用任何轮次的修订后重验。rev4：同前。rev5：同前。rev6：同前。rev7：同前。rev8：同前。rev9：同前。rev10：同前。rev11：同前。rev12：同前。rev13：同前。）',
   mo({ schema: VERIFY_SCHEMA, label: 'dossier-verify', phase: 'Dossier', agentType: 'general-purpose' }, 'verify', false)
 )
 if (!dv) return { chapter: CHID, escalated: 'dossier-verify-failed', stage: 'Dossier', note: 'dossier 对抗性自核 agent 失败（限流/崩溃），未核对不得放行' }
@@ -618,7 +618,7 @@ for (let r = 1; r <= 3; r++) {
        '①–⑤ 任一真卡住 → blocking=true（卡回 writer），并给 problem + suggested_fix + rationale；其余风格性建议 negotiable=true、blocking=false。全部台阶都过 → pass=true、issues=[]。')
     : ('你是这本书的目标读者：高级工程师（应用/算法背景扎实），但**没有操作系统方向的日常**——OS 底座词（用户态/内核态/系统调用/页表/虚拟地址/虚拟内存/物理内存/共享内存/mmap/进程隔离/零拷贝/socket 的搬运语义/中断/上下文切换/NUMA/页锁定内存）对你同样是生词，首现没当场讲清你就真的卡住；你也**没读过这个仓库的源码**。只读 ' + CH + '/narrative/chapter.md（含它引用的图），**不准看源码、不准上网、不准看 dossier/concepts 等任何素材产物**。\n' +
        '流程必须两步走（不许省第一步）：**第一步建清单**——通读全章，列出所有非常识术语/缩写/记号，五类都要扫到：OS 底座词、系统/网络词、Python 生态词、本书自定义词、数学记号；**第二步逐词首现回查**——每个词的首现处（本句或往前几句内）有没有讲清到「能说出它是什么、为什么在这里出现」？不带任何解释的括注不算讲清。判「前章已立、可豁免」必须先 Grep 已定稿前章的 narrative 找到出处行、把出处写进 rationale；找不到出处＝未解释。⚠️ 豁免 grep 的坑：`ch0[1-5]-*` 这类字符类 glob 在本机会**静默零命中**（exp-2026-08-28：九章盲扫里 14 条假「无出处」判定全出自它）——判定零命中前必须换宽 glob（如 path 指到 artifacts-v3 根、pattern 带目录层级）复核，复核仍零才可下「未解释」结论。\n' +
-       '清单之外继续挑"读不懂/卡住"处：② 逻辑跳跃、缺中间步骤；③ 引入了本章没建立的概念；④ 只有结论无直觉/例子；⑤ 全章一致性：同一概念多个叫法未打通、代码标识符没就地绑回其含义/数学符号、某段依赖后文才讲的概念（顺序颠倒）。\n' +
+       '清单之外继续挑"读不懂/卡住"处：② 逻辑跳跃、缺中间步骤；③ 引入了本章没建立的概念；④ 只有结论无直觉/例子；⑤ 全章一致性：同一概念多个叫法未打通、代码标识符没就地绑回其含义/数学符号、某段依赖后文才讲的概念（顺序颠倒）；⑥ **机制行为默认已知**（exp-2026-09-06，ch9 教训：介绍异步版却没走读过 step 代码、后面把「延迟一拍收货」等行为细节当已知用）——扫描正文每一条**行为级断言**（某机制的时序/顺序/返回值/优先级，非单纯点名）：它依据的代码/机制本章走读过了吗？没走读又没标「第 N 章展开」的行为断言 = blocking。「边界句声明了全貌归后章」不是豁免——声明边界之后照样断言行为细节，同罪。\n' +
        '每条给 problem + suggested_fix + rationale。分级：①类首现未解释与②③⑤里真卡住的 → blocking=true（exp-2026-08-28：真实读者被 ch5 的共享内存/用户态/零拷贝四连问卡死，①类就是这种）；④类与纯风格建议 → negotiable。读得顺则 pass=true、issues=[]。')
   const readerThunk = function () {
     return agent(readerPrompt, mo({ schema: DIM_SCHEMA, label: 'review:reader r' + r, phase: 'Review', agentType: 'general-purpose' }, 'reader', false))
