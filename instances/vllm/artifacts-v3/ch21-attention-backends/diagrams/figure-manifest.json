@@ -1,0 +1,343 @@
+{
+  "figures": [
+    {
+      "figure_id": "L2-ch21",
+      "svg": "L2-ch21.svg",
+      "png": "L2-ch21.png",
+      "claim": "模型文件里没有 attention 的实现，只有一个 Attention() 插座——底下是几十个可换的后端，同一模型里不同层还能各用各的：head_size 是 576 还是 128？KV cache 是 FP8 还是 BF16？卡是 Hopper 还是 Blackwell？每一层到底跑哪个 kernel、是谁在什么时刻按什么规则决定的，选错了会怎样？",
+      "numbers": [
+        {
+          "n": 1,
+          "where": "vllm/model_executor/layers/attention/attention.py:L350-L363",
+          "what": "建层选后端：模型装配期每个 Attention 层 __init__（构造函数还没实例化任何 impl）调 get_attn_backend(head_size, dtype, kv_cache_dtype, has_sink, use_mm_prefix, use_per_head_quant_scales, attn_type, has_sliding_window)——选后端发生在『还只有类对象、没有实例』的阶段，这正是后端身份证全用 staticmethod 的原因"
+        },
+        {
+          "n": 2,
+          "where": "vllm/v1/attention/selector.py:L140-L168",
+          "what": "打包+逐组覆写：零散参数收进可哈希的 AttentionSelectorConfig（供 @cache 当键）；attention_config.backend_per_kind 非空时按 get_attn_spec_kind(use_mla, has_sliding_window, attn_type) 推导本层所属 KVCacheSpecKind，命中覆写表则换掉全局 backend——『逐 KV 组混布』的用户入口"
+        },
+        {
+          "n": 3,
+          "where": "vllm/platforms/cuda.py:L83-L89",
+          "what": "查优先级表：平台 _get_backend_priorities(use_mla, device_capability, num_heads, kv_cache_dtype, use_non_causal) 按算力代（major 10=Blackwell/12/其他）与 MLA 分叉给出候选列表——表序是经验的（注释挂 benchmark issue 链接），换硬件代要重测"
+        },
+        {
+          "n": 4,
+          "where": "vllm/platforms/cuda.py:L378-L392",
+          "what": "逐个 validate：对候选表依序 get_class()+validate_configuration——每个能力探针失败追加一条原因；后端依赖没装（ImportError）也当一条原因而非崩溃——『没装 flashinfer』不挡 flashinfer 之后的候选"
+        },
+        {
+          "n": 5,
+          "where": "vllm/platforms/cuda.py:L453-L456",
+          "what": "取最高优先级合法者：min(priority) 于幸存候选；用户显式指定 backend 时只校验它、不合法直接 ValueError 不回退（L406-L423）；--block-size 挤掉更高优先级后端则 warning（L461-L480）；选中后若后端要求特定 KV layout 则 set_kv_cache_layout 全局生效（selector.py:L196-L206）"
+        },
+        {
+          "n": 6,
+          "where": "vllm/v1/worker/gpu_model_runner.py:L7061-L7085",
+          "what": "逐层归组：initialize_attn_backend 对每个 KV cache 组逐层问 layers[layer_name].get_attn_backend()，按 (后端类全名, 该层 KVCacheSpec, num_heads_q) 三元组把层聚成 AttentionGroup（每组一套 metadata builder + 一张组内共享 metadata）；建组前先过最弱链 CG 降级（L7114-L7119），随后 prepare_kernel_block_sizes 组内协商 kernel 块大小、initialize_metadata_builders 逐组建 builder（L7649-L7655）"
+        },
+        {
+          "n": 7,
+          "where": "vllm/v1/worker/gpu_model_runner.py:L7433-L7453",
+          "what": "KV 张量定形：attn_backend.get_kv_cache_shape(num_blocks, kernel_block_size, num_kv_heads, head_size) 定逻辑形、get_kv_cache_stride_order() 定物理置换，裸显存 as_strided 成后端要的形状；混布组 block 维分歧（K/V-first vs blocks-first）时探测+归一 blocks-first（归一实现 L7507-L7539）（L7470-L7539）；最后 bind_kv_cache 把张量绑到 static_forward_context 里的每个层实例 .kv_cache"
+        },
+        {
+          "n": 8,
+          "where": "vllm/v1/worker/gpu_model_runner.py:L2430-L2449",
+          "what": "每拍组装 Common：_build_attention_metadata 用持久缓冲切片组装 CommonAttentionMetadata（query_start_loc/seq_lens/num_reqs/num_actual_tokens/max_query_len/max_seq_len + block_table_tensor/slot_mapping 先用组 0 的）——所有后端、所有层共享的字段只算一次"
+        },
+        {
+          "n": 9,
+          "where": "vllm/v1/worker/gpu_model_runner.py:L2561-L2574",
+          "what": "逐组翻译与铺设：每个 KV cache 组 shallow copy 一份 cm、换上本组的 block_table_tensor/slot_mapping（组 0 之外）；同 (spec, builder 类型) 已建过且 builder 支持 update_block_table 则只换表复用（L2530-L2538）；否则 builder.build(common_prefix_len, cm) 产出后端专属 metadata，按 layer_name 铺进 dict（L2555-L2556）——组内所有层共享同一份"
+        },
+        {
+          "n": 10,
+          "where": "vllm/v1/worker/gpu_model_runner.py:L4432-L4443",
+          "what": "进 forward context：set_forward_context(attn_metadata, ..., slot_mapping=slot_mappings) 把 {layer_name: metadata} 与层版 slot_mapping 挂进模块级全局 _forward_context（通道机制 ch19 已立：算子内 get_attention_context 按 layer_name 取）"
+        },
+        {
+          "n": 11,
+          "where": "vllm/v1/attention/backends/flash_attn.py:L1123-L1132",
+          "what": "写腿：FA 的 forward_includes_kv_cache_update=False → Attention.forward 先走 unified_kv_cache_update 算子 → impl.do_kv_cache_update → reshape_and_cache_flash(key, value, key_cache, value_cache, slot_mapping, ...) 照 slot_mapping 把本拍 K/V 散写进 paged cache（slot_mapping 的形状决定实际 token 数）；slot 怎么算出来归 ch22"
+        },
+        {
+          "n": 12,
+          "where": "vllm/v1/attention/backends/flash_attn.py:L1041-L1067",
+          "what": "读腿：impl.forward 先 kv_cache.transpose(1,2).split(head_size) 拆 K/V cache，再 flash_attn_varlen_func(q, k=key_cache, v=value_cache, cu_seqlens_q=query_start_loc, seqused_k=seq_lens, block_table=block_table, causal=..., scheduler_metadata=...)——ch20 的 tiling kernel 在这一行被喂料：varlen 打平 + paged 块表取数，输出写预分配 output"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "cartography 渲染器一次出净（no overflow warnings）；全图 + 12 张全分辨率裁片亲读；机械逐字核对：spec 全部真相串（hook/title/l0_zoom/reading/frame/center/rail_header/loop/14 组件名/全部 methods/files/10 流标签/12 站 where）对 SVG 文本零缺漏、零省略号截断；lint_diagram_geometry（cartography strict）通过；拷贝为字节级同源（一张图原则）。；2026-09-06 开篇图复核轮(Illustrate 站重发):gen_L2.py ch21 重渲 no overflow warnings 且输出与盲审版 SVG/PNG 字节级同源(spec 未动·渲染器确定性);Read PNG 亲眼看(整图 4400x2696 + 顶带/center 左右半/south/站号轨 5 张原生裁片):①-⑧ 拍片方法与 file:line、12 站徽标与 where、10 流标签、回环/why 注/FA 四件套逐一对上 spec,无相撞/悬空、CJK 无豆腐;机械核对 spec 全部真相串(hook/l0_zoom/reading/frame/center/rail_header/loop/16 组件名+methods+files/10 流标签/12 站 where+what 全文)对 SVG 文本 0 缺失、7 处 '...' 全部源自 spec 方法签名省略号(spec 计数=SVG 计数=7、零渲染器截断);lint_diagram_geometry(cartography strict)通过;diagrams/ 拷贝刷新后 cmp 字节同源(一张图原则)。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "独立盲审（只看 PNG+spec，未看 gen_L2/dossier/正文）：只看图复述路线＝两入口→①选后端入口→②平台优先级表→③validate 回退→④逐组归组→⑤KV 定形→⑥组装 Common→⑦翻译铺设→⑧读写两腿→下一拍回⑥，站栏 12 站顺序与 where 逐站对上 spec.stations（beat 站徽 1·2/3/4·5/6/7/8/9·10/11·12 亦一致）；16 个组件框名与方法行（含全部 file:line 锚）逐一对上 spec.components，10 条流标签一致；放大裁片下全图可读、无截断/错位/相撞，零 cosmetic 记档项。 …… 2026-09-06 复核轮（独立盲审重发，整图 4400x2696 + 顶带/北双入口/①-⑧ 逐框原生裁片/南下排六框/站号轨/节间箭头标签/虚线⑧→插座/插座→KV cache/回环脚注共 19 张裁片亲读）：只看图复述路线＝上排两入口（左＝装配期 load_model 建层、右＝每拍 execute_model 接 ch18）→①选后端入口(徽 1·2)→②平台优先级表(徽 3)→③validate 回退(徽 4·5)→④逐 KV 组归组(徽 6)→⑤KV 张量定形(徽 7)→⑥组装 Common(徽 8)→⑦翻译与铺设(徽 9·10)→⑧读写两腿(徽 11·12)→下一拍回⑥（→ch22 表与槽位/→ch20 kernel 数学），站号轨 12 站自上而下 1..12 且 where 逐站对上 spec.stations（attention.py:L350-L363/selector.py:L140-L168/cuda.py:L83-L89/cuda.py:L378-L392/cuda.py:L453-L456/gpu_model_runner.py:L7061-L7085/L7433-L7453/L2430-L2449/L2561-L2574/L4432-L4443/flash_attn.py:L1123-L1132/L1041-L1067）；16 组件框名+方法行+灰字源码路径、10 条流标签（每层构造触发/AttentionSelectorConfig/候选列表 priority=下标/胜者类+set_kv_cache_layout 副作用/AttentionGroup×kernel_block_sizes/_get_slot_mappings 组版层版/cm_base/{layer_name: 后端 metadata}/算子分发 ch19 虚线/do_kv_cache_update 写·impl.forward 读）、frame 标题+文件、hook、读图注、center 标题+where、rail_header、loop 脚注逐字对上 spec，无杜撰方法名或锚点；全图可读、无截断/裁切/相撞/悬空/CJK 豆腐，零 cosmetic 记档项；cartography 拷贝 sha256 与 artifacts 版逐字节相同（拷贝可读性同判）。PASS 维持。"
+      }
+    },
+    {
+      "figure_id": "ch21-fig-m01-protocol",
+      "gen": "gen_ch21-fig-m01-protocol.py",
+      "svg": "ch21-fig-m01-protocol.svg",
+      "png": "ch21-fig-m01-protocol.png",
+      "claim": "AttentionBackend 协议=四个抽象 staticmethod 身份证(get_name/get_impl_cls/get_builder_cls/get_kv_cache_shape)+能力探针族+validate_configuration 聚合器(探针失败逐条追加字符串原因、supports_combination 收尾、返回空列表=合法)——全 staticmethod 因为选后端发生在『还没实例化任何东西』的装配期(实例方法要求先 new,而 new 之前要先选出是哪个类)。",
+      "numbers": [
+        {
+          "value": "四个抽象 staticmethod:get_name / get_impl_cls / get_builder_cls / get_kv_cache_shape",
+          "provenance": "vllm/v1/attention/backend.py:L60-L97"
+        },
+        {
+          "value": "validate_configuration:探针失败往 invalid_reasons 追加字符串原因、supports_combination 收尾、返回空列表=合法",
+          "provenance": "vllm/v1/attention/backend.py:L319-L393"
+        },
+        {
+          "value": "forward_includes_kv_cache_update 默认 True、FlashAttentionBackend 改 False",
+          "provenance": "vllm/v1/attention/backend.py:L67 + vllm/v1/attention/backends/flash_attn.py:L86"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "2026-09-06 Illustrate 站自查:渲染两轮(首轮时间线 3 行文案超宽被 fit() 抓 → 拆行),重渲 Read PNG 亲眼看(整图 3000x1564 + 代码块/身份证卡两张原生裁片):装配期时间线四站(站 1 建层→站 2-3 打包+查表→站 4 validate[本图,橙]→站 6-7 建组定形[虚线=后文])+『谈判窗口没有实例→全 staticmethod』注记;左协议卡四张身份证逐一与源码符号核对(get_name/get_impl_cls/get_builder_cls/get_kv_cache_shape,均带 staticmethod 徽标+@abstractmethod 注记);右聚合器 s1 代码字面逐字符比 pin 源码(if not cls.supports_head_size(head_size): / invalid_reasons.append(\"head_size not supported\")),双出口 [ ]=合法/非空=逐条原因;底条 FIKU 默认 True vs FA False。lint_diagram_geometry 干净。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "独立盲审(只看 PNG+spec,未看 gen/dossier/正文):只看图复述=插座背面四张类级身份证(get_name/get_impl_cls/get_builder_cls/get_kv_cache_shape,均 staticmethod+@abstractmethod),谈判发生在装配期时间线(站1建层→站2-3打包查表→站4 validate[本图橙]→站6-7建组定形[虚线=后文]),窗口没有实例故全 staticmethod;右聚合器代码逐字可读且对上 spec(invalid_reasons.append 字符串原因/supports_combination 收尾/双出口 空列表=合法·非空=逐条原因);底条 FIKU 默认 True vs FA False 对上。全图+左卡/右代码块原生裁片亲读,无重叠/悬空,10 秒可读,claim 与 3/3 numbers 全对上。 …… 2026-09-06 独立盲审轮(全新一轮,只看 PNG+explainer spec,未看 gen/dossier/正文;细字经原生裁片远程转录核对):只看图复述=协议=四张类级身份证(get_name→'FLASH_ATTN'/get_impl_cls→FlashAttentionBackendImpl(计算体 forward 读腿+do_kv_cache_update 写腿)/get_builder_cls→FlashAttentionMetadataBuilder(Common→后端专属单翻译官)/get_kv_cache_shape(num_blocks,block_size,num_kv_heads,head_size)→KV 逻辑形 K/V 打包进 content 维,均 static 徽标)+能力探针族 classmethod 十几个(supports_head_size/supports_sliding_window/supports_fp8/…)+validate_configuration 聚合器源码卡(invalid_reasons=[]→if not cls.supports_head_size(head_size): invalid_reasons.append(「head_size not supported」)→十几个探针逐个 if→invalid_reasons.extend(cls.supports_combination(...))→return invalid_reasons 空列表=合法;双出口 []→合法·非空→逐条原因落选),底带装配期时间线(站1 建层 __init__→站2-3 打包+查表→站4 validate[本图]→站6-7 建组+KV 定形)+『谈判窗口没有实例→协议全用 staticmethod/classmethod;实例方法要求先 new,而 new 之前要先选出是哪个类』注——claim 逐点对上;3/3 numbers 对上(四方法名全在且带 static 徽标/聚合器三要素逐字/FIKU 默认 True(backend.py:L67) vs FlashAttentionBackend False(flash_attn.py:L86) 写腿单独走);左列卡/右代码卡/出口与时间线原生裁片逐字核对,无重叠/悬空。PASS 维持。"
+      }
+    },
+    {
+      "figure_id": "ch21-fig-m04-priorities",
+      "gen": "gen_ch21-fig-m04-priorities.py",
+      "svg": "ch21-fig-m04-priorities.svg",
+      "png": "ch21-fig-m04-priorities.png",
+      "claim": "同一层到底跑哪个 kernel 由平台优先级表决定:use_mla × 算力代(major 10=Blackwell/12/其他)× fp8 KV × num_heads 分叉出候选名单,表序即默认最优——名单是经验参数(注释挂 benchmark),换硬件代要重测。",
+      "numbers": [
+        {
+          "value": "非 MLA + SM100(major=10,non-causal 关):FLASHINFER → FLASH_ATTN → TRITON_ATTN → FLEX_ATTENTION → TURBOQUANT",
+          "provenance": "traces/ch21-m05.json priority_table_non_mla_sm100 + vllm/platforms/cuda.py:L144-L163"
+        },
+        {
+          "value": "非 MLA + SM90 等其他代:FLASH_ATTN 提到表头",
+          "provenance": "traces/ch21-m05.json block_size_warning.priority_table_non_mla_sm90 + vllm/platforms/cuda.py:L158-L163"
+        },
+        {
+          "value": "MLA + SM100 表头:FLASHINFER_MLA → TOKENSPEED_MLA(注释 wins past bs≈8, regresses at bs≤2)→ CUTLASS_MLA → FLASH_ATTN_MLA → FLASHMLA → TRITON_MLA → *sparse",
+          "provenance": "vllm/platforms/cuda.py:L98-L129"
+        },
+        {
+          "value": "MLA + 其他代（Hopper 等）：FLASH_ATTN_MLA → FLASHMLA → FLASHINFER_MLA → TRITON_MLA → FLASH_ATTN_MLA_SPARSE → FLASHMLA_SPARSE",
+          "provenance": "vllm/platforms/cuda.py:L136-L143"
+        },
+        {
+          "value": "major 10 / 12 / 其他 三代分叉；major=12（消费级 Blackwell）只留 [TRITON_MLA, FLASHINFER_MLA_SPARSE_SM120] 两家——不上图（图注口径：图略）",
+          "provenance": "vllm/platforms/cuda.py:L94-L143 + L130-L134（tests/test_attention_backends.py TestPriorities.test_mla_sm120_head 对拍）"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "2026-09-06 Illustrate 站自查:渲染两轮(首轮 TOKENSPEED_MLA 经验注释框居中于药丸、左端伸进条件框被亲眼看图抓 → 锚定候选列左缘),重渲 Read PNG 亲眼看(整图 3000x1584 + 行3 原生裁片):四行候选名单逐一与 spec/trace 逐字核(R1 五名、R2 FLASH_ATTN 表头+橙虚线交换框、R3 七名含稀疏尾(*sparse)+注释 R1 dims + FP8 KV only; wins past bs≈8, regresses at bs≤2、R4 两名);枚举名逐字符比 pin 源码 cuda.py:L83-L167;①徽标=表头=默认最优;底部两块(名单≠胜者:validate→min(priority)→显式 ValueError/表序经验性:#35807+non-causal 提前 why)。lint_diagram_geometry 干净。；2026-09-06 figure-integration 修复轮:右下经验块第三条改为两条——稀疏尾两家(*sparse_backends)永远补在主链尾·不占表头,对内序 fp8 与 BF16·heads≤16 → FLASHINFER_MLA_SPARSE 先、BF16·heads>16 对调(逐字核 cuda.py:L98-L116);①徽标仍只在四行表头主链首位,稀疏尾保持 ⑦ 虚线收拢;重渲 Read PNG 亲眼看(整图 + 右下块原生裁片),lint_diagram_geometry 干净。；2026-09-06 figure-integration 修复轮（方向 A 收敛五件套）：R4 由「MLA·major=12 两家」改为「MLA·其他代(Hopper 等)」六家——cands 六名与序逐字核 cuda.py:L136-L142，保住在库 PNG+图注与前轮 R2-2 修复意图；fs 条与页脚函数区间 L83-L167 顺手修正为 L83-L163（函数体实止 L163，与图注/dossier 锚点一致）；major=12 两家降为 numbers[4] 非图面记档（explainer figure_spec 同步）；改 gen 脚本重跑写 SVG、cairosvg 重渲 PNG，Read PNG 亲眼看（整图 + R4 行 2x + fs 条 + 右下经验块 + 页脚原生裁片）。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "2026-09-06 独立盲审·修复复核轮(只看 PNG+issue 清单,未看 gen/正文;整图 3000x1584 + 上下半幅 2x + R4 标签/链/页脚原生裁片亲读):方向 A 落实确认——全图恰四行优先级分支,R4=「MLA · 其他代（Hopper 等）」(锚 cuda.py L136–L143),链上六名逐字转录=FLASH_ATTN_MLA → FLASHMLA → FLASHINFER_MLA → TRITON_MLA → FLASH_ATTN_MLA_SPARSE → FLASHMLA_SPARSE,与 numbers[3](Hopper 六家,L136-L143)逐名逐序对上;major=12 两家 [TRITON_MLA, FLASHINFER_MLA_SPARSE_SM120] 不再占行,仅以「图略」脚注出现(L130–L134),与 numbers[4]「不上图(图略)」口径一致;R1 五名(FLASHINFER→FLASH_ATTN→TRITON_ATTN→FLEX_ATTENTION→TURBOQUANT)/R2 FLASH_ATTN 表头+橙虚线交换框/R3 七名含 TOKENSPEED_MLA 经验注(wins past bs≈8, regresses at bs≤2)+*sparse 尾,均与 numbers[1]-[3] 对上;页脚函数区间亲读 L83–L163。PNG mtime(17:33:58)晚于 SVG(17:33:57)与 gen(17:33:48),「从盘上脚本重渲静默翻回 major=12」漂移入口闭合;manifest numbers 已同步 Hopper 六家,五件套收敛。5/5 numbers 对上,无相撞/悬空,CJK 无豆腐。PASS。"
+      }
+    },
+    {
+      "figure_id": "ch21-fig-m07-layout",
+      "gen": "gen_ch21-fig-m07-layout.py",
+      "svg": "ch21-fig-m07-layout.svg",
+      "png": "ch21-fig-m07-layout.png",
+      "claim": "后端自报 KV 布局两件套——get_kv_cache_shape 给逻辑形 (B,H,N,2D)(K/V 打包进 content 维),get_kv_cache_stride_order 给逻辑→物理的置换(NHD=(0,2,1,3) 同 token 的 heads 内存连续 / HND=(0,1,2,3) 恒等)——裸显存 as_strided 一次定形,块维位置由哨兵 1234567 自动探测。",
+      "numbers": [
+        {
+          "value": "逻辑形 (256, 2, 64, 128) = 256 kernel 块 × 2 KV 头 × 64 token/块 × 2*64(K/V 打包)",
+          "provenance": "traces/ch21-m08.json kv_tensor_shaping.logical_shape + vllm/v1/attention/backends/flash_attn.py:L133-L144"
+        },
+        {
+          "value": "NHD 物理步长 (16384, 128, 256, 1)——物理内存序 (B,N,H,2D) 连续,每块 64 token × 2 头 × 128 = 16384 元素",
+          "provenance": "traces/ch21-m08.json kv_tensor_shaping.strides_nhd"
+        },
+        {
+          "value": "HND 物理步长 (16384, 8192, 128, 1)——恒等置换物理序 (B,H,N,2D) 连续，头维一步 = N×2D = 64×128 = 8192（同一头的全部 token）",
+          "provenance": "traces/ch21-m08.json kv_tensor_shaping.strides_hnd + vllm/v1/attention/backends/flash_attn.py:L146-L168"
+        },
+        {
+          "value": "stride_order:NHD=(0,2,1,3)、HND=(0,1,2,3)",
+          "provenance": "vllm/v1/attention/backends/flash_attn.py:L146-L168 + traces/ch21-m08.json kv_tensor_shaping.stride_order_nhd_default"
+        },
+        {
+          "value": "块维哨兵探测 get_kv_cache_block_dim(_S=1234567 代入再 .index) = 0(blocks-first)",
+          "provenance": "vllm/v1/attention/backend.py:L100-L117 + traces/ch21-m08.json kv_tensor_shaping.block_dim_sentinel"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "2026-09-06 Illustrate 站自查:渲染两轮(首轮置换块左侧行标签越出框线被几何门禁抓 → 收进框内),重渲 Read PNG 亲眼看(整图 3000x1552 + 右带/置换块两张原生裁片):左①逻辑形轴条 B=256/H=2/N=64/2D=128(K|V 分界线)→ 放大块 0 网格(头0/头1 × token0-3+⋮,首格 K·64|V·64);右②步长四行(16384=64×2×128/256=2×128/128/1)逐维注解 + NHD 内存条(t·h 成对装箱,同 token 头相邻)+ HND 对照条(同头 token 连续,头分界线);底③置换图(逻辑 [B H N 2D]→NHD [B N H 2D] 交叉箭头)+ as_strided 零拷贝 + 哨兵 _S=1234567→块维 0。截断处均标 ⋮ 与实际 N=64。lint_diagram_geometry 干净。；2026-09-06 figure-integration 修复轮:HND 对照条下增印步长行 (16384, 8192, 128, 1)——头维一步 8192 = 64×128(出处 traces/ch21-m08.json 增记 strides_hnd,经真实 _reshape_attention_kv_cache 以恒等置换 host 实算),重渲 Read PNG 亲眼看(整图 + 右下原生裁片):新行不与底排三框相撞、数字逐位对 spec,lint_diagram_geometry 干净。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "独立盲审·修复轮(只看 PNG+issue 清单,未看 gen/spec/正文):②步长账本 HND 行步长 = (16384, 8192, 128, 1)(HND 行整行 1.5x-4x 逐位核),公式注 = 8192 = 64×128——与维序 B·H·N·2D=(256·2·64·128) 自洽(H 步长=N×2D 代入本运行 N=64);旧错值 2048 / 16×128 在右带全境(账本上/下条、HND 行 L/R 两半、面板顶)放大逐行核,零残留;NHD 行未动仍为 (16384, 128, 256, 1);HND 对照条下新增步长行与底部③置换带无相撞。 …… 2026-09-06 复核轮(本轮盲审独立重验,整图+账本 3x/4x/HND 行 4x 通条/对照条 3x/底带 2x 裁片):HND 四格逐位 8192·128·1、注记 8192 = 64×128、右带 2x-8x 残留扫描零命中、NHD 行与维序未动——全部复核一致,PASS 维持。 …… 2026-09-06 独立盲审轮(全新一轮,只看 PNG+explainer spec,未看 gen/dossier/正文;细字经原生裁片远程转录核对):只看图复述=后端自报 KV 布局两件套——①逻辑形 (B,H,N,2D)=(256,2,64,128) 轴条(B=256 kernel 块/H=2 KV 头/N=64 token/块/2D=128)带放大块 0 网格(头0/头1×token0..3+⋮,首格 K·64|V·64 分界);②步长账本 NHD(项目默认)=(16384,128,256,1)(B:16384=64×2×128 一块的完整空间/H:128=2×128 单 token 全部头/N:256=2×128 相邻 token/D:1 最内连续)、HND=(16384,8192,128,1)(注记 8192=64×128 同一头全部 token),NHD 内存条 t·h 成对装箱同 token 头相邻(t0·h0 t0·h1 t1·h0…)、HND 对照条同头 token 连续;③置换图 NHD=(0,2,1,3) 交叉 H↔N/HND=(0,1,2,3) 恒等+as_strided 零拷贝——一次定形终身免拷+哨兵 get_kv_cache_block_dim(_S=1234567 代入 shape 再 .index(_S))=0(blocks-first)——claim 逐点对上;5/5 numbers 逐位核(账本两行裁片逐位转录,公式自洽:16384=64×2×128、8192=64×128、128=2×128、256=2×128);三带①②③编号可读、无相撞/悬空。PASS 维持。"
+      }
+    },
+    {
+      "figure_id": "ch21-fig-m08-groups",
+      "gen": "gen_ch21-fig-m08-groups.py",
+      "svg": "ch21-fig-m08-groups.svg",
+      "png": "ch21-fig-m08-groups.png",
+      "claim": "层按 (后端类全名, KVCacheSpec, num_heads_q) 三元组聚成 AttentionGroup——同一模型逐层混布不同后端是合法态,代价是每组一套 metadata builder、全模型 cudagraph 档被最弱组拖累、kernel 块大小要组内协商。",
+      "numbers": [
+        {
+          "value": "3 层 → 2 组:FlashAttentionBackend=[L0,L1]、TritonStub=[L2](spec 与 num_heads_q=4 全同,仅后端类全名不同就分家)",
+          "provenance": "traces/ch21-m08.json grouping"
+        },
+        {
+          "value": "min_cg_support=UNIFORM_BATCH(值 2;档位刻度 ALWAYS=3>UNIFORM_BATCH=2>UNIFORM_SINGLE_TOKEN_DECODE=1>NEVER=0)",
+          "provenance": "traces/ch21-m08.json weakest_link + vllm/v1/attention/backend.py:L606-L620"
+        },
+        {
+          "value": "kernel 块协商:管理块 256 = 4 × 64(FA 声明 MultipleOf(16)、Triton 桩声明 [24,64]),KV 逻辑形 (256,2,64,128)",
+          "provenance": "traces/ch21-m08.json negotiation + kv_tensor_shaping + vllm/v1/worker/utils.py:L266-L376"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "2026-09-06 Illustrate 站自查:渲染两轮(首轮三张层卡注记语义含混[『与左邻同 key』对 L0 不成立] → 改为开组/并入/新 key 三段叙事),重渲 Read PNG 亲眼看(整图 3000x1388 + 顶带/账二账三两张原生裁片):三元组核对行(后端类全名 ✗/KVCacheSpec ✓/num_heads_q=4 ✓)逐项对 trace;组 A/B 卡(套数/共享/档位/声明块)与 trace 一致;账二阶梯 NEVER=0/UNIFORM_SINGLE_TOKEN_DECODE=1/UNIFORM_BATCH=2[高亮本例]/ALWAYS=3+min(...)=UNIFORM_BATCH(2)+host 恒 FA2 诚实注;账三 256 条拆 4×64+协商算式+逻辑形 (256,2,64,128)。肘形箭头两端贴层卡底/组卡顶。lint_diagram_geometry 干净。；2026-09-06 figure-integration 修复轮:FA 组声明改为 [MultipleOf(16)](16 的倍数)——真源 flash_attn.py:L83-L84 覆写值(基类默认才是 [MultipleOf(1)]),组 A 卡与账三候选行两处联动改,账三第二行补「64 又是 16 的倍数(FA ✓)」;traces/ch21-m08.json fa_declared_sizes 已改为动态生成并重跑(64/256=4×64 协商结果不变),重渲 Read PNG 亲眼看(整图 + 组A卡/账三两张原生裁片),lint_diagram_geometry 干净。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "独立盲审·修复轮(只看 PNG+issue 清单,未看 gen/spec/正文):FA 声明两处联动已改——组 A 卡与账三·kernel 块协商的声明均为 [MultipleOf(16)]（16 的倍数）(各 2.7x-4x 超读核),「MultipleOf(1)/任意整数」全图零残留;账三第二行带「64 又是 16 的倍数（FA ✓）」注,判定挂在 kernel 块 64 上(64%16==0),语义正确;协商结果未动:kernel 块 64、管理块 256=4×64、KV 逻辑形 (256,2,64,128);Triton 桩声明 [24,64] 未动。整图+组卡带/账三带多档放大亲读,无重叠。 …… 2026-09-06 复核轮(本轮盲审独立重验,整图+组A卡 4x/组B卡 4x/账三上段·下段·右段 4x 裁片):组A卡与账三声明均 [MultipleOf(16)]、MultipleOf(1)/任意整数 全图零残留、「64 又是 16 的倍数（FA ✓）」注在、256=4×64 与 (256,2,64,128) 未动、Triton 桩 [24,64] 未动——全部复核一致,PASS 维持。 …… 2026-09-06 独立盲审轮(全新一轮,只看 PNG+explainer spec,未看 gen/dossier/正文;细字经原生裁片远程转录核对):只看图复述=层按三元组 key(后端类全名,KVCacheSpec,num_heads_q)聚成 AttentionGroup——L0 FlashAttentionBackend 开组、L1 同 key 并入、L2 Triton 桩仅后端类全名✗(spec✓/num_heads_q=4✓)即新 key 分家→3 层→2 组(组A=[L0,L1]/组B=[L2]);混布三笔账=每组一套 metadata builder·组内共享一份 metadata、最弱链 CG 阶梯 ALWAYS=3>UNIFORM_BATCH=2(本例高亮)>UNIFORM_SINGLE_TOKEN_DECODE=1>NEVER=0 且 min(UNIFORM_BATCH,UNIFORM_BATCH)=UNIFORM_BATCH(2)+host 恒 FA2·真机 SM90+FA3 为 ALWAYS 诚实注、kernel 块协商 256=4×64(FA 声明 [MultipleOf(16)] 16 的倍数/Triton 桩 [24,64]·注 64 又是 16 的倍数(FA✓))+KV 逻辑形 (256,2,64,128)——claim 逐点对上、3/3 numbers 对上;层卡/组卡/账二/账三原生裁片核对,肘形箭头两端贴卡无悬空。PASS 维持。"
+      }
+    },
+    {
+      "figure_id": "ch21-fig-m10-common",
+      "gen": "gen_ch21-fig-m10-common.py",
+      "svg": "ch21-fig-m10-common.svg",
+      "png": "ch21-fig-m10-common.png",
+      "claim": "每拍 runner 组装一份 CommonAttentionMetadata(核心 10 字段)供所有后端所有层共享——块表/槽位先填组 0 的,组 0 之外 shallow copy 只换这两样,组内全部层铺同一份后端专属 metadata:这就是几十个后端能塞进同一个 runner 每拍心跳的原因。",
+      "numbers": [
+        {
+          "value": "核心 10 字段:query_start_loc(+cpu)/seq_lens/num_reqs/num_actual_tokens/max_query_len/max_seq_len/block_table_tensor/slot_mapping/causal",
+          "provenance": "vllm/v1/attention/backend.py:L412-L444"
+        },
+        {
+          "value": "实测一拍(2 请求 padding 到 4 行/8 token):query_start_loc=[0,4,6,6,6](前缀和+非递减尾)、seq_lens=[16,20,16,20](尾 2 行上拍残留)、组 0 块表=[[0,1],[2,3],[0,0],[0,0]]、组 0 槽位=[12,13,14,15,50,51,-1,-1]",
+          "provenance": "traces/ch21-m11.json translation.cm_base_shared_fields + batch + fa_build_rename"
+        },
+        {
+          "value": "组 0 之外只换 block_table/slot_mapping 两字段(shallow copy);组 1 表=[[4,5],[6,7],[0,0],[0,0]]、槽位=[76,77,78,79,114,115,-1,-1]",
+          "provenance": "vllm/v1/worker/gpu_model_runner.py:L2561-L2574 + traces/ch21-m11.json translation.group1_table_swap_reuse"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "2026-09-06 Illustrate 站自查:渲染两轮(首轮左侧两条输入箭头末端距中心卡左缘 18px 悬空——背景全幅 rect 使几何门禁的 inside 豁免漏检,亲眼抓 → 末端改贴卡缘),重渲 Read PNG 亲眼看(整图 3000x1424 + 中心卡原生裁片):九行字段名逐一比 backend.py:L412-L444(query_start_loc 行注明 gpu+cpu 两份=核心十字段);实测值逐字核 [0,4,6,6,6]/[16,20,16,20]/4/8/4/20/[[0,1],[2,3],[0,0],[0,0]]/[12,13,14,15,34,35,-1,-1]/True;◆ 两行(块表/槽位)橙底高亮,组 1 浅拷卡只列换表值;底部 padding 读法条(尾 6,6,6=空段非递减/尾 2 行=上拍残留/max 形状每拍重填)。lint_diagram_geometry 干净。；2026-09-06 Revise 第 2 轮数值勘误:req1 槽位按 slot=块表[pos//16]×16+pos%16 由位置 18/19 重算(trace 种子同步修正,见 traces/run_ch21-m11.py)——组 0 [34,35]→[50,51](块 3=表行第 1 项)、组 1 [98,99]→[114,115](块 7=表行第 1 项);gen 两处数字同步、sharp 重渲 PNG(3000x1424)后 Read PNG 亲眼看:中心卡 slot_mapping=[12,13,14,15, 50,51, -1,-1]、右卡 [76,77,78,79, 114,115, -1,-1],布局零改动、无相撞越界;旧 PNG(05:05 过期渲染,未随 14:56 SVG 重渲)曾把组 0 印成 [..,114,115,..]——与组 0 表行 [2,3] 按公式无解,正是评审 blocking 项,已随本次重渲+种子修正一并消除。上文盲审 PASS 针对修正前数字,Archive 站宜对两图补一轮独立盲审。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "独立盲审(只看 PNG+spec,未看 gen/正文):只看图复述=每拍 runner 组一份 CommonAttentionMetadata 核心十字段(query_start_loc 注明 gpu+cpu 两份)全楼共享,◆块表/槽位两行橙底=逐组要换的仅此两样,组1=copy(cm_base) 只换表值、组内多层铺同一份——claim 逐点对上。数字逐个核:query_start_loc=[0,4,6,6,6]/seq_lens=[16,20,16,20](尾 2 行上拍残留)/num_reqs=4/num_actual_tokens=8/max_query_len=4/max_seq_len=20/组0 表 [[0,1],[2,3],[0,0],[0,0]]·槽位 [12,13,14,15,34,35,-1,-1]/组1 表 [[4,5],[6,7],[0,0],[0,0]]·槽位 [76,77,78,79,98,99,-1,-1]/causal=True——全部逐字对上 spec.numbers;底条 padding 读法(前缀和非递减尾/上拍残留/max 每拍重填)自洽。无重叠,左入箭头贴卡缘。 …… 2026-09-06 独立盲审轮(全新一轮,只看 PNG+explainer spec,未看 gen/dossier/正文;细字经原生裁片远程转录核对):只看图复述=每拍 runner 组一份 CommonAttentionMetadata(共用水表)所有后端所有层只抄一次,核心十字段逐行带实测值(query_start_loc 行注明 +cpu 两份=十字段);◆=逐组要换的仅 block_table/slot_mapping 两样,组 1=copy(cm_base) 浅拷只换这两样,铺设 layer_name→metadata 组内全部层拿到同一份——claim 逐点对上;数字逐位核:query_start_loc=[0,4,6,6,6](+cpu)/seq_lens=[16,20,16,20]/num_reqs=4/num_actual_tokens=8/max_query_len=4/max_seq_len=20/block_table_tensor=[[0,1],[2,3],[0,0],[0,0]]◆/slot_mapping=[12,13,14,15,34,35,-1,-1]◆/causal=True/组 1 表 [[4,5],[6,7],[0,0],[0,0]]·槽位 [76,77,78,79,98,99,-1,-1](右卡双裁片交叉核,98,99 无误读);底条 padding 读法=尾 6,6,6 空段非递减·尾 2 行上拍残留·max 形状每拍重填——3/3 numbers 对上;左入箭头贴卡缘,无重叠。PASS 维持。"
+      }
+    },
+    {
+      "figure_id": "ch21-fig-m11-translate",
+      "gen": "gen_ch21-fig-m11-translate.py",
+      "svg": "ch21-fig-m11-translate.svg",
+      "png": "ch21-fig-m11-translate.png",
+      "claim": "builder.build() 的「翻译」= Common 字段改名搬入(block_table_tensor→block_table、query_start_loc/seq_lens/slot_mapping 直搬)+ 后端特有字段补算(FA:scheduler_metadata/use_cascade/sliding_window)——同 (spec, builder) 的混合组走 update_block_table 浅拷只换表,共享字段零重算。",
+      "numbers": [
+        {
+          "value": "改名搬入:block_table_tensor→block_table=[[0,1],[2,3],[0,0],[0,0]](尾 2 行由 [9,9] 填成 NULL_BLOCK_ID=0)",
+          "provenance": "traces/ch21-m11.json translation.fa_build_rename + block_table_after_null_fill"
+        },
+        {
+          "value": "FA 特有字段:scheduler_metadata=None(host 恒 FA2)、use_cascade=False、sliding_window=(-1,-1)",
+          "provenance": "traces/ch21-m11.json translation.fa_only_fields + vllm/v1/attention/backends/flash_attn.py:L672-L696"
+        },
+        {
+          "value": "fanout 与复用:m[L0] is m[L1](同一对象);组 1 m[L2] 非 m[L0] 但共享 query_start_loc 同一张量(表 [[4,5],[6,7],[0,0],[0,0]]/槽位 [76,77,78,79,114,115,-1,-1])",
+          "provenance": "traces/ch21-m11.json translation.layer_name_fanout + group1_table_swap_reuse"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "2026-09-06 Illustrate 站自查:一次渲染通过,Read PNG 亲眼看(整图 3000x1412 + 翻译中带/铺设卡两张原生裁片):左右 before/after 四行字段对齐,直搬 ×3(绿,同张量别名)与改名(橙粗,block_table_tensor→block_table)箭头各带标签;[9,9]→NULL_BLOCK_ID=0 填充注挂在改名箭头下方;右卡 FA 特有块(scheduler_metadata=None host 恒 FA2/use_cascade=False/sliding_window=(-1,-1)/num_*_reqs=0);底部 fanout(两层名→同一对象,is=true)与组 1 浅拷换表(表/槽位值逐字对 trace,m′ 共享 query_start_loc)。lint_diagram_geometry 干净。；2026-09-06 figure-integration 修复轮：gen 脚本↔SVG md5 复核零漂移，cairosvg 重渲 PNG（旧 PNG 为过期渲染：左卡 block_table_tensor=[[0,1],[2,3],[9,9],[0,0]] 混合态、填充注为单数「尾行」）；重渲后 Read PNG 亲眼看（整图 + 左卡 block_table 行 3x + 填充注框原生裁片）：左卡 block_table_tensor=[[0,1],[2,3],[0,0],[0,0]]（尾 2 行均 [0,0]）、注「尾 2 行由 [9,9] 填成 NULL_BLOCK_ID=0（块 0 保留给 padding;进 builder 之前已由 runner 填好）」——与 manifest numbers[0]、m10 同拍 post-fill 值、正文轮②「尾 2 行 [9,9] → [0,0]」逐字一致。；2026-09-06 Revise 第 2 轮数值勘误:req1 槽位随 trace 种子修正(组 0 [34,35]→[50,51]、组 1 [98,99]→[114,115],按 slot=块表[pos//16]×16+pos%16 由位置 18/19 落表行第 1 项重算,见 traces/run_ch21-m11.py),gen 三处数字同步、sharp 重渲 PNG(3000x1412)后 Read PNG 亲眼看:左/右卡 slot_mapping=[12,13,14,15,50,51,-1,-1]、组 1 浅拷块 slot_mapping=[76,77,78,79, 114,115, -1,-1],布局零改动。上文盲审 PASS 针对修正前数字,Archive 站宜对两图补一轮独立盲审。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "2026-09-06 独立盲审·修复复核轮(只看 PNG+issue 清单,未看 gen/正文;整图 3000x1412 + 左/中/右三带 2x 原生裁片亲读):①翻译带 block_table_tensor 四行为 [0,1]/[2,3]/[9,9]/[9,9]——尾 2 行均 [9,9],过期渲染的「[9,9] 与 [0,0] 混合态」全图零残留(放大逐行核);②括注为复数「尾 2 行由 [9,9] 填成 NULL_BLOCK_ID=0」,旧单数「尾行」注零残留;③fill_ 后卡 blk_table_tensor 四行 [0,1]/[2,3]/[0,0]/[0,0]、括注「尾 2 行已被填成 NULL_BLOCK_ID=0」——与 numbers[0] 终值 [[0,1],[2,3],[0,0],[0,0]]、issue 所引 m10 同拍 post-fill 值、traces rows_2_3_before=[9,9]×2/after=[[0,0],[0,0]] 三方自洽;④改名箭头 block_table_tensor→block_table(橙)与直搬 ×3(绿)未动,切片填充注挂在箭头下(块 0 保留给 padding·进 builder 之前已由 runner 填好);⑤PNG mtime(17:32:47)晚于 SVG(17:32:38),「SVG 改了 PNG 没重渲」漂移入口闭合。3/3 numbers 对上,无相撞/悬空,CJK 无豆腐。PASS。"
+      }
+    },
+    {
+      "figure_id": "ch21-fig-m12-readleg",
+      "gen": "gen_ch21-fig-m12-readleg.py",
+      "svg": "ch21-fig-m12-readleg.svg",
+      "png": "ch21-fig-m12-readleg.png",
+      "claim": "读腿一行 flash_attn_varlen_func 同时吃下 varlen 打平(cu_seqlens_q 前缀和切序列)与 paged KV(block_table 页表指路)——query 按因果只看自己位置之前的键,输出写进预分配 output:ch20 讲过的 tiling 数学,在真实源码里就发生在这一行。",
+      "numbers": [
+        {
+          "value": "调用面:flash_attn_varlen_func(q, k=key_cache, v=value_cache, cu_seqlens_q=query_start_loc, seqused_k=seq_lens, block_table=block_table, causal=True)",
+          "provenance": "vllm/v1/attention/backends/flash_attn.py:L1041-L1066"
+        },
+        {
+          "value": "实测:cu_seqlens_q=[0,4]、seqused_k=[16]、block_table=[[0,1]]——q0(位置 12)看 13 个键、q3(位置 15)看 16 个键",
+          "provenance": "traces/ch21-m11.json forward_legs.read_leg"
+        },
+        {
+          "value": "输出 (4, 256)=4 token × 4 头 × 64 维;与手工 attention 对拍 max_abs_diff ≤ 5e-4(fp16 精度内;实测 6.4e-5 / 5.0e-4)",
+          "provenance": "traces/ch21-m11.json forward_legs.read_leg.manual_check_max_abs_diff"
+        },
+        {
+          "value": "K/V 拆包:kv_cache.transpose(1,2).split(head_size=64, dim=-1):(64,2,16,128) → 两个 (64,16,2,64)",
+          "provenance": "vllm/v1/attention/backends/flash_attn.py:L904-L905 + traces/ch21-m11.json setup.kv_tensor_shape_after_station7"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "2026-09-06 Illustrate 站自查:渲染三轮(① block_table 标签 end 锚在 x=60 左越界 37px 被几何门禁抓 → 锚到网格左缘;② cu_seqlens/seqused_k 注记栈与 q0..q3 行标签同带拥挤亲眼抓 → 挪进块表条与网格之间的空带),终版 Read PNG 亲眼看(整图 3000x1524 + 左带原生裁片):调用面一行逐字符比 flash_attn.py:L1041-L1066;K/V 拆包 shape 流 (64,2,16,128)→(64,16,2,128)→两个 (64,16,2,64);因果阶梯 16 列全画(深绿=本拍新 4/浅绿=历史/灰=被挡),q0..q3 逐行看 13/14/15/16 键;块 0 盖 16 键、块 1 表内第 2 项本拍未盖到;输出 (4,256) 与对拍 6.4e-5/5.0e-4;回指 ch20(实线)/预告 ch22(虚线)措辞与样式按跨章规则。lint_diagram_geometry 干净。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "独立盲审(只看 PNG+spec,未看 gen/正文):只看图复述=读腿一行 flash_attn_varlen_func 同时吃 varlen 打平(cu_seqlens_q=[0,4] 前缀和切序列)与 paged KV(block_table=[[0,1]] 页表指路,块0 盖 16 键·块1 表内第2项本拍未盖到),因果阶梯 q0(位置12)看13键→q3(位置15)看16键(逐行 13/14/15/16,深绿=本拍新4/浅绿=历史/灰=被挡),输出写预分配 (4,256)=4 token×4头×64维,对拍 6.4e-5/5.0e-4≤5e-4(fp16 精度内);K/V 拆包 (64,2,16,128)→transpose(64,16,2,128)→split 两个 (64,16,2,64);回指 ch20 实线/预告 ch22 虚线——claim 与 4/4 spec.numbers 全对上。全图+左带/阶梯区原生裁片亲读,无重叠/悬空。 …… 2026-09-06 独立盲审轮(全新一轮,只看 PNG+explainer spec,未看 gen/dossier/正文;细字经原生裁片远程转录核对):只看图复述=读腿一行 flash_attn_varlen_func(q, k=key_cache, v=value_cache, cu_seqlens_q=query_start_loc, seqused_k=seq_lens, block_table=block_table, causal=True)(调用行裁片逐参数转录核)同时吃 varlen 打平(cu_seqlens_q=[0,4] 前缀和切序列·seqused_k=[16])与 paged KV(block_table=[[0,1]] 页表指路:块 0 盖 16 键·块 1 表内第 2 项本拍未盖到);因果阶梯 q0(位置 12)看 13 键→q3(位置 15)看 16 键,逐行 13/14/15/16(深绿=本拍新 4/浅绿=历史/灰=被挡);输出 (4,256)=4 token×4 头×64 维写进预分配 output,对拍 max_abs_diff 6.4e-5/5.0e-4≤5e-4(fp16 精度内);K/V 拆包 kv_cache(64,2,16,128)→transpose(1,2)→(64,16,2,128)→split(head_size=64,dim=-1)→两个 (64,16,2,64);回指 ch20(实线:tiling 数学)/预告 ch22(虚线:slot 的由来)——claim 逐点对上、4/4 numbers 对上;阶梯 16 列可数,无重叠/悬空。PASS 维持。"
+      }
+    }
+  ]
+}

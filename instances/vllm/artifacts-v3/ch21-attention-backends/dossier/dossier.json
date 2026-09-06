@@ -1,0 +1,1091 @@
+{
+  "chapter_id": "ch21",
+  "part": "V",
+  "title": "注意力后端",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "chapter_kind": "code",
+  "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。本章把 L0 的『执行臂+模型层接缝』打开：模型文件里没有 attention 实现只有 Attention() 插座——插座底下是几十个可换的『注意力后端』（FlashAttention/FlashInfer/Triton/...），本章讲谁来决定每一层跑哪个后端（优先级表 + validate 回退）、同一个模型里不同层怎么各用各的（逐 KV 组混布）、以及后端四件套（Backend/Metadata/Builder/Impl）怎么接住 ch18 的 block_table/slot_mapping、把 ch20 的 tiling kernel 喂上料。",
+  "hook_suggestion": "「模型文件里没有 attention 的实现，只有一个 Attention() 插座——插座底下是几十个可换的后端：FlashAttention、FlashInfer、Triton……而且同一个模型里不同层可以各用各的。head_size 是 576 还是 128？KV cache 是 FP8 还是 BF16？卡是 Hopper 还是 Blackwell？每一层到底跑哪个 kernel，是谁、在什么时刻、按什么规则决定的？选错了会发生什么？」（从 Part V hook『Python 写的 attention 变成 CUDA graph 重播的 kernel』的『attention』一词 + 本章 introduces 优先级表/validate 回退/逐 KV 组混布 + deepread/gpu-exec why_chains[10] 的 pain 段『head_size/dtype/kv_cache_dtype/block_size/sliding_window/sink/MLA/算力代的组合爆炸——用户不可能记住哪组合法且最优』提炼为真问题）",
+  "scope_note": "本章解读注意力后端的『选』与『装』与『喂』：主线一（装配期·选后端，站 1-5，每模型一次）= Attention.__init__ 建层即选（attention.py:L350-L363）→ get_attn_backend 入口打包 AttentionSelectorConfig（selector.py:L101-L174）→ 平台优先级表 _get_backend_priorities（cuda.py:L82-L163）→ 逐个 validate_configuration 过滤（cuda.py:L358-L394）→ min priority 取胜者 + set_kv_cache_layout 副作用（cuda.py:L396-L492 + selector.py:L177-L208）。主线二（KV 初始化期·分组与定形，站 6-7）= initialize_attn_backend 按 (full_cls_name, KVCacheSpec, num_heads_q) 把层聚成 AttentionGroup（gpu_model_runner.py:L7020-L7125，先过最弱链 CG 降级 L7114-L7119）→ prepare_kernel_block_sizes 组内协商块大小 → get_kv_cache_shape/stride_order 把裸显存 as_strided 成后端要的形状并 bind 到层（L7433-L7453）。主线三（运行期·每拍 metadata 与读写两腿，站 8-12）= CommonAttentionMetadata 组装（L2430-L2449）→ 逐 KV 组换 block_table/slot_mapping → builder.build() 翻译成后端专属 metadata → 按 layer_name 铺进 dict（L2561-L2574/L2540-L2556）→ set_forward_context 设模块级全局 _forward_context（L4432-L4443；v0.27.1 为 forward_context.py:L196 模块级全局+override_forward_context L245-L256 global 保存/恢复，非 threading.local——通道本身 ch19 已立）→ 写腿 reshape_and_cache_flash 照 slot_mapping 散写（flash_attn.py:L1098-L1132）→ 读腿 flash_attn_varlen_func 照 block_table 读 paged KV（flash_attn.py:L1041-L1066）。边界：算子化/forward context/CUDA graph 档位链归 ch19（本章只接 min_cg_support 接口）；FA kernel 内部数学归 ch20；slot_mapping/block_table 怎么算出来（Triton kernel、PAD 语义、双镜像）归 ch22——本章把它们当『已就位的接口字段』消费；MLA 后端内部归 ch24/25（本章只在优先级表里点名）；模型层拼装细节归 ch23。",
+  "one_line": "Attention() 是插座不是实现：每个注意力层在构造期经 get_attn_backend 自选后端——平台按 use_mla×算力代给出优先级表、逐个 validate_configuration（ImportError 容忍）取最高优先级合法者（显式指定则只校验不回退）；KV 初始化期再按 (后端类全名, KVCacheSpec, num_heads_q) 把层聚成 AttentionGroup，同一模型可逐 KV 组混布不同后端（代价：每组一套 metadata builder + 全模型 cudagraph 档位被最弱组拖累）；运行期每拍 runner 组装一份 CommonAttentionMetadata、逐组交 builder.build() 翻译成后端专属 metadata、按 layer_name 铺进 forward context——后端 Impl 拿它照 slot_mapping 写 KV、照 block_table 读 KV，把 ch20 的 tiling kernel 喂上料。",
+  "code_spine": [
+    "vllm/model_executor/layers/attention/attention.py:L223-L363  Attention 层（模型层插座）：__init__ 建层即选后端——attn_backend 参数为 None 时调 get_attn_backend(head_size,dtype,kv_cache_dtype,has_sink,use_mm_prefix,has_sliding_window,...)（L350-L363）",
+    "vllm/v1/attention/selector.py:L101-L174  get_attn_backend 入口：零散参数收进 AttentionSelectorConfig NamedTuple（L24-L39 定义、L140-L156 打包）；backend_per_kind 按 KVCacheSpecKind 逐组覆写全局后端（L158-L168）",
+    "vllm/v1/attention/selector.py:L178-L208  _cached_get_attn_backend（@cache 记忆化）：current_platform.get_attn_backend_cls → resolve_obj_by_qualname 把类路径字符串 import 成类 → 后端要求特定 KV layout 则全局 set_kv_cache_layout（L196-L206）",
+    "vllm/platforms/cuda.py:L83-L163  _get_backend_priorities：按 use_mla × device_capability.major（10=Blackwell/12/其他）× fp8 KV × num_heads 出优先级表——MLA+major10 表头 [FLASHINFER_MLA, TOKENSPEED_MLA(注释: wins past bs≈8, regresses at bs≤2), CUTLASS_MLA, FLASH_ATTN_MLA, FLASHMLA, TRITON_MLA, *sparse]；非 MLA：major10 且非 non-causal → FLASHINFER 优先，否则 FLASH_ATTN 优先",
+    "vllm/platforms/cuda.py:L359-L394  get_valid_backends：对优先级表逐个 get_class()+validate_configuration，ImportError 也当一条原因（L385-L386），合法者带 priority 收进 _BackendCandidate",
+    "vllm/platforms/cuda.py:L397-L492  get_attn_backend_cls：显式选 backend → 只校验它、不合法直接 ValueError（L406-L423）；自动选 → min(priority) 取胜者（L453-L456）、--block-size 挤掉更高优先级后端则 warning（L461-L480）、日志 \"Using %s attention backend out of potential backends: %s\"（L482-L490）",
+    "vllm/v1/attention/backends/registry.py:L34-L159  AttentionBackendEnum：枚举值=默认类路径字符串（~34 个后端条目 + CUSTOM=None 占位）；get_path() 查 _ATTN_OVERRIDES 覆盖表回退枚举值；get_class() = resolve_obj_by_qualname 懒加载（L149-L159）；register_backend 运行时覆盖/注册第三方（L241-L293）",
+    "vllm/v1/attention/backend.py:L56-L148  AttentionBackend ABC：四个抽象 staticmethod 身份证（get_name/get_impl_cls/get_builder_cls/get_kv_cache_shape）+ get_kv_cache_block_dim 哨兵探测（L100-L117）+ get_kv_cache_stride_order 物理布局声明（L120-L148）+ forward_includes_kv_cache_update 旗标（L67）",
+    "vllm/v1/attention/backend.py:L320-L393  validate_configuration 聚合器：十几个能力探针逐个检查、失败追加一条字符串原因，supports_combination 组合探针收尾；返回空列表=该后端在此配置下合法",
+    "vllm/v1/attention/backend.py:L412-L493  CommonAttentionMetadata：跨层跨后端共享的 per-batch 元数据（核心 10 字段：query_start_loc(+cpu)/seq_lens/num_reqs/num_actual_tokens/max_query_len/max_seq_len/block_table_tensor/slot_mapping/causal）",
+    "vllm/v1/attention/backend.py:L606-L724  AttentionCGSupport 四档（ALWAYS/UNIFORM_BATCH/UNIFORM_SINGLE_TOKEN_DECODE/NEVER）+ AttentionMetadataBuilder 抽象：build() 是 Common→后端专属 metadata 的唯一中心入口（L692-L709）、update_block_table 多组复用（L711-L724）",
+    "vllm/v1/attention/backend.py:L796-L934  AttentionImplBase/AttentionImpl：后端具体计算抽象，forward 签名（layer,query,key,value,kv_cache,attn_metadata,output,...)（L922-L934）",
+    "vllm/config/attention.py:L18-L36  AttentionConfig：backend 全局后端 + backend_per_kind 逐 KVCacheSpecKind 覆写（docstring 自带 {\"mla_attention\": \"FLASHINFER_MLA\"} 例子）",
+    "vllm/v1/kv_cache_interface.py:L94-L104  KVCacheSpecKind 十种组 kind（FULL_ATTENTION/MLA_ATTENTION/SLIDING_WINDOW/.../CROSS_ATTENTION/UNKNOWN）——backend_per_kind 的键空间",
+    "vllm/model_executor/layers/attention/attention.py:L621-L694  Attention.get_kv_cache_spec：层自报 KVCacheSpec（FullAttentionSpec/SlidingWindowSpec[自选 sw_block_size]/None[encoder-only]）——分组的原料（消费侧 gpu_model_runner.get_kv_cache_spec L7800）",
+    "vllm/v1/worker/gpu_model_runner.py:L7020-L7125  initialize_attn_backend：AttentionGroupKey=(attn_backend 类全名, kv_cache_spec, num_heads_q) 等价类把层聚成 AttentionGroup（L7061-L7089 归组循环、L7090-L7106 建组）；先过 _check_and_update_cudagraph_mode 最弱链降级再建组（L7114-L7119）",
+    "vllm/v1/worker/utils.py:L217-L263  AttentionGroup（backend/layer_names/kv_cache_spec/kv_cache_group_id）+ create_metadata_builders：get_builder_cls 实例化、kernel_block_size 覆写 spec、requires_block_table_width 时算表宽",
+    "vllm/v1/worker/utils.py:L266-L332  select_common_block_size + prepare_kernel_block_sizes（L335 起）：组内多后端协商共同 kernel 块大小（『256-token 管理块拆 4×64 kernel 块』的协商点）",
+    "vllm/v1/worker/gpu_model_runner.py:L7161-L7202  _check_and_update_cudagraph_mode：min_cg_support 取全部组最弱 CG 支持 → resolve_cudagraph_mode_and_sizes 降级链 → initialize_cudagraph_keys（ch19 档位链的后端侧接口）",
+    "vllm/v1/worker/gpu_model_runner.py:L7433-L7453  _reshape_kv_cache_tensors 消费点：attn_backend.get_kv_cache_shape(...) 定逻辑形 + get_kv_cache_stride_order() 定物理置换，裸张量 as_strided 成后端要的形状；L7470-L7539（含 _update_hybrid_attention_mamba_layout 的 as_strided_ blocks-first 归一实现） _has_mixed_attention_kv_layout：get_kv_cache_block_dim 探测 block 维分歧 → 归一 blocks-first",
+    "vllm/v1/worker/gpu_model_runner.py:L2284-L2574  _build_attention_metadata：_get_block_table 取组块表并填 NULL_BLOCK_ID 尾行（L2325-L2341）→ CommonAttentionMetadata 组装 cm_base（L2430-L2449）→ 逐 KV 组 shallow copy 换 block_table_tensor/slot_mapping（L2561-L2574）→ builder.build()/update_block_table 缓存复用（L2526-L2546）→ 按 layer_name 铺进 dict（L2555-L2556）",
+    "vllm/v1/worker/gpu_model_runner.py:L4367-L4392  execute_model 调用点：_get_slot_mappings（组版+层版两种口径，L4082 起）→ _build_attention_metadata；L4432-L4443 set_forward_context(attn_metadata, ..., slot_mapping=slot_mappings) 设模块级全局 _forward_context",
+    "vllm/model_executor/layers/attention/attention.py:L488-L582  Attention.forward：预分配 output + reshape 在 op 外（NOTE L534-L541）→ use_direct_call 平台分叉：direct 直调 / op 走 torch.ops.vllm.unified_*（L543-L581）；forward_includes_kv_cache_update=False 时先 unified_kv_cache_update 写、返回 dummy 依赖",
+    "vllm/model_executor/layers/attention/attention.py:L732-L798  get_attention_context（按 layer_name 从 forward_context 取本层 metadata/kv_cache/slot_mapping，ch19 已立通道）+ unified_kv_cache_update 算子：impl.do_kv_cache_update 写腿落点",
+    "vllm/v1/attention/backends/flash_attn.py:L72-L239  FlashAttentionBackend（四件套之一）：能力探针实现 + get_kv_cache_shape 返回 (num_blocks, num_kv_heads, block_size, 2*head_size)——K/V 打包进 content 维（L143-L144）+ stride_order NHD=(0,2,1,3)/HND=(0,1,2,3)（L146-L168）+ forward_includes_kv_cache_update=False（L86）",
+    "vllm/v1/attention/backends/flash_attn.py:L243-L299  FlashAttentionMetadata（四件套之二）：后端专属 dataclass——Common 字段改名搬入（block_table_tensor→block_table）+ FA 特有（use_cascade/scheduler_metadata/sliding_window/...）",
+    "vllm/v1/attention/backends/flash_attn.py:L333-L737  FlashAttentionMetadataBuilder（四件套之三）：_cudagraph_support FA3=ALWAYS / FA2=UNIFORM_BATCH（L352-L356）；build() 解构 Common 字段→schedule 闭包产 FA3 AOT scheduler_metadata→装配 FlashAttentionMetadata（L458-L726）；update_block_table 浅拷只换表（L728-L737）",
+    "vllm/v1/attention/backends/flash_attn.py:L838-L1096  FlashAttentionImpl.forward（四件套之四）：kv_cache.transpose(1,2).split(head_size) 拆 K/V cache（L904-L905）→ flash_attn_varlen_func(cu_seqlens_q=query_start_loc, seqused_k=seq_lens, block_table=...) 照块表读 paged KV（L1041-L1066）；NOTE(woosuk) eager 接缝 CPU 开销警告（L880-L887）",
+    "vllm/v1/attention/backends/flash_attn.py:L1098-L1132  FlashAttentionImpl.do_kv_cache_update：reshape_and_cache_flash 照 slot_mapping 散写 K/V（写腿）",
+    "vllm/_custom_ops.py:L2614-L2633  reshape_and_cache_flash thin wrapper：转发 _C_cache_ops CUDA kernel（语义：每 token 按 slot=block_idx*block_size+offset 落格；slot_mapping 形状决定实际 token 数）"
+  ],
+  "stations": [
+    {
+      "n": 1,
+      "where": "vllm/model_executor/layers/attention/attention.py:L350-L363",
+      "what": "建层选后端：模型装配期每个 Attention 层 __init__（构造函数还没实例化任何 impl）调 get_attn_backend(head_size, dtype, kv_cache_dtype, has_sink, use_mm_prefix, use_per_head_quant_scales, attn_type, has_sliding_window)——选后端发生在『还只有类对象、没有实例』的阶段，这正是后端身份证全用 staticmethod 的原因"
+    },
+    {
+      "n": 2,
+      "where": "vllm/v1/attention/selector.py:L140-L168",
+      "what": "打包+逐组覆写：零散参数收进可哈希的 AttentionSelectorConfig（供 @cache 当键）；attention_config.backend_per_kind 非空时按 get_attn_spec_kind(use_mla, has_sliding_window, attn_type) 推导本层所属 KVCacheSpecKind，命中覆写表则换掉全局 backend——『逐 KV 组混布』的用户入口"
+    },
+    {
+      "n": 3,
+      "where": "vllm/platforms/cuda.py:L83-L89",
+      "what": "查优先级表：平台 _get_backend_priorities(use_mla, device_capability, num_heads, kv_cache_dtype, use_non_causal) 按算力代（major 10=Blackwell/12/其他）与 MLA 分叉给出候选列表——表序是经验的（注释挂 benchmark issue 链接），换硬件代要重测"
+    },
+    {
+      "n": 4,
+      "where": "vllm/platforms/cuda.py:L378-L392",
+      "what": "逐个 validate：对候选表依序 get_class()+validate_configuration——每个能力探针失败追加一条原因；后端依赖没装（ImportError）也当一条原因而非崩溃——『没装 flashinfer』不挡 flashinfer 之后的候选"
+    },
+    {
+      "n": 5,
+      "where": "vllm/platforms/cuda.py:L453-L456",
+      "what": "取最高优先级合法者：min(priority) 于幸存候选；用户显式指定 backend 时只校验它、不合法直接 ValueError 不回退（L406-L423）；--block-size 挤掉更高优先级后端则 warning（L461-L480）；选中后若后端要求特定 KV layout 则 set_kv_cache_layout 全局生效（selector.py:L196-L206）"
+    },
+    {
+      "n": 6,
+      "where": "vllm/v1/worker/gpu_model_runner.py:L7061-L7085",
+      "what": "逐层归组：initialize_attn_backend 对每个 KV cache 组逐层问 layers[layer_name].get_attn_backend()，按 (后端类全名, 该层 KVCacheSpec, num_heads_q) 三元组把层聚成 AttentionGroup（每组一套 metadata builder + 一张组内共享 metadata）；建组前先过最弱链 CG 降级（L7114-L7119），随后 prepare_kernel_block_sizes 组内协商 kernel 块大小、initialize_metadata_builders 逐组建 builder（L7649-L7655）"
+    },
+    {
+      "n": 7,
+      "where": "vllm/v1/worker/gpu_model_runner.py:L7433-L7453",
+      "what": "KV 张量定形：attn_backend.get_kv_cache_shape(num_blocks, kernel_block_size, num_kv_heads, head_size) 定逻辑形、get_kv_cache_stride_order() 定物理置换，裸显存 as_strided 成后端要的形状；混布组 block 维分歧（K/V-first vs blocks-first）时归一 blocks-first（L7470-L7539（含 _update_hybrid_attention_mamba_layout 的 as_strided_ blocks-first 归一实现））；最后 bind_kv_cache 把张量绑到 static_forward_context 里的每个层实例 .kv_cache"
+    },
+    {
+      "n": 8,
+      "where": "vllm/v1/worker/gpu_model_runner.py:L2430-L2449",
+      "what": "每拍组装 Common：_build_attention_metadata 用持久缓冲切片组装 CommonAttentionMetadata（query_start_loc/seq_lens/num_reqs/num_actual_tokens/max_query_len/max_seq_len + block_table_tensor/slot_mapping 先用组 0 的）——所有后端、所有层共享的字段只算一次"
+    },
+    {
+      "n": 9,
+      "where": "vllm/v1/worker/gpu_model_runner.py:L2561-L2574",
+      "what": "逐组翻译与铺设：每个 KV cache 组 shallow copy 一份 cm、换上本组的 block_table_tensor/slot_mapping（组 0 之外）；同 (spec, builder 类型) 已建过且 builder 支持 update_block_table 则只换表复用（L2530-L2538）；否则 builder.build(common_prefix_len, cm) 产出后端专属 metadata，按 layer_name 铺进 dict（L2555-L2556）——组内所有层共享同一份"
+    },
+    {
+      "n": 10,
+      "where": "vllm/v1/worker/gpu_model_runner.py:L4432-L4443",
+      "what": "进 forward context：set_forward_context(attn_metadata, ..., slot_mapping=slot_mappings) 把 {layer_name: metadata} 与层版 slot_mapping 挂进模块级全局 _forward_context（通道机制 ch19 已立：算子内 get_attention_context 按 layer_name 取）"
+    },
+    {
+      "n": 11,
+      "where": "vllm/v1/attention/backends/flash_attn.py:L1123-L1132",
+      "what": "写腿：FA 的 forward_includes_kv_cache_update=False → Attention.forward 先走 unified_kv_cache_update 算子 → impl.do_kv_cache_update → reshape_and_cache_flash(key, value, key_cache, value_cache, slot_mapping, ...) 照 slot_mapping 把本拍 K/V 散写进 paged cache（slot_mapping 的形状决定实际 token 数）；slot 怎么算出来归 ch22"
+    },
+    {
+      "n": 12,
+      "where": "vllm/v1/attention/backends/flash_attn.py:L1041-L1067",
+      "what": "读腿：impl.forward 先 kv_cache.transpose(1,2).split(head_size) 拆 K/V cache，再 flash_attn_varlen_func(q, k=key_cache, v=value_cache, cu_seqlens_q=query_start_loc, seqused_k=seq_lens, block_table=block_table, causal=..., scheduler_metadata=...)——ch20 的 tiling kernel 在这一行被喂料：varlen 打平 + paged 块表取数，输出写预分配 output"
+    }
+  ],
+  "stations_note": "站号 = 注意力后端生命周期三幕：装配期选后端（1-5，每模型一次、每层触发但 @cache 摊销成每配置一次）→ KV 初始化期分组与定形（6-7，无请求在场）→ 运行期每拍 metadata 与读写两腿（8-12，每拍心跳）。与前后章衔接：ch19 站 13-14 的『set_forward_context / unified_attention_with_output 算子』是本章站 10-12 的通道（通道归 ch19、走什么料归本章）；ch18 站的『commit_block_table / compute_slot_mapping』产出本章站 8-9 消费的 block_table_tensor/slot_mapping（怎么算归 ch22）；ch20 的 flash_attn_varlen_func 数学内幕在本章站 12 落到真实调用面。",
+  "key_classes": [
+    {
+      "name": "AttentionBackend",
+      "file": "vllm/v1/attention/backend.py",
+      "responsibility": "所有注意力后端的抽象基类（L56）。四个抽象 staticmethod 是后端身份证：get_name / get_impl_cls / get_builder_cls / get_kv_cache_shape——全 staticmethod 因为选后端发生在还没实例化任何东西的阶段；外加一组 supports_*/is_* 能力探针 + validate_configuration 聚合器（L319-L393，探针失败追加字符串原因、空列表=合法）+ get_kv_cache_stride_order/get_kv_cache_block_dim 物理布局声明 + forward_includes_kv_cache_update 旗标（默认 True，FA 改 False）。"
+    },
+    {
+      "name": "CommonAttentionMetadata",
+      "file": "vllm/v1/attention/backend.py",
+      "responsibility": "跨层跨后端共享的 per-batch 元数据 dataclass（L411-L412）。核心 10 字段：query_start_loc(+cpu 前缀和切序列)/seq_lens/num_reqs/num_actual_tokens/max_query_len/max_seq_len/block_table_tensor/slot_mapping/causal。runner 每拍组装一次（gpu_model_runner.py:L2430-L2449），喂给每个 KV 组的 builder——block_table_tensor 与 slot_mapping 在此作为接口字段被后端接住（读写两腿的料）。"
+    },
+    {
+      "name": "AttentionMetadataBuilder",
+      "file": "vllm/v1/attention/backend.py",
+      "responsibility": "抽象 builder（泛型 M=后端专属 metadata 类型，L623）。build(common_prefix_len, common_attn_metadata, fast_build) 是 Common→后端专属 metadata 的唯一中心入口（L692-L709）；update_block_table 多 KV 组复用已建 metadata 只换块表（L711-L724）；_cudagraph_support/get_cudagraph_support 声明 CG 四档支持（L606-L620 + L650-L657）。"
+    },
+    {
+      "name": "AttentionImpl / AttentionImplBase",
+      "file": "vllm/v1/attention/backend.py",
+      "responsibility": "后端具体计算的抽象（L796/L895）。AttentionImpl.forward(layer, query, key, value, kv_cache, attn_metadata, output, output_scale, output_block_scale) 是算注意力的落点（L922-L934）；do_kv_cache_update 是照 slot_mapping 写 KV 的可选钩子（forward_includes_kv_cache_update=False 的后端由 unified_kv_cache_update 算子调它）。"
+    },
+    {
+      "name": "AttentionCGSupport",
+      "file": "vllm/v1/attention/backend.py",
+      "responsibility": "cudagraph 支持四档枚举（L606-L620）：ALWAYS（含 mixed prefill-decode）/ UNIFORM_BATCH（等长 query 批，spec-decode 可用）/ UNIFORM_SINGLE_TOKEN_DECODE（仅 query_len==1）/ NEVER。混布时全模型取最弱档（min_cg_support）。"
+    },
+    {
+      "name": "AttentionBackendEnum",
+      "file": "vllm/v1/attention/backends/registry.py",
+      "responsibility": "后端注册表枚举（L34）：每个成员的值就是一段默认类路径字符串（~34 个：FLASH_ATTN/FLASHINFER/TRITON_ATTN/...各 MLA 家族/模型驱动 DSV4 sparse/MiniMax M3，CUSTOM=None 占位）。get_path() 先查 _ATTN_OVERRIDES 覆盖表回退枚举值；get_class() = resolve_obj_by_qualname 懒加载（用到才 import，没装依赖的后端不挡别人）；register_backend（L241-L293）支持装饰器/直接两种方式运行时覆盖或注册第三方。MambaAttentionBackendEnum 同构（L174-L234 全类）。"
+    },
+    {
+      "name": "AttentionSelectorConfig",
+      "file": "vllm/v1/attention/selector.py",
+      "responsibility": "NamedTuple（L24-L39）：把选后端要看的全部维度（head_size/dtype/kv_cache_dtype/block_size/use_mla/has_sink/use_sparse/attn_type/has_sliding_window/use_non_causal/use_batch_invariant/use_kv_connector/use_pcp）打成一个可哈希键，供 @cache 记忆化命中。"
+    },
+    {
+      "name": "get_attn_backend / _cached_get_attn_backend",
+      "file": "vllm/v1/attention/selector.py",
+      "responsibility": "选后端公开入口（L101-L174）：打包 config + backend_per_kind 逐 kind 覆写 → 内层 @cache（L177-L208）：platform.get_attn_backend_cls 返回类路径字符串 → resolve_obj_by_qualname import 成类 → get_required_kv_cache_layout 非空则全局 set_kv_cache_layout。同一配置只解一次。"
+    },
+    {
+      "name": "_get_backend_priorities / get_valid_backends / get_attn_backend_cls",
+      "file": "vllm/platforms/cuda.py",
+      "responsibility": "平台侧选后端三件（CudaPlatformBase）：L82-L163 优先级表（use_mla×算力代×fp8×num_heads 的经验排序）；L358-L394 逐候选 validate_configuration（ImportError 容忍）产 _BackendCandidate 列表；L396-L492 显式选只校验不回退 / 自动选 min priority + block-size warning + 『Using %s attention backend out of potential backends』日志。跨硬件移植=重写这三个函数（platforms/<x>.py 各一份）。"
+    },
+    {
+      "name": "AttentionGroup",
+      "file": "vllm/v1/worker/utils.py",
+      "responsibility": "同 (后端类全名, KVCacheSpec, num_heads_q) 层的等价类（L217-L263）：backend + layer_names + kv_cache_spec + kv_cache_group_id + metadata_builders（DBO 下每 ubatch 一份）。create_metadata_builders 用 get_builder_cls 实例化、kernel_block_size 覆写 spec；select_common_block_size（L266-L332）/prepare_kernel_block_sizes（L335 起）在组内多后端间协商共同 kernel 块大小。"
+    },
+    {
+      "name": "Attention（v1 统一注意力层）",
+      "file": "vllm/model_executor/layers/attention/attention.py",
+      "responsibility": "模型里每个注意力层的插座封装（L223）。__init__ 建层即选后端（L350-L363）→ get_impl_cls 实例化 self.impl（L420-L433）→ 自注册 static_forward_context[prefix]（L443-L446）；get_kv_cache_spec 层自报 KV 规格（L621-L694）；forward 把 q/k/v reshape 后经 unified_kv_cache_update/unified_attention_with_output 两个算子（或 use_direct_call 平台直调）分发到 impl（L543-L581）。"
+    },
+    {
+      "name": "FlashAttentionBackend 四件套",
+      "file": "vllm/v1/attention/backends/flash_attn.py",
+      "responsibility": "贯穿本章的具体后端样板：Backend（L72-L239）声明 KV 逻辑形 (num_blocks, num_kv_heads, block_size, 2*head_size)（K/V 打包进 content 维）+ stride_order（NHD=(0,2,1,3)/HND=(0,1,2,3)）+ forward_includes_kv_cache_update=False + 能力探针实现；Metadata（L242-L299）专属 dataclass；Builder（L333-L737）build 翻译（FA3 AOT scheduler_metadata/cascade/sliding_window 对称化）；Impl（L743-L1132）forward 用 flash_attn_varlen_func 照 block_table 读、do_kv_cache_update 用 reshape_and_cache_flash 照 slot_mapping 写。"
+    },
+    {
+      "name": "reshape_and_cache_flash",
+      "file": "vllm/_custom_ops.py",
+      "responsibility": "写腿算子的 Python 薄包装（L2614-L2633）：转发 _C_cache_ops CUDA kernel。语义（正文据此讲、不杜撰实现）：对每 token i 取 slot=slot_mapping[i]，key[i]/value[i] 落到 cache 相应块内槽位（slot_mapping 的形状决定实际 token 数、pad 位跳过）。"
+    }
+  ],
+  "data_flow": [
+    "【装配期·选后端（本章站 1-5，每模型一次）】模型装配 load_model 逐层构造 → 每个 Attention.__init__（attention.py:L350-L363）调 get_attn_backend(head_size, dtype, kv_cache_dtype, ...) [selector.py:get_attn_backend] → 打包 AttentionSelectorConfig + backend_per_kind 逐 kind 覆写（L158-L168）→ @cache _cached_get_attn_backend → current_platform.get_attn_backend_cls [cuda.py:get_attn_backend_cls]：显式指定→只校验该后端（L406-L423）；自动→_get_backend_priorities 出表（L82-L163）→ get_valid_backends 逐个 validate_configuration+ImportError 容忍（L358-L394）→ min(priority) 取胜者（L453-L456）→ 返回类路径字符串 → resolve_obj_by_qualname import 成类 → set_kv_cache_layout 若后端要求（selector.py:L196-L206）→ 回到 Attention：get_impl_cls() 实例化 self.impl（attention.py:L420-L433）+ 自注册 static_forward_context（L443-L446）。",
+    "【KV 初始化期·分组与定形（本章站 6-7）】GPUModelRunner.initialize_kv_cache（gpu_model_runner.py:L7624-L7681）→ initialize_attn_backend（L7020-L7125）：逐 KV cache 组逐层 get_attn_backend() 按 (full_cls_name, kv_cache_spec, num_heads_q) 聚成 AttentionGroup [worker/utils.py:AttentionGroup]；先 _check_and_update_cudagraph_mode（L7161-L7202）min_cg_support 最弱链 → resolve_cudagraph_mode_and_sizes → initialize_cudagraph_keys（ch19 档位链）→ prepare_kernel_block_sizes 组内协商 kernel 块 [worker/utils.py:select_common_block_size] → initialize_metadata_builders 逐组 get_builder_cls 实例化（L7127-L7148）→ initialize_kv_cache_tensors（L7541 起）：get_kv_cache_shape/stride_order → as_strided（L7433-L7453）→ bind_kv_cache 绑到每层 .kv_cache；混布组 block 维分歧归一 blocks-first（L7470-L7539（含 _update_hybrid_attention_mamba_layout 的 as_strided_ blocks-first 归一实现））。",
+    "【运行期·每拍 metadata 与读写（本章站 8-12；完整一拍数据流见 deepread/gpu-exec.json data_flow 步 4-5，本章只展开其中注意力段）】execute_model 内 _prepare_inputs（ch18：commit_block_table 先行 + compute_slot_mapping）→ _get_slot_mappings 出组版+层版两种口径（gpu_model_runner.py:L4367-L4376 → L4082）→ _build_attention_metadata（L4378-L4392 → L2284）：_get_block_table 取组块表填 NULL_BLOCK_ID 尾行（L2325-L2341）→ 组装 cm_base CommonAttentionMetadata（L2430-L2449）→ 逐 KV 组 copy(cm) 换 block_table_tensor/slot_mapping（L2561-L2574）→ builder.build()（或 update_block_table 缓存复用 L2530-L2538）→ 按 layer_name 铺进 dict（L2555-L2556）→ set_forward_context 设模块级全局 _forward_context（override_forward_context 保存/恢复进出作用域）（L4432-L4443）。",
+    "【前向时·每个 Attention 层（读写两腿）】model.forward 逐层 → Attention.forward（attention.py:L488-L582）：预分配 output、reshape 在 op 外 → forward_includes_kv_cache_update=False 且非 KV 共享层 → unified_kv_cache_update(key, value, layer_name)（L551-L553/L571-L573）→ get_attention_context 取本层 kv_cache/slot_mapping（L732-L772）→ impl.do_kv_cache_update [flash_attn.py:L1098-L1132] → reshape_and_cache_flash 照 slot_mapping 写（写腿，返回 dummy 依赖保序）→ unified_attention_with_output(query, ..., layer_name) → impl.forward [flash_attn.py:L838-L1096]：kv_cache.transpose(1,2).split 拆 K/V → flash_attn_varlen_func 照 block_table 读 paged KV 算注意力写 output（读腿，ch20 kernel 的真实调用面）。"
+  ],
+  "why_chains": [
+    {
+      "decision": "注意力后端选择：平台给出优先级表，逐个 validate 回退；可逐 KV 组混布",
+      "old_design": "v0：VLLM_ATTENTION_BACKEND 单一环境变量全局指定 + 各处 if-else 检查兼容性；选错了运行期才炸。",
+      "pain": "head_size/dtype/kv_cache_dtype/block_size/sliding_window/sink/MLA/算力代的组合爆炸——用户不可能记住哪组合法且最优；新硬件（OOT 插件）需要整套替换。",
+      "solution": "vllm/v1/attention/selector.py:L101-L174 get_attn_backend 入口（_cached_get_attn_backend @cache 记忆化 L177-L208）→ 平台 get_attn_backend_cls（vllm/platforms/cuda.py:L396-L492）。_get_backend_priorities（L83-L163）按 MLA/算力代出优先级表——MLA+Blackwell(major==10)：[FLASHINFER_MLA, TOKENSPEED_MLA（注释 \"R1 dims + FP8 KV only ... wins past bs≈8, regresses at bs≤2\" L120-L123）, CUTLASS_MLA, FLASH_ATTN_MLA, FLASHMLA, TRITON_MLA, *sparse 后端（fp8 KV 或 head 数再分档 L98-L116）]；major==12：[TRITON_MLA, FLASHINFER_MLA_SPARSE_SM120]；其他代 MLA 另一套（L136-L143）；非 MLA：Blackwell 因 non-causal cutlass 路径有问题故 [FLASHINFER, FLASH_ATTN, ...]，其余代 FLASH_ATTN 优先（L144-L163）。逐个 validate_configuration（含 ImportError 容忍）取最高优先级有效者（get_valid_backends L359-L394），日志 \"Using %s attention backend out of potential backends: %s\"（L482-L490）。用户显式选后端时不回退、直接报错（L407-L423）；--block-size 挤掉更高优先级后端则 warning（L464-L481）。选中后若后端要求特定 KV cache layout 全局设置（selector.py:L196-L206 set_kv_cache_layout）。模型内混布：initialize_attn_backend 按 (backend 类全名, kv_cache_spec, num_heads_q) 把层分组成 AttentionGroup（gpu_model_runner.py:L7020-L7125）——MLA 层与 full attention 层可用不同后端。v0.27 新增：attention_config.backend_per_kind 按 KVCacheSpecKind 逐组覆写全局后端（selector.py:L158-L168）。后端能力向上传染：_check_and_update_cudagraph_mode 取全部组最弱 CG 支持降级（gpu_model_runner.py:L7161-L7202，min_cg_support）。",
+      "cost": "自动选择的结果对用户不完全可预测（要靠日志确认 \"out of potential backends\" 行）；多后端混布意味着同一模型走多条 metadata 构建路径（每组一套 builder：initialize_metadata_builders L7127-L7148，DBO 下还要 ×num_ubatches 份）；最弱支持降级让一个后端拖累全模型 cudagraph 档位；优先级表本身是经验参数（注释里挂 benchmark issue 链接 L96-L97），换硬件代要重测。",
+      "source_card": "deepread/gpu-exec.json why_chains[11]（全链收录——本章主角；solution 各锚点已对 v0.27.1 逐个复核：TOKENSPEED_MLA 注释行号实为 L120-L123、get_valid_backends 实为 L358-L394）"
+    },
+    {
+      "decision": "模型定义层 = 平台无关层的纯拼装（attention 是插座不是实现）：模型文件只做层组装，Attention 层不知道具体 kernel",
+      "old_design": "HF modeling_*.py 每个模型自带注意力实现与 KV 管理；新架构 = 重写一遍 attention+TP+量化胶水；同一 FlashAttention kernel 要为几十个模型各改一遍。",
+      "pain": "模型文件与 kernel 实现焊死：换 kernel（新后端）要改几十个模型文件；反过来新模型接入也碰不到 kernel 选择逻辑。Attention 层 forward 不收 attn_metadata/kv_cache 参数——『执行环境』若经参数透传会污染所有模型 forward 签名（这条的算子化/编译侧由 ch19 讲透，本章只消费其通道）。",
+      "solution": "模型文件只拼层：LlamaDecoderLayer = RMSNorm + QKVParallelLinear + Attention + SiluAndMul + RowParallelLinear；Attention 层不知道具体 kernel——forward 不收 attn_metadata/kv_cache 参数，unified_attention_with_output 自定义算子从 ForwardContext 按 layer_name 取（vllm/model_executor/layers/attention/attention.py:L488-L582 forward、L732-L772 get_attention_context、L775-L798 unified_kv_cache_update 返回 dummy tensor 给 torch.compile 造数据依赖保序）；后端选择在 Attention.__init__ 自完成（L350-L363 调 get_attn_backend，L420-L433 get_impl_cls 实例化 impl）——『模型定义域在构造期产出层注册表，runner 在运行期消费』。",
+      "cost": "接入税重：新架构作者要同时懂模型层契约 + KV cache 规格体系（层自报 KVCacheSpec attention.py:L621-L694）+ static_forward_context 注册；『一层到底谁实现』要跨 attention.py/后端文件/platforms 三处追；隐式全局状态：不设 forward context 直接调 attention 即 assert 崩。",
+      "source_card": "deepread/model-sample.json why_chains[9]（只收『插座+自选后端』这半条；模型拼装四件套/权重加载/新旧布局归 ch23）"
+    }
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/attention/backend.py",
+      "lines": "L56-L97",
+      "what": "AttentionBackend ABC 头部：三个 ClassVar 能力面（dtype/kv_cache_dtype）+ forward_includes_kv_cache_update 旗标 + 四个抽象 staticmethod 身份证（get_name/get_impl_cls/get_builder_cls/get_kv_cache_shape）。全 staticmethod 因为选后端发生在『还没实例化任何 impl』的阶段。",
+      "code": "class AttentionBackend(ABC):\n    \"\"\"Abstract class for attention backends.\"\"\"\n\n    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]\n    supported_kv_cache_dtypes: ClassVar[list[\"CacheDType\"]] = [\n        \"auto\",\n        \"float16\",\n        \"bfloat16\",\n    ]\n\n    # Does attention's forward() include kv cache update?\n    forward_includes_kv_cache_update: bool = True\n\n    @staticmethod\n    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:\n        return [MultipleOf(1)]\n\n    @staticmethod\n    @abstractmethod\n    def get_name() -> str:\n        raise NotImplementedError\n\n    @staticmethod\n    @abstractmethod\n    def get_impl_cls() -> type[\"AttentionImplBase\"]:\n        raise NotImplementedError\n\n    @staticmethod\n    @abstractmethod\n    def get_builder_cls():  # -> Type[\"AttentionMetadataBuilder\"]:\n        raise NotImplementedError\n\n    @staticmethod\n    @abstractmethod\n    def get_kv_cache_shape(\n        num_blocks: int,\n        block_size: int,\n        num_kv_heads: int,\n        head_size: int,\n        cache_dtype_str: str = \"auto\",\n    ) -> tuple[int, ...]:\n        raise NotImplementedError",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/attention/backend.py",
+      "lines": "L319-L393",
+      "what": "validate_configuration 聚合器：十几个能力探针逐个检查、失败往 invalid_reasons 追加一条字符串原因，supports_combination 组合探针收尾——返回空列表=该后端在此配置下合法。这是『validate 回退』的判定核心。",
+      "code": "    @classmethod\n    def validate_configuration(\n        cls,\n        head_size: int,\n        dtype: torch.dtype,\n        kv_cache_dtype: \"CacheDType | None\",\n        block_size: int | None,\n        use_mla: bool,\n        has_sink: bool,\n        use_sparse: bool,\n        use_mm_prefix: bool,\n        use_per_head_quant_scales: bool,\n        device_capability: \"DeviceCapability\",\n        attn_type: str,\n        has_sliding_window: bool = False,\n        use_non_causal: bool = False,\n        use_batch_invariant: bool = False,\n        use_kv_connector: bool = False,\n        use_pcp: bool = False,\n    ) -> list[str]:\n        invalid_reasons = []\n        if not cls.supports_head_size(head_size):\n            invalid_reasons.append(\"head_size not supported\")\n        if not cls.supports_dtype(dtype):\n            invalid_reasons.append(\"dtype not supported\")\n        if not cls.supports_kv_cache_dtype(kv_cache_dtype):\n            invalid_reasons.append(\"kv_cache_dtype not supported\")\n        if not cls.supports_block_size(block_size):\n            invalid_reasons.append(\"block_size not supported\")\n        ...\n        if use_mla != cls.is_mla():\n            if use_mla:\n                invalid_reasons.append(\"MLA not supported\")\n            else:\n                invalid_reasons.append(\"non-MLA not supported\")\n        ...\n        if not cls.supports_compute_capability(device_capability):\n            invalid_reasons.append(\"compute capability not supported\")\n        if not cls.supports_attn_type(attn_type):\n            invalid_reasons.append(f\"attention type {attn_type} not supported\")\n        ...\n        combination_reason = cls.supports_combination(\n            head_size,\n            dtype,\n            kv_cache_dtype,\n            block_size,\n            use_mla,\n            has_sink,\n            use_sparse,\n            use_mm_prefix,\n            device_capability,\n        )\n        if combination_reason is not None:\n            invalid_reasons.append(combination_reason)\n        return invalid_reasons",
+      "elide": [
+        "excerpt 含 3 个 ...：#1=L348-L351（use_mm_prefix 探针）、#2=L357-L365（has_sink/use_sparse/use_per_head_quant_scales 三探针）、#3=L370-L379（五探针）（use_mm_prefix/has_sink/use_sparse/use_per_head_quant_scales，结构都是『旗标为真且探针 False → 追加原因』）"
+      ]
+    },
+    {
+      "path": "vllm/v1/attention/selector.py",
+      "lines": "L101-L174",
+      "what": "get_attn_backend 入口全文：kv_cache_dtype 合法性 assert → 从全局 vllm_config 收集选后端要看的维度（user_specified_block_size 才带 block_size、kv_connector、prefill_context_parallel）→ 打包 AttentionSelectorConfig → backend_per_kind 按 get_attn_spec_kind 推导的 kind 覆写全局后端 → 交 @cache 内层。",
+      "code": "def get_attn_backend(\n    head_size: int,\n    dtype: torch.dtype,\n    kv_cache_dtype: str | None,\n    use_mla: bool = False,\n    has_sink: bool = False,\n    use_sparse: bool = False,\n    use_mm_prefix: bool = False,\n    use_per_head_quant_scales: bool = False,\n    attn_type: str | None = None,\n    num_heads: int | None = None,\n    has_sliding_window: bool = False,\n) -> type[AttentionBackend]:\n    \"\"\"Selects which attention backend to use and lazily imports it.\"\"\"\n\n    if kv_cache_dtype is not None:\n        valid_cache_dtypes = get_args(CacheDType)\n        assert kv_cache_dtype in valid_cache_dtypes, (\n            f\"Invalid kv_cache_dtype: {kv_cache_dtype}. \"\n            f\"Valid values are: {valid_cache_dtypes}\"\n        )\n\n    from vllm.config import get_current_vllm_config\n\n    vllm_config = get_current_vllm_config()\n\n    cache_config = vllm_config.cache_config\n    block_size: int | None\n    if cache_config is not None and cache_config.user_specified_block_size:\n        block_size = cache_config.block_size\n    else:\n        block_size = None\n\n    kv_transfer_config = vllm_config.kv_transfer_config\n    use_kv_connector = (\n        kv_transfer_config is not None and kv_transfer_config.is_kv_transfer_instance\n    )\n\n    attn_type = attn_type or AttentionType.DECODER\n    attn_selector_config = AttentionSelectorConfig(\n        head_size=head_size,\n        dtype=dtype,\n        kv_cache_dtype=cast(CacheDType | None, kv_cache_dtype),\n        block_size=block_size,\n        use_mla=use_mla,\n        has_sink=has_sink,\n        use_sparse=use_sparse,\n        use_mm_prefix=use_mm_prefix,\n        use_per_head_quant_scales=use_per_head_quant_scales,\n        attn_type=attn_type,\n        has_sliding_window=has_sliding_window,\n        use_non_causal=vllm_config.attention_config.use_non_causal,\n        use_batch_invariant=envs.VLLM_BATCH_INVARIANT,\n        use_kv_connector=use_kv_connector,\n        use_pcp=vllm_config.parallel_config.prefill_context_parallel_size > 1,\n    )\n\n    # A per-KV-group override (keyed by KVCacheSpecKind) takes precedence over\n    # the global backend; kinds not present in the map fall back to it.\n    attention_config = vllm_config.attention_config\n    backend = attention_config.backend\n    if attention_config.backend_per_kind:\n        kind = get_attn_spec_kind(\n            use_mla=use_mla,\n            has_sliding_window=has_sliding_window,\n            attn_type=attn_type,\n        )\n        backend = attention_config.backend_per_kind.get(kind.value, backend)\n\n    return _cached_get_attn_backend(\n        backend=backend,\n        attn_selector_config=attn_selector_config,\n        num_heads=num_heads,\n    )",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/attention/selector.py",
+      "lines": "L177-L208",
+      "what": "@cache 内层：平台 get_attn_backend_cls 返回类路径字符串 → resolve_obj_by_qualname 真正 import → 后端要求特定 KV cache layout（如 NHD/HND）则全局 set_kv_cache_layout（副作用！）。@cache 让同一配置只解一次——同一模型几十层共享结果。",
+      "code": "@cache\ndef _cached_get_attn_backend(\n    backend,\n    attn_selector_config: AttentionSelectorConfig,\n    num_heads: int | None = None,\n) -> type[AttentionBackend]:\n    from vllm.platforms import current_platform\n\n    attention_cls = current_platform.get_attn_backend_cls(\n        backend,\n        attn_selector_config=attn_selector_config,\n        num_heads=num_heads,\n    )\n    if not attention_cls:\n        raise ValueError(\n            f\"Invalid attention backend for {current_platform.device_name}\"\n        )\n    backend = resolve_obj_by_qualname(attention_cls)\n\n    # Adjust kv cache layout if the selected backend requires a specific one\n    required_layout = backend.get_required_kv_cache_layout()\n    if required_layout is not None:\n        from vllm.v1.attention.backends.utils import set_kv_cache_layout\n\n        set_kv_cache_layout(required_layout)\n        logger.info_once(\n            \"Using %s KV cache layout for %s backend.\",\n            required_layout,\n            backend.get_name(),\n        )\n\n    return backend",
+      "elide": []
+    },
+    {
+      "path": "vllm/platforms/cuda.py",
+      "lines": "L82-L163",
+      "what": "优先级表本体：use_mla × device_capability.major 分叉。MLA+Blackwell(10)：FLASHINFER_MLA 第一、TOKENSPEED_MLA 第二（注释自述只在 R1 dims + FP8 KV 下合法、bs≈8 以上才赢、bs≤2 反而退化）、sparse 后端按 fp8 KV / num_heads 再分档；非 MLA：Blackwell 非 non-causal 时 FLASHINFER 第一（non-causal 的 cutlass 路径有问题故 FLASH_ATTN 优先）、其余代 FLASH_ATTN 第一。",
+      "code": "@cache\ndef _get_backend_priorities(\n    use_mla: bool,\n    device_capability: DeviceCapability,\n    num_heads: int | None = None,\n    kv_cache_dtype: CacheDType | None = None,\n    use_non_causal: bool = False,\n) -> list[AttentionBackendEnum]:\n    \"\"\"Get backend priorities with lazy import to avoid circular dependency.\"\"\"\n    from vllm.utils.torch_utils import is_quantized_kv_cache\n\n    if use_mla:\n        if device_capability.major == 10:\n            # Sparse MLA backend priorities\n            # See https://github.com/vllm-project/vllm/issues/35807 for\n            # benchmark results\n            if kv_cache_dtype is not None and is_quantized_kv_cache(kv_cache_dtype):\n                # Prefer FlashInfer for fp8 kv cache\n                sparse_backends = [\n                    AttentionBackendEnum.FLASHINFER_MLA_SPARSE,\n                    AttentionBackendEnum.FLASHMLA_SPARSE,\n                ]\n            else:\n                ...\n            return [\n                AttentionBackendEnum.FLASHINFER_MLA,\n                # R1 dims + FP8 KV only; rejected by supports_combination\n                # otherwise. Behind FLASHINFER_MLA: wins past bs≈8, regresses\n                # at bs≤2.\n                AttentionBackendEnum.TOKENSPEED_MLA,\n                AttentionBackendEnum.CUTLASS_MLA,\n                AttentionBackendEnum.FLASH_ATTN_MLA,\n                AttentionBackendEnum.FLASHMLA,\n                AttentionBackendEnum.TRITON_MLA,\n                *sparse_backends,\n            ]\n        ...\n    else:\n        # SM100f defaults to FlashInfer for TRTLLM causal attention, but its non-causal\n        # cutlass path (used for dflash attention) is known to have problems.\n        # So prefer FlashAttention when non-causal on SM100f.\n        if device_capability.major == 10 and not use_non_causal:\n            return [\n                AttentionBackendEnum.FLASHINFER,\n                AttentionBackendEnum.FLASH_ATTN,\n                AttentionBackendEnum.TRITON_ATTN,\n                AttentionBackendEnum.FLEX_ATTENTION,\n                AttentionBackendEnum.TURBOQUANT,\n            ]\n        else:\n            return [\n                AttentionBackendEnum.FLASH_ATTN,\n                AttentionBackendEnum.FLASHINFER,\n                AttentionBackendEnum.TRITON_ATTN,\n                AttentionBackendEnum.FLEX_ATTENTION,\n                AttentionBackendEnum.TURBOQUANT,\n            ]",
+      "elide": [
+        "第一个 ... = L105-L117：BF16 KV 时按 num_heads 分档（num_heads≤16 用 FLASHINFER_MLA_SPARSE 在前——FlashMLA 要 padding；否则 FLASHMLA_SPARSE 在前）",
+        "第二个 ... = L130-L143：major==12 一套 [TRITON_MLA, FLASHINFER_MLA_SPARSE_SM120] 与其他代 MLA 一套 [FLASH_ATTN_MLA, FLASHMLA, FLASHINFER_MLA, TRITON_MLA, FLASH_ATTN_MLA_SPARSE, FLASHMLA_SPARSE]——正文点一句即可"
+      ]
+    },
+    {
+      "path": "vllm/platforms/cuda.py",
+      "lines": "L358-L394",
+      "what": "get_valid_backends 全文：对优先级表依序 get_class()+validate_configuration；get_class() 懒加载抛 ImportError 也被接住当一条原因（『没装 flashinfer』不挡后面的候选）；合法者带 priority 收进 _BackendCandidate。这就是『逐个 validate 回退』的循环体。",
+      "code": "    @classmethod\n    def get_valid_backends(\n        cls,\n        device_capability: DeviceCapability,\n        attn_selector_config: AttentionSelectorConfig,\n        num_heads: int | None = None,\n    ) -> tuple[\n        list[_BackendCandidate],\n        dict[AttentionBackendEnum, tuple[int, list[str]]],\n    ]:\n        valid_backends_priorities = []\n        invalid_reasons: dict[AttentionBackendEnum, tuple[int, list[str]]] = {}\n\n        backend_priorities = _get_backend_priorities(\n            attn_selector_config.use_mla,\n            device_capability,\n            num_heads,\n            attn_selector_config.kv_cache_dtype,\n            attn_selector_config.use_non_causal,\n        )\n        for priority, backend in enumerate(backend_priorities):\n            try:\n                backend_class = _get_attn_backend_class(backend)\n                invalid_reasons_i = backend_class.validate_configuration(\n                    device_capability=device_capability,\n                    **attn_selector_config._asdict(),\n                )\n            except ImportError:\n                invalid_reasons_i = [\"ImportError\"]\n            if invalid_reasons_i:\n                invalid_reasons[backend] = (priority, invalid_reasons_i)\n            else:\n                valid_backends_priorities.append(\n                    _BackendCandidate(backend_class, backend, priority)\n                )\n\n        return valid_backends_priorities, invalid_reasons",
+      "elide": []
+    },
+    {
+      "path": "vllm/platforms/cuda.py",
+      "lines": "L396-L492",
+      "what": "get_attn_backend_cls 两路：① 用户显式指定 → 只校验它、不合法直接 ValueError（不回退！）；② 自动选 → 全军覆没报错 / min(priority) 取幸存者 → --block-size 挤掉更高优先级者 warning → 『Using %s attention backend out of potential backends』日志（自动选择结果的确认口）。",
+      "code": "    @classmethod\n    def get_attn_backend_cls(\n        cls,\n        selected_backend: AttentionBackendEnum | None,\n        attn_selector_config: AttentionSelectorConfig,\n        num_heads: int | None = None,\n    ) -> str:\n        device_capability = cls.get_device_capability()\n        assert device_capability is not None\n\n        # First try checking just the selected backend, if there is one.\n        if selected_backend is not None:\n            try:\n                backend_class = _get_attn_backend_class(selected_backend)\n                invalid_reasons = backend_class.validate_configuration(\n                    device_capability=device_capability,\n                    **attn_selector_config._asdict(),\n                )\n            except ImportError:\n                invalid_reasons = [\"ImportError\"]\n            if invalid_reasons:\n                raise ValueError(\n                    f\"Selected backend {selected_backend} is not valid for \"\n                    f\"this configuration. Reason: {invalid_reasons}\"\n                )\n            else:\n                logger.info(\"Using %s backend.\", selected_backend)\n                return _backend_cls_path(backend_class)\n\n        # No selected backend or the selected backend is invalid,\n        # so we try finding a valid backend.\n        valid_backends_priorities, all_invalid_reasons = cls.get_valid_backends(\n            device_capability=device_capability,\n            attn_selector_config=attn_selector_config,\n            num_heads=num_heads,\n        )\n        ...\n        if len(valid_backends_priorities) == 0:\n            raise ValueError(\n                f\"No valid attention backend found for {cls.device_name} \"\n                f\"with {config_str}. Reasons: {reasons_str}.\"\n            )\n\n        # We have found some valid backends. Select the one with the\n        # highest priority.\n        selected_candidate = min(\n            valid_backends_priorities,\n            key=lambda candidate: candidate.priority,\n        )\n        selected_backend_class = selected_candidate.backend_class\n        selected_backend = selected_candidate.backend\n        selected_priority = selected_candidate.priority\n\n        # If the user specified --block-size (but not --attention-backend),\n        # check whether that constraint precluded any higher-priority backends.\n        if attn_selector_config.block_size is not None:\n            ...\n        logger.info_once(\n            \"Using %s attention backend out of potential backends: %s.\",\n            selected_backend.name,\n            \"[\"\n            + \", \".join(\n                f\"'{candidate.backend.name}'\" for candidate in valid_backends_priorities\n            )\n            + \"]\",\n        )\n\n        return _backend_cls_path(selected_backend_class)",
+      "elide": [
+        "第一个 ... = L432-L444：reasons_str/config_str 拼接与 debug_once 日志（把全部落选原因拼给人看）",
+        "第二个 ... = L464-L481：--block-size warning 的函数体（筛出『因 block_size 不支持而落选且优先级更高』者发 logger.warning，建议去掉 --block-size 让系统自选最优块大小）"
+      ]
+    },
+    {
+      "path": "vllm/v1/attention/backends/registry.py",
+      "lines": "L34-L128",
+      "what": "AttentionBackendEnum 头部：枚举值就是完整类路径字符串（FLASH_ATTN/TRITON_ATTN/FLASHINFER/各 MLA 家族/模型驱动的 DSV4 sparse...约 35 项）+ CUSTOM=None 占位（第三方注册用）。枚举=『名字→类路径』的静态表。",
+      "code": "class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):\n    \"\"\"Enumeration of all supported attention backends.\n\n    The enum value is the default class path, but this can be overridden\n    at runtime using register_backend().\n\n    To get the actual backend class (respecting overrides), use:\n        backend.get_class()\n    \"\"\"\n\n    FLASH_ATTN = \"vllm.v1.attention.backends.flash_attn.FlashAttentionBackend\"\n    FLASH_ATTN_DIFFKV = (\n        \"vllm.v1.attention.backends.flash_attn_diffkv.FlashAttentionDiffKVBackend\"\n    )\n    TRITON_ATTN = \"vllm.v1.attention.backends.triton_attn.TritonAttentionBackend\"\n    ...\n    FLASHINFER = \"vllm.v1.attention.backends.flashinfer.FlashInferBackend\"\n    FLASHINFER_MLA = (\n        \"vllm.v1.attention.backends.mla.flashinfer_mla.FlashInferMLABackend\"\n    )\n    ...\n    NO_ATTENTION = \"vllm.v1.attention.backends.no_attention.NoAttentionBackend\"\n    FLEX_ATTENTION = \"vllm.v1.attention.backends.flex_attention.FlexAttentionBackend\"\n    ...\n    CPU_ATTN = \"vllm.v1.attention.backends.cpu_attn.CPUAttentionBackend\"\n    TURBOQUANT = \"vllm.v1.attention.backends.turboquant_attn.TurboQuantAttentionBackend\"\n    # Placeholder for third-party/custom backends - must be registered before use\n    # set to None to avoid alias with other backend, whose value is an empty string\n    CUSTOM = None",
+      "elide": [
+        "3 个 ... marker 共省略约 25 个同构条目：TRITON_ATTN_DIFFKV/ROCM 族（5 个）/XPU_MLA_SPARSE/TORCH_SDPA（ViT 专用空串）/TOKENSPEED_MLA/sparse 家族（FLASHINFER_MLA_SPARSE(_SM120)/FLASHMLA_SPARSE(_DSV4)/FLASHINFER_MLA_SPARSE_DSV4/ROCM_FLASHMLA_SPARSE_DSV4）/TRITON_MLA/CUTLASS_MLA/FLASHMLA/FLASH_ATTN_MLA(_SPARSE)/MINIMAX_M3_SPARSE/CUTLASS_MSA/TRITON_MSA/HPC_ATTN/ROCM_AITER_UNIFIED_ATTN——全是『名字 = 完整类路径字符串』的同构行"
+      ]
+    },
+    {
+      "path": "vllm/v1/attention/backends/registry.py",
+      "lines": "L130-L159",
+      "what": "get_path/get_class：先查 _ATTN_OVERRIDES 运行时覆盖表、回退枚举值（类路径字符串），再 resolve_obj_by_qualname 真正 import——用到哪个才 import 哪个（懒加载），没装依赖的后端不会在 import registry 时拖崩进程。",
+      "code": "    def get_path(self, include_classname: bool = True) -> str:\n        \"\"\"Get the class path for this backend (respects overrides).\n\n        Returns:\n            The fully qualified class path string\n\n        Raises:\n            ValueError: If Backend.CUSTOM is used without being registered\n        \"\"\"\n        path = _ATTN_OVERRIDES.get(self, self.value)\n        if not path:\n            raise ValueError(\n                f\"Backend {self.name} must be registered before use. \"\n                f\"Use register_backend(Backend.{self.name}, 'your.module.YourClass')\"\n            )\n        if not include_classname:\n            path = path.rsplit(\".\", 1)[0]\n        return path\n\n    def get_class(self) -> \"type[AttentionBackend]\":\n        \"\"\"Get the backend class (respects overrides).\n\n        Returns:\n            The backend class\n\n        Raises:\n            ImportError: If the backend class cannot be imported\n            ValueError: If Backend.CUSTOM is used without being registered\n        \"\"\"\n        return resolve_obj_by_qualname(self.get_path())",
+      "elide": []
+    },
+    {
+      "path": "vllm/config/attention.py",
+      "lines": "L17-L36",
+      "what": "AttentionConfig：backend 全局后端 + backend_per_kind 逐 KV 组覆写（docstring 自带 {\"mla_attention\": \"FLASHINFER_MLA\"} 例子并说明『未列出的 kind 回退 backend（或自动选择）；被选后端对该 kind 非法则启动即报错』）——『逐 KV 组混布』的用户面。",
+      "code": "@config\nclass AttentionConfig:\n    \"\"\"Configuration for attention mechanisms in vLLM.\"\"\"\n\n    backend: AttentionBackendEnum | None = None\n    \"\"\"Attention backend to use. Use \"auto\" or None for automatic selection.\"\"\"\n\n    minimax_m3_msa_decode_backend: MiniMaxM3MSADecodeBackend = \"triton\"\n    \"\"\"Sparse decode kernel used by the MiniMax M3 MSA backend.\"\"\"\n\n    backend_per_kind: dict[str, AttentionBackendEnum] = field(default_factory=dict)\n    \"\"\"Per-KV-cache-group attention backend overrides, keyed by\n    `KVCacheSpecKind` (e.g. `{\"mla_attention\": \"FLASHINFER_MLA\",\n    \"sliding_window_mla\": \"TRITON_MLA\"}`). This lets a model that splits its\n    layers across multiple KV-cache groups (e.g. interleaved full and\n    sliding-window attention) use a different backend per group.\n\n    An entry overrides `backend` for layers of the matching kind; kinds not\n    listed fall back to `backend` (or automatic selection). A selected backend\n    that is invalid for that kind raises at startup.\"\"\"",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/attention/attention.py",
+      "lines": "L343-L363",
+      "what": "Attention.__init__ 选后端段：建层时若构造方没显式传 attn_backend，就调 get_attn_backend(head_size, dtype=get_default_dtype(), kv_cache_dtype, has_sink, use_mm_prefix, use_per_head_quant_scales, attn_type, has_sliding_window)——模型定义域在构造期自选后端（模型文件不感知具体 kernel）。",
+      "code": "        # NOTE: model_config may be None during certain tests\n        model_config = vllm_config.model_config\n        self.use_mm_prefix = model_config is not None and model_config.is_mm_prefix_lm\n\n        # During model initialization, the default dtype is set as the model\n        # weight and activation dtype.\n        dtype = torch.get_default_dtype()\n        if attn_backend is None:\n            self.attn_backend = get_attn_backend(\n                head_size,\n                dtype,\n                kv_cache_dtype,\n                use_mla=False,\n                has_sink=self.has_sink,\n                use_mm_prefix=self.use_mm_prefix,\n                use_per_head_quant_scales=use_per_head_quant_scales,\n                attn_type=attn_type,\n                has_sliding_window=sliding_window is not None,\n            )\n        else:\n            self.attn_backend = attn_backend",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/attention/attention.py",
+      "lines": "L420-L446",
+      "what": "选完即装：get_impl_cls() 实例化 self.impl（模型定义域消费后端类的落点）→ self.backend = AttentionBackendEnum[名字]（反查枚举）→ use_direct_call 平台分叉旗标 → 自注册 static_forward_context[prefix]，重名即 raise（ch19 已立此注册，此处看它与后端选择同处一个构造函数）。",
+      "code": "        impl_cls = self.attn_backend.get_impl_cls()\n        self.impl = impl_cls(  # type: ignore[assignment]  # impl_cls always returns an AttentionImpl subclass\n            num_heads,\n            head_size,\n            scale,\n            num_kv_heads,\n            alibi_slopes,\n            sliding_window,\n            kv_cache_dtype,\n            logits_soft_cap,\n            attn_type,\n            kv_sharing_target_layer_name,\n            **extra_impl_args,\n        )\n        self.backend = AttentionBackendEnum[self.attn_backend.get_name()]\n        self.dtype = dtype\n\n        # For cuda-alike (CUDA and ROCM) and cpu platforms, we control how\n        # torch.compile works by registering the attention as one giant\n        # opaque custom op. For other platforms, we directly call them\n        # and let torch.compile handle them.\n        self.use_direct_call = not current_platform.opaque_attention_op()\n\n        compilation_config = vllm_config.compilation_config\n        if prefix in compilation_config.static_forward_context:\n            raise ValueError(f\"Duplicate layer name: {prefix}\")\n        compilation_config.static_forward_context[prefix] = self",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L7020-L7125",
+      "what": "initialize_attn_backend：AttentionGroupKey=(attn_backend, kv_cache_spec, num_heads_q) 三元组等价类——逐层问 get_attn_backend()、按 full_cls_name（防动态子类重复）+ 该层 spec + Q 头数归组；跨全部 KV cache 组循环建 AttentionGroup；建组前先过 _check_and_update_cudagraph_mode（先降级再建 builder，避免按高档建完又降）。",
+      "code": "    def initialize_attn_backend(\n        self,\n        kv_cache_config: KVCacheConfig,\n        is_profiling: bool = False,\n    ) -> None:\n        \"\"\"\n        Initialize the attention backends and attention metadata builders.\n        \"\"\"\n        assert len(self.attn_groups) == 0, \"Attention backends are already initialized\"\n\n        class AttentionGroupKey(NamedTuple):\n            \"\"\"Deduplication key for attention groups within a KV cache group.\n\n            Splits on per-rank ``num_heads_q`` in addition to backend + spec\n            so layers with different Q-head counts (e.g. a spec-decode draft\n            with fewer attention heads than its target) get separate metadata\n            builders. The builders' scratch (e.g. ``softmax_segm_*`` in\n            ``triton_attn``, ``num_qo_heads`` in FlashInfer) is sized by\n            ``num_heads_q`` and assumes uniformity within the group; see\n            ``get_num_attention_heads_from_layers`` in\n            ``vllm/v1/attention/backends/utils.py``.\n            \"\"\"\n\n            attn_backend: type[AttentionBackend]\n            kv_cache_spec: KVCacheSpec\n            num_heads_q: int\n\n        def get_attn_backends_for_group(\n            kv_cache_group_spec: KVCacheGroupSpec,\n        ) -> tuple[dict[AttentionGroupKey, list[str]], set[type[AttentionBackend]]]:\n            layer_type = cast(type[Any], AttentionLayerBase)\n            layers = get_layers_from_vllm_config(\n                self.vllm_config, layer_type, kv_cache_group_spec.layer_names\n            )\n            attn_backends = {}\n            attn_backend_layers = defaultdict(list)\n            # Dedupe based on full class name; this is a bit safer than\n            # using the class itself as the key because when we create dynamic\n            # attention backend subclasses (e.g. ChunkedLocalAttention) unless\n            # they are cached correctly, there will be different objects per\n            # layer.\n            for layer_name in kv_cache_group_spec.layer_names:\n                attn_backend = layers[layer_name].get_attn_backend()\n\n                if layer_name in self.kv_sharing_fast_prefill_eligible_layers:\n                    attn_backend = create_fast_prefill_custom_backend(\n                        \"FastPrefill\",\n                        attn_backend,  # type: ignore[arg-type]\n                    )\n\n                full_cls_name = attn_backend.full_cls_name()\n                layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec\n                if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):\n                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]\n                # Non-Attention layer types (e.g. Mamba1, ShortConv) do not\n                # expose ``num_heads``; fall back to 0 so they cluster as\n                # before. Such layers never coexist with Attention in a\n                # single KV cache group (different KVCacheSpec), so the\n                # fallback can never spuriously merge them with attention\n                # layers.\n                num_heads_q = getattr(layers[layer_name], \"num_heads\", 0)\n                key = (full_cls_name, layer_kv_cache_spec, num_heads_q)\n                attn_backends[key] = AttentionGroupKey(\n                    attn_backend, layer_kv_cache_spec, num_heads_q\n                )\n                attn_backend_layers[key].append(layer_name)\n            return (\n                {attn_backends[k]: v for k, v in attn_backend_layers.items()},\n                set(group_key.attn_backend for group_key in attn_backends.values()),\n            )\n        ...\n        attention_backend_maps = []\n        attention_backend_list = []\n        for kv_cache_group_spec in kv_cache_config.kv_cache_groups:\n            attn_backends = get_attn_backends_for_group(kv_cache_group_spec)\n            attention_backend_maps.append(attn_backends[0])\n            attention_backend_list.append(attn_backends[1])\n\n        # Resolve cudagraph_mode before actually initialize metadata_builders\n        self._check_and_update_cudagraph_mode(\n            attention_backend_list,\n            kv_cache_config.kv_cache_groups,\n            is_profiling=is_profiling,\n        )\n\n        # Check if attention backend supports PCP&DCP and related features.\n        check_attention_cp_compatibility(self.vllm_config)\n\n        for i, attn_backend_map in enumerate(attention_backend_maps):\n            self.attn_groups.append(create_attn_groups(attn_backend_map, i))",
+      "elide": [
+        "... = L7090-L7106 create_attn_groups 闭包：对归组结果逐 key 建 AttentionGroup(key.attn_backend, layer_names, key.kv_cache_spec, kv_cache_group_id) 收进列表"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L7161-L7202",
+      "what": "_check_and_update_cudagraph_mode：遍历全部组全部后端取 get_cudagraph_support 的最小值（min_cg_support）——『最弱链』：一个 UNIFORM_BATCH 后端就能把全模型 FULL 档压掉；再走 resolve_cudagraph_mode_and_sizes 降级链（ch19）+ initialize_cudagraph_keys 预生成 key。",
+      "code": "    def _check_and_update_cudagraph_mode(\n        self,\n        attention_backends: list[set[type[AttentionBackend]]],\n        kv_cache_groups: list[KVCacheGroupSpec],\n        is_profiling: bool = False,\n    ) -> None:\n        \"\"\"\n        Resolve the cudagraph_mode when there are multiple attention\n        groups with potential conflicting CUDA graph support.\n        Then initialize the cudagraph_dispatcher based on the resolved\n        cudagraph_mode.\n        \"\"\"\n        min_cg_support = AttentionCGSupport.ALWAYS\n        min_cg_attn_backend = None\n\n        for attn_backend_set, kv_cache_group in zip(\n            attention_backends, kv_cache_groups\n        ):\n            for attn_backend in attn_backend_set:\n                builder_cls = attn_backend.get_builder_cls()\n\n                cg_support = builder_cls.get_cudagraph_support(\n                    self.vllm_config, kv_cache_group.kv_cache_spec\n                )\n                if cg_support.value < min_cg_support.value:\n                    min_cg_support = cg_support\n                    min_cg_attn_backend = attn_backend.__name__\n        cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(\n            min_cg_support,\n            min_cg_attn_backend,\n            self.uniform_decode_query_len,\n            use_v2_model_runner=False,\n            tensor_parallel_size=self.parallel_config.tensor_parallel_size,\n            kv_cache_config=self.kv_cache_config,\n            max_num_reqs=self.max_num_reqs,\n            is_profiling=is_profiling,\n        )\n        # Trigger cudagraph dispatching keys initialization after\n        # resolved cudagraph mode.\n        self.cudagraph_dispatcher.initialize_cudagraph_keys(\n            cudagraph_mode, self.uniform_decode_query_len\n        )",
+      "elide": [
+        "尾部省略 L7204-L7218：spec decode drafter 的 cudagraph dispatcher 同构初始化（不进本章主线）"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L2430-L2449",
+      "what": "cm_base 组装：_build_attention_metadata 用持久缓冲切片拼 CommonAttentionMetadata——所有后端所有层共享的字段每拍只算这一次；block_table_tensor/slot_mapping 先填组 0 的（组 0 之外的组在逐组循环里换）。",
+      "code": "        cm_base = CommonAttentionMetadata(\n            query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],\n            query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],\n            seq_lens=self.seq_lens[:num_reqs_padded],\n            _seq_lens_cpu=seq_lens_cpu,\n            _num_computed_tokens_cpu=num_computed_tokens_cpu,\n            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,\n            replayssm_decode_base_cpu=replayssm_decode_base_cpu,\n            num_reqs=num_reqs_padded,\n            num_actual_tokens=num_tokens_padded,\n            max_query_len=max_query_len,\n            max_seq_len=max_seq_len,\n            block_table_tensor=block_table_gid_0,\n            slot_mapping=slot_mapping_gid_0,\n            causal=True,\n            is_prefilling=is_prefilling,\n            positions=self.positions[:num_tokens_padded],\n            mm_req_doc_ranges=req_doc_ranges,\n            rswa_prefix_lens=rswa_prefix_lens,\n        )",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L2526-L2574",
+      "what": "翻译与铺设三段：① build 分派（cudagraph 捕获用 build_for_cudagraph_capture；同 (spec,builder) 已建过且支持换表则 update_block_table 复用；否则 build）② 按 layer_name 把同一份 metadata 铺给组内全部层 ③ 逐 KV 组 shallow copy cm_base、换本组 block_table_tensor/slot_mapping——混合组只有表和槽位不同，其余字段白拿组 0 的。",
+      "code": "            if for_cudagraph_capture:\n                attn_metadata_i = builder.build_for_cudagraph_capture(\n                    common_attn_metadata\n                )\n            elif (\n                cache_key in cached_attn_metadata\n                and builder.supports_update_block_table\n            ):\n                attn_metadata_i = builder.update_block_table(\n                    cached_attn_metadata[cache_key],\n                    common_attn_metadata.block_table_tensor,\n                    common_attn_metadata.slot_mapping,\n                )\n            else:\n                attn_metadata_i = builder.build(\n                    common_prefix_len=cascade_attn_prefix_len,\n                    common_attn_metadata=common_attn_metadata,\n                    **extra_attn_metadata_args,\n                )\n                if builder.supports_update_block_table:\n                    cached_attn_metadata[cache_key] = attn_metadata_i\n            ...\n            for layer_name in attn_group.layer_names:\n                attn_metadata_dict[layer_name] = attn_metadata_i\n\n        # Prepare the attention metadata for each KV cache group and make layers\n        # in the same group share the same metadata.\n        ...\n        for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):\n            cm = copy(cm_base)  # shallow copy\n\n            # Basically only the encoder seq_lens, block_table and slot_mapping change\n            # for each kv_cache_group.\n            ...\n            if kv_cache_gid > 0:\n                cm.block_table_tensor = _get_block_table(kv_cache_gid)\n                cm.slot_mapping = slot_mappings[kv_cache_gid]",
+      "elide": [
+        "第一个 ... = L2548-L2553 ubatch 分支（DBO 下 attn_metadata 是 list[dict]、按 ubid 选 dict——扩展态不进主线）",
+        "第二个 ... = L2560 与 L2566-L2571：spec_decode_common_attn_metadata 初始化与 _get_encoder_seq_lens（encoder-decoder 组的 seq_lens 特例）"
+      ]
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L133-L168",
+      "what": "后端自报 KV 布局（v0.27 新形）：逻辑形 (num_blocks, num_kv_heads, block_size, 2*head_size)——K 和 V 打包进最后一维 content dim（不再是 v0.21 的 (2, num_blocks, ...) 头维拆 K/V）；stride_order 是逻辑形→物理内存序的置换：NHD 把 block_size 提前 (0,2,1,3)、HND 恒等 (0,1,2,3)。",
+      "code": "    @staticmethod\n    def get_kv_cache_shape(\n        num_blocks: int,\n        block_size: int,\n        num_kv_heads: int,\n        head_size: int,\n        cache_dtype_str: str = \"auto\",\n    ) -> tuple[int, ...]:\n        if block_size % 16 != 0:\n            raise ValueError(\"Block size must be a multiple of 16.\")\n        # K and V are packed into the content dim: logical (B, H, N, 2*D).\n        return (num_blocks, num_kv_heads, block_size, 2 * head_size)\n\n    @staticmethod\n    def get_kv_cache_stride_order(\n        include_num_layers_dimension: bool = False,\n    ) -> tuple[int, ...]:\n        # `stride_order` indicates the permutation that gets us from\n        # `get_kv_cache_shape` (logical (B, H, N, 2*D)) to the actual memory\n        # layout we want.\n        cache_layout = get_kv_cache_layout()\n        if cache_layout == \"NHD\" and include_num_layers_dimension:\n            # (num_blocks, num_layers, block_size, num_kv_heads, 2*head_size)\n            return (1, 0, 3, 2, 4)\n        elif cache_layout == \"NHD\":\n            # (num_blocks, block_size, num_kv_heads, 2*head_size)\n            stride_order = (0, 2, 1, 3)\n        elif cache_layout == \"HND\" and include_num_layers_dimension:\n            # (num_blocks, num_kv_heads, num_layers, block_size, 2*head_size)\n            return (1, 2, 0, 3, 4)\n        elif cache_layout == \"HND\":\n            # (num_blocks, num_kv_heads, block_size, 2*head_size)\n            stride_order = (0, 1, 2, 3)\n        else:\n            raise ValueError(f\"Unknown cache layout format {cache_layout}.\")\n        return stride_order",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L458-L476",
+      "what": "Builder.build() 开场：从 CommonAttentionMetadata 解构出共享字段——『翻译』的第一半是把 Common 的字段直搬；FA 特有字段（scheduler_metadata/cascade/sliding_window）在后续分支里补算。",
+      "code": "    def build(\n        self,\n        common_prefix_len: int,\n        common_attn_metadata: CommonAttentionMetadata,\n        fast_build: bool = False,\n    ) -> FlashAttentionMetadata:\n        \"\"\"\n        fast_build disables AOT scheduling, used when there will be few\n        iterations i.e. spec-decode\n        \"\"\"\n        num_reqs = common_attn_metadata.num_reqs\n        num_actual_tokens = common_attn_metadata.num_actual_tokens\n        max_query_len = common_attn_metadata.max_query_len\n        max_seq_len = common_attn_metadata.max_seq_len\n        query_start_loc = common_attn_metadata.query_start_loc\n        seq_lens = common_attn_metadata.seq_lens\n        block_table_tensor = common_attn_metadata.block_table_tensor\n        slot_mapping = common_attn_metadata.slot_mapping\n        causal = common_attn_metadata.causal",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L642-L650",
+      "what": "build() 主路径（非 DCP、非 cascade 的 else 分支）：schedule 闭包（FA3 才有 AOT 调度，FA2 返回 None）吃 query_start_loc/seq_lens/max_seq_len 产出 scheduler_metadata——后端特有字段的补算样本。",
+      "code": "        else:\n            scheduler_metadata = schedule(\n                batch_size=num_reqs,\n                cu_query_lens=query_start_loc,\n                max_query_len=max_query_len,\n                seqlens=seq_lens,\n                max_seq_len=max_seq_len,\n                causal=causal,\n            )",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L672-L696",
+      "what": "『翻译』的落点：装配 FlashAttentionMetadata——block_table=block_table_tensor、slot_mapping=slot_mapping 把 Common 字段改名搬入，其余是 build 过程中算出的 FA 特有字段（scheduler_metadata/cascade 族/sliding_window 对称化结果）。",
+      "code": "        attn_metadata = FlashAttentionMetadata(\n            num_actual_tokens=num_actual_tokens,\n            max_query_len=max_query_len,\n            query_start_loc=query_start_loc,\n            max_seq_len=max_seq_len,\n            seq_lens=seq_lens,\n            block_table=block_table_tensor,\n            slot_mapping=slot_mapping,\n            max_dcp_context_kv_len=max_dcp_context_kv_len,\n            dcp_context_kv_lens=dcp_context_kv_lens,\n            num_decode_reqs=num_decode_reqs,\n            num_prefill_reqs=num_prefill_reqs,\n            num_decode_tokens=num_decode_tokens,\n            num_prefill_tokens=num_prefill_tokens,\n            use_cascade=use_cascade,\n            common_prefix_len=common_prefix_len,\n            scheduler_metadata=scheduler_metadata,\n            cu_prefix_query_lens=cu_prefix_query_lens,\n            prefix_kv_lens=prefix_kv_lens,\n            suffix_kv_lens=suffix_kv_lens,\n            prefix_scheduler_metadata=prefix_scheduler_metadata,\n            max_num_splits=max_num_splits,\n            causal=causal,\n            sliding_window=effective_sliding_window,\n        )",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L850-L905",
+      "what": "Impl.forward 头部：docstring 写死 KV cache 逻辑形 [num_blocks, num_kv_heads, block_size, 2*head_size]；NOTE(woosuk) eager 接缝警告（piecewise 图下本方法在 eager 跑，view/slice 都慢、改这里必须 benchmark）；(B,H,N,2D) → transpose(1,2)+split 拆 K/V cache——v0.21 的 kv_cache.unbind(0) 已成历史。",
+      "code": "        \"\"\"Forward pass with FlashAttention.\n\n        Args:\n            query: shape = [num_tokens, num_heads, head_size]\n            key: shape = [num_tokens, num_kv_heads, head_size]\n            value: shape = [num_tokens, num_kv_heads, head_size]\n            kv_cache: shape =\n                [num_blocks, num_kv_heads, block_size, 2 * head_size]\n            attn_metadata: Metadata for attention.\n        Returns:\n            shape = [num_tokens, num_heads * head_size]\n        NOTE: FP8 quantization, flash-attn expect the size of\n              {q,k,v}_descale to be (num_sequences, num_kv_heads).\n              We use torch's .expand() to avoid duplicating values\n        \"\"\"\n        assert self.vllm_flash_attn_version is not None, (\n            \"FlashAttention version not detected.\"\n        )\n\n        if output_scale is not None or output_block_scale is not None:\n            raise NotImplementedError(\n                \"fused output quantization is not yet supported for FlashAttentionImpl\"\n            )\n\n        if attn_metadata is None:\n            # Profiling run.\n            return output.fill_(0)\n\n        attn_type = self.attn_type\n\n        # IMPORTANT!\n        # NOTE(woosuk): With piece-wise CUDA graphs, this method is executed in\n        # eager-mode PyTorch. Thus, we need to be careful about any CPU overhead\n        # in this method. For example, `view` and `slice` (or `[:n]`) operations\n        # are surprisingly slow even in the case they do not invoke any GPU ops.\n        # Minimize the PyTorch ops in this method as much as possible.\n        # Whenever making a change in this method, please benchmark the\n        # performance to make sure it does not introduce any overhead.\n\n        num_actual_tokens = attn_metadata.num_actual_tokens\n\n        # Handle encoder attention differently - no KV cache needed\n        if attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):\n            # For encoder attention,\n            # we use direct Q, K, V tensors without caching\n            return self._forward_encoder_attention(\n                query[:num_actual_tokens],\n                key[:num_actual_tokens],\n                value[:num_actual_tokens],\n                output[:num_actual_tokens],\n                attn_metadata,\n                layer,\n            )\n\n        # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))\n        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)",
+      "elide": [
+        "L906-L922 省略：canonicalize_singleton_dim_strides 修退化步长（TP 下 num_kv_heads=1 时 TMA 要求 ≥16 字节对齐）——性能细枝，一句带过即可"
+      ]
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L929-L935",
+      "what": "非 cascade 主路径取料：从后端专属 metadata 解出 cu_seqlens_q=query_start_loc、seqused_k=seq_lens、block_table、scheduler_metadata——Builder 翻译出的字段在这里被消费。",
+      "code": "        if not attn_metadata.use_cascade:\n            cu_seqlens_q = attn_metadata.query_start_loc\n            seqused_k = attn_metadata.seq_lens\n            max_seqlen_q = attn_metadata.max_query_len\n            max_seqlen_k = attn_metadata.max_seq_len\n            block_table = attn_metadata.block_table\n            scheduler_metadata = attn_metadata.scheduler_metadata",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L1041-L1067",
+      "what": "读腿：flash_attn_varlen_func 一次调用吃下整批——varlen 打平（cu_seqlens_q 前缀和切序列）+ paged KV（k/v 是整块 key_cache/value_cache、block_table 指路）+ causal/window/scale/scheduler_metadata。ch20 的 tiling kernel 在这一行被喂料。",
+      "code": "                flash_attn_varlen_func(\n                    q=query[:num_actual_tokens],\n                    k=key_cache,\n                    v=value_cache,\n                    out=output[:num_actual_tokens],\n                    cu_seqlens_q=cu_seqlens_q,\n                    max_seqlen_q=max_seqlen_q,\n                    seqused_k=seqused_k,\n                    max_seqlen_k=max_seqlen_k,\n                    softmax_scale=self.scale,\n                    causal=causal,\n                    alibi_slopes=self.alibi_slopes,\n                    window_size=sliding_window_size,\n                    block_table=block_table,\n                    softcap=self.logits_soft_cap,\n                    scheduler_metadata=scheduler_metadata,\n                    fa_version=self.vllm_flash_attn_version,\n                    q_descale=q_descale,\n                    k_descale=k_descale,\n                    v_descale=v_descale,\n                    dynamic_causal=dynamic_causal,\n                    num_splits=attn_metadata.max_num_splits,\n                    s_aux=self.sinks,\n                    mask_mod=rswa_mask_mod_fn or mm_mask_mod,\n                    aux_tensors=rswa_aux or mm_aux,\n                )\n                return output",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L1098-L1132",
+      "what": "写腿：do_kv_cache_update——encoder 类早退；同样 transpose+split 拆 K/V cache；reshape_and_cache_flash 照 slot_mapping 散写。NOTE(woosuk)：key/value 是 padded 的而 slot_mapping 不 pad，但 op 用 slot_mapping 的形状定 token 数，所以不用切 [:num_actual_tokens]。",
+      "code": "    def do_kv_cache_update(\n        self,\n        layer: torch.nn.Module,\n        key: torch.Tensor,\n        value: torch.Tensor,\n        kv_cache: torch.Tensor,\n        slot_mapping: torch.Tensor,\n    ) -> None:\n        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):\n            # For encoder attention,\n            # we use direct Q, K, V tensors without caching\n            return\n\n        # Scatter write into the KV cache using slot_mapping indices.\n        # No TMA kernel is invoked here, so stride canonicalization is not needed.\n        # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))\n        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)\n\n        # Reshape the input keys and values and store them in the cache.\n        # Skip this if sharing KV cache with an earlier attention layer.\n        # NOTE(woosuk): Here, key and value are padded while slot_mapping is\n        # not padded. However, we don't need to do key[:num_actual_tokens]\n        # and value[:num_actual_tokens] because the reshape_and_cache_flash\n        # op uses the slot_mapping's shape to determine the number of\n        # actual tokens.\n        reshape_and_cache_flash(\n            key,\n            value,\n            key_cache,\n            value_cache,\n            slot_mapping,\n            self.kv_cache_dtype,\n            layer._k_scale,\n            layer._v_scale,\n        )",
+      "elide": []
+    },
+    {
+      "path": "vllm/_custom_ops.py",
+      "lines": "L2614-L2633",
+      "what": "reshape_and_cache_flash thin wrapper：转发 _C_cache_ops CUDA kernel。语义（正文据此讲、不杜撰实现）：每 token 按 slot 落格（块号×块大小+块内偏移的逆分解在 kernel 内），slot_mapping 的形状决定实际 token 数、pad 位跳过。",
+      "code": "def reshape_and_cache_flash(\n    key: torch.Tensor,\n    value: torch.Tensor,\n    key_cache: torch.Tensor,\n    value_cache: torch.Tensor,\n    slot_mapping: torch.Tensor,\n    kv_cache_dtype: str,\n    k_scale: torch.Tensor,\n    v_scale: torch.Tensor,\n) -> None:\n    torch.ops._C_cache_ops.reshape_and_cache_flash(\n        key,\n        value,\n        key_cache,\n        value_cache,\n        slot_mapping,\n        kv_cache_dtype,\n        k_scale,\n        v_scale,\n    )",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/attention/attention.py",
+      "lines": "L526-L582",
+      "what": "Attention.forward 分发段：预分配 output + reshape 刻意在 op 外（NOTE）；use_direct_call 平台分叉——direct 直调 Python 函数 / op 走 torch.ops.vllm.unified_*（进编译图，ch19）；forward_includes_kv_cache_update=False 且非 KV 共享层时先 unified_kv_cache_update 写（dummy 依赖保序）再 unified_attention_with_output 算。",
+      "code": "        if output_shape is None:\n            # Handle both 2D [num_tokens, hidden] and\n            # 3D [num_tokens, heads, head_dim] query\n            num_tokens = query.shape[0]\n            output_shape = torch.Size((num_tokens, self.num_heads * self.head_size_v))\n        output = torch.empty(output_shape, dtype=output_dtype, device=query.device)\n        hidden_size = output_shape[-1]\n        # Reshape the query, key, and value tensors.\n        # NOTE(woosuk): We do this outside the custom op to minimize the\n        # CPU overheads from the non-CUDA-graph regions.\n        query = query.view(-1, self.num_heads, self.head_size)\n        output = output.view(-1, self.num_heads, self.head_size_v)\n        if key is not None:\n            key = key.view(-1, self.num_kv_heads, self.head_size)\n        if value is not None:\n            value = value.view(-1, self.num_kv_heads, self.head_size_v)\n        kv_cache_dummy_dep = None\n        if self.use_direct_call:\n            # Skip this if sharing KV cache with an earlier attention layer.\n            if (\n                not self.attn_backend.forward_includes_kv_cache_update\n                and self.kv_sharing_target_layer_name is None\n                and key is not None\n                and value is not None\n            ):\n                kv_cache_dummy_dep = unified_kv_cache_update(\n                    key, value, self.layer_name\n                )\n            unified_attention_with_output(\n                query,\n                key,\n                value,\n                output,\n                self.layer_name,\n                kv_cache_dummy_dep=kv_cache_dummy_dep,\n            )\n        else:\n            # Skip this if sharing KV cache with an earlier attention layer.\n            encoded = _encode_layer_name(self.layer_name)\n            if (\n                not self.attn_backend.forward_includes_kv_cache_update\n                and self.kv_sharing_target_layer_name is None\n                and key is not None\n                and value is not None\n            ):\n                kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(\n                    key, value, encoded\n                )\n            torch.ops.vllm.unified_attention_with_output(\n                query,\n                key,\n                value,\n                output,\n                encoded,\n                kv_cache_dummy_dep=kv_cache_dummy_dep,\n            )\n        return output.view(-1, hidden_size)",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/attention/attention.py",
+      "lines": "L775-L798",
+      "what": "unified_kv_cache_update 算子体：按 layer_name 从 forward context 取本层 kv_cache/slot_mapping → impl.do_kv_cache_update（后端多态落点）→ 返回 key.new_empty(0) 空 tensor 当 dummy 依赖——torch.compile 据此保住『先写后算』顺序。",
+      "code": "def unified_kv_cache_update(\n    key: torch.Tensor,\n    value: torch.Tensor,\n    layer_name: LayerNameType,\n) -> torch.Tensor:\n    \"\"\"\n    Returns a dummy that is passed to unified_attention to signal a side effect and\n    the data dependency between them to ensure torch.compile preserves ordering.\n    \"\"\"\n    layer_name = _resolve_layer_name(layer_name)\n    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)\n    if layer_slot_mapping is not None:\n        assert hasattr(attn_layer.impl, \"do_kv_cache_update\"), (\n            f\"{attn_layer.impl.__class__.__name__} does not support kv cache update\"\n        )\n        attn_layer.impl.do_kv_cache_update(  # type: ignore[attr-defined]\n            attn_layer,\n            key,\n            value,\n            kv_cache,\n            layer_slot_mapping,\n        )\n\n    return key.new_empty(0)",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/models/llama.py",
+      "lines": "L221-L231",
+      "what": "LlamaAttention.forward 全文（本章开篇第一块）：QKV 投影、拆包、RoPE 之后注意力计算只有一行 self.attn(q, k, v) 委托——『插座：模型文件里没有注意力』的直接证据（回登 exp-2026-09-06-01 同型漏登）。",
+      "code": "    def forward(\n        self,\n        positions: torch.Tensor,\n        hidden_states: torch.Tensor,\n    ) -> torch.Tensor:\n        qkv, _ = self.qkv_proj(hidden_states)\n        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)\n        q, k = self.rotary_emb(positions, q, k)\n        attn_output = self.attn(q, k, v)\n        output, _ = self.o_proj(attn_output)\n        return output",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/attention/backends/flash_attn.py",
+      "lines": "L728-L737",
+      "what": "update_block_table 浅拷复用：同 (spec, builder 类型) 的混合组只换 block_table/slot_mapping 两张表，其余字段零重算——『翻译不改字段值、只换容器与名字』不变量在 FA 侧的落点（回登）。",
+      "code": "    def update_block_table(\n        self,\n        metadata: FlashAttentionMetadata,\n        blk_table: torch.Tensor,\n        slot_mapping: torch.Tensor,\n    ) -> FlashAttentionMetadata:\n        new_metadata = copy.copy(metadata)\n        new_metadata.block_table = blk_table\n        new_metadata.slot_mapping = slot_mapping\n        return new_metadata",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L2325-L2341",
+      "what": "_get_block_table（_build_attention_metadata 内嵌闭包）：按组取块表，padded 行填 NULL_BLOCK_ID（Block 0 保留给 padding）——CUDA graph max 形状与真实批之间的表尾对齐（回登）。",
+      "code": "        def _get_block_table(kv_cache_gid: int):\n            assert num_reqs_padded is not None and num_tokens_padded is not None\n            kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec\n            if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):\n                # … 省略：encoder-only 组建全零表的五行 …\n            else:\n                blk_table = self.input_batch.block_table[kv_cache_gid]\n                blk_table_tensor = blk_table.get_device_tensor(num_reqs_padded)\n\n            # Fill unused block table entries with NULL_BLOCK_ID (null block)\n            # for CUDAGraph padding. Block 0 is reserved for padding.\n            blk_table_tensor[num_reqs:num_reqs_padded].fill_(NULL_BLOCK_ID)\n            return blk_table_tensor",
+      "elide": [
+        "L2329-L2333 encoder-only 组 torch.zeros 建全零表五行——encoder 侧无分页 KV，本章不展开"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L4432-L4456",
+      "what": "execute_model 里的 set_forward_context：把 {layer_name: 后端专属 metadata} 与层版 slot_mapping 挂进模块级全局 forward context（通道 ch19 已立），模型前向开始后算子按层名回查（回登）。",
+      "code": "        with (\n            set_forward_context(\n                attn_metadata,\n                self.vllm_config,\n                num_tokens=num_tokens_padded,\n                # … 省略：num_tokens_across_dp / cudagraph_runtime_mode / batch_descriptor / ubatch_slices 四个实参 …\n                slot_mapping=slot_mappings,\n                skip_compiled=has_encoder_input,\n            ),\n            # … 省略：record_function 计时与 KV 连接器输出两个并列 with 项 …\n        ):\n            model_output = self._model_forward(\n                input_ids=input_ids,\n                positions=positions,\n                intermediate_tensors=intermediate_tensors,\n                inputs_embeds=inputs_embeds,\n                **model_kwargs,\n            )",
+      "elide": [
+        "L4437-L4440 num_tokens_across_dp / cudagraph_runtime_mode / batch_descriptor / ubatch_slices 四个实参（DP/CG 档位与批描述符，ch18-19 领地）",
+        "L4444-L4448 record_function 计时与 maybe_get_kv_connector_output 两个并列 with 项（旁支）"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/block_table.py",
+      "lines": "L240-L248",
+      "what": "map_to_kernel_blocks 换算核心（『kernel 块协商』节末行为断言的落码，2026-09-06 修净新增）：blocks_per_kv_block==1 早退（口径一致免换算）；否则管理块号 reshape 成列乘放大率、加 [0,1,...,放大率-1] 行向量、摊平——本例放大率 4，0 号管理块展开成 kernel 块号 [0,1,2,3]。全表调用时机与表宽放大归 ch22。",
+      "code": "        if blocks_per_kv_block == 1:\n            return kv_manager_block_ids\n\n        kernel_block_ids = (\n            kv_manager_block_ids.reshape(-1, 1) * blocks_per_kv_block\n            + kernel_block_arange\n        )\n\n        return kernel_block_ids.reshape(-1)",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L7558-L7578",
+      "what": "initialize_kv_cache_tensors 两路分派（『定形』节行为断言的落码，2026-09-06 修净新增）：use_uniform_kv_cache（单组 + KV 连接器偏好跨层块 + 按块步长索引，判定在 kv_connector_model_runner_mixin.py:L115-L162）命中走 allocate_uniform_kv_caches 一次分配全体层共享的快路；else 通用腿逐层分配 + _reshape_kv_cache_tensors 定形——本章走读的定形消费点住这条腿。",
+      "code": "        if self.use_uniform_kv_cache(self.attn_groups):\n            kv_caches, cross_layers_kv_cache, attn_backend = (\n                self.allocate_uniform_kv_caches(\n                    # … 省略：五个实参 …\n                )\n            )\n            # … 省略：cross_layers 两行挂到 self 的收尾 …\n        else:\n            # Fallback to the general case\n            # … 省略：一行注释 …\n            kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)\n            # … 省略：注释与空行 …\n            kv_caches = self._reshape_kv_cache_tensors(\n                kv_cache_raw_tensors, kernel_block_sizes\n            )",
+      "elide": [
+        "L7561-L7566 allocate_uniform_kv_caches 的五个实参（kv_cache_config / attn_groups / cache_dtype / device / kernel_block_sizes）",
+        "L7568-L7569 cross_layers_kv_cache / cross_layers_attn_backend 两行挂到 self 的收尾",
+        "L7572 # Initialize the memory buffer for KV cache 注释一行",
+        "L7574-L7575 空行与 # Change the memory buffer to the desired shape 注释一行"
+      ]
+    }
+  ],
+  "theory": [
+    "优先级表选择算法 = 全序候选 + 谓词过滤 + 首个幸存者：_get_backend_priorities 给出列表序（priority=enumerate 下标），get_valid_backends 对每个候选做 O(探针数) 次常数检查（全 Python 端、无 IO），min(priority) 于幸存集合。显式指定退化为单元素校验（不合法抛错，绝不静默换后端）。复杂度 O(候选数×探针数) 常数级且被 @cache 摊销到每配置一次——不进每拍热路径。",
+    "混布分组的等价类划分：initialize_attn_backend 以 (后端类全名, 该层 KVCacheSpec, num_heads_q) 三元组为 key 把层聚成 AttentionGroup——等价类内『同一后端+同一 KV 规格+同一 Q 头数』→ 可共享一份 metadata builder 与一份组内 metadata。跨组重复劳动被 update_block_table 缓存进一步消掉：同 (spec, builder 类型) 的混合组只有 block_table/slot_mapping 不同，浅拷已建 metadata 只换表（缓存 key=(KVCacheSpec, builder 类型)，gpu_model_runner.py:L2472-L2479/L2530-L2538）。",
+    "KV 布局三件套的代数：逻辑 shape（FA: (B,H,N,2D)=num_blocks×num_kv_heads×block_size×2·head_size）× stride_order（逻辑维→物理序的置换；NHD=(0,2,1,3) 让同 token 的 heads 连续、HND=(0,1,2,3) 让同 head 的 token 连续）× block_dim 哨兵探测（get_kv_cache_block_dim 用 _S=1234567 当 num_blocks 代入 shape 再 .index(_S) 反查哪一维是块维——不用每个后端手写维号）。混布组若各后端 block 维位置不一致（K/V-first vs blocks-first），同一 block_id 会映射到不同字节 → as_strided_ 统一 blocks-first（gpu_model_runner.py:L7470-L7539（含 _update_hybrid_attention_mamba_layout 的 as_strided_ blocks-first 归一实现））。",
+    "读写两级寻址（本章只到接口层，恒等式与 PAD 语义归 ch22）：slot_mapping = token→物理槽 的扁平映射（写新 KV：reshape_and_cache_flash 逐 token 落格，其形状即实际 token 数）；block_table = 请求→逻辑块号列表 的页表（读历史 KV：flash_attn_varlen_func 沿表取分散的 K/V 块）。前者管『新 token 写哪』、后者管『历史 KV 读哪』——两级合起来就是 paged KV 的间接寻址（F7 伏笔，ch22 全款回收）。",
+    "最弱链传播：cudagraph 档位 = min over 全部组全部后端的 get_cudagraph_support（ALWAYS=3 > UNIFORM_BATCH=2 > UNIFORM_SINGLE_TOKEN_DECODE=1 > NEVER=0）。实数例：FA3 builder 是 ALWAYS、FA2 builder 是 UNIFORM_BATCH（flash_attn.py:L352-L356 按 get_flash_attn_version() 二选一）——模型里只要有一组 FA2，全模型 FULL 档就只在均匀批可用。这是『后端能力向上传染』的量化形态。"
+  ],
+  "mechanisms": [
+    {
+      "id": "ch21-m01",
+      "name": "AttentionBackend 抽象协议：四静态身份证（get_name/get_impl_cls/get_builder_cls/get_kv_cache_shape）+ 能力探针族 + validate_configuration 聚合器（空原因列表=合法）",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/v1/attention/backend.py:L56-L97",
+        "vllm/v1/attention/backend.py:L320-L393"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch21-m02",
+      "name": "懒加载注册表：枚举值=类路径字符串、get_class() 经 resolve_obj_by_qualname 用到才 import、register_backend 运行时覆盖/注册第三方（CUSTOM 占位）",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/v1/attention/backends/registry.py:L34-L64",
+        "vllm/v1/attention/backends/registry.py:L130-L159",
+        "vllm/v1/attention/backends/registry.py:L241-L293"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "ch21-m03",
+      "name": "选择入口与记忆化：get_attn_backend 把零散维度打包成可哈希 AttentionSelectorConfig，@cache 同配置只解一次（每模型几十层摊销成一次）",
+      "kind": "config",
+      "source_anchors": [
+        "vllm/v1/attention/selector.py:L24-L39",
+        "vllm/v1/attention/selector.py:L101-L174",
+        "vllm/v1/attention/selector.py:L178-L208"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "ch21-m04",
+      "name": "平台优先级表：use_mla × 算力代（major 10/12/其他）× fp8 KV × num_heads 的经验排序——表序即默认最优，注释挂 benchmark 论证（TOKENSPEED_MLA wins past bs≈8, regresses at bs≤2）",
+      "kind": "config",
+      "source_anchors": [
+        "vllm/platforms/cuda.py:L83-L163"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch21-m05",
+      "name": "validate 回退：逐候选 validate_configuration（ImportError 也当一条原因——没装依赖不挡后面的候选），min priority 取胜者；显式指定只校验不回退直接报错；--block-size 挤掉高优先级者 warning；set_kv_cache_layout 副作用",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/platforms/cuda.py:L359-L394",
+        "vllm/platforms/cuda.py:L397-L492",
+        "vllm/v1/attention/selector.py:L196-L206"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core",
+      "paper_origin_note": "vLLM 自身的后端选择实现算法（优先级表+谓词过滤+首个幸存者），无论文出处；机制上类比『能力协商+回退』（如 HTTP content negotiation），不引用外部算法论文。"
+    },
+    {
+      "id": "ch21-m06",
+      "name": "逐 KV 组覆写 backend_per_kind：get_attn_spec_kind 从层信号（use_mla/has_sliding_window/attn_type）推导 KVCacheSpecKind，命中覆写表则换掉全局后端；未列出的 kind 回退 backend——混布的用户入口",
+      "kind": "config",
+      "source_anchors": [
+        "vllm/v1/attention/selector.py:L61-L98",
+        "vllm/v1/attention/selector.py:L158-L168",
+        "vllm/config/attention.py:L18-L36",
+        "vllm/v1/kv_cache_interface.py:L94-L104"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "ch21-m07",
+      "name": "后端自报 KV 布局：get_kv_cache_shape 逻辑形 (B,H,N,2D)（K/V 打包进 content 维，v0.27 新形——v0.21 的 (2,num_blocks,...) 已废）+ get_kv_cache_stride_order 物理置换（NHD/HND）+ get_kv_cache_block_dim 哨兵探测 + get_required_kv_cache_layout 全局覆写",
+      "kind": "layout",
+      "source_anchors": [
+        "vllm/v1/attention/backends/flash_attn.py:L134-L168",
+        "vllm/v1/attention/backend.py:L100-L148",
+        "vllm/v1/worker/gpu_model_runner.py:L7433-L7453"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch21-m08",
+      "name": "逐 KV 组混布：initialize_attn_backend 按 (后端类全名, KVCacheSpec, num_heads_q) 等价类聚成 AttentionGroup（每组一套 builder + 组内共享 metadata）；prepare_kernel_block_sizes/select_common_block_size 组内多后端协商共同 kernel 块大小",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_model_runner.py:L7020-L7125",
+        "vllm/v1/worker/utils.py:L217-L263",
+        "vllm/v1/worker/utils.py:L266-L332",
+        "vllm/v1/worker/gpu_model_runner.py:L7644-L7655"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch21-m09",
+      "name": "最弱链 CG 降级：_check_and_update_cudagraph_mode 取全部组最弱 AttentionCGSupport（min_cg_support）→ resolve_cudagraph_mode_and_sizes 降级链 → initialize_cudagraph_keys（ch19 档位链的后端侧接口；FA3=ALWAYS vs FA2=UNIFORM_BATCH）",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_model_runner.py:L7161-L7202",
+        "vllm/v1/attention/backend.py:L606-L620",
+        "vllm/v1/attention/backends/flash_attn.py:L352-L365"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "ch21-m10",
+      "name": "CommonAttentionMetadata：跨层跨后端共享的 per-batch 元数据（核心 10 字段）——runner 每拍组装一次，所有后端所有层共享量不重算",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/attention/backend.py:L412-L444",
+        "vllm/v1/worker/gpu_model_runner.py:L2430-L2449"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch21-m11",
+      "name": "builder.build() 翻译：Common 字段直搬（block_table_tensor→block_table）+ 后端特有字段补算（FA：AOT scheduler_metadata/cascade 判定/sliding_window 对称化）→ 按 layer_name 铺进 dict；混合组 update_block_table 只换表复用",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/attention/backends/flash_attn.py:L458-L476",
+        "vllm/v1/attention/backends/flash_attn.py:L672-L696",
+        "vllm/v1/worker/gpu_model_runner.py:L2526-L2574",
+        "vllm/v1/attention/backend.py:L692-L724"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch21-m12",
+      "name": "读腿：Impl.forward 先 transpose(1,2).split 拆 K/V cache，再 flash_attn_varlen_func(cu_seqlens_q=query_start_loc, seqused_k=seq_lens, block_table=...) 照块表读 paged KV——ch20 tiling kernel 的真实喂料口；eager 接缝 CPU 开销警告（NOTE woosuk）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/attention/backends/flash_attn.py:L838-L905",
+        "vllm/v1/attention/backends/flash_attn.py:L929-L935",
+        "vllm/v1/attention/backends/flash_attn.py:L1041-L1066"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch21-m13",
+      "name": "写腿：forward_includes_kv_cache_update=False 时 Attention.forward 先 unified_kv_cache_update 算子（dummy 依赖保序）→ impl.do_kv_cache_update → reshape_and_cache_flash 照 slot_mapping 散写（slot_mapping 形状决定实际 token 数）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/model_executor/layers/attention/attention.py:L543-L581",
+        "vllm/model_executor/layers/attention/attention.py:L775-L798",
+        "vllm/v1/attention/backends/flash_attn.py:L1098-L1132",
+        "vllm/_custom_ops.py:L2614-L2633"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch21-m14",
+      "name": "建层即选后端：模型装配期每个 Attention.__init__ 自调 get_attn_backend（模型文件不感知 kernel）→ get_impl_cls 实例化 impl → 自注册 static_forward_context——『插座』半边（拼装细节归 ch23）",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/model_executor/layers/attention/attention.py:L350-L363",
+        "vllm/model_executor/layers/attention/attention.py:L420-L446"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "ch21-m15",
+      "name": "混布布局归一：_has_mixed_attention_kv_layout 用 get_kv_cache_block_dim 探测各组 block 维位置，K/V-first 与 blocks-first 混布时 as_strided_ 统一成 blocks-first（同一 block_id 必须映射到同一字节）（含 _update_hybrid_attention_mamba_layout L7507-L7539 的 as_strided_ blocks-first 归一实现）",
+      "kind": "layout",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_model_runner.py:L7470-L7539",
+        "vllm/v1/attention/backend.py:L99-L117"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "backend.py L1009-L1100 MLAAttentionImpl 整类与 L1101-L1122 subclass_attention_backend/subclass_attention_backend_with_overrides 两工厂",
+        "why_safe": "MLA 实现族是 ch24/25 专题；subclass_* 是动态造子类的高级机制。删去不影响 AttentionBackend/Common/Builder/Impl/FA 主链的可运行与可理解性。"
+      },
+      {
+        "what": "backend.py CommonAttentionMetadata 的长尾可选字段与方法（L442-L493：logits_indices_padded/encoder_seq_lens(_cpu)/dcp_local_seq_lens(_cpu)/positions/is_prefilling/seq_lens_cpu_upper_bound/mm_req_doc_ranges/rswa_prefix_lens/replayssm_decode_base_cpu/deprecated _seq_lens_cpu 等 + batch_size/naive_query_lens/replace/compute_num_computed_tokens/token_to_req_indices/unpadded 方法） 连带删：gpu_model_runner.py L2429-L2449 cm_base 构造中传入上述被删字段的 kwargs 行（保留的 cm_base 调用不得再传已删字段，防 TypeError）。",
+        "why_safe": "保留核心 10 必填字段（query_start_loc(+cpu)/seq_lens/num_reqs/num_actual_tokens/max_query_len/max_seq_len/block_table_tensor/slot_mapping/causal）即讲清接口契约；旁支字段服务于 mm/DCP/R-SWA/mamba 等扩展态。"
+      },
+      {
+        "what": "backend.py AttentionImplBase 的 DCP/PCP/LSE 族字段与 __new__ 的分布式初始化（L804-L889）、AttentionImpl 的 fused_* 量化融合钩子（L936 起）、AttentionLayer Protocol（L775-L793）",
+        "why_safe": "精简版单进程无 DCP/PCP；fused_* 是量化融合 pass 的探针（ch27 线）；Protocol 仅供类型检查。"
+      },
+      {
+        "what": "selector.py L211-L230 get_mamba_attn_backend/_cached_get_mamba_attn_backend",
+        "why_safe": "Mamba 后端选择线本章不展开（ch22 只碰 SlotMappingMode）。"
+      },
+      {
+        "what": "registry.py 约 13-14 个可删同构枚举条目（ROCM 族/XPU/DSV4 sparse/MiniMax MSA/HPC/CPU_ATTN/FLEX）（ROCM 族/XPU/DSV4 sparse/MiniMax MSA/HPC/CPU_ATTN/FLEX 可留）与 MambaAttentionBackendEnum 整体（L174-L234） 保留：cuda.py _get_backend_priorities（excerpt 5）优先级表引用的全部成员（TOKENSPEED_MLA/CUTLASS_MLA/FLASH_ATTN_MLA/FLASHMLA/TRITON_MLA/FLASHINFER_MLA_SPARSE/FLASHMLA_SPARSE/FLASH_ATTN_MLA_SPARSE（cuda.py:L141 亦引用）及 _SM120 变体、CUSTOM 与非 MLA 常用项）——删之则优先级表 NameError。 TORCH_SDPA 保留——cuda.py L500/L506/L528/L548 的 ViT 专用接口仍引用（标准 decoder 踩不到，但删则 NameError）。",
+        "why_safe": "保留 FLASH_ATTN/FLASHINFER/TRITON_ATTN/FLEX_ATTENTION/TURBOQUANT + 两三个 MLA 名字 + CUSTOM 即可演示『枚举值=类路径』；Mamba 枚举同构。"
+      },
+      {
+        "what": "flash_attn.py：cascade_attention/_forward_with_dcp/_forward_encoder_attention/_make_mm_prefix_mask_mod/_make_rswa_mask_mod/use_cascade_attention 模块级函数 + build() 的 DCP（L556-L616）与 cascade（L617-L641）两分支 + forward() 的 mm_prefix/R-SWA/dynamic_causal 段（L974-L1039）+ descale view（L924-L927、L937-L945）+ sinks（s_aux）参数 + __init__ 的 DCP/rswa/mm 字段 连带删：forward 内对应调用点/实参行（encoder 早退段 L892-L902 的 return _forward_encoder_attention；varlen 调用中 descale/s_aux/mask_mod/aux_tensors/dynamic_causal 各 kwargs 行）。 连带删：FlashAttentionMetadataBuilder.build() 尾段 L698-L724（mm_prefix_range_tensor 计算+R-SWA 拷入持久缓冲——消费被删的 mm_req_doc_ranges/rswa_prefix_lens/rswa_window/persistent_rswa_*）。",
+        "why_safe": "cascade 的数学与调用现场已由 ch20 讲（那边含 merge_attn_states）；DCP/mm/R-SWA/sink 是扩展态。标准 decoder 走 not use_cascade 且 dcp_world_size==1 的主分支即可端到端跑通，删特例不改主路径数值。"
+      },
+      {
+        "what": "flash_attn.py Builder.__init__ 的 DCP/rswa/持久缓冲段（L401-L440、L444-L456（**排除 L392-L400 的 dcp_world_size try/except 与 L441-L443 的 aot_sliding_window=None——保留区 schedule 闭包 L528/L537 无条件读二者，删则 AttributeError**；use_full_cuda_graph/scheduler_metadata 预分配亦保留））与 aot_sliding_window 多窗口回退（L484-L498）",
+        "why_safe": "保留 aot_schedule 判定与 FA3 scheduler_metadata 预分配即可讲『AOT 调度为什么要持久缓冲』；扩展态缓冲初始化删去不破坏主链。"
+      },
+      {
+        "what": "gpu_model_runner.py _build_attention_metadata 的 mm_prefix/rswa/replayssm/dcp/is_prefilling/ubatch/spec-decode 分支（L2312-L2313、L2360-L2364、L2366-L2379、L2382-L2427（**L2315-L2321 max_seq_len 计算与 L2343-L2345 block_table_gid_0/slot_mapping_gid_0 保留——cm_base 的料**）、L2451-L2470、L2500-L2524、L2548-L2553、L2576-L2598（含 L2587-L2589 else 收尾与 L2590-L2598 Step3p5MTP/Gemma4 逐组块表捕获——只删到 L2586 会留孤悬行+悬空 else 语法错误））与 routed_experts 快照（L2347-L2358） 同一删除的连带收尾：L2560 spec_decode_common_attn_metadata 初始化行、函数尾 L2608-L2618（unpadded+return 二元组）与调用点 L4378 的二元组解包——三处须同步调整（初始化行与二元组随 spec-decode 面同删，调用点解包改单值），在清单内批准。",
+        "why_safe": "保留 _get_block_table（含 NULL_BLOCK_ID 尾行填）+ cm_base 组装 + 逐组换表 + build/update_block_table 分派 + layer_name 铺设即本章主线；扩展态分支各属后章。"
+      },
+      {
+        "what": "gpu_model_runner.py initialize_attn_backend 的 FastPrefill 包装分支（L7064-L7068）与 check_attention_cp_compatibility（L7121-L7122）、initialize_kv_cache 的 mamba/connector/routed_experts/kv_sharing 尾部（L7637-L7639、L7641-L7643（**L7640 保留——initialize_attn_backend 主路径调用点，站 6 入口（另 L7159 有 drafter.initialize_attn_backend，位于 initialize_metadata_builders 尾段 L7150-L7159——该尾段连带本条删除面处理：drafter 路径属 spec-decode 面，一并删）**）、L7663-L7681）",
+        "why_safe": "FastPrefill/CP 兼容检查/KV connector 挂接都是正交特性；分组主线不受影响。"
+      },
+      {
+        "what": "attention.py __init__ 的 alibi_sqrt/batch-invariance+prefix-caching 互斥/chunk_lookback/FLEX_ATTENTION block_m 段（L364-L418）与 quant/query_quant/kv_cache 量化初始化（L467-L486（**L460-L466 保留——含 _init_kv_cache_quant 调用（attention.py 内唯一调用点（models/kimi_k3/nvidia/mla.py:275 与 model_executor/layers/attention/mla_attention.py:464 亦调用，均在本章精简范围外）），删则保留的写腿 L1130-L1131 读 _k_scale/_v_scale 必 AttributeError**））、forward 的 calculate_kv_scales/query_quant 段（L508-L511、L514-L524（**L512-L513 保留——L512 是 output_dtype 默认值的 guard、L513 是赋值；L514 是 query_quant 分支 guard 连体删除；保留的 L531 torch.empty 必需**））、get_kv_cache_spec 的 turboquant 分支（L668-L685）",
+        "why_safe": "量化与各后端特化参数是正交特性；精简版走标准 decoder 路径。"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "AttentionBackend",
+        "why": "全章抽象核心，读者必须认住它的协议形状。"
+      },
+      {
+        "symbol": "get_name",
+        "why": "后端身份；validate/日志/枚举反查都用它。"
+      },
+      {
+        "symbol": "get_impl_cls",
+        "why": "Attention.__init__ 据此实例化 impl——『抽象→具体』的桥。"
+      },
+      {
+        "symbol": "get_builder_cls",
+        "why": "metadata 翻译的 builder 类来源；最弱链 CG 也从它取。"
+      },
+      {
+        "symbol": "get_kv_cache_shape",
+        "why": "后端自报 KV 逻辑形——本章必讲的布局声明。"
+      },
+      {
+        "symbol": "get_kv_cache_stride_order",
+        "why": "物理布局置换（NHD/HND）声明。"
+      },
+      {
+        "symbol": "get_kv_cache_block_dim",
+        "why": "哨兵探测块维——混布归一与跨层统一布局的门控。"
+      },
+      {
+        "symbol": "get_supported_kernel_block_sizes",
+        "why": "kernel 块大小声明，select_common_block_size 协商的输入（桥 ch22）。"
+      },
+      {
+        "symbol": "supports_head_size",
+        "why": "代表性能力探针（validate 回退的判定件）。"
+      },
+      {
+        "symbol": "supports_dtype",
+        "why": "能力探针。"
+      },
+      {
+        "symbol": "supports_kv_cache_dtype",
+        "why": "能力探针（fp8 KV 分档的入口）。"
+      },
+      {
+        "symbol": "supports_block_size",
+        "why": "能力探针（--block-size warning 的来源）。"
+      },
+      {
+        "symbol": "supports_compute_capability",
+        "why": "算力代探针（FA 要求 >=8.0）。"
+      },
+      {
+        "symbol": "supports_combination",
+        "why": "组合探针（跨维约束如『fp8 KV 需 FA3/SM90』的落点）。"
+      },
+      {
+        "symbol": "validate_configuration",
+        "why": "validate 回退的判定核心聚合器。"
+      },
+      {
+        "symbol": "forward_includes_kv_cache_update",
+        "why": "写腿归属旗标（FA=False → 独立算子先写）；也牵动 slot_mapping padded 口径（桥 ch22）。"
+      },
+      {
+        "symbol": "get_required_kv_cache_layout",
+        "why": "后端对全局 KV layout 的要求（set_kv_cache_layout 副作用来源）。"
+      },
+      {
+        "symbol": "CommonAttentionMetadata",
+        "why": "跨后端共享元数据接口，读写两腿的料。"
+      },
+      {
+        "symbol": "block_table_tensor",
+        "why": "读腿接口字段——block_table 进后端的形态。"
+      },
+      {
+        "symbol": "slot_mapping",
+        "why": "写腿接口字段——slot_mapping 进后端的形态。"
+      },
+      {
+        "symbol": "query_start_loc",
+        "why": "varlen 切序列的前缀和（flash_attn_varlen_func 的 cu_seqlens_q）。"
+      },
+      {
+        "symbol": "seq_lens",
+        "why": "每请求历史长度（seqused_k）。"
+      },
+      {
+        "symbol": "num_actual_tokens",
+        "why": "实际 token 数（pad 之外的切片界）。"
+      },
+      {
+        "symbol": "max_seq_len",
+        "why": "kernel 上界参数。"
+      },
+      {
+        "symbol": "causal",
+        "why": "因果旗标（v0.27 可为张量做 per-seq causal）。"
+      },
+      {
+        "symbol": "AttentionMetadataBuilder",
+        "why": "Common→后端专属 metadata 的抽象 builder。"
+      },
+      {
+        "symbol": "build",
+        "why": "翻译的唯一中心入口方法。"
+      },
+      {
+        "symbol": "update_block_table",
+        "why": "混合组只换表复用的机制。"
+      },
+      {
+        "symbol": "supports_update_block_table",
+        "why": "复用资格声明。"
+      },
+      {
+        "symbol": "get_cudagraph_support",
+        "why": "CG 支持档位声明——最弱链的输入。"
+      },
+      {
+        "symbol": "AttentionCGSupport",
+        "why": "CG 四档枚举（ALWAYS/UNIFORM_BATCH/...）。"
+      },
+      {
+        "symbol": "AttentionImplBase",
+        "why": "impl 抽象基类。"
+      },
+      {
+        "symbol": "AttentionImpl",
+        "why": "标准 impl 抽象，forward 签名所在。"
+      },
+      {
+        "symbol": "do_kv_cache_update",
+        "why": "写腿的后端落点。"
+      },
+      {
+        "symbol": "AttentionBackendEnum",
+        "why": "后端注册表枚举。"
+      },
+      {
+        "symbol": "get_path",
+        "why": "覆盖表感知的类路径查询。"
+      },
+      {
+        "symbol": "get_class",
+        "why": "懒加载解析入口。"
+      },
+      {
+        "symbol": "register_backend",
+        "why": "运行时覆盖/第三方注册机制。"
+      },
+      {
+        "symbol": "_ATTN_OVERRIDES",
+        "why": "覆盖表本体。"
+      },
+      {
+        "symbol": "resolve_obj_by_qualname",
+        "why": "字符串→类的懒加载原语。"
+      },
+      {
+        "symbol": "AttentionSelectorConfig",
+        "why": "选后端可哈希键。"
+      },
+      {
+        "symbol": "get_attn_backend",
+        "why": "选后端公开入口（模型层与 selector 两处同名方法都要在）。"
+      },
+      {
+        "symbol": "_cached_get_attn_backend",
+        "why": "@cache 内层 + set_kv_cache_layout 副作用。"
+      },
+      {
+        "symbol": "get_attn_spec_kind",
+        "why": "层信号→KVCacheSpecKind 的推导（backend_per_kind 的键）。"
+      },
+      {
+        "symbol": "backend_per_kind",
+        "why": "逐 KV 组覆写——introduces『逐 KV 组混布』的用户面。"
+      },
+      {
+        "symbol": "KVCacheSpecKind",
+        "why": "十种组 kind 枚举——覆写表的键空间。"
+      },
+      {
+        "symbol": "_get_backend_priorities",
+        "why": "优先级表本体——introduces『优先级表』。"
+      },
+      {
+        "symbol": "_BackendCandidate",
+        "why": "幸存候选三元组（类+枚举+优先级）。"
+      },
+      {
+        "symbol": "get_valid_backends",
+        "why": "逐个 validate 的循环体——introduces『validate 回退』。"
+      },
+      {
+        "symbol": "get_attn_backend_cls",
+        "why": "显式/自动两路裁决 + 胜者日志。"
+      },
+      {
+        "symbol": "set_kv_cache_layout",
+        "why": "选中后端对全局 layout 的副作用。"
+      },
+      {
+        "symbol": "full_cls_name",
+        "why": "归组去重的键原料（动态子类安全）。"
+      },
+      {
+        "symbol": "AttentionGroup",
+        "why": "混布等价类容器。"
+      },
+      {
+        "symbol": "AttentionGroupKey",
+        "why": "(后端类全名, spec, num_heads_q) 三元组键——归组规则本体。"
+      },
+      {
+        "symbol": "initialize_attn_backend",
+        "why": "归组主流程。"
+      },
+      {
+        "symbol": "get_attn_backends_for_group",
+        "why": "组内逐层归组循环。"
+      },
+      {
+        "symbol": "create_metadata_builders",
+        "why": "每组一套 builder 的实例化。"
+      },
+      {
+        "symbol": "initialize_metadata_builders",
+        "why": "逐组逐 attn group 建 builder 的编排。"
+      },
+      {
+        "symbol": "select_common_block_size",
+        "why": "组内多后端 kernel 块协商。"
+      },
+      {
+        "symbol": "prepare_kernel_block_sizes",
+        "why": "逐组 kernel 块大小产出（256→4×64 例）。"
+      },
+      {
+        "symbol": "_check_and_update_cudagraph_mode",
+        "why": "最弱链降级主流程。"
+      },
+      {
+        "symbol": "min_cg_support",
+        "why": "最弱链变量——能力传染的量化。"
+      },
+      {
+        "symbol": "resolve_cudagraph_mode_and_sizes",
+        "why": "降级链接口（ch19 侧）。"
+      },
+      {
+        "symbol": "initialize_cudagraph_keys",
+        "why": "降级后 keys 预生成（桥 ch19）。"
+      },
+      {
+        "symbol": "_build_attention_metadata",
+        "why": "每拍 metadata 组装+翻译+铺设主流程。"
+      },
+      {
+        "symbol": "_get_block_table",
+        "why": "组块表取用 + NULL_BLOCK_ID 尾行填（桥 ch19 padding 四件套）。"
+      },
+      {
+        "symbol": "NULL_BLOCK_ID",
+        "why": "块表 pad 值（Block 0 保留给 padding）。"
+      },
+      {
+        "symbol": "initialize_kv_cache_tensors",
+        "why": "shape/stride 消费 + bind 落点。"
+      },
+      {
+        "symbol": "_reshape_kv_cache_tensors",
+        "why": "as_strided 定形实现。"
+      },
+      {
+        "symbol": "bind_kv_cache",
+        "why": "张量绑到每层 .kv_cache。"
+      },
+      {
+        "symbol": "_has_mixed_attention_kv_layout",
+        "why": "block 维分歧探测。"
+      },
+      {
+        "symbol": "FlashAttentionBackend",
+        "why": "贯穿全章的具体后端样板。"
+      },
+      {
+        "symbol": "FlashAttentionMetadata",
+        "why": "后端专属 metadata，对比 Common 看『翻译』。"
+      },
+      {
+        "symbol": "FlashAttentionMetadataBuilder",
+        "why": "build 实现 + FA3/FA2 CG 档分叉。"
+      },
+      {
+        "symbol": "FlashAttentionImpl",
+        "why": "FA 的 forward/do_kv_cache_update 实现。"
+      },
+      {
+        "symbol": "schedule",
+        "why": "build 内闭包——FA3 AOT scheduler_metadata 的产出。"
+      },
+      {
+        "symbol": "get_scheduler_metadata",
+        "why": "FA3 预调度调用（host 端调度元数据）。"
+      },
+      {
+        "symbol": "flash_attn_varlen_func",
+        "why": "读腿 kernel 入口（ch20 黑盒在此接线）。"
+      },
+      {
+        "symbol": "reshape_and_cache_flash",
+        "why": "写腿算子。"
+      },
+      {
+        "symbol": "Attention",
+        "why": "模型层插座：建层选后端 + forward 分发。"
+      },
+      {
+        "symbol": "static_forward_context",
+        "why": "层注册表（ch19 已立、本章是注册的发起方）。"
+      },
+      {
+        "symbol": "use_direct_call",
+        "why": "平台分叉：直调 vs torch.ops。"
+      },
+      {
+        "symbol": "unified_kv_cache_update",
+        "why": "写腿算子（dummy 依赖保序）。"
+      },
+      {
+        "symbol": "unified_attention_with_output",
+        "why": "读+算算子。"
+      },
+      {
+        "symbol": "get_attention_context",
+        "why": "按 layer_name 取本层料的核心取数函数。"
+      },
+      {
+        "symbol": "layer_name",
+        "why": "贯穿 metadata/kv_cache/slot_mapping 的键。"
+      },
+      {
+        "symbol": "kv_cache_dummy_dep",
+        "why": "写→算数据依赖保序的载体。"
+      },
+      {
+        "symbol": "get_kv_cache_spec",
+        "why": "层自报 KV 规格（分组的原料；层侧与 runner 侧同名方法）。"
+      },
+      {
+        "symbol": "kv_sharing_target_layer_name",
+        "why": "跨层 KV 共享的跳写判据。"
+      },
+      {
+        "symbol": "_encode_layer_name",
+        "why": "保留的 forward op 路径 L564 使用"
+      },
+      {
+        "symbol": "build_for_cudagraph_capture",
+        "why": "excerpt 16 保留分支 L2526-L2529 使用"
+      },
+      {
+        "symbol": "num_reqs",
+        "why": "核心字段：FA build 与 varlen 调用直接消费"
+      },
+      {
+        "symbol": "max_query_len",
+        "why": "核心字段：FA build 与 varlen 调用直接消费"
+      },
+      {
+        "symbol": "set_forward_context",
+        "why": "站 10 落点 L4432-L4443、本章运行期主线（定义 vllm/forward_context.py:L260）"
+      }
+    ]
+  },
+  "foreshadow_due": {
+    "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，不跑）",
+    "should_plant": [],
+    "should_recover": [],
+    "note": "pedagogy-plan.foreshadows 十条无一在 no=21 埋或收：本章是纯『消费型』章节。F7（block_table 间接寻址，planted:13）的正式回收账记在 paid:22（ch22 slot_mapping 与 block_table）；但本章 pedagogy 条目 notes 写『回收 block_table 伏笔』——按真相源裁决：ch21 只消费 block_table 接口（读腿 flash_attn_varlen_func 照表取数、写腿 slot_mapping 散写，正文可回指 ch13 埋的伏笔作衔接语），全款回收（恒等式/Triton kernel/PAD 语义/双镜像）仍归 ch22。writer 据此掌握分寸：本章讲『表怎么被用』，不讲『表怎么算出来』。"
+  },
+  "l2_spec": "book/cartography/l2-specs/ch21.json（同批产出；stations 与本档 stations 同一份账本）"
+}

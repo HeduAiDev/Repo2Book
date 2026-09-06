@@ -1,0 +1,257 @@
+{
+  "chapter_id": "ch21",
+  "environment_note": "全部 trace 取自 host CPU（无 CUDA、无 vllm 包）跑本章精简版（HOST SEAM 承载 CUDA 面，见 implementation/impl-notes.md §Seam）。取证环境与 pin 源码行为的差异三处，writer 引用数字时须就近挑明：(1) FLASHINFER/FLEX_ATTENTION/TURBOQUANT 走真实 vllm.* 类路径 → host ImportError——这不是伪造，是懒加载注册表在『机器上没装该后端依赖』时的真实行为（真机上同理：没装 flashinfer 包就是 ImportError 被 get_valid_backends 接住当一条落选原因）；(2) get_flash_attn_version 在 host 恒 FA2（真身按算力代+库解析 3/4/2）→ FA builder 的 CG 档观测为 UNIFORM_BATCH、build 的 scheduler_metadata=None——真机 SM90+FA3 应为 ALWAYS+AOT scheduler_metadata；(3) flash_attn_varlen_func/reshape_and_cache_flash 为逐 token 精确数学镜像（fp64 softmax、slot 逆分解），与手工 attention 对拍 max_abs_diff ≤ 5e-4（fp16 精度内，traces/ch21-m11.json forward_legs）。",
+  "mechanisms": [
+    {
+      "mechanism_id": "ch21-m01",
+      "intuition": "插座国家标准：墙上插孔的形状是国标（AttentionBackend 协议），吹风机厂商（各注意力后端）只要插头符合国标就能互相替换——而国标只规定『插孔长什么样』，不规定吹风机内部怎么造风。",
+      "note_for_writer": "四件套=Backend（身份证+能力探针）/Metadata（后端专属 per-batch 数据）/Builder（Common→专属 metadata 翻译）/Impl（forward+do_kv_cache_update 计算）。四个抽象 staticmethod 是身份证：选后端发生在『还只有类对象、没有任何实例』的装配期——这正是它们必须是 staticmethod 的原因（实例方法要求先 new，而 new 之前要先选出是哪个类）。validate_configuration 是聚合器：十几个能力探针逐个检查、失败追加一条字符串原因，supports_combination 组合探针收尾，返回空列表=该后端在此配置下合法——『合法』不是一个布尔而是『原因清单为空』，这让胜者日志和 debug 输出天然可读。",
+      "figure_specs": [
+        {
+          "figure_id": "ch21-fig-m01-protocol",
+          "l0_anchor": "L0 执行臂+模型层接缝的放大：模型层框内的 Attention() 插座背面——把插座背面那一圈『接口簧片』（协议）单独拉出来画，正文讲站 1-4 时用",
+          "claim": "AttentionBackend 协议=四个 staticmethod 身份证（get_name/get_impl_cls/get_builder_cls/get_kv_cache_shape）+ 能力探针族 + validate_configuration 聚合器（失败逐条追加原因、空列表=合法），全 staticmethod 因为选后端发生在『还没实例化任何东西』的装配期。",
+          "template": "flow",
+          "numbers": [
+            {"value": "四个抽象 staticmethod：get_name / get_impl_cls / get_builder_cls / get_kv_cache_shape", "provenance": "vllm/v1/attention/backend.py:L60-L97（dossier embed_excerpts[0]）"},
+            {"value": "validate_configuration：探针失败往 invalid_reasons 追加字符串原因、supports_combination 收尾、返回空列表=合法", "provenance": "vllm/v1/attention/backend.py:L319-L393（dossier embed_excerpts[1]）"},
+            {"value": "forward_includes_kv_cache_update 默认 True、FlashAttentionBackend 改 False", "provenance": "vllm/v1/attention/backend.py:L67 + vllm/v1/attention/backends/flash_attn.py:L86"}
+          ],
+          "caption_draft": "插座背面：后端要接上 Attention()，必须交出四张『类级别』身份证（连实例都还没有就要能答）——能跑哪个 kernel 的谈判发生在装配期，用的是类与静态声明，不是对象。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "ch21-m02",
+      "intuition": "黄页目录：枚举值直接就是类路径字符串（『名字→门牌号』静态表），get_class() 拿到门牌号才真正上门 import——没装的那家不会因为你翻了一页黄页就拖垮整本目录。",
+      "note_for_writer": "懒加载的意义在 m05 的 trace 里被真实触发：未注册覆盖的成员（FLASHINFER 等）走真实 vllm.* 路径 → host ImportError → get_valid_backends 把它当一条落选原因而非崩溃（traces/ch21-m05.json get_valid_backends[0]）。register_backend 是第三方入口：测试正是用它把包内真身挂到 FLASH_ATTN 名下——这就是该机制的真实用法（装饰器形态路径自动取 __module__.__qualname__）。"
+    },
+    {
+      "mechanism_id": "ch21-m03",
+      "intuition": "同一个问题只查一次字典：选后端要看十几个维度，全部打包成一个可哈希的 NamedTuple 当 @cache 的键——第 2 层到第 32 层问的是同一个问题，答案直接从缓存拿。",
+      "note_for_writer": "记忆化的实证在 traces/ch21-m05.json memoization：同配置两次 get_attn_backend 返回同一个类对象（a is b=true）。AttentionSelectorConfig 的字段清单（head_size/dtype/kv_cache_dtype/block_size/use_mla/has_sink/use_sparse/use_mm_prefix/use_per_head_quant_scales/attn_type/has_sliding_window/use_non_causal/use_batch_invariant/use_kv_connector/use_pcp）见 selector.py:L24-L39。"
+    },
+    {
+      "mechanism_id": "ch21-m04",
+      "intuition": "米其林推荐名单：平台按『菜系』（MLA 与否）×『城市』（算力代）给出一份排序好的候选名单——排第一的不一定总能订到位（依赖没装/能力不够），但名单序就是『能订到时优先吃哪家』的默认答案。",
+      "note_for_writer": "表序是经验的：注释里挂 benchmark issue 链接（cuda.py:L96-L97），TOKENSPEED_MLA 注释自述『R1 dims + FP8 KV only; wins past bs≈8, regresses at bs≤2』（cuda.py:L120-L123）——同一后端在不同 batch size 域有相反的优劣，表序只能取折中。非 MLA 分叉的 why：SM100 的 FlashInfer non-causal cutlass 路径已知有问题，故 non-causal 时 FLASH_ATTN 提前（cuda.py:L144-L163）。",
+      "figure_specs": [
+        {
+          "figure_id": "ch21-fig-m04-priorities",
+          "l0_anchor": "L0 执行臂+模型层接缝的放大：模型装配期发生在执行臂（gpu_column）的 load_model 一侧——此图画『装配期决定每层跑哪个 kernel』的那张裁决表，是站 3 的放大",
+          "claim": "同一层到底跑哪个 kernel 由平台优先级表决定：use_mla × 算力代（major 10=Blackwell/12/其他）× fp8 KV × num_heads 分叉出候选名单，表序即默认最优——名单是经验参数（注释挂 benchmark），换硬件代要重测。",
+          "template": "state-table",
+          "numbers": [
+            {"value": "非 MLA + SM100（major=10，non-causal 关）：FLASHINFER → FLASH_ATTN → TRITON_ATTN → FLEX_ATTENTION → TURBOQUANT", "provenance": "traces/ch21-m05.json priority_table_non_mla_sm100 + vllm/platforms/cuda.py:L144-L163"},
+            {"value": "非 MLA + SM90 等其他代：FLASH_ATTN 提到表头", "provenance": "traces/ch21-m05.json block_size_warning.priority_table_non_mla_sm90 + vllm/platforms/cuda.py:L158-L163"},
+            {"value": "MLA + SM100 表头：FLASHINFER_MLA → TOKENSPEED_MLA（注释 wins past bs≈8, regresses at bs≤2）→ CUTLASS_MLA → FLASH_ATTN_MLA → FLASHMLA → TRITON_MLA → *sparse", "provenance": "vllm/platforms/cuda.py:L98-L129（dossier embed_excerpts[4]）"},
+            {"value": "MLA + 其他代（Hopper 等）：FLASH_ATTN_MLA → FLASHMLA → FLASHINFER_MLA → TRITON_MLA → FLASH_ATTN_MLA_SPARSE → FLASHMLA_SPARSE", "provenance": "vllm/platforms/cuda.py:L136-L143"},
+            {"value": "major 10 / 12 / 其他 三代分叉；major=12（消费级 Blackwell）只留 [TRITON_MLA, FLASHINFER_MLA_SPARSE_SM120] 两家——不上图（图注口径：图略）", "provenance": "vllm/platforms/cuda.py:L94-L143 + L130-L134（tests/test_attention_backends.py TestPriorities.test_mla_sm120_head 对拍）"}
+          ],
+          "caption_draft": "裁决表：平台按 MLA×算力代给出的候选名单是排好序的——表头是『一切合法时』的默认最优；但表序是 benchmark 出来的经验值（TOKENSPEED_MLA 注释自述 bs≈8 以上才赢、bs≤2 反而退化），换硬件代要重测。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "ch21-m05",
+      "intuition": "餐厅代客排位：门口名单按推荐序排好（优先级表），逐个问『这位能坐吗』（validate）——没来的（ImportError）和忌口的（能力探针不过）都跳过，坐下的是名单里最靠前的能坐者；但你点名要坐某桌（显式指定），不合适就直接请出（ValueError），绝不给你偷偷换桌。",
+      "worked_example": {
+        "params": {
+          "场景": "SM100（Blackwell, major=10）非 MLA、head_size=64、fp16、kv_cache_dtype=auto、自动选择；对照场景：显式指定非法后端、--block-size 24 挤掉表头、SM70 全军覆没",
+          "host": "host 跑精简版：FLASH_ATTN/TRITON_ATTN 经 register_backend（真实注册机制）挂到包内真身/桩；FLASHINFER/FLEX_ATTENTION/TURBOQUANT 走真实 vllm.* 路径 → ImportError（= 真机上『没装该依赖』的同型行为）",
+          "driver": "explainer/traces/run_ch21-m05.py"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/ch21-m05.json",
+        "table": {
+          "columns": ["轮次", "场景", "候选（优先级）", "探针结果", "判定"],
+          "rows": [
+            ["①", "自动选择 @ SM100", "FLASHINFER（0）", "get_class → ImportError", "落选——没装依赖当一条原因，不挡后面的候选"],
+            ["②", "自动选择 @ SM100", "FLASH_ATTN（1）", "validate_configuration 返回 []（合法）", "幸存 → min(priority) 取胜者"],
+            ["③", "自动选择 @ SM100", "TRITON_ATTN（2）", "[]（合法）", "幸存但优先级更低，不选"],
+            ["④", "自动选择 @ SM100", "FLEX_ATTENTION（3）/ TURBOQUANT（4）", "ImportError", "落选"],
+            ["⑤", "显式指定 TRITON_ATTN + head_size=100", "TRITON_ATTN", "[\"head_size not supported\"]（100 不是 8 的倍数）", "ValueError 直接报错——不回退、不静默换后端"],
+            ["⑥", "--block-size 24 @ SM90", "FLASH_ATTN（0）", "[\"block_size not supported\"]（24 不是 16 的倍数）", "落选 → 胜者 TRITON_ATTN（2）+ 发 warning 建议去掉 --block-size"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "自动选择必终止、结果唯一确定：要么幸存集非空且 min(priority) 唯一取胜者，要么显式 ValueError——不存在无限回退或静默无后端。",
+        "argument": "候选列表是有限全序（@cache 的列表，priority=enumerate 下标两两不同），get_valid_backends 的 for 循环每轮恰好消耗一个候选、无重访——有限步必停；若幸存集非空，priority 互异使 min 唯一；若为空，len(valid)==0 分支显式 raise（cuda.py:L432-L446）——基例（显式指定路径根本不进循环，单元素校验）+ 归纳步（循环每轮消耗一个候选）。"
+      },
+      "quantified": "每次选择 = 候选数 × 探针数次纯 Python 常数判定：本例 5 候选 × 十几个探针 ≈ 百次常数级检查，且被 @cache 摊销到每配置一次——traces/ch21-m05.json memoization 实证同配置两次调用返回同一类对象（a is b=true），即一个 32 层同构模型只有第 1 层真正跑选择、其余 31 层命中缓存；这些全在装配期，不进每拍热路径。",
+      "paper_origin_note": "vLLM 自身的后端选择实现（优先级表+谓词过滤+首个幸存者），无论文出处；机制上类比 HTTP content negotiation 的能力协商+回退。"
+    },
+    {
+      "mechanism_id": "ch21-m06",
+      "intuition": "公司总机+分机：backend 是总机默认接给谁，backend_per_kind 是『市场部来电转 A、售后来电转 B』的分机表——没列出的部门继续走总机默认。",
+      "note_for_writer": "用户面在 vllm/config/attention.py:L18-L36（docstring 自带 {\"mla_attention\": \"FLASHINFER_MLA\"} 例子）；层信号→kind 的推导矩阵（use_mla×has_sliding_window×attn_type → 十种 KVCacheSpecKind）在 selector.py:L61-L98（get_attn_spec_kind）；覆写发生在 get_attn_backend 打包之后、进 @cache 之前（selector.py:L158-L168）。测试对拍：SW 层被覆写为 TRITON_ATTN、full attention 层回退全局（tests/test_attention_backends.py TestSelector.test_backend_per_kind_overrides_by_kind）。"
+    },
+    {
+      "mechanism_id": "ch21-m07",
+      "intuition": "集装箱两种装法：逻辑形状说『这批货是 块×头×槽×内容 四个维度』，物理序说『箱内先按什么码』——NHD 是同一槽位的所有头挨着放（取一个 token 的全部头一次拿完），HND 是同一头的所有槽位挨着放；as_strided 只改『怎么看』不改『怎么放』，一次定形终身免拷。",
+      "note_for_writer": "逻辑形 (num_blocks, num_kv_heads, block_size, 2*head_size)——K 和 V 打包进最后一维 content dim（v0.21 的 (2, num_blocks, ...) 头维拆 K/V 已废）。stride_order 是逻辑形→物理内存序的置换：NHD=(0,2,1,3) 把 block_size 维提前、HND=(0,1,2,3) 恒等。混布组各后端 block 维位置不一致时（K/V-first vs blocks-first）同一 block_id 会映射到不同字节 → as_strided_ 统一 blocks-first（m15）。get_kv_cache_block_dim 的哨兵探测：_S=1234567 当 num_blocks 代入 shape 再 .index(_S) 反查块维——不用每个后端手写维号。",
+      "figure_specs": [
+        {
+          "figure_id": "ch21-fig-m07-layout",
+          "l0_anchor": "L0 执行臂+模型层接缝的放大：kv_column 那一列裸显存如何被『看成』后端要的形状——站 7（as_strided 定形）的放大，m15 布局归一的画法基础",
+          "claim": "后端自报 KV 布局两件套——get_kv_cache_shape 给逻辑形 (B,H,N,2D)（K/V 打包进 content 维），get_kv_cache_stride_order 给逻辑→物理的置换（NHD=(0,2,1,3) 同 token 的 heads 内存连续 / HND=(0,1,2,3) 恒等）——裸显存 as_strided 一次定形。",
+          "template": "layout",
+          "numbers": [
+            {"value": "逻辑形 (256, 2, 64, 128) = 256 kernel 块 × 2 KV 头 × 64 token/块 × 2*64（K/V 打包）", "provenance": "traces/ch21-m08.json kv_tensor_shaping.logical_shape + vllm/v1/attention/backends/flash_attn.py:L133-L144"},
+            {"value": "NHD 物理步长 (16384, 128, 256, 1)——物理内存序 (B,N,H,2D) 连续，每块 64 token × 2 头 × 128 = 16384 元素", "provenance": "traces/ch21-m08.json kv_tensor_shaping.strides_nhd"},
+            {"value": "HND 物理步长 (16384, 8192, 128, 1)——恒等置换物理序 (B,H,N,2D) 连续，头维一步 = N×2D = 64×128 = 8192（同一头的全部 token）", "provenance": "traces/ch21-m08.json kv_tensor_shaping.strides_hnd + vllm/v1/attention/backends/flash_attn.py:L146-L168"},
+            {"value": "stride_order：NHD=(0,2,1,3)、HND=(0,1,2,3)", "provenance": "vllm/v1/attention/backends/flash_attn.py:L146-L168 + traces/ch21-m08.json kv_tensor_shaping.stride_order_nhd_default"},
+            {"value": "块维哨兵探测 get_kv_cache_block_dim(_S=1234567 代入再 .index) = 0（blocks-first）", "provenance": "vllm/v1/attention/backend.py:L100-L117 + traces/ch21-m08.json kv_tensor_shaping.block_dim_sentinel"}
+          ],
+          "caption_draft": "同一块裸显存、两种『看法』：逻辑形说清四维语义（K/V 挤在最后一维），stride_order 决定物理码放（NHD 让同 token 的头连续、喂 TMA 友好）——as_strided 零拷贝切换，块维位置由哨兵 1234567 自动探测而非每个后端手写。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "ch21-m08",
+      "intuition": "车间班组划分：同一车间（KV cache 组）里，用同型号机床干同工序的工人（同后端+同 KV 规格+同 Q 头数的层）编进一个班组（AttentionGroup）共享一套工装（metadata builder）——机床型号不同的另立班组；但全车间的安全等级（cudagraph 档位）按最危险的那个班组算。",
+      "worked_example": {
+        "params": {
+          "层配置": "3 层同在一个 KV cache 组、同 spec FullAttentionSpec(block_size=256, num_kv_heads=2, head_size=64)、同 num_heads_q=4：L0/L1 用 FlashAttentionBackend、L2 用 TRITON_ATTN 桩（块声明 [24,64]）",
+          "entry_note": "逐层混布的用户入口是 AttentionConfig.backend_per_kind；本例经 Attention(attn_backend=...) 直传构造，归组走同一条 initialize_attn_backend",
+          "driver": "explainer/traces/run_ch21-m08.py"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/ch21-m08.json",
+        "table": {
+          "columns": ["轮次", "阶段", "对象", "关键标量", "产出"],
+          "rows": [
+            ["①", "逐层归组", "model.layers.0.self_attn（FlashAttentionBackend）", "key=(FlashAttentionBackend 全名, spec, 4)", "组 A"],
+            ["②", "逐层归组", "model.layers.1.self_attn（FlashAttentionBackend）", "同 key → 并入", "组 A=[L0, L1]"],
+            ["③", "逐层归组", "model.layers.2.self_attn（TritonStubBackend）", "full_cls_name 不同 → 新 key（spec 与头数都相同也没用）", "组 B=[L2]"],
+            ["④", "最弱链 CG", "组 A 与组 B 的 builder 各自报档", "两者皆 UNIFORM_BATCH（2）→ min_cg_support=UNIFORM_BATCH（2）", "全模型 CG 档被压到均匀批"],
+            ["⑤", "kernel 块协商", "管理块 256 vs 声明并集", "FA=[MultipleOf(16)]（256%16==0 ✓）、Triton=[24,64] → 256 = 4 × 64", "kernel 块 64（256 拆 4 块）"],
+            ["⑥", "定形 bind", "裸显存按新 kernel 块 as_strided", "逻辑形 (256, 2, 64, 128)、每层 .kv_cache 绑定", "3 层全部绑定成功"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "归组是严格的等价类划分：每个注意力层恰好属于一个 AttentionGroup，层不丢、不重、不串组。",
+        "argument": "对 kv_cache_group_spec.layer_names 的 for 循环保证每层恰好被访问一次；每次访问生成一个 key 并 append 进该 key 的 layer_names 列表——由字典按 key 分桶的构造，每层的归属由其 key 唯一决定（key 是纯函数：full_cls_name+spec+num_heads_q），故各桶两两不相交且并集=全部层。归组数 = 不同 key 的个数。"
+      },
+      "quantified": "3 层 → 2 个 attn group（1 个 KV cache 组内）：混布的账单可数——2 套 metadata builder（每组一套）、全模型 CG 档 = min(UNIFORM_BATCH, UNIFORM_BATCH) = UNIFORM_BATCH(2)（若组内只有 FA3 builder 单干本可到 ALWAYS(3)）；kernel 块协商把 KV 逻辑形从 (64, 2, 256, 128)（管理块直用）变为 (256, 2, 64, 128)（64 块 × 4 细分，traces/ch21-m08.json kv_tensor_shaping 实证）。注：CG 档观测值 2 受 host 恒 FA2 影响（真机 SM90+FA3 的 FA builder 为 ALWAYS，见顶层 environment_note）。",
+      "figure_specs": [
+        {
+          "figure_id": "ch21-fig-m08-groups",
+          "l0_anchor": "L0 执行臂+模型层接缝的放大：执行臂 initialize_kv_cache 一侧的站 6 归组——把『模型层一摞 Attention 层』按后端拆班组的装配期动作画出来",
+          "claim": "层按 (后端类全名, KVCacheSpec, num_heads_q) 三元组聚成 AttentionGroup——同一模型逐层混布不同后端是合法态，代价是每组一套 metadata builder、全模型 cudagraph 档被最弱组拖累、kernel 块大小要组内协商。",
+          "template": "flow",
+          "numbers": [
+            {"value": "3 层 → 2 组：FlashAttentionBackend=[L0,L1]、TritonStub=[L2]（spec 与 num_heads_q=4 全同，仅后端类全名不同就分家）", "provenance": "traces/ch21-m08.json grouping"},
+            {"value": "min_cg_support=UNIFORM_BATCH（值 2；档位刻度 ALWAYS=3>UNIFORM_BATCH=2>UNIFORM_SINGLE_TOKEN_DECODE=1>NEVER=0）", "provenance": "traces/ch21-m08.json weakest_link + vllm/v1/attention/backend.py:L606-L620"},
+            {"value": "kernel 块协商：管理块 256 = 4 × 64（FA 声明 MultipleOf(16)、Triton 桩声明 [24,64]）", "provenance": "traces/ch21-m08.json negotiation + vllm/v1/worker/utils.py:L266-L376"}
+          ],
+          "caption_draft": "拆班组：三元组等价类把 3 层拆成 2 个 AttentionGroup（每组一套 builder、组内共享一份 metadata）；最弱链让一个 UNIFORM_BATCH 后端把全模型 CG 档从 ALWAYS 压下来；256-token 管理块协商成 4×64 的 kernel 块——混布不是免费的，三笔账都在装配期一次结清。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "ch21-m09",
+      "intuition": "木桶效应的工程版：整条 CUDA graph 流水线的档位不看最强的后端，看最短的板——一个只支持『等长批』的后端混进来，全模型的 FULL 档 capture 就只在均匀批可用。",
+      "note_for_writer": "数值素材在 traces/ch21-m08.json weakest_link（含四档刻度 ALWAYS=3/UNIFORM_BATCH=2/UNIFORM_SINGLE_TOKEN_DECODE=1/NEVER=0）；FA3/FA2 二选一在 flash_attn.py:L352-L356（按 get_flash_attn_version()）。降级链 resolve_cudagraph_mode_and_sizes + initialize_cudagraph_keys 归 ch19（本章只讲 min_cg_support 接口）。"
+    },
+    {
+      "mechanism_id": "ch21-m10",
+      "intuition": "全楼共一张水表：每拍整栋楼（所有后端所有层）共用的读数——多少户（请求）、每户几口人（token）、进水表（block_table）、分户阀（slot_mapping）——只抄一次表；只有各单元自装的表（逐 KV 组的 block_table/slot_mapping）才逐单元换。",
+      "note_for_writer": "核心 10 字段：query_start_loc(+cpu 前缀和切序列)/seq_lens/num_reqs/num_actual_tokens/max_query_len/max_seq_len/block_table_tensor/slot_mapping/causal。cm_base 组装锚 gpu_model_runner.py:L2430-L2449（持久缓冲切片，不新建张量）；实测一拍的字段值在 traces/ch21-m11.json translation.cm_base_shared_fields（含 cudagraph padding 后的 [0,4,6,6,6]/[16,20,16,20]）。",
+      "figure_specs": [
+        {
+          "figure_id": "ch21-fig-m10-common",
+          "l0_anchor": "L0 执行臂+模型层接缝的放大：执行臂每拍心跳（gpu_column）里『组装 metadata』那一格——站 8 的放大，向下接 builder 翻译、向上接 ch18 的块表/槽位产出",
+          "claim": "每拍 runner 组装一份 CommonAttentionMetadata（核心 10 字段）供所有后端所有层共享——块表/槽位先填组 0 的，组 0 之外 shallow copy 只换这两样，组内全部层铺同一份后端专属 metadata。",
+          "template": "tensor-flow",
+          "numbers": [
+            {"value": "核心 10 字段：query_start_loc(+cpu)/seq_lens/num_reqs/num_actual_tokens/max_query_len/max_seq_len/block_table_tensor/slot_mapping/causal", "provenance": "vllm/v1/attention/backend.py:L412-L444"},
+            {"value": "实测一拍（2 请求 padding 到 4 行/8 token）：query_start_loc=[0,4,6,6,6]（前缀和+非递减尾）、seq_lens=[16,20,16,20]（尾 2 行上拍残留）", "provenance": "traces/ch21-m11.json translation.cm_base_shared_fields + batch"},
+            {"value": "组 0 之外只换 block_table/slot_mapping 两字段（shallow copy）", "provenance": "vllm/v1/worker/gpu_model_runner.py:L2561-L2574（dossier embed_excerpts[15]）+ traces/ch21-m11.json translation.group1_table_swap_reuse"}
+          ],
+          "caption_draft": "共用水表：一拍的 per-batch 读数（谁在批里、各多长、表指哪、槽位哪）整楼只抄一次——后端差异被压缩到『每个 KV 组两张表』，这就是几十个后端能塞进同一个 runner 每拍心跳的原因。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "ch21-m11",
+      "intuition": "海关转运单改封面：CommonAttentionMetadata 是国际标准报关单，各国（后端）内部格式不同——Builder 把标准单字段改名搬入（block_table_tensor→block_table）再补本国特有栏位（FA：调度元数据/级联判定）；同格式国家的第二票货（混合组同 spec 同 builder）不用重填整单，换页复印（update_block_table 浅拷）只换集装箱号。",
+      "worked_example": {
+        "params": {
+          "场景": "混布模型 2 个 KV cache 组（组0: L0/L1 同后端同组、组1: L2 同后端同 spec——换表复用最小复刻）；批 = 2 个 prefill 请求 + cudagraph padding 到 4 行/8 token",
+          "请求": "req0: 4 个新 token（位置 12..15，历史 12，seq_len=16，块 [0,1]，槽位 12..15）；req1: 2 个新 token（位置 18..19，seq_len=20，块 [2,3]，槽位 50..51）",
+          "driver": "explainer/traces/run_ch21-m11.py"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/ch21-m11.json",
+        "table": {
+          "columns": ["轮次", "流水段", "动作", "关键数值", "产出"],
+          "rows": [
+            ["①", "每拍入口（站 8）", "2 请求 padding 到 4 行/8 token，持久缓冲切片组装 cm_base", "query_start_loc=[0,4,6,6,6]、seq_lens=[16,20,16,20]（尾 2 行上拍残留）", "CommonAttentionMetadata（共享字段只算一次）"],
+            ["②", "块表尾行填充", "_get_block_table 把 padded 行填 NULL_BLOCK_ID", "尾 2 行 [9,9] → [0,0]（Block 0 保留给 padding）", "块表 pad 完成"],
+            ["③", "翻译（站 9）", "FA builder.build(cm_base)：Common 字段改名搬入 + FA 特有字段补算", "block_table_tensor→block_table 直搬；scheduler_metadata=None（host 恒 FA2，真机 FA3 才有）；use_cascade=False；sliding_window=(-1,-1)", "FlashAttentionMetadata"],
+            ["④", "layer_name 铺设", "组 0 两个层名指向同一对象", "m[L0] is m[L1]（fanout，组内共享同一份）", "attn_metadata dict"],
+            ["⑤", "逐组换表", "copy(cm_base) 只换 block_table/slot_mapping", "组 1 表=[[4,5],[6,7],[0,0],[0,0]]、槽位=[76,77,78,79,114,115,-1,-1]", "cm_1"],
+            ["⑥", "换表复用", "组 1 同 (spec, builder 类型) 缓存命中 → update_block_table 浅拷只换表", "m[L2] 非 m[L0] 但共享 query_start_loc 同一张量", "L2 的 FA metadata（零重算）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "翻译不改变字段值、只换容器与名字：同一份 Common 喂给 builder，产出的后端专属 metadata 与 Common 的共享字段是同张量别名（data_ptr 级），update_block_table 复用版与其余字段也逐一同一。",
+        "argument": "build() 对共享字段只做解构赋值（flash_attn.py:L458-L476 无拷贝无变换），装配时原引用搬入 dataclass——故 m[L2].query_start_loc is m[L0].query_start_loc（traces/ch21-m11.json 实证 true）；update_block_table 用 copy.copy 浅拷已建 metadata、仅替换 block_table/slot_mapping 两个引用，其余字段从旧对象原样继承。铺设循环 attn_metadata[layer_name]=同一对象保证组内全部层读到的就是同一份。"
+      },
+      "quantified": "本例每拍 metadata 账单：2 个 KV cache 组 × 1 个 attn group = 1 次完整 build 翻译 + 1 次 update_block_table 浅拷换表（对比不用缓存要 2 次完整 build——共享字段全部免重算）；批 2 请求 padding 到 4 行/8 token 的代价 = 块表 2 行重填 + 槽位 2 个 PAD（-1）。FA 特有字段补算量在本例为 0（host 恒 FA2 无 AOT 调度；真机 FA3 会多一笔 host 端 scheduler_metadata 计算）。",
+      "figure_specs": [
+        {
+          "figure_id": "ch21-fig-m11-translate",
+          "l0_anchor": "L0 执行臂+模型层接缝的放大：执行臂每拍心跳里『builder 翻译』那一格（站 9）——Common 与后端专属 metadata 的对照摊开",
+          "claim": "builder.build() 的『翻译』= Common 字段改名搬入（block_table_tensor→block_table、query_start_loc/seq_lens/slot_mapping 直搬）+ 后端特有字段补算（FA：scheduler_metadata/use_cascade/sliding_window）——同 (spec, builder) 的混合组走 update_block_table 浅拷只换表。",
+          "template": "before-after",
+          "numbers": [
+            {"value": "改名搬入：block_table_tensor→block_table=[[0,1],[2,3],[0,0],[0,0]]（尾 2 行由 [9,9] 填成 NULL_BLOCK_ID=0）", "provenance": "traces/ch21-m11.json translation.fa_build_rename + block_table_after_null_fill"},
+            {"value": "FA 特有字段：scheduler_metadata=None（host 恒 FA2）、use_cascade=False、sliding_window=(-1,-1)", "provenance": "traces/ch21-m11.json translation.fa_only_fields + vllm/v1/attention/backends/flash_attn.py:L672-L696"},
+            {"value": "fanout 与复用：m[L0] is m[L1]（同一对象）；组 1 m[L2] 非 m[L0] 但共享 query_start_loc 同一张量", "provenance": "traces/ch21-m11.json translation.layer_name_fanout + group1_table_swap_reuse"}
+          ],
+          "caption_draft": "报关单改封面：Builder 把通用 Common 单改名搬进 FA 自己的单子、补上 FA 特有栏——组内两个层名共享同一对象；第二个 KV 组同格式不重填整单，浅拷换表（块表/槽位）即用，共享字段零重算。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "ch21-m12",
+      "intuition": "图书馆按索书号取书：这一拍 4 个新 query（读者）不必自己知道书在哪个书库——cu_seqlens_q 说『这批读者从第 0 页到第 4 页是一家人的』，block_table 是索书号页表，kernel 沿表把散在各书架（块）的 K/V 取来，因果规矩是『只能看排在你前面的人（含自己）』。",
+      "note_for_writer": "读腿两步：(1) kv_cache.transpose(1,2).split(head_size, dim=-1) 拆 K/V cache（(B,H,N,2D)→两个 (B,N,H,D)）；(2) flash_attn_varlen_func 一次调用吃整批——cu_seqlens_q=query_start_loc、seqused_k=seq_lens、block_table 指路。ch20 的 tiling kernel 在这一行被喂料（数学归 ch20、本章只讲真实调用面）。eager 接缝 CPU 开销警告（NOTE woosuk：piecewise 图下本方法在 eager 跑、view/slice 都慢）flash_attn.py:L880-L887。数值对拍在 traces/ch21-m11.json forward_legs.read_leg。",
+      "figure_specs": [
+        {
+          "figure_id": "ch21-fig-m12-readleg",
+          "l0_anchor": "L0 执行臂+模型层接缝的放大：模型层 Attention() 插座通电后的读腿——站 12 的放大，把 ch20 的 kernel 调用面与 ch22 的页表在这里接上",
+          "claim": "读腿一行 flash_attn_varlen_func 同时吃下 varlen 打平（cu_seqlens_q 前缀和切序列）与 paged KV（block_table 页表指路）——query 按因果只看自己位置之前的键，输出写进预分配 output。",
+          "template": "tensor-flow",
+          "numbers": [
+            {"value": "调用面：flash_attn_varlen_func(q, k=key_cache, v=value_cache, cu_seqlens_q=query_start_loc, seqused_k=seq_lens, block_table=block_table, causal=True)", "provenance": "vllm/v1/attention/backends/flash_attn.py:L1041-L1066（dossier embed_excerpts[17]）"},
+            {"value": "实测：cu_seqlens_q=[0,4]、seqused_k=[16]、block_table=[[0,1]]——q0（位置 12）看 13 个键、q3（位置 15）看 16 个键", "provenance": "traces/ch21-m11.json forward_legs.read_leg"},
+            {"value": "输出 (4, 256)=4 token × 4 头 × 64 维；与手工 attention 对拍 max_abs_diff ≤ 5e-4（fp16 精度内）", "provenance": "traces/ch21-m11.json forward_legs.read_leg.manual_check_max_abs_diff"},
+            {"value": "K/V 拆包：kv_cache.transpose(1,2).split(head_size=64, dim=-1)", "provenance": "vllm/v1/attention/backends/flash_attn.py:L904-L905"}
+          ],
+          "caption_draft": "读腿喂料：varlen 打平（前缀和切序列）+ 页表取数（block_table 沿表取分散的 K/V 块）在同一次 kernel 调用里完成——ch20 讲过的 tiling 数学，在真实源码里就发生在这一行。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "ch21-m13",
+      "intuition": "先归档再开会：FA 的注意力计算不含归档（forward_includes_kv_cache_update=False），所以每个层先把本拍新 K/V 按 slot_mapping 散写进档案柜（KV cache），拿到一张回执（dummy 空 tensor）再去开会（attention 算子）——回执是给编译器看的：保证『先写后算』的顺序不被优化掉。",
+      "note_for_writer": "写腿三跳：Attention.forward → unified_kv_cache_update 算子（dummy 依赖保序）→ impl.do_kv_cache_update → reshape_and_cache_flash。slot_mapping 的形状决定实际 token 数（key/value 是 padded 的而 slot_mapping 不 pad，woosuk NOTE flash_attn.py:L1113-L1119）。slot 怎么算出来归 ch22；实测写腿落位（块 0 的 12..15 行 == 本拍 k）在 traces/ch21-m11.json forward_legs.write_leg。PAD 槽位 -1 跳过。"
+    },
+    {
+      "mechanism_id": "ch21-m14",
+      "intuition": "精装房交付：模型文件（LlamaDecoderLayer）只写『这里装一个 Attention()』——水电接口（后端）在装修队进场时（__init__）就自选自装好，还顺手在物业（static_forward_context）登记了房号（layer_name）；住户模型 forward 永远不碰水电管线（不收 attn_metadata/kv_cache 参数）。",
+      "note_for_writer": "建层即选后端锚 attention.py:L350-L363（构造方没显式传 attn_backend 时调 get_attn_backend）；选完即装 L420-L446（get_impl_cls 实例化 impl + 枚举反查 + 自注册 static_forward_context，重名即 raise）。『插座+自选后端』why 链的另一半（模型拼装四件套/权重加载）归 ch23。"
+    },
+    {
+      "mechanism_id": "ch21-m15",
+      "intuition": "统一左舵：两家车厂（后端）方向盘一边在左一边在右（块维一个在前一个在后）——共用同一条产线（同一块裸显存）就必须统一左舵（blocks-first），否则同一个车牌号（block_id）会开到不同的车位（字节偏移）。",
+      "note_for_writer": "探测用 get_kv_cache_block_dim 的哨兵（m07）；分歧时 _update_hybrid_attention_mamba_layout 用 as_strided_ 统一 blocks-first（gpu_model_runner.py:L7470-L7539）。enc-dec 共享解码/交叉注意力分配也会触发（Whisper 例，docstring 自述）。"
+    }
+  ]
+}
