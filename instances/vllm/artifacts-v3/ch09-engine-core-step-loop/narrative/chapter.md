@@ -571,7 +571,7 @@ class ExecuteModelState(NamedTuple):  # L437
 
 ### 实测：worker 面的契约，逐手验（配套精简版）
 
-配套精简版直接驱动 worker，把两段式契约的手感逐手过一遍（贪婪采样、词表 8）。边界先说清：异步调度系统的全貌（batch_queue、延迟一拍收货、`step_with_batch_queue`）归 Part III 末章[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)；本节与下一节只验两段式契约本身，worker 面与 executor 面在同步版里验，异步面只验「发起与等待分离」这一件事。静态账一张（动作、暂存态、返回三列；流程怎么走到下一步，读下面的散文）：
+配套精简版直接驱动 worker，把两段式契约的手感逐手过一遍（贪婪采样、词表 8）。边界先说清：`step_with_batch_queue` 的循环骨架（批队列怎么填、⑤为什么延迟一拍）在下一节「异步版对照」里走读，完整状态机与补偿机制（乐观推进、拒绝回扣、过期输出）归 Part III 末章[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)；本节与下一节只验两段式契约本身，worker 面与 executor 面在同步版里验，异步面只验「发起与等待分离」这一件事。静态账一张（动作、暂存态、返回三列；流程怎么走到下一步，读下面的散文）：
 
 <!-- trace: m3 -->
 | 动作 | execute_model_state | 返回 |
@@ -613,6 +613,89 @@ class AsyncOutputFuture(Future):
 ```
 
 `result()` 惰性调 `async_output.get_output()`：那是在等 D2H 拷贝事件，不是在等计算。配套精简版也把这一手演了一遍（host 契约演示：D2H 用线程事件代行，语义同 `get_output()` 的「阻塞至拷贝完成」，CUDA 拷贝流本体属执行篇）。`executor.sample_tokens(non_block=True)` 交回 `AsyncOutputFuture`（done=False）；事件未置位时 `result()` 挂起，脚本注入 0.25s 的拷贝延迟、期间零返回；事件置位后 0.142ms 交出结果（采样 [[4]]），二次 `result()` 只剩 0.008ms（Future 已 done，纯缓存读）。「只等搬运」的真实含义在这里看得分明：等的方式便宜（挂起、零 CPU、释放 GIL）、等待排在③之后，亚毫秒只是就绪后的取货价；至于等的墙钟罩不罩住前向余尾，取决于取货时机——当拍发起后立刻取就罩着，batch_queue 版延迟一拍才取、常常已就绪（下面真引擎的数字正是后者）。
+
+「延迟一拍才取」这个时机，`AsyncOutputFuture` 管不着（它只负责「取的时候才等」），得看驱动它的循环。`step_fn` 绑定后忙循环每圈调用的就是 `step_with_batch_queue`，docstring 自述三步流，骨架如下（省略处以省略号标出，读完逐个交代）：
+
+```python
+# vllm/v1/engine/core.py:L625-L739 · EngineCore.step_with_batch_queue
+    def step_with_batch_queue(
+        self,
+    ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+        """Schedule and execute batches with the batch queue.
+        Note that if nothing to output in this step, None is returned.
+
+        The execution flow is as follows:
+        1. Try to schedule a new batch if the batch queue is not full.
+        If a new batch is scheduled, directly return an empty engine core
+        output. In other words, fulfilling the batch queue has a higher priority
+        than getting model outputs.
+        2. If there is no new scheduled batch, meaning that the batch queue
+        is full or no other requests can be scheduled, we block until the first
+        batch in the job queue is finished.
+        3. Update the scheduler from the output.
+        """
+
+        batch_queue = self.batch_queue
+        assert batch_queue is not None
+        assert len(batch_queue) < self.batch_queue_size  # L648
+
+        model_executed = False
+        deferred_scheduler_output = None
+        if self.scheduler.has_requests():  # L652
+            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())  # L653
+            with self.log_error_detail(scheduler_output):
+                exec_future = self.model_executor.execute_model(  # L655
+                    scheduler_output, non_block=True
+                )
+            if self.is_ec_consumer:
+                model_executed = scheduler_output.total_num_scheduled_tokens > 0
+
+            if self.is_pooling_model or not model_executed:
+                # No sampling required (no requests scheduled).
+                future = cast(Future[ModelRunnerOutput], exec_future)
+            else:
+                if not scheduler_output.pending_structured_output_tokens:
+                    grammar_output = self.scheduler.get_grammar_bitmask(  # L668
+                        scheduler_output
+                    )
+                    future = self.model_executor.sample_tokens(  # L671
+                        grammar_output, non_block=True
+                    )
+                # … 省略：else 支的延迟采样，pending 时把采样推迟到函数尾部（L674-L677）…
+            if not deferred_scheduler_output:  # L679
+                # Add this step's future to the queue.
+                batch_queue.appendleft((future, scheduler_output, exec_future))  # L681
+                if len(batch_queue) < self.batch_queue_size and (
+                    model_executed or self.scheduler.has_requests()
+                ):
+                    # Don't block on next worker response unless the queue is full
+                    # or there are no more requests to schedule.
+                    return None, model_executed  # L687
+
+        # … 省略：队列空的防御性早退（L689-L693，注释自认 should not reach here）…
+
+        # Block until the next result is available.
+        future, scheduler_output, exec_model_fut = batch_queue.pop()  # L696
+        with (
+            self.capture_iteration_details(scheduler_output) as iteration_details,
+            self.log_error_detail(scheduler_output),
+        ):
+            model_output = future.result()  # L701
+            # … 省略：model_output 为 None（execute_model 失败）时的异常浮出支（L702-L706）…
+
+        # Before processing the model output, process any aborts that happened
+        # during the model execution.
+        self._process_aborts_queue()  # L710
+        engine_core_outputs = self.scheduler.update_from_output(  # L711
+            scheduler_output, model_output
+        )
+        # … 省略：迭代详情挂接与延迟采样的补发起段（L714-L738）…
+        return engine_core_outputs, model_executed  # L739
+```
+
+对着读，下面实测里要用的几条行为断言，每条都能钉到行号。第一条，**填队列优先于取输出**：docstring 第 1 步的原话就是「fulfilling the batch queue has a higher priority than getting model outputs」。排上新批时，①调度（L653）、②发起前向（L655，non_block）、③取掩码（L668）、④发起采样（L671，non_block）按同步版的顺序发起（池化模型或空批走 L661 的分支，不采样、直接复用 execute 的 Future），三元组 `(future, scheduler_output, exec_future)` 入队（L681）；只要入队后队列未满、且本批真跑过或手里还有请求可排（L682-L684），函数在 L687 直接返回 None，⑤的 `update_from_output` 这次调用里根本没执行。第二条，**延迟一拍收货**：新批排不上（手里的请求都已排进在飞的批）或队列已满时，这次调用才落到收货段，L696 弹出的是最早入队的三元组，L701 的 `result()` 等的因此是上一拍入队的 Future，随后 L711 的⑤记的也是这份弹出的账（docstring 第 3 步「Update the scheduler from the output」）。两相对照：同步版 `step()` 一次调用五段各走一次；这里一次调用要么纯发起，要么发起加结上一批的账，批 A 在 GPU 上跑的同时 CPU 调度批 B，重叠在结构上就是⑤被挪到了下一次调用。
+
+拿实测场景把两条路各走一遍（`max_concurrent_batches=2`，异步调度且无流水线并行时的取值，`vllm/config/vllm.py:L539-L550`）：拍 1 排上 req-A 的新批、队列 0 变 1 未满，走早退路空手而回；拍 2 又排上新批、队列 1 变 2 占满，pop 出拍 1 的单，⑤记拍 1 的账。四处省略补一笔：`pending_structured_output_tokens`（批内还有 token 的语法掩码要等上一拍的采样结果才能算）非零时，④不在原地发起，而是把 scheduler_output 挂进 `deferred_scheduler_output`、推迟到函数尾部的补发起段（L719-L737）再取掩码采样，本章实测没有结构化输出、该支不触发，L679 的守卫因此恒真；队列空的防御性早退（源码注释自认 should not reach here）与 execute_model 失败的异常浮出支，正常驱动都走不到；尾部另省了每次都跑的统计挂接，就是同步版那对透传上下文的收尾。此外节选里的 `cast` 是标准库 typing 的类型断言（运行时原样返回），`is_ec_consumer` 是 EC 传输（external context，外部上下文的 KV 迁移，Part IV 的地盘）部署才可能为 False 的旗标，普通部署恒为 True、只负责置位 `model_executed`。骨架到此为止：调度器状态领先真实进度之后的补偿（乐观推进、拒绝回扣、过期输出）是另一层机制，归 Part III 末章[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)。
 
 真引擎把同一对请求在两版引擎上各跑一遍（「一拍五段」一节的实测环境），「发起与等待分离」直接量了出来：
 
@@ -938,7 +1021,7 @@ docstring 自己招供「no busy loop」：`get_output` 直接调 `step_fn()` �
 
 摘录开头那个 `should_execute_dummy_batch` 分支是多引擎（DP，数据并行）部署的同步要求：别的引擎还有活、本引擎已空时，`has_unfinished_requests_dp` 把旗立起来（`llm_engine.py:L197-L203`），下一拍空跑一个 dummy 批让各引擎的 GPU 集合通信保持同拍、返回空列表。单引擎部署这行永不触发。除此之外引擎代码全同、五拍一支不少：没有 ZMQ、没有 input_queue/output_queue 这对交接队列、没有守护线程，用户每调一次 `step()` 就是一拍。这是「心脏与外壳分离」最干净的证据：本章拆的是心脏，外壳（进程、线程、队列）按需装配。
 
-第三种驱动就是开头说破的重叠版。它的演进有三步 git 证据：d4d309409（2025-07）实现异步调度，当时还是 opt-in 开关（要用户显式打开才生效）；c2ff33cc8（2025-12）把它翻转为默认——就是前面引过的「Enable async scheduling unless there is an incompatible option」；3e440786a（2026-01）打通异步与流水线并行，commit 标题自带数字：端到端吞吐 +30.8%、TPOT（每 token 生成时间）缩短 31.8%（标题原文『31.8% TPOT improvement』，improvement 指更快）。机制一句话：`max_concurrent_batches > 1` 时装上批队列（`core.py:L206-L212`）、`step_fn` 绑定 `step_with_batch_queue`：批 A 在 GPU 上跑的同时，CPU 同步调度批 B，填队列优先于取输出，CPU 调度时间从 GPU 执行时间**之后**挪到了**旁边**。④拍「发起与等待分离」的实测对照（上一节图 B 的右栏）就是它的收货侧一角。代价也真实：调度器状态领先真实进度（乐观推进），投机解码拒绝回扣、过期输出排空、延迟释放的栅栏、缺 token 的延迟采样分支，一连串补偿机制全是这笔账；本 pin 前三个月里就有三个此域的修复 PR。用状态机复杂度换 GPU 利用率，30% 级的吞吐是价签。拆解归 Part III 末章。
+第三种驱动就是开头说破的重叠版。它的演进有三步 git 证据：d4d309409（2025-07）实现异步调度，当时还是 opt-in 开关（要用户显式打开才生效）；c2ff33cc8（2025-12）把它翻转为默认——就是前面引过的「Enable async scheduling unless there is an incompatible option」；3e440786a（2026-01）打通异步与流水线并行，commit 标题自带数字：端到端吞吐 +30.8%、TPOT（每 token 生成时间）缩短 31.8%（标题原文『31.8% TPOT improvement』，improvement 指更快）。机制一句话：`max_concurrent_batches > 1` 时装上批队列（`core.py:L206-L212`）、`step_fn` 绑定 `step_with_batch_queue`：批 A 在 GPU 上跑的同时，CPU 同步调度批 B，填队列优先于取输出（循环骨架的走读见「第二拍与第四拍」一节），CPU 调度时间从 GPU 执行时间**之后**挪到了**旁边**。④拍「发起与等待分离」的实测对照（上一节图 B 的右栏）就是它的收货侧一角。代价也真实：调度器状态领先真实进度（乐观推进），投机解码拒绝回扣、过期输出排空、延迟释放的栅栏、缺 token 的延迟采样分支，一连串补偿机制全是这笔账；本 pin 前三个月里就有三个此域的修复 PR。用状态机复杂度换 GPU 利用率，30% 级的吞吐是价签。拆解归 Part III 末章。
 
 ## 总结：循环框点亮，账本列待开
 
