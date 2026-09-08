@@ -1,0 +1,288 @@
+{
+ "chapter_id": "ch23-model-layer-assembly",
+ "environment_note": "全部 trace 取自 host CPU 上的精简版（implementation/，只做减法、切头数学/分片算术/出口三步逐字保留）：① tp=2 的多 rank 视角由 HOST SEAM 的 dist._TP_STATE 旋钮承载（impl-notes §Seam 清单 2）——构造期切头数学与 weight_loader 分片算术是纯索引运算、不碰集合通信，tp=2 下跑的就是真实代码路径；② 集合通信（all_reduce/gather）在 world_size>1 时由 seam 显式 raise「须进容器」（ch34 领地），故 m5 的 TP gather 分支（logits_processor.py:L84-L96）只以 tp=1 恒等旁路形态经过，gather 语义（rank>0 返回 None）引源码注释不引运行值；③ 注意力数学由测试电池同款 RefAttentionImpl 注入（真实注入位 = attention.py:L251 的 attn_backend 参数，后端选择归 ch21；数学 = ch20 已立的精确注意力，双精度对照全链通过 tests 54 例——dossier-fix2 对齐修订后新增 fused-on-disk 装载段位、L5362/EPLB/aux 解包断言）。writer 引用数值时可当真实代码行为引用；涉及「真 GPU/多卡运行」的量级（kernel launch、通信字节数）请标 dossier/deepread 卡出处。",
+ "mechanisms": [
+  {
+   "mechanism_id": "m1",
+   "intuition": "乐高说明书：一层 DecoderLayer 就是四块标准件按固定图样串起来——两块 RMSNorm 垫片、一个注意力块、一个 MLP 块。与 HF 最大的不同是那根「残差总线」：HF 把它藏在局部变量里逐步加，vLLM 把它提升成穿出整层的一等公民接线——每半层在总线上「先加料再归一化」，而且加料和归一化合并成一次 kernel（RMSNorm(x, residual) 收二元组、回二元组）；首层总线从输入直接搭起（residual=None 特判）。",
+   "worked_example": null,
+   "figure_specs": [
+    {
+     "figure_id": "ch23-fig-decoder-layer",
+     "l0_zoom_answer": "L0 的 GPU 执行列（gpu_column）模型层框——L2 章图「⑥ DecoderLayer 穿针」拍片（站 8）的机制级放大：把该拍片里的一个盒子拆开画单层内部",
+     "claim": "一个 DecoderLayer 只装配四个积木（双 RMSNorm + LlamaAttention + LlamaMLP），residual 是穿出层的一等公民——RMSNorm(hidden, residual) 一次 kernel 同时完成加残差+归一化并返回 (hidden, residual) 二元组，首层 residual=None 特判起步",
+     "template": "layout",
+     "numbers": [
+      {"value": "4", "provenance": "vllm/model_executor/models/llama.py:L282-L308（四件套装配：self_attn + mlp + input_layernorm + post_attention_layernorm）"},
+      {"value": "2", "provenance": "vllm/model_executor/models/llama.py:L305-L307（双 RMSNorm 垫片）"},
+      {"value": "5", "provenance": "vllm/model_executor/models/llama.py:L221-L231（LlamaAttention.forward 五行）"},
+      {"value": "2", "provenance": "vllm/model_executor/models/llama.py:L310-L327（forward 返回二元组 (hidden_states, residual)）"},
+      {"value": "64", "provenance": "explainer/traces/m5.json params.hidden_size（本章示例模型的层宽）"},
+      {"value": "2", "provenance": "explainer/traces/m5.json params.num_layers（示例模型层数）"}
+     ],
+     "caption_draft": "单层剖面：左侧进线 (hidden_states, residual) 二元组——第一半层首层特判 residual=hidden（虚线标注「首层」），此后 RMSNorm(hidden, residual) 一次完成「加残差+归一化」吐出二元组（融合 add-norm，标 layernorm.py:L74-L95）；中间四件套按序摆放：input_layernorm → self_attn（内画 qkv_proj→rope→attn 插座→o_proj 五步缩略）→ post_attention_layernorm → mlp（gate_up→SiluAndMul→down）；右侧出线仍是 (hidden_states, residual)。对照框：HF modeling_llama 把 residual 藏在局部变量、四次单独操作——vLLM 把它画成贯穿总线。图右下角小字：残差继续穿到 LlamaModel.forward 的 norm 收尾与 PP 分段（IntermediateTensors 双字段）。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m2",
+   "intuition": "切蛋糕：8 块 Q 蛋糕（query 头）均分给 2 个人（rank）各 4 块；2 块 KV 小蛋糕人数不超就照切（partition），人数超过蛋糕数就每人复刻一份一模一样的（replicate）——GQA 的 KV 头少于 rank 数时，多张卡各装同一份 KV 权重。切完把 Q/K/V 三块拼成一个三明治（qkv_proj 融合权重），forward 一次 GEMM 吃完、再按刀口 split 回三份。",
+   "worked_example": {
+    "params": "hidden=64、head_dim=8（=64//8 派生）、8 query 头 / 2 KV 头（GQA）、tp=2；rank=1 视角（rank=0 对称）+ replicate 分支（8q/1kv）+ tp=1 退化基线 + 整除断言 + 实尺对照（head_dim=128/hidden=4096）",
+    "trace_source": "run",
+    "trace_ref": "traces/m2.json",
+    "table": {
+     "columns": [
+      "案例 / 分支",
+      "tp",
+      "num_heads/rank",
+      "num_kv_heads/rank",
+      "num_kv_head_replicas",
+      "q_size",
+      "kv_size",
+      "融合权重每 rank 三段 [q|k|v]（行×列）"
+     ],
+     "rows": [
+      ["A·partition：8q/2kv，tp=2，rank=1（2≥2 整除→切）", "2", "4", "1", "1", "32", "8", "[32|8|8]=48 行 ×64 列"],
+      ["B·replicate：8q/1kv，tp=2（2%1==0→复制）", "2", "4", "1", "2", "32", "8", "[32|8|8]=48 行 ×64 列（k/v 段两卡装同一段）"],
+      ["C·退化基线：4q/2kv、head_dim=16，tp=1", "1", "4", "2", "1", "64", "32", "[64|32|32]=128 行 ×64 列"],
+      ["D·整除断言：4q 头，tp=3", "3", "—构造即 AssertionError", "—", "—", "—", "—", "total_num_heads % tp 不整除，快速失败"],
+      ["E·实尺：8q/2kv，head_dim=128，tp=2，rank=1", "2", "4", "1", "1", "512", "128", "[512|128|128]=768 行 ×4096 列"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "三段 offset 线性递推（q 段从 0 起、k 段起点=q 段长、v 段起点=q+k 段长）保证融合权重每 rank 恰被 q/k/v 三段无重不漏铺满——案例 A 中 [0,32)+[32,40)+[40,48) 拼成 48 行整，且 forward 的 split([q_size,kv_size,kv_size]) 与装填段宽互为镜像",
+    "argument": "记 sq=num_heads×head_dim、sk=num_kv_heads×head_dim、sv=num_kv_heads×v_head_size。_get_shard_offset_mapping（linear.py:L1111-L1119）给出 offset(q)=0、offset(k)=sq、offset(v)=sq+sk——后段起点恒等于前段终点（线性递推），故 narrow(0, offset, size) 区间两两相邻不相交；total=sq+sk+sv 与 create_weights 的 sum(output_partition_sizes)（linear.py:L187-L207）是同一公式 → 并集恰为整张权重。基例：q 段从 0 起步铺 [0,sq)；归纳步：每追加一段，offset 严格增加 size>0（头数与 head_dim 皆正整数），区间保持不交；段数固定为 3，递推有限步终止。切头整除性由 divide()（distributed/utils.py：不整除即 ValueError）与 llama.py:L141 的 assert 双保险，在构造期快速失败而非装载期静默错位。"
+   },
+   "quantified": "构造期每层一次的纯标量算术：5 个派生量（num_heads、num_kv_heads、q_size、kv_size、scaling）+ 2 条整除断言。权重账（trace 案例 A）：每 rank 融合权重 48×64=3072 元素，恰为全局 96 行（64+16+16）之半——tp=2 下每卡只存一半注意力投影权重。实尺放大（trace 案例 E，head_dim=128/hidden=4096）：每 rank 融合权重 768×4096，fp16 恰 6291456 B（6 MB）；若 1-KV-头（replicas=2）则两张卡各再背一份相同的 k/v 段——复制的显存代价直接可见。",
+   "figure_specs": [
+    {
+     "figure_id": "ch23-fig-tp-head-split",
+     "l0_zoom_answer": "L0 的 GPU 执行列（gpu_column）模型层框——L2 章图「③ 拼装积木」拍片（站 4）内 LlamaAttention 的放大 + south 区「权重装载三型 · 分片算术」格的机制级放大",
+     "claim": "8q/2kv/tp=2 时全局 qkv 权重 [64|16|16] 行被切成两半：q 段按 tp_rank 切（rank1 取 [64,128)），k/v 段按 tp_rank//replicas 切（replicas=1 时同样取下半 [16,32)），每 rank 拼成 [32|8|8]=48 行的融合权重",
+     "template": "tiling",
+     "numbers": [
+      {"value": "8", "provenance": "explainer/traces/m2.json case_A_partition_8q_2kv_tp2.rank1.total_num_heads"},
+      {"value": "2", "provenance": "explainer/traces/m2.json case_A_partition_8q_2kv_tp2.rank1.total_num_kv_heads"},
+      {"value": "64", "provenance": "explainer/traces/m2.json case_A_partition_8q_2kv_tp2.rank1.global_q_rows（全局 q 段行数）"},
+      {"value": "16", "provenance": "explainer/traces/m2.json case_A_partition_8q_2kv_tp2.rank1.global_kv_rows_each（全局 k/v 段各自行数）"},
+      {"value": "32", "provenance": "explainer/traces/m2.json case_A_partition_8q_2kv_tp2.rank1.q_size（每 rank q 段行数）"},
+      {"value": "8", "provenance": "explainer/traces/m2.json case_A_partition_8q_2kv_tp2.rank1.kv_size（每 rank k/v 段行数）"},
+      {"value": "48", "provenance": "explainer/traces/m2.json case_A_partition_8q_2kv_tp2.rank1.qkv_weight_shape_per_rank[0]（融合权重行数）"},
+      {"value": "2", "provenance": "explainer/traces/m2.json case_B_replicate_8q_1kv_tp2.num_kv_head_replicas_meaning（replicas=2：同一段 k 权重复制进 2 个 rank）"},
+      {"value": "768", "provenance": "explainer/traces/m2.json case_E_real_scale_8q_2kv_head128_hidden4096_tp2_rank1.fused_weight_shape_per_rank[0]（实尺每 rank 融合行数）"}
+     ],
+     "caption_draft": "tiling 图三行：上行全局权重（一条 64 行的 q 长条 + 16 行 k + 16 行 v，各自中线切开）；中行 rank0 拿三段的上半（q[0:32)、k[0:8)、v[0:8)）、rank1 拿下半（q[32:64)、k[8:16)、v[8:16)）——q 的刀口与 k/v 的刀口独立，因为 shard_rank 公式不同（q=tp_rank、k/v=tp_rank//replicas）；下行两 rank 各自拼成 [32|8|8]=48 行融合权重（三段染色对应上行来源）。右下角 replicate 小图：8q/1kv 时 replicas=2，rank0/rank1 的 k 段都指向全局 k[0:16)——同一块被复制进两卡（GQA KV 头复制的装载语义）。实尺注脚：head_dim=128 时同一图形变成 [512|128|128]=768 行 ×4096 列、fp16 6 MB/rank。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m3",
+   "intuition": "电器插座：模型只管把插头（q/k/v 三根线）插进墙上标准插座（Attention 层），电压电流（attn_metadata/kv_cache/slot_mapping）由大楼配电系统（runner 的 set_forward_context）提前送到墙内线路（thread-local ForwardContext）——插头形状里根本没有这三根线，同一台设备换一栋楼（换注意力后端）照常工作，楼里的电路改造（ch21 后端选择）设备完全无感。",
+   "worked_example": null,
+   "figure_specs": [
+    {
+     "figure_id": "ch23-fig-attention-socket",
+     "l0_zoom_answer": "L0 的 GPU 执行列（gpu_column）模型层框——L2 章图「⑦ Attention 插座」拍片（站 9/10）的机制级放大：把拍片里的插座盒子剖开画上下文取线",
+     "claim": "Attention 是插座不是实现：LlamaAttention.forward 五行签名里没有 attn_metadata/kv_cache/slot_mapping——三个上下文件按 layer_name 从 ForwardContext 取（get_attention_context 返回四元组），KV 写算子返回空张量 dummy 给 torch.compile 造数据依赖保「先写后读」顺序",
+     "template": "flow",
+     "numbers": [
+      {"value": "5", "provenance": "vllm/model_executor/models/llama.py:L221-L231（forward 五行：qkv_proj→split→rotary_emb→attn→o_proj）"},
+      {"value": "3", "provenance": "vllm/model_executor/layers/attention/attention.py:L732-L772（get_attention_context 取三件上下文：attn_metadata / kv_cache / slot_mapping）"},
+      {"value": "4", "provenance": "vllm/model_executor/layers/attention/attention.py:L732-L746（返回四元组：attn_metadata、attn_layer、kv_cache、layer_slot_mapping）"},
+      {"value": "2", "provenance": "vllm/model_executor/layers/attention/attention.py:L775-L798 + L819-L846（两个自定义算子：unified_kv_cache_update 写、unified_attention_with_output 读）"},
+      {"value": "0", "provenance": "vllm/model_executor/layers/attention/attention.py:L798（return key.new_empty(0)——空张量 dummy，docstring 明言 for torch.compile data dependency）"},
+      {"value": "0", "provenance": "vllm/model_executor/layers/attention/attention.py:L759-L762（spec decode 时 attn_metadata 是 list[dict]、[0] 为 base 模型）取 list 下标 0"}
+     ],
+     "caption_draft": "上下两层 flow：上层模型侧（灰）——LlamaAttention.forward 五行依次 qkv_proj→split→rotary_emb→attn(q,k,v)→o_proj，attn 的入参列表里刻意画空三个虚线插孔（attn_metadata/kv_cache/slot_mapping 均不在签名）；下层插座内部（绿）——Attention.forward 把 q/k/v view 重排后先调 unified_kv_cache_update（写 KV 进 cache、返回 new_empty(0) 空张量，虚线箭头标「dummy 数据依赖：让 torch.compile 不许把写挪到读后面」）再调 unified_attention_with_output（读算）；两个算子都经 get_attention_context(layer_name) 从左侧 ForwardContext 竖井里取四元组——竖井由 runner 的 set_forward_context 在进模型前挂好（站 6），spec decode 时 attn_metadata 是 list[dict] 取 [0]。右下角标注：impl.forward 由 ch21 优先级表选定的后端实现——模型层与后端选择解耦（Part VI hook 的源码实证）。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m4",
+   "intuition": "总装线只交半成品：forward 是总装车间，交付的是 hidden_states 这台「无屏主机」；13 万种配置的「显示器」（lm_head 物化 logits）由出货口（runner）按订单（采样位清单）另行加装——不是给每台主机都配齐显示器再拆掉。流水线分段的厂区（PP 非末 rank）交的是更彻底的散件包（IntermediateTensors）。",
+   "worked_example": null,
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m5",
+   "intuition": "考试只批最后一题：整张卷子（批内全部 token 的前向）每一道题都要算，但判分（物化 logits）只看每人最后一道题——每请求只取本拍最后一个已算 token 的那一行。「哪些题要判」这件事写在监考守则（runner）里而不是考生手册（模型）里：模型只提供 compute_logits 这个「判分能力」，普通批、spec decode、pooling 各有各的判分位策略。",
+   "worked_example": {
+    "params": "示例模型 vocab=100（pad 到 128）、hidden=64、2 层、4q/2kv；一拍批 = 8 token 两请求：r0 完整 prompt 5 token（positions 0..4）、r1 chunked prefill 部分请求本拍排进 3/5 token（positions 0..2）；seed=0/3 确定性权重与输入；经 GPUModelRunner.execute_model 全链（set_forward_context → forward → 采样位切片 → compute_logits）",
+    "trace_source": "run",
+    "trace_ref": "traces/m5.json",
+    "table": {
+     "columns": [
+      "阶段",
+      "动作 / 公式",
+      "形状或值",
+      "说明"
+     ],
+     "rows": [
+      ["批构成", "两请求拼批（query_start_loc 前缀和）", "[0,5,8]", "r0 占 5 token、r1 本拍排进 3 token（部分请求）"],
+      ["前向（契约方法一）", "model(input_ids, positions)", "hidden_states=[8,64]", "全 8 个位置都算；返回 hidden 不是 logits"],
+      ["采样位策略（归 runner）", "logits_indices = query_start_loc[1:] - 1", "[4,7]", "r0 取第 4 行、r1 取第 7 行——部分请求也采、结果被忽略（woosuk NOTE）"],
+      ["切片", "sample_hidden_states=hidden_states[logits_indices]", "[2,64]", "8 行压到 2 行"],
+      ["compute_logits（契约方法二）", "h @ lm_head.weight.T", "[2,128]", "lm_head 权重已 pad 到 64 倍数=128"],
+      ["TP gather 分支", "lm_head.tp_size>1 才 gather", "tp=1 不进", "单卡旁路；多 rank 时 gather 语义 rank>0 返回 None"],
+      ["裁词表 padding", "logits[..., :100]", "[2,100]", "128 裁回 org_vocab=100"],
+      ["交付采样", "argmax 取下一 token", "r0→75", "r1 同样出了一行 logits（argmax=27），但属部分请求、被丢弃"],
+      ["反事实：HF 式全位置物化", "全 8 行都过 lm_head", "1024 值（org 口径 800）", "采样位口径只 200 值——4 倍差距，vocab 越大差距不变地等比放大"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "query_start_loc 是批内请求前缀和（首项 0、严格递增），logits_indices=qsl[1:]-1 对每请求恰取一个落在该请求自己批内区间的行号，物化行数恰等于请求数——本例 8 个前向行压成 2 个采样行，无一请求落空、无一请求多采",
+    "argument": "前缀和性质：qsl[0]=0 且每个进批请求本拍至少排 1 个 token（调度器不排空请求）→ qsl 严格递增 → 区间 [qsl[r], qsl[r+1]) 非空，故采样位 qsl[r+1]-1 满足 qsl[r] ≤ qsl[r+1]-1 < qsl[r+1]，恰在本请求区间内且取到区间最后一行；索引个数 = len(qsl)-1 = 请求数。单调量：按序处理第 r 个请求，已产出采样行数严格 +1，经 num_reqs 步终止——不存在某请求被跳过或被采两次的分支。chunked prefill 的部分请求同样满足区间性质（它也占了非空区间），被采出的行随后在调度侧被忽略——正确性不靠「不采」而靠「采了丢弃」（woosuk NOTE 的工程取舍）。"
+   },
+   "quantified": "本例（8 token/2 请求/vocab 100）：采样位口径物化 200 个 logit 值 vs HF 式全位置 org 口径 800 个——4 倍节省（trace counterfactual 段）；实尺放大（dossier theory/WC1 pain 同一副算术）：DeepSeek vocab 129280、fp32 4B/token 值——4096-token prefill chunk 全位置物化 4096×129280×4B≈2.0 GB 纯浪费，采样位口径每请求仅 129280×4B≈0.5 MB；TP 下全位置物化还把 lm_head 词表分片的 gather 通信同倍放大（gather 语义见 logits_processor.py:L84-L96，本 trace 以 tp=1 旁路经过、语义引源码注释）。出口三步的算术账：一次 GEMM [2,64]×[64,128] + 一次切片裁剪 [2,128]→[2,100]，无第二遍全词表遍历。",
+   "figure_specs": [
+    {
+     "figure_id": "ch23-fig-sampling-position-export",
+     "l0_zoom_answer": "L0 的 GPU 执行列（gpu_column）模型层框——L2 章图「⑧ compute_logits」拍片（站 11/12）的机制级放大：出口张量流的形状演变",
+     "claim": "8-token 批（r0=5 全 + r1=3 部分请求）只在 2 个采样位物化 logits：hidden_states [8,64] 经 logits_indices=[4,7] 切成 [2,64]，lm_head GEMM 到 [2,128]（pad 后词表），裁 padding 成 [2,100] 交付",
+     "template": "tensor-flow",
+     "numbers": [
+      {"value": "8", "provenance": "explainer/traces/m5.json params.total_tokens"},
+      {"value": "64", "provenance": "explainer/traces/m5.json params.hidden_size"},
+      {"value": "5", "provenance": "explainer/traces/m5.json params.req0_tokens_scheduled"},
+      {"value": "3", "provenance": "explainer/traces/m5.json params.req1_tokens_scheduled（chunked prefill 部分请求）"},
+      {"value": "[0,5,8]", "provenance": "explainer/traces/m5.json runner_policy.query_start_loc"},
+      {"value": "[4,7]", "provenance": "explainer/traces/m5.json runner_policy.logits_indices"},
+      {"value": "2", "provenance": "explainer/traces/m5.json params.num_requests（采样位数=请求数）"},
+      {"value": "128", "provenance": "explainer/traces/m5.json export.lm_head_weight_shape_padded[0]（词表 pad 到 64 倍数）"},
+      {"value": "100", "provenance": "explainer/traces/m5.json params.vocab_size_org（org_vocab 裁剪边界）"},
+      {"value": "1024", "provenance": "explainer/traces/m5.json counterfactual_full_materialization.values_all_positions_padded（HF 式反事实）"},
+      {"value": "200", "provenance": "explainer/traces/m5.json counterfactual_full_materialization.values_sampled_org_vocab"},
+      {"value": "75", "provenance": "explainer/traces/m5.json outcome.next_token_req0（argmax 交付的下一 token id）"}
+     ],
+     "caption_draft": "tensor-flow 左→右四站：① 前向产物 hidden_states [8,64]（8 行全画、每请求一色：r0 五行一色、r1 三行另一色）；② 采样位切片 logits_indices=[4,7]（两根虚线只勾第 4、7 行）得 [2,64]——公式 query_start_loc[1:]-1 标在刀口上，r1 是部分请求也照采、结果被忽略（woosuk NOTE 小字）；③ lm_head GEMM 得 [2,128]（词表 pad 到 64 倍数的 128 列，尾部 28 列打灰）；④ 裁 padding [:, :100] 得交付 logits [2,100] → argmax 出下一 token（r0→75）。图底反事实条带：HF 式全位置物化 [8,128]=1024 值 vs 采样位 200 值——4 倍，并注实尺算术 4096×129280×4B≈2.0 GB（dossier WC1）。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m6",
+   "intuition": "快递转运中心：checkpoint 的包裹上贴的是旧地址（HF 名 q_proj/k_proj/v_proj/gate_proj/up_proj），转运系统（WeightsMapper）按改址单（五条 orig_to_new_stacked 映射）换成新地址并盖分拣标签（shard_id 'q'/'k'/'v'/0/1），分拣员（AutoWeightsLoader）递归按楼层分拣，遇到有自己分拣室的楼层（LlamaModel 自带 load_weights）就整批转交——主分拣中心（ForCausalLM）只特批一种件：权重共享件（tie 时 lm_head 的包裹直接免运 skip_prefixes）。",
+   "worked_example": null,
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m7",
+   "intuition": "拼图的三种拆法：QKV 是三幅画各按自家刀口剪一半（q 按人头切、k/v 按 KV 头数切——人多吃同一份就复制），再上下拼进一块板；gate_up 是两幅画各取半幅左右拼接；Row 干脆横着切条（input 维行切）——每卡拿自己那几条，算完再合拢（all_reduce），bias 只许台面 0 号加一次。",
+   "worked_example": {
+    "params": "三型同台：QKV partition（8q/2kv、head=16、hidden=64、tp=2、rank=1）+ QKV replicate（8q/1kv → replicas=2）+ Merged（gate_up output_sizes=[32,32]、tp=2、rank=1）+ Row（o_proj 形 [32,64]、tp=2、rank=1）；全局权重每行/列预埋自身编号（q 行号、k=1000+行号、v=2000+行号、gate=1+行号、up=2+行号、Row 填列号），装载后逐元素比对验证落段",
+    "trace_source": "run",
+    "trace_ref": "traces/m7.json",
+    "table": {
+     "columns": [
+      "装载型 / 案例 rank=1",
+      "shard_id",
+      "shard_offset（段起点）",
+      "shard_size",
+      "shard_rank 公式",
+      "start_idx",
+      "取全局区间",
+      "落进融合权重",
+      "校验"
+     ],
+     "rows": [
+      ["QKV·partition（8q/2kv，tp=2）", "q", "0", "64", "tp_rank=1", "64", "q_global[64:128)", "w[0:64)", "逐元素相等"],
+      ["QKV·partition", "k", "64", "16", "tp_rank//replicas=1//1=1", "16", "k_global[16:32)", "w[64:80)", "逐元素相等"],
+      ["QKV·partition", "v", "80", "16", "tp_rank//replicas=1//1=1", "16", "v_global[16:32)", "w[80:96)", "逐元素相等"],
+      ["QKV·replicate（8q/1kv，replicas=2）", "k", "64", "16", "tp_rank//replicas=1//2=0", "0", "k_global[0:16)（rank0 同段）", "w[64:80)", "相等——同一段复制进两卡"],
+      ["Merged·gate_up（output_sizes=[32,32]）", "gate（id=0）", "0", "16", "tp_rank=1", "16", "gate[16:32)", "w[0:16)", "逐元素相等"],
+      ["Merged·gate_up", "up（id=1）", "16", "16", "tp_rank=1", "16", "up[16:32)", "w[16:32)", "逐元素相等"],
+      ["Row·o_proj（权重[32,64]，沿 input 维切）", "—（不分段）", "—", "32（本秩 input 列）", "tp_rank=1", "32", "全局第[32:64)列", "整张 w", "相等（bias 只 rank0 加、tp>1 时 all_reduce）"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "三型 loader 的 narrow 区间在固定 tp_size 下遍历全部 rank 无重不漏盖住全局权重（replicate 分支例外且是设计使然——replicas 个相邻 rank 故意取同一段）；融合段内三/二段 offset 递推铺满本 rank 权重",
+    "argument": "统一骨架 start_idx = shard_rank × shard_size，且 shard_size = 全局段长 // tp_size（divide 保证整除、不整除构造期即 ValueError）→ partition/Merged/Row 三型中 shard_rank = tp_rank（或段序基址 + tp_rank·size），区间 [r·s,(r+1)·s) 相邻不相交，并集恰 [0, tp·s) = 全局段——基例 r=0 铺 [0,s)；归纳步 r 每增 1 区间右移恰好 s，有限 tp 步铺满。QKV 的 k/v 段把 shard_rank 换成 tp_rank//num_kv_head_replicas：replicas 个连续 rank 映到同一 shard_rank → 同一段被复制 replicas 份，这不是覆盖漏洞而是 GQA 装载语义（每 rank 的 q 头组需要对齐一份完整 KV 头权重；num_kv_heads= max(1,·) 保证至少一份）。Row 型把同一算术的维度从 output_dim（行）换到 input_dim（列），计算侧对偶是 forward 后 all_reduce + bias 只 rank0 加——行切的每份是部分和，必须归约。"
+   },
+   "quantified": "装完一个 DecoderLayer 的四个并行线性层共 7 次 weight_loader 调用：qkv_proj 3 次（q/k/v 各一，每次 2 回 narrow——先切参数段再切全局段）+ gate_up_proj 2 次 + o_proj 1 次 + down_proj 1 次（后两个都是 Row 型单次行切）。本例每 rank qkv 融合权重 96 行= q64+k16+v16（全局 192 行之半）；replicate 例（8q/1kv）中 k 段 16 行被两个 rank 各装一份——复制的装载代价=多卡冗余存 16×64 元素/层。量级感：实尺 Llama 每层 qkv 装载即 3 次调用搬 (8·128+2·128+2·128)×hidden 行（trace 案例 E 同参数），全部为窄拷贝、零通信。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m8",
+   "intuition": "酒店前台查房卡：报架构名（hf_config.architectures 字符串）→ 前台翻登记册（registry 条目表）拿房号（模块名+类名）——但真正领你上房的导游（importlib）只在你说「现在要进房」那一刻才出发。登记册上几百个名字今晚只出动一个导游：条目表本身全是字符串对，一行源码都没 import。",
+   "worked_example": null,
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m9",
+   "intuition": "品牌旗舰的独栋门面：老商业街（model_executor/models/ 扁平目录）每家店什么平台都卖、柜台越堆越长；新开发区（vllm/models/<name>/）给旗舰品牌独栋楼，一层一个平台专柜（nvidia/amd/xpu 子包），大门口（__init__.py）听你口音（current_platform）直接引到对应专柜。老街的店照常营业（DSV3.2 仍在扁平 deepseek_v2.py）——两条街门牌系统都认：老街条目写相对名、前台自动补街名前缀；新街条目写全地址、前台原样放行。",
+   "worked_example": null,
+   "figure_specs": [
+    {
+     "figure_id": "ch23-fig-two-layouts",
+     "l0_zoom_answer": "L0 的 GPU 执行列（gpu_column）模型层框——L2 章图 south 区「新布局 vllm/models/<name>/（硬件隔离）」格 + 「① registry 解析」拍片（站 1）的机制级放大",
+     "claim": "同一张 registry 表里两代布局并存：DeepseekV32 走扁平相对名（'deepseek_v2' → 前台拼 vllm.model_executor.models. 前缀）、DeepseekV4 走 vllm. 开头全限定路径（vllm.models.deepseek_v4，_resolve_module_name 原样放行），新布局 __init__.py 按 current_platform 三分发 nvidia/amd/xpu 子包",
+     "template": "before-after",
+     "numbers": [
+      {"value": "2", "provenance": "vllm/model_executor/models/registry.py:L92-L95（同一张表两代布局并存：L92-L94 扁平 vs L95 全限定）"},
+      {"value": "3", "provenance": "vllm/models/deepseek_v4/__init__.py:L17-L32（is_rocm/is_xpu/else 三分支平台分发）"},
+      {"value": "3", "provenance": "vllm/model_executor/models/registry.py:L617+L643（同款全限定条目：DSparkDraftModel、DeepSeekV4MTPModel）"},
+      {"value": "1", "provenance": "vllm/model_executor/models/registry.py:L1017-L1019（load_model_cls 三行：importlib.import_module → getattr——import 推迟到实例化一刻）"}
+     ],
+     "caption_draft": "左右对照：左「旧扁平布局」——model_executor/models/ 一层的 deepseek_v2.py 一个文件塞 DSV2/V3/V3.2 全部平台分支（registry 条目 ('deepseek_v2','DeepseekV3ForCausalLM')，前台自动补 vllm.model_executor.models. 前缀）；右「新硬件隔离布局」——vllm/models/deepseek_v4/ 独栋目录树：__init__.py 门口三分支（is_rocm→amd/、is_xpu→xpu/、else→nvidia/），各专柜再导出 ForCausalLM/MTP/DSpark 三类（条目 ('vllm.models.deepseek_v4','DeepseekV4ForCausalLM') 全限定原样放行，注释原话 hardware-isolated）。中间竖条画两条查表路径汇入同一 _resolve_module_name 判定（vllm. 开头？）。底部注：两条街并存是迁移进行时（'[1/N]'），读者要能分辨；DSV4 接入清单六件套归 ch28 capstone。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m10",
+   "intuition": "装修四步曲：先定基调（set_default_torch_dtype + target_device 上下文，保证毛坯件出厂即对 dtype/设备）→ 搭毛坯（initialize_model 建空壳，参数全未初始化）→ 流式进家具（load_weights 逐个 (name,tensor) 搬入，怎么摆由模型自己声明）→ 竣工验收（process_weights_after_loading 两轮重打包 + eval() 冻结）——一次装修住到引擎退休，运行期每拍不再动一颗钉子。",
+   "worked_example": null,
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m11",
+   "intuition": "新员工自助入职：每个 Attention 插座出生时（__init__ 尾部三行）自己往公司花名册（compilation_config.static_forward_context）登记「我叫 model.layers.0.self_attn.attn，值日的是我」——重名当场拒收（Duplicate layer name raise）。此后编译系统（ch19）与运行期上下文（ForwardContext.no_compile_layers 即这本花名册的快照）都按册找人，模型代码不必再自报家门。",
+   "worked_example": null,
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m12",
+   "intuition": "共享出口的复印店：词表按人头均分（TP 分片），各家只复印自己那段；lm_head 是 embedding 的反向业务（ParallelLMHead 就是 VocabParallelEmbedding 的子类，同一套分区账）；tie 模型干脆两块招牌一台机器（lm_head.tie_weights 复用 embed_tokens 的同一份权重，装载时 skip_prefixes 免单）；零头凑整（词表 pad 到 64 倍数）是为了刀口切得整齐，交货时再把零头裁掉（LogitsProcessor 的 [:, :org_vocab_size]）。",
+   "worked_example": null,
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m13",
+   "intuition": "出口柜台的三张新面孔：柜台本身可外包（@PluggableLayer.register 注册点——OOT 平台后门，另一处在 mla.py）；小票精度可选（head_dtype fp32 供 RL 训推对账，默认随模型 dtype）；大客户（spec decode 的 draft 模型）可以不打整份价目表、只问最贵的几样（get_top_tokens 词表并行局部 argmax 归约，通信 O(batch×2×tp) 对 O(batch×vocab)）——领地归 ch33，本章只认脸。",
+   "worked_example": null,
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m14",
+   "intuition": "剧场占座：流水线分工（PP）下不属于本舞台的幕次也用「本幕缺席」的牌子（PPMissingLayer，Identity 子类）占住座位号——座位编号（model.layers.31.… 这个参数名）在任何分工方案下都不变，道具组（权重加载）照座位号放东西，换场（改 PP 切法）不会搞乱任何一件道具的去处；牌位本身不上台（islice 只迭代本 rank 的真层）。",
+   "worked_example": null,
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m15",
+   "intuition": "一套底盘多种车身：同一副 Llama 骨架，出厂配生成驾驶舱（ForCausalLM），改装厂能给它换池化测量车（as_embedding_model）或分类跑车（as_seq_cls_model）——底盘积木一个不动，只换出口的头；连注意力也能换向（is_causal=False → ENCODER_ONLY 双向注意力分流）。",
+   "worked_example": null,
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m16",
+   "intuition": "预埋的膨胀螺栓：骨架浇注时就在每层预留了挂点（EagleModelMixin._maybe_add_hidden_state 采集逐层 hidden 的钩子）和身份铭牌（bases 上 SupportsEagle/Eagle3/LocalArgmaxMixin 标记，供 hasattr 探测）——平时空着不影响结构，ch32/33 装 EAGLE 投机解码时直接挂上去，不用砸墙。",
+   "worked_example": null,
+   "figure_specs": []
+  }
+ ],
+ "notes_for_writer": {
+  "trace_files": {
+   "m2": "TP 切头数学四案例（partition/replicate/tp1 基线/tp3 断言）+ 实尺账（head_dim=128 → 每 rank [512|128|128]=768 行、fp16 6 MB）",
+   "m5": "采样位出口全链（runner.execute_model 真跑）：qsl=[0,5,8] → logits_indices=[4,7] → [2,100] logits 交付 + HF 式全位置反事实（1024 vs 200 值）+ 手写 GEMM 对照（偏差 4.05e-06）",
+   "m7": "三型 weight_loader 落段逐元素验证（partition q/k/v + replicate 复制 + Merged gate/up + Row 行切），全部 verify=true"
+  },
+  "tests_as_material": "无 worked example 的机制若需数字，测试电池 tests/test_model_layer_assembly.py（54 例，dossier-fix2 修订后全绿）可直接引：m3 的签名无 metadata 断言（TestAttentionSocket::test_forward_signature_has_no_metadata）与 spec decode list[dict] 取 [0]（test_get_attention_context_spec_decode_list）；m11 的重复 layer_name raise 与 bind_kv_cache 占位替换（test_self_registration_into_static_forward_context）；m10 的 eval() 与四段编排次序（test_base_loader_load_model_orchestration）；m14 的 PP 哨兵占名（test_make_layers_pp_sentinel：4 层 pp=2 rank=1 → [0,2) 哨兵 [2,4) 真层、名字仍 0..3）；m12 的 pad 100→128 与 tie 共享权重（test_load_weights_end_to_end / test_load_weights_tied）；m6 的五条映射与 shard_id 盖章（TestWeightMapping）；m8 的新旧条目解析（TestRegistry）。引用时注明出处为测试电池。",
+  "coverage_map": "dossier 16 机制全部有条目：m2/m5/m7 全套（直觉/数值推演/不变量/量化）+ m1/m2/m3/m5/m9 五个 figure-spec；其余机制给直觉与锚点（正文叙事素材），数字需求按上一条从测试电池或源码常量取。",
+  "figure_l0_discipline": "五张 figure-spec 全部登记了 l0_zoom_answer（它是 L0 模型层框哪一块的放大 + 对应 L2 章图哪一格/拍片），illustrator 渲染时须把「L0 位置」画进图注第一要素；机制图用 svg-diagram skill v2 画，配色守 l0_common 角色色（模型层积木=C_GPU_S 绿系、engine 侧=橙、采样出口=C_SAMPLE），不得另立画法。",
+  "environment_caveats": "① m5 的 TP gather 分支与 m7 的 all_reduce/bias-rank0 语义：host 单卡 seam 下未真跑多 rank，正文引「rank>0 返回 None」「bias 只 rank0 加」时锚源码（logits_processor.py:L84-L96 / linear.py:L1748-L1774）不锚本 trace；② RefAttentionImpl 是测试注入件（真实注入位 attention.py:L251 attn_backend 参数），正文叙述时按「参考后端」口径；③ tp=2 的切头/装载算术是真实代码路径（纯索引运算无通信），可放心当真源码行为引用。",
+  "wc_anchors": "两条 why 主线的现核锚点（dossier why_chains 已逐行核验）：WC1 forward/compute_logits 拆分——llama.py:L516-L526/L528-L533、gpu_model_runner.py:L2239/L2242-L2262/L4484-L4485、logits_processor.py:L137-L153；WC2 纯拼装+新布局——llama.py:L248-L331/L345-L354、attention.py:L488-L582/L732-L772、registry.py:L92-L95/L1439-L1445（_resolve_module_name 行号以校正后为准）、deepseek_v4/__init__.py:L17-L32。"
+ }
+}
