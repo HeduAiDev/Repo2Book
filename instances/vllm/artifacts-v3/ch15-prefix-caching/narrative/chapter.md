@@ -14,9 +14,31 @@ Part IV 的总问题一句不变：**显存就那么多，KV cache 必须活到�
 
 > *图注：本章放大的是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 图「调度 · 显存账本」列 KV 半区的缓存面。[第 13 章](../../ch13-paged-kv/narrative/chapter.md)打开过这半区的块池与块表、[第 14 章](../../ch14-memory-ledger/narrative/chapter.md)打开过它上面的定账与门，本章打开的是同一块池之上那层前缀哈希账本（全部机制都是纯 CPU 元数据；只有 CoW（copy-on-write，写时复制，进阶一开课）拷贝对过线后 worker 才动手）。图上三段读：北行是请求侧与存储面（哈希在请求上增量算、平面哈希表、粒度分离）；中排 ①-⑦ 是命中主循环（查 → 链上走 → 多组不动点 → touch 挂块 → CoW 换尾 → 写回 → 拷贝过线）；南行是留与逐（抢占打回但哈希保留、逆序 free 加劈分、惰性驱逐），加三条 why 注（非 radix、两个不变量、驱逐为什么是惰性的）与邻章分界。站号 1-12 = 一个前缀的一生流经代码的顺序（1-2 算哈希 · 3-5 查 · 6-9 挂/写/拷 · 10-12 留与逐），正文按讲解需要编排、不必照站号读。*
 
-读法建议：想知道「哈希凭什么能当指纹用」，从[「指纹」](#指纹把整条前缀压进一枚哈希站-1-2)读起；关心「为什么没有 radix 树」，看[「先澄清：radix 是隔壁的路」](#先澄清radix-是隔壁的路)（「指纹」节开头；「表」那节的图里亦有摘要）；想知道被抢占的请求怎么「重算变重载」，直奔[「留与逐」](#留与逐藏在注释里的两个不变量站-10-12)与[「收口」](#收口被打回的请求回来先查表站-10-12-的回环)；用混合模型（Gemma、gpt-oss、Jamba 这类）的读者重点看进阶三幕；想跟全程，按序读。
+读法建议：想知道四道工序在一次调度里各自在哪被谁调用，先读下一节[「一拍调度」](#一拍调度四道工序谁调用谁)；想知道「哈希凭什么能当指纹用」，从[「指纹」](#指纹把整条前缀压进一枚哈希站-1-2)读起；关心「为什么没有 radix 树」，看[「先澄清：radix 是隔壁的路」](#先澄清radix-是隔壁的路)（「指纹」节开头；「表」那节的图里亦有摘要）；想知道被抢占的请求怎么「重算变重载」，直奔[「留与逐」](#留与逐藏在注释里的两个不变量站-10-12)与[「收口」](#收口被打回的请求回来先查表站-10-12-的回环)；用混合模型（Gemma、gpt-oss、Jamba 这类）的读者重点看进阶三幕；想跟全程，按序读。
 
 照例交代取证环境，全章数值表都适用：本章实测来自配套精简版：按 v0.27.1 只做减法抽出的「哈希+命中+驱逐+CoW+混合」全链，host 上实跑纯控制流，不依赖 GPU 与 vLLM 运行时，且本章跑的是 `enable_prefix_caching=True` 支（真实部署的默认值，vllm/config/cache.py:L93）。全部驱动以 `PYTHONHASHSEED=0` 播种（不播种时首块种子是 32 个随机字节，播种后是确定值，细节马上讲到），表里所有哈希字节都对这粒种子负责。两处取证口径与真实引擎有刻意差别，后文碰到会就近再提：其一，mamba 组的边界状态条目在驱动里用与 full 组同一个注册原语登记（真实代码里由 MambaManager 重写的入口内部调同一个原语，差分测试已证明两者逐字节一致）；其二，混合不动点一节的 finder 调用计数用只观察不改行为的包装器记录。
+
+## 一拍调度：四道工序谁调用谁
+
+往下读之前先摆一张全景。本章后文每一节都只放大机制的一个切面，最容易迷路的问题是：算、查、挂、写这四道工序，各自在哪儿、被谁调用？用一拍的实测调用记录把位置定住。场景还是本章反复用的那对请求：A 64 token 已跑完并释放、前缀留表（哈希表 4 条），B 80 token、前 32 个与 A 相同，这一拍被调度。用开篇取证环境交代过的「只观察不改行为」包装器，录下 B 这一拍共 17 个调用事件，关键几步如下（行号均为本章取证的 v0.27.1 源码）：
+
+<!-- trace: m21 -->
+| 工序 | 谁调用谁 | 这一拍的账 | 锚点 |
+|---|---|---|---|
+| 算（入场前） | Request 构造 → update_block_hashes → 哈希闭包 → hash_block_tokens | B 构造即算 5 个满块哈希（80 token）；A 当年构造时算 4 个 | request.py:L208-L209 |
+| 查（准入步） | 调度循环 waiting 准入 → KVCacheManager.get_computed_blocks → 协调器 find_longest_cache_hit（单组是转发段 L486-L504，多组的调和形态进阶二嵌）→ 管家 → BlockPool.get_cached_block | 3 次查表：hash0 命中（块 1）、hash1 命中（块 2）、hash2 miss 即断；hit=32、预算 79 | scheduler.py:L744-L766 → kv_cache_manager.py:L229-L295 → kv_cache_coordinator.py:L486-L504 → single_type_kv_cache_manager.py:L682-L739 → block_pool.py:L198-L217 |
+| 挂 | allocate_slots → coordinator.allocate_new_computed_blocks → 管家.add_local_computed_blocks → BlockPool.touch | 命中块 1、2 ref_cnt 0→1、O(1) 摘出自由队列 | kv_cache_manager.py:L535-L540 → single_type_kv_cache_manager.py:L232-L289 → block_pool.py:L702-L717 |
+| 写·新块 | allocate_slots → coordinator.allocate_new_blocks → 管家.allocate_new_blocks → BlockPool.get_new_blocks | 80−32=48 token 需槽 → 3 个新块（5、6、7），从队头拿、惰性摘哈希 | kv_cache_manager.py:L542-L547 → single_type_kv_cache_manager.py:L330-L369 → block_pool.py:L647-L661 |
+| 写回·满块 | allocate_slots 尾 → coordinator.cache_blocks → 管家.cache_blocks → BlockPool.cache_full_blocks | 已缓存 2 < 满块 5，不短路：登记 [2,5) 区间 3 块、map 4→7 | kv_cache_manager.py:L559-L563 → kv_cache_coordinator.py:L652-L683 → single_type_kv_cache_manager.py:L427-L477 → block_pool.py:L225-L342 |
+| 算（每拍） | 采样后 _update_request_with_output → append_output_token_ids → update_block_hashes | 每拍 append 1 个 token，只在跨满块边界时补 1 枚哈希 | request.py:L249-L265；scheduler.py:L2094-L2111 |
+
+表里的速记先就地注掉。函数名按调用链从外到内读：三个外层入口是 allocate_slots（KVCacheManager 的分配入口，一次调用办完挂块、分新块、写回满块）、update_block_hashes（请求侧哈希续算入口，「指纹」节整节讲）、_update_request_with_output（调度器每拍收采样的入口，「写回」节会再见到）；内层的 touch、get_new_blocks、cache_full_blocks 等都是后文各节的主角，此处见到名字即可。角色与速记：协调器指 KVCacheManager 之下的分发层（单组模型时几乎是根直通线，「表」一节末会见到它的两个形态）；管家指 SingleTypeKVCacheManager，按注意力类型各管一套块账的管理器，本章后文一直这么叫；哈希闭包指引擎侧配好、挂到请求上的哈希函数包；hash0/hash1/hash2 是请求链上第 0、1、2 枚满块哈希；块号沿用池块号（null 块占 0 号）；ref_cnt 是块的引用计数（[第 13 章](../../ch13-paged-kv/narrative/chapter.md)立的记账术）；hit=32 即命中 32 个 token，预算 79 即查找上限 max_cache_hit_length=80−1；O(1) 指与池子大小无关的常量时间；map 指平面哈希表的条目数（「表」一节整节讲它）；「惰性摘哈希」指分配复用旧块时才摘掉它的缓存条目（「留与逐」一节的正题）。
+
+![一拍调度全景：谁调用谁](../diagrams/ch15-fig-call-panorama.png)
+
+> *图注：B 这一拍的 17 个调用事件全景（正文上表的全量版）。泳道自上而下：Request、Scheduler、KVCacheManager、Coordinator、管家、BlockPool。事件 0 在拍外：B 构造即算 5 枚哈希（哈希账本长在请求身上，不占调度拍的账）；事件 1-7 是准入查，5 层下潜、平面 dict 查 3 次（2 命中 1 miss）即断，hit=32、预算 79；事件 8-17 是同一趟 allocate_slots 的三段：挂（touch 块 1、2 出队）→ 写新块（48 token 拆 3 块：5、6、7）→ 写回（登记 [2,5)、map 4→7，块表 5 项随返回值交还调度器）；拍尾采样后 append 顺手续算哈希（虚线回 Request 泳道）。后文每节讲一个切面，迷路时回这张图对位置。*
+
+三个结构事实先立住，后文各节都会用。其一，**查只发生在准入步**：调度循环只在请求一次没算过（`num_computed_tokens == 0`，scheduler.py:L745；waiting 首次进门或被抢占者归零后重进）时查表，running 中的请求不再查，「查」节展开为什么。其二，**挂、写新块、写回满块恒在同一趟 allocate_slots 里依序发生**：先 touch 挂命中块，再分配新块，最后写回满块；这段直线调用的真码「写回」一节开头会嵌。其三，**哈希不在这条流水线上算**：它长在请求身上，进门算一遍、每出一个 token 顺手补一段，两头的源码「指纹」节整节走读。往后每节也会像这里一样先交代调用位置，再下潜实现。
 
 ## 指纹：把整条前缀压进一枚哈希（站 1-2）
 
@@ -246,7 +268,7 @@ def generate_block_hash_extra_keys(
 
 ## 表：不是树的平面字典（存储面）
 
-指纹有了，存哪、怎么查？现在走到 L0 图缓存面的存储侧。vLLM 的答案朴素得近乎莽撞：**一个平面 dict**。直觉：图书馆不做目录树，每本书（块）腰上贴条形码（哈希+组号打包的 bytes），借书处就一个大抽屉（dict），同码的复本摞在同一格，借谁都是先到的那本。
+指纹有了，存哪、怎么查？现在走到 L0 图缓存面的存储侧。vLLM 的答案朴素得近乎莽撞：**一个平面 dict**。直觉：图书馆不做目录树，每本书（块）腰上贴条形码（哈希+组号打包的 bytes），借书处就一个大抽屉（dict），同码的复本摞在同一格，借哪本都行。
 
 ```python
 # vllm/v1/core/block_pool.py:L33-L54
@@ -294,6 +316,29 @@ def make_block_hash_with_group_id(
 ![平面哈希表：没有树的查找结构](../diagrams/ch15-fig-flat-hash-map.png)
 
 > *图注：L0 缓存面存储侧放大（对应 L2 章图北行「平面哈希表」格）。左：键的字节构成：32 字节 sha256 哈希拼 4 字节组号（big-endian）；中：insert 的三段语义：无键挂单块、同键合并内层 dict（「摞同一格」）、dict 直插，重复键 get_one_block 任取；右：radix 迷思澄清（全仓 v1 核心代码 grep「radix」零命中）与 NOTE #1/#2 的取舍：不去重换块表 append-only，union 类型省内层 dict 的 GC。对照 radix 树的指针跳转与节点分配：这里一次 dict 查找 O(1)、零节点对象。*
+
+### 一个池子多张账：组的实拍与判据
+
+键里那 4 字节组号带出一个前文绕着走的问题：组是什么、为什么会有组？[第 14 章](../../ch14-memory-ledger/narrative/chapter.md)的「一个池子多张账」整节讲过分桶算法（同型层合桶、等量化组、页统一），这里不重讲算法，只回收结论，再补本章视角的实拍：**一个共享的块池，每组一个管家、各持自己的一套请求块表**。协调器有两个形态：全部层同型时分派 UnitaryKVCacheCoordinator（单组协调器，一个管家、查找直通），有异型层时分派 HybridKVCacheCoordinator（混合协调器，按注意力类型归并出组、命中要调和），分派点在 kv_cache_coordinator.py:L851-L903。分组的全部意义一句话：**「保留多少历史、什么时候回收、命中怎么判」由各组自己的 spec 说了算**。同一请求在两组的块表可以合法地长成两个样子，实拍（full 组与 SWA 组都是 16-token 块、窗 48，SWA 即滑动窗口注意力，[第 14 章](../../ch14-memory-ledger/narrative/chapter.md)立过：每 token 只看得见窗内历史，窗外的块可以回收；请求 64 token prompt 加 1 个 decode token）：
+
+<!-- trace: m23 -->
+| 配置·对象 | 谁管账 | 同一请求的组账本（块表形态） | 判读 |
+|---|---|---|---|
+| uniform：全部层 full | Unitary 协调器、1 管家、1 张块表（组号 0） | [1,2,3,4,9]（prefill 4 块 + decode 1 块，全程无回收） | spec 全同 ⇒ 一张账一个管家、无调和，即「不分组的情形」 |
+| hybrid：full+SWA | Hybrid 协调器、2 管家（组号 0/1）各持独立块表、共享同一个 BlockPool 对象 | prefill 后两组各 4 块（[1,2,3,4] 与 [5,6,7,8]，页统一的等大块）；decode 拍 SWA 组把窗外 1 块（64−48=16 token）以 null 换位回收 → [NULL,6,7,8,10]，full 组纹丝不动 [1,2,3,4,9] | 两组「保留多少历史」由各自 spec 说了算：分组＝各自管理各自的驱逐、回收与命中判定 |
+| 键的构成（两组各一把钥匙） | 同一前缀哈希拼 4 字节组号（big-endian）进键 | 同一 hash0：full 组键尾 4 字节 [0,0,0,0]、SWA 组 [0,0,0,1] | 同一前缀在每组各查各的物理块，组号进键才不串门（上文键构造在此落地） |
+
+SWA 组那一行值得停一下：decode 拍开始时，窗外那 16 个 token 的块对 SWA 层已经没用了（窗宽 48 折算 3 块；窗界不与块界对齐，decode 拍实持跨到 4 块，即上表 [NULL,6,7,8,10] 的形态），下一拍就被以 null 换位回收、块还池（null 块是占位符：块表第 i 项恒对应第 i×block_size 个 token 的位置不变量要求条目留在原位，物理块还池后位置以 null 占住；这个回收动作与形态都是[第 14 章](../../ch14-memory-ledger/narrative/chapter.md)走读过的）；与此同时 full 组的同一位置纹丝不动，因为全注意力层还要全部历史。同一请求、同一个池，两张账各自演化，谁也不越组改谁的账。
+
+顺手拆一个容易混的说法。「块视图」（block view）在这片代码的讨论里常被拿来指两样不同的东西：一样是上面这种**组账本视图**，每个请求在每个组各有一张块表，长哪样由该组的 spec 与回收纪律决定，本书就叫「块表」；另一样是下一小节的**哈希粒度视图**，同一串请求侧哈希按不同块大小重新取读（零成本重串），本书叫「粒度视图」。前者是物理块的使用账，后者是哈希的读法，混着叫同一个名字，就会觉得这个词忽而指这忽而指那。
+
+那什么样的模型会走出多组？判据一句话：**看各层自报的 KVCacheSpec 是否同型，不看注意力算法花不花哨**。KVCacheSpec（每层向账本自报的缓存规格：页形状、要不要留历史、留多少，[第 14 章](../../ch14-memory-ledger/narrative/chapter.md)站 4 立过）全同就是单组；存在异型才分组。正例三连：gpt-oss 的 dense 层与 sliding-128 滑窗层两类 spec 掺排（配上 EAGLE（一种投机解码方案：小草稿模型先猜几个 token、大模型一次验证）的草稿层后是 12 滑窗 + 13 dense，[第 14 章](../../ch14-memory-ledger/narrative/chapter.md)实跑过它的 13/13 等量组），Jamba 按 attention:Mamba = 1:7 掺层（Mamba 层报的是状态型 MambaSpec，页大小由状态形状决定），Gemma 3 按 5 局部:1 全局掺排（局部窗 1024）。反例恰好最有意思：DeepSeek V3.2 的 DSA（DeepSeek Sparse Attention，DeepSeek 的稀疏注意力：先给全序列打分、只挑一部分 token 参与 attention 计算）算法上足够稀疏，但**稀疏的是计算、不是存储**：每层照存全量 MLA（Multi-head Latent Attention，多头潜在注意力，DeepSeek-V2 引入的 KV 压缩形态）压缩 KV，所有层由同一个 lambda 构造（deepseek_v2.py:L1400-L1406）、稀疏开关是模型级标志而非层间混排（L1159），账本眼里全层同型：MLAAttentionSpec（MLA 层的缓存规格，继承 FullAttentionSpec（全注意力层的缓存规格）的子类，kv_cache_interface.py:L389）。于是 V3.2 走单组，一组不多。
+
+读者点名的 DeepSeek V4，在本章取证的 v0.27.1 源码里已经能按同一条判据读出它的账本户口：注册表（vLLM 的模型登记表，架构名映射到实现模块）有条目（registry.py:L95，`DeepseekV4ForCausalLM`，实现按平台分发在 vllm/models/deepseek_v4/），而各层自报的 spec 是**混排**的。每个注意力层都挂一个滑窗缓存（attention.py:L319-L325），报 SlidingWindowMLASpec（继承滑窗规格家族的 MLA 形态，sparse_swa.py:L87-L102）；带压缩的层（各层压缩比来自 config 的逐层表，attention.py:L210-L213）另有一个压缩器状态缓存，报另一种块大小的 SlidingWindowMLASpec（compressor.py:L191-L203）；主 KV 报带 V4 专属字段的 MLAAttentionSpec，`alignment`（对齐字节）/`compress_ratio`（压缩比）/`model_version`（版本标记）三个字段在 kv_cache_interface.py:L389-L395 的注释里明写 "DeepseekV4 only fields"。spec 异型 ⇒ 组化自动接管：[第 14 章](../../ch14-memory-ledger/narrative/chapter.md)的分组、本章的不动点调和（进阶二）对 V4 原样生效，没有一行为它特设。至于 V4 的稀疏 MLA、打分器、压缩器在计算侧到底怎么做，归后面拆读 DeepSeek-V4 整模型的那一章，本章只认到账本户口为止。
+
+![为什么需要组：判据与案例](../diagrams/ch15-fig-why-groups.png)
+
+> *图注：分组判据与案例一图清。左：Hybrid 协调器两个管家（full 与 SWA）共享同一个块池、各持块表，同一请求 decode 拍后两组块表分叉（full 组 [1,2,3,4,9] 纹丝不动、SWA 组窗外块 null 换位回收成 [NULL,6,7,8,10]）；键构成条：同一枚哈希拼不同组号得到两把钥匙（键尾字节 00 00 00 00 与 00 00 00 01）。右：判据「看 spec 不看算法」加五张案例卡：纯 full（全同型 → 单组）、gpt-oss（12 滑窗 + 13 dense → 分组）、Jamba（1:7 → 分组）、Gemma 3（5:1、窗 1024 → 分组）、DeepSeek V3.2 DSA 反例（计算稀疏但存储同型 MLA → 单组）。V4 的 spec 混排不入图，其三处自报的行号上文已列，计算侧机制归拆读 V4 的专章。*
 
 ### 一串珠子两种戴法：粒度视图零成本重串
 
@@ -544,7 +589,7 @@ B 例的账：64 token 的 prompt 查 3 次表（2 命中 1 miss）命中 32，�
             self.num_cached_block[request_id] = block_idx                # L289
 ```
 
-三步：touch 救回 → 窗外段以 null 块占位（[第 14 章](../../ch14-memory-ledger/narrative/chapter.md)立的槽位不变量：块表第 i 项恒对应第 i×block_size 个 token）→ 命中块 extend 进请求块表。尾部那段 `_partial_hit_reqs` 记账是进阶一的钩子，此处按下。共享的物理图景是一块公共资产记在几个租客名下：
+三步：touch 救回 → 窗外段以 null 块占位（[第 14 章](../../ch14-memory-ledger/narrative/chapter.md)立的位置不变量：块表第 i 项恒对应第 i×block_size 个 token）→ 命中块 extend 进请求块表。尾部那段 `_partial_hit_reqs` 记账是进阶一的钩子，此处按下。共享的物理图景是一块公共资产记在几个租客名下：
 
 <!-- trace: m5 -->
 | 时点 | 块 1 ref_cnt | 块 2 ref_cnt | 块 1 在自由队列？ | 说明 |
@@ -566,7 +611,80 @@ LRU 在[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md
 
 ## 写回：满块才配拥有指纹（站 8）
 
-命中的块挂上了，请求新算的块怎么变成「下一个请求的礼物」？现在走到 L0 图命中主循环的「写回」一拍。入口在管家的 `cache_blocks`（每个 chunk 调度后都会走）：
+命中的块挂上了，请求新算的块怎么变成「下一个请求的礼物」？现在走到 L0 图命中主循环的「写回」一拍。入口不在管家自己身上：开篇全景表「写回·满块」那行的起点，是 `allocate_slots` 的尾部。把那段真码摆出来（挂那一段「挂」节已从被调方看过，这里从调用方看三段的排布）：
+
+```python
+# vllm/v1/core/kv_cache_manager.py:L529-L563 · KVCacheManager.allocate_slots（尾部三段）
+        if (
+            new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+            or num_external_computed_tokens > 0
+        ):
+            # Append the new computed blocks to the request blocks until now to
+            # avoid the case that the new blocks cannot be allocated.
+            self.coordinator.allocate_new_computed_blocks(             # L535
+                request_id=request.request_id,
+                new_computed_blocks=new_computed_block_list,
+                num_local_computed_tokens=num_local_computed_tokens,
+                num_external_computed_tokens=num_external_computed_tokens,
+            )
+
+        new_blocks = self.coordinator.allocate_new_blocks(             # L542
+            request.request_id,
+            num_tokens_need_slot,
+            num_tokens_main_model,
+            num_encoder_tokens,
+        )
+
+        # P/D: delay caching blocks if we have to recv from
+        # remote. Update state for locally cached blocks.
+        if not self.enable_caching or delay_cache_blocks:
+            return self.create_kv_cache_blocks(new_blocks)
+
+        # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
+        # + num_external_computed_tokens + num_new_tokens, but must exclude
+        # "non-committable" tokens (e.g., draft tokens that could be rejected).
+        # Therefore, we cap the number at `request.num_tokens`, ensuring only
+        # "finalized" tokens are cached.
+        num_tokens_to_cache = min(
+            total_computed_tokens + num_new_tokens,
+            request.num_tokens,
+        )
+        self.coordinator.cache_blocks(request, num_tokens_to_cache)    # L563
+```
+
+三段依序：先挂（`allocate_new_computed_blocks`，「挂」节的主角 touch 在这一段里被调到；开头那个 if 判的是「本次有没有命中块要挂」，`empty_kv_cache_blocks` 是空命中的哨兵对象），再分配新块，最后才是写回。写回前那道 `min` 值得看一眼：本拍要缓存的 token 数上限压到 `request.num_tokens`，注释交代了原因，投机解码的草稿 token 可能被拒收，没定稿的不许入缓存。（注释里的 P/D 是 prefill 与 decode 分离部署的形态：KV 要从 prefill 侧的机器收回来，缓存推迟到收齐，本章不展开。）掐好之后交给协调器，协调器的活是转发：
+
+```python
+# vllm/v1/core/kv_cache_coordinator.py:L652-L683 · KVCacheCoordinator.cache_blocks（转发循环）
+    def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:   # L652
+        if self.enable_partial_hash_hits:
+            aligned_num_computed_tokens = num_computed_tokens
+        else:
+            # Cache hits in this coordinator are always a multiple of
+            # ``scheduler_block_size`` tokens (see ``find_longest_cache_hit``).
+            # Within an aligned region, SWA groups may only consult a subset of
+            # blocks per ``scheduler_block_size``-segment so the unused blocks
+            # also stay out of the prefix-cache hash map.
+            aligned_num_computed_tokens = (
+                num_computed_tokens
+                // self.scheduler_block_size
+                * self.scheduler_block_size
+            )
+        for manager in self.single_type_managers:                      # L666
+            num_tokens_to_cache = aligned_num_computed_tokens
+            # … 省略：eagle 段七行（投机解码的 lookahead 块额外可缓存，非投机路径空转）……
+            # The manager already knows the fine hit granularity
+            # (``scheduler_block_size``); retention is passed separately so it
+            # can keep both the coarse segment tails and the fine replay
+            # boundary (which needs the fine value).
+            manager.cache_blocks(                                      # L679
+                request,
+                num_tokens_to_cache,
+                retention_interval=self.retention_interval,
+            )
+```
+
+两件事：把要缓存的 token 数对齐到 `scheduler_block_size`（调度块大小）的整数倍再往下传（注释解释：SWA 组在一段内只查部分块，没被查过的块不该进哈希表；进阶一的细粒度部分命中开关 `enable_partial_hash_hits` 开着时跳过这道对齐）；然后逐管家转发，一组一条 `manager.cache_blocks`，`retention_interval`（进阶三的稀疏驻留旋钮）原样随行。最后落到管家的 `cache_blocks`（每个 chunk 调度后都会走到这一趟）：
 
 ```python
 # vllm/v1/core/single_type_kv_cache_manager.py:L427-L477
@@ -609,10 +727,65 @@ LRU 在[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md
         self.num_cached_block[request.request_id] = num_full_blocks      # L477
 ```
 
-开头的幂等闸（`num_cached_blocks >= num_full_blocks` 即 return）与结尾的进度账（`num_cached_block` 推进到满块数）配对：登记区间恰为 [已缓存、新满)（左闭右开区间），每块恰好处理一次，chunked prefill 下每个 chunk 只登记增量。真正入表的核心环：
+开头的幂等闸（`num_cached_blocks >= num_full_blocks` 即 return）与结尾的进度账（`num_cached_block` 推进到满块数）配对：登记区间恰为 [已缓存、新满)（左闭右开区间），每块恰好处理一次，chunked prefill 下每个 chunk 只登记增量。真正入表的是块池的 `cache_full_blocks`，整函数 118 行（block_pool.py:L225-L342），正文嵌两段：先看签名与 docstring 首段，再看函数体中段切片的登记主循环。
 
 ```python
-# vllm/v1/core/block_pool.py:L259-L299 · BlockPool.cache_full_blocks
+# vllm/v1/core/block_pool.py:L225-L241 · BlockPool.cache_full_blocks（签名与 docstring 首段）
+    def cache_full_blocks(                                              # L225
+        self,
+        request: Request,
+        blocks: list[KVCacheBlock],
+        num_cached_blocks: int,
+        num_full_blocks: int,
+        block_size: int,
+        kv_cache_group_id: int,
+        block_mask: list[bool] | None = None,
+    ) -> None:
+        """Cache a list of full blocks for prefix caching.
+        This function takes a list of blocks that will have their block hash
+        metadata to be updated and cached. Given a request, it updates the
+        metadata for each block and caching it in the
+        `cached_block_hash_to_block`.
+        The block hashes values are computed by the Request object immediately  # L240
+        when it is created and when new tokens are appended.
+        # … 省略：Args 六行（参数说明；block_mask 的语义上段代码注释已给）……
+        """
+```
+
+docstring 最后两句值得单独念出声，它回答的是读这个函数最容易冒出来的问题：**登记循环里哪一步在算哈希？一步都没有**。哈希是请求侧的账，两个产生时机本章都已走读：构造请求时首算，此后每拍采样后续算。构造那一头：
+
+```python
+# vllm/v1/request.py:L204-L209 · Request.__init__（哈希账本开张即首算）
+        self.block_hashes: list[BlockHash] = []                         # L204
+        # Store the block hasher without binding self to avoid creating a
+        # reference cycle (Request -> partial -> Request) that prevents
+        # immediate garbage collection via reference counting.
+        self._block_hasher: Callable[[Request], list[BlockHash]] | None = block_hasher
+        self.update_block_hashes()                                      # L209
+```
+
+`block_hashes` 开张、闭包挂上、当场 `update_block_hashes` 首算，这就是 37 token 的请求构造时就有 2 个满块哈希的地方（「指纹」节增量实测表的第一行）。续算那一头是「指纹」节嵌过的 request.py:L249-L265（`append_output_token_ids` 尾部的 `update_block_hashes`），它的调用点在每拍采样之后：
+
+```python
+# vllm/v1/core/sched/scheduler.py:L2094-L2111 · Scheduler._update_request_with_output（每拍采样后）
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int], is_stale: bool = False
+    ) -> tuple[list[int], bool]:
+        # is_stale is only used by the AsyncScheduler override.
+        # Append generated tokens and check for stop. Note that if a request
+        # is still being prefilled, we expect the model runner
+        # to return empty token ids for the request.
+        stopped = False
+        for num_new, output_token_id in enumerate(new_token_ids, 1):     # L2102
+            request.append_output_token_ids(output_token_id)             # L2103
+            # … 省略：停检六行（check_stop、截尾与 break，与本章无涉）……
+        return new_token_ids, stopped
+```
+
+采样出的 token 逐个交给请求，请求顺手续算、只在跨满块边界时多算一枚。`cache_full_blocks` 从头到尾只消费 `request.block_hashes` 里现成的哈希，请求带进来什么它登记什么。这份分工的收益：算哈希的增量纪律（只算新满块）留在请求身上，入表的幂等纪律（只登新满区间）留在池子这边，两边互不需要理解对方。另外 `_block_hasher` 特意存成不绑 `self` 的裸可调用对象，注释交代了原因：绑了会形成 Request 指向闭包、闭包又指回 Request 的引用环，引用计数就回收不了它。下面是函数体的中段切片（登记主循环）：
+
+```python
+# vllm/v1/core/block_pool.py:L259-L299 · BlockPool.cache_full_blocks（函数体中段切片）
         if num_cached_blocks >= num_full_blocks:
             return
         new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
@@ -669,6 +842,45 @@ LRU 在[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md
 ![写回：满块入表、掩码控表](../diagrams/ch15-fig-writeback-mask.png)
 
 > *图注：L0 缓存面「写回」一拍的放大（对应 L2 站 8）。左：40-token prompt 的登记账：块 0、1 满块入表（登记的是覆盖 16、32 token 边界的哈希），块 2 只有 8 个 token 不入表（满了才配拥有指纹）；结论条目数=满块数 2。右：block_mask=[True,False] 对照，被掩的块连表都不进，SWA 窗外、Mamba 对齐里永不可能服务命中的块从源头不占哈希表；下配幂等闸（num_cached_blocks >= num_full_blocks 即 return）与进度账。*
+
+### 短路与晋升：partial 什么时候写进去
+
+本节到此还压着一个最容易卡住的问题：幂等闸明明「`num_cached_blocks >= num_full_blocks` 即 return」，可上面「三个决策」里说会有「部分条目晋升：摘掉旧的短条目、插一条覆盖更长边界的新条目」，进阶一还会讲块内部分条目。都短路了，partial 条目是什么时候写进去的？晋升为什么没被闸挡住？
+
+答案的结构在管家这一层的覆写里。全注意力管家覆写了 `cache_blocks`：同一次调用先走父类的满块登记（幂等闸在这一段里），回来再走 `_cache_partial_tail_block`（prompt 尾落在块内时，把那个边界也注册成条目）：
+
+```python
+# vllm/v1/core/single_type_kv_cache_manager.py:L779-L789 · FullAttentionManager.cache_blocks（覆写）
+    def cache_blocks(
+        self,
+        request: Request,
+        num_tokens: int,
+        retention_interval: int | None = None,
+    ) -> None:
+        super().cache_blocks(request, num_tokens, retention_interval=retention_interval)   # L785
+        hash_block_size = self.block_pool.hash_block_size
+        if self.block_size == hash_block_size:
+            return
+        self._cache_partial_tail_block(request, num_tokens)             # L789
+```
+
+两段共享一次调用、先后依序。短路只挡第一段（满块区间登记）；第二段是覆写加出来的，闸管不着它，块大小等于哈希粒度时干脆不存在（L787 早退）。第一段放不放行，则由「已缓存账本是否落后于满块数」决定。把 48-token 的 prompt 放进 64-token 块的配置（进阶一同款：块 64、哈希粒度 16、full+mamba 两组，所以 map 是两组合计）逐拍走一遍，四行关键拍：
+
+<!-- trace: m22 -->
+| 拍 | num_tokens | 请求侧哈希 | 满块数（÷64） | 幂等闸 | 满块/partial 登记 | map 条目 |
+|---|---|---|---|---|---|---|
+| prefill | 48 | 3 枚（@16/@32/@48，构造即算） | 0 | 0 >= 0 → 短路 | partial 尾照登：boundary=48（48//16×16），@48 入表；覆写在 super() 之后继续跑，闸拦不住这一段 | 1（块 1 @48） |
+| decode | 50 | 3 | 0 | 0 >= 0 → 短路（幂等） | already_cached → 无新条目 | 1 |
+| decode | 63 | 3 | 0 | 0 >= 0 → 短路（幂等） | already_cached → 无新条目 | 1 |
+| decode（第 16 个生成 token） | 64 | 4（append 时补第 4 枚） | 1 | 0 >= 1 不成立 → 闸翻转放行 | 满块晋升：摘 @48 插 @64（主哈希覆盖 48→64）；随后 partial 尾把 @48 作别名补登回来（prompt 边界恒 48），一块挂主哈希+别名两条目；mamba 组同拍登它的 @64 | 3（full 主 @64 + full 别名 @48 + mamba @64） |
+
+prefill 拍先看懂：满块数 0、闸关着，但 partial 尾登记是覆写的第二段，照常把 @48 边界（prompt 尾对齐到哈希粒度的落点，48 本就落在 16 的倍数上）注册上墙。15 个 decode 拍双路幂等：满块没多、partial 已在表（`cache_partial_block` 里 already_cached 判等后直接返回，函数本体进阶一嵌）。第 16 个生成 token 让总数到 64：请求侧账本补第 4 枚哈希，满块数从 0 跳到 1，已缓存账本还停在 0，闸条件 0 >= 1 不成立、放行；`cache_full_blocks` 走到上面嵌过的那个 `if blk.block_hash is not None` 分支（block_pool.py:L284，注释明言这是唯一合法的「新满块已有哈希」场景），摘掉 @48 短条目、插 @64 长条目；回头 `_cache_partial_tail_block` 又把 @48 作为别名补登回来，于是这块同时挂主哈希与别名两条目（一块多键的记账，「留与逐」一节的反向索引正是为它备的）。注意 map=3 的构成要拆开数：full 主 @64、full 别名 @48、mamba 组 @64 各一条，不是含糊的「加了两条」。
+
+![partial→full：短路与晋升的时序](../diagrams/ch15-fig-partial-to-full.png)
+
+> *图注：写回时序的逐拍放大（与上一张写回图成对：那张讲登记什么、这张讲何时登记）。prefill 拍幂等闸短路（0>=0）但 @48 条目照上墙（map=1）；15 个 decode 拍两路都幂等；第 16 个生成 token 跨过 64 边界那一拍：请求侧账本补第 4 枚哈希（3→4）、闸 0>=1 翻转放行、cache_full_blocks 摘 @48 插 @64（主哈希覆盖 48→64），随后 partial 尾把 @48 作别名补登，一块两键；mamba 组同拍入表，map 到 3。*
+
+为什么说晋升是常态、不是特例分支？看两个量的步调。`num_cached_block`（已缓存账本）只在满块登记收尾被推进到满块数（上文 L477 那行）；`num_full_blocks = num_tokens // block_size` 是台阶函数，decode 每拍 token 数加一，只在跨过块大小整数倍的那一拍跳一格。于是差值 d = 满块数 − 已缓存平时恒 0（闸关着），跨块边界那一拍从 0 跳到 1，闸条件 d <= 0 失效、放行一次登记后 d 归零。换句话说：闸挡的是「没有新的满块要登记」，挡不住「token 跨过了块边界」。**partial→full 的摘旧插新是每次写满块的前奏**：只要一个块先以部分条目入过表、后来写满，晋升必然发生；@48→@64 这四行只是把必然拍成了慢动作。`cache_partial_block` 本体怎么判重、phase 2 怎么探这些块内条目、命中之后 CoW 怎么换尾，进阶一三件套整节展开；这里记住时序结论就够：partial 与满块同一次调用登记（super() 之后）、晋升随跨块边界自动发生，都不是额外的特例分支。
 
 ## 留与逐：藏在注释里的两个不变量（站 10-12）
 
@@ -881,7 +1093,7 @@ class FreeKVCacheBlockQueue:
 | 对照 1 | 一块挂主哈希+别名 | 主哈希 main | 2 | — | 部分条目时代一块多键（反向索引记账） |
 | 对照 2 | _remove_cached_block_hashes | 无 | 0 | — | 主哈希+别名一次摘干净，不留悬空键 |
 
-场景一全程 map 条目数 1→1→0：free 不减、复用才减。这条「惰性」纪律马上要担起大任：它是下一节那笔回收的机制内核。收尾前补一个特殊出口：`reset_prefix_cache`（管理接口；RLHF 指人类反馈强化学习训练循环里权重会被更新）要求全部块空闲才清，否则 warning 拒绝；真清时重建空 map、全部块 reset_hash（block_pool.py:L763-L797）——**权重变了，全部缓存在数学上失效，必须整体作废**。因为哈希只指纹了 token 序列，指纹不了算出这些 KV 的权重。
+场景一全程 map 条目数 1→1→0：free 不减、复用才减。这条「惰性」纪律马上要担起大任：它是下一节那笔回收的机制内核。收尾前补一个特殊出口：`reset_prefix_cache`（管理接口；RLHF（人类反馈强化学习）训练循环里权重会被更新）要求全部块空闲才清，否则 warning 拒绝；真清时重建空 map、全部块 reset_hash（block_pool.py:L763-L797）——**权重变了，全部缓存在数学上失效，必须整体作废**。因为哈希只指纹了 token 序列，指纹不了算出这些 KV 的权重。
 
 ## 收口：被打回的请求回来先查表（站 10-12 的回环）
 
@@ -1206,7 +1418,7 @@ B 命中 48/80=60% 的 prompt；代价 = 每组 1 块显存（2 组共 2 块）+
 
 ## 进阶二：几套注意力一起认——不动点（站 5）
 
-第二幕回到「查」那节挂起的分支：混合模型有多个组（[第 14 章](../../ch14-memory-ledger/narrative/chapter.md)的组化；SWA 即滑动窗口注意力、Mamba 即状态空间模型，都是那一章立过的回收型/状态型层），每个组有自己的块表、自己的命中判定：**full 组要求从头连续、SWA 组只要求窗内连续、Mamba 组只要边界上那一个状态块**。一条请求的命中长度必须让**所有组同时成立**，单次扫描给不出。旧世界（早期 v1）只有一张表一种类型，混合模型要么不支持、要么全按 full 处理。vLLM 的解法直觉上是「会签合同」：合同能签多长由最挑刺的部门说了算，每个部门要么认可当前长度、要么拿红笔砍短；只要有谁砍了，全体重审一轮。长度只会越砍越短、砍到底（0）为止，所以一定散会。源码形态：
+第二幕回到「查」那节挂起的分支：混合模型有多个组（[第 14 章](../../ch14-memory-ledger/narrative/chapter.md)的组化，「表」一节末已见过同一请求两组块表分叉的实拍与分组判据；SWA 即滑动窗口注意力、Mamba 即状态空间模型，都是那一章立过的回收型/状态型层），每个组有自己的块表、自己的命中判定：**full 组要求从头连续、SWA 组只要求窗内连续、Mamba 组只要边界上那一个状态块**。一条请求的命中长度必须让**所有组同时成立**，单次扫描给不出。旧世界（早期 v1）只有一张表一种类型，混合模型要么不支持、要么全按 full 处理。vLLM 的解法直觉上是「会签合同」：合同能签多长由最挑刺的部门说了算，每个部门要么认可当前长度、要么拿红笔砍短；只要有谁砍了，全体重审一轮。长度只会越砍越短、砍到底（0）为止，所以一定散会。源码形态：
 
 ```python
 # vllm/v1/core/kv_cache_coordinator.py:L685-L817
