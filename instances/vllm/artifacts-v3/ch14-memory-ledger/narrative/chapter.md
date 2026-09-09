@@ -448,7 +448,7 @@ def _check_enough_kv_cache_memory(
 | uniform Llama-2-7B | 256（=cdiv(4096,16)，单组） | 4.0（=1024/256） | 16384（=4.0×4096=1024×16） |
 | 混合（in_flight 8192） | 513（full 256 + swa cap 257，cap=cdiv(min(511+8192,4096),16)+1） | 1.9961（=1024/513） | 8176 |
 
-uniform 一行是前文的验算；混合一行的看点是**公式通用**：每请求块数 = 各组占块之和（full 组按整序列 256、SWA 组封顶在 257，「封顶」的来历是下一节的大戏），同一公式 `num_blocks / 每请求块和` 通吃两种布局。混合行三个常数先给代入清单：这一景 SWA 组取窗 512、块 16（511 = 窗 512−1），封顶公式代入在途 8192 即 `cdiv(min(511+8192, 4096), 16)+1`、被 max_model_len 4096 顶住，细账见后文「第二道」；容量 8176 = int(并发 1.9961 × 4096)（容量恒等式 tokens = 并发 × max_model_len，下文日志两行的算法）。启动日志那两行 "GPU KV cache size: %s tokens" 与 "Maximum concurrency for %s tokens per request: %.2fx"（kv_cache_utils.py:L2225-L2240）就是它的输出。**其三，喂两侧**。调度器侧拿到的是拍平版：
+uniform 一行是前文的验算；混合一行的看点是**公式通用**：每请求块数 = 各组占块之和（full 组按整序列 256、SWA 组封顶在 257，「封顶」的来历是下一节的大戏），同一公式 `num_blocks / 每请求块和` 通吃两种布局。混合行三个常数先给代入清单：这一景 SWA 组取窗 512、块 16（511 = 窗 512−1），封顶公式代入在途 8192（在途＝max_in_flight_tokens，已排进 batch 但还没落账的 token 上界，正片见「门多紧」）即 `cdiv(min(511+8192, 4096), 16)+1`、被 max_model_len 4096 顶住，细账见后文「第二道」。257 这个值要诚实读：在途 8192 顶到 max_model_len 时 cap 只比全长 256 多 1，这一景 SWA 语义近乎退化；窗口真正发力在小在途与长序列，这笔账留到「回收感知准入上限」一节末的收益合成再算。容量 8176 = int(并发 1.9961 × 4096)（容量恒等式 tokens = 并发 × max_model_len，下文日志两行的算法）。启动日志那两行 "GPU KV cache size: %s tokens" 与 "Maximum concurrency for %s tokens per request: %.2fx"（kv_cache_utils.py:L2225-L2240）就是它的输出。**其三，喂两侧**。调度器侧拿到的是拍平版：
 
 ```python
 # vllm/v1/core/kv_cache_utils.py:L1855-L1874
@@ -500,13 +500,30 @@ def generate_scheduler_kv_cache_config(
 
 **滑动窗口注意力**（Sliding Window Attention，SWA）：每个 token 只「看得见」前面 W 个 token（W 就是窗口大小），位置 i 的 query 只对 `[i−W+1, i]` 的 key/value 算注意力。动机就是 KV 账：全注意力层每生成一个 token 要为**全部历史**存 K/V，序列越长池越大；SWA 层的 KV 需求封顶在 W，与序列长度无关。这路数的工程化出自 Mistral 7B（arXiv:2310.06825）：W=4096，配「滚动缓冲区」，论文原话 "The cache has a fixed size of W, and the keys and values for the timestep i are stored in position i mod W of the cache"，i 超过 W 后老位置直接被覆写，32k 序列上省 8 倍缓存显存。常被问的「窗口截断了信息怎么传远」：答案是层层接力，第 k 层每个位置能看到上一层 `[i−W, i]` 的隐状态，信息逐层向前搬，k 层之后理论可达 k × W（论文按 W=4096 算出 32 层约 131K token 的理论跨度）。vLLM 的实现与 Mistral 的环不同**粒度**：Mistral 是 token 级的环（覆写），vLLM 是**块级**的回收，窗外整块 free 归池、原位换 null 占位（本节末与下一节都有实跑），没有环形覆写。差异不是风格：分页是 vLLM 一切显存操作的地基，回收也不例外。
 
-**混合注意力模型**（hybrid attention）：省 KV 的层与管全局的层按固定比例掺着排，这是 Gemma、Llama、gpt-oss 这批模型的真实架构。Gemma 3 技报（arXiv:2503.19786）说得直白："A challenge with long context is the memory explosion of the KV cache during inference. To reduce this issue, we interleave multiple local layers between each global layer"，5 个局部层配 1 个全局层（5:1），局部层窗口 1024，消融显示纯全局布局的 KV 开销约 60%、混合后压到 15% 以下。LLaMA 4 是 3 local : 1 full，局部层是「分块注意力」（chunked attention，块大小 8192，块内互看）。gpt-oss 每两层一块交替 dense 与 sliding-128（128 token 的窗口）；配上 EAGLE（一种投机解码方案：小草稿模型先猜几个 token、大模型一次验证，采样篇展开）的草稿层后正是 12 个滑窗层 + 13 个全注意力层，这个 12+13 马上会再见到。对推理引擎，这一切意味着一件事：**一个模型各层自报的 KVCacheSpec 不再全同**，一张块表伺候不了。（vLLM 官方的混合 KV 管理设计文档是这条线的正门：[docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/)。）
+**混合注意力模型**（hybrid attention）：省 KV 的层与管全局的层按固定比例掺着排，这是 Gemma、Llama、gpt-oss 这批模型的真实架构。Gemma 3 技报（arXiv:2503.19786）说得直白："A challenge with long context is the memory explosion of the KV cache during inference. To reduce this issue, we interleave multiple local layers between each global layer"，5 个局部层配 1 个全局层（5:1），局部层窗口 1024，消融显示纯全局布局的 KV 开销约 60%、混合后压到 15% 以下。LLaMA 4 是 3 local : 1 full，局部层是「分块注意力」（chunked attention，块大小 8192，块内互看）。gpt-oss 每两层一块交替 dense 与 sliding-128（128 token 的窗口）；配上 EAGLE（一种投机解码方案：小草稿模型先猜几个 token、大模型一次验证，采样篇展开）的草稿层后正是 12 个滑窗层 + 13 个全注意力层，这个 12+13 马上会再见到。对推理引擎，这一切意味着一件事：**一个模型各层自报的 KVCacheSpec 不再全同**，一张块表伺候不了。（vLLM 官方的混合 KV 管理设计文档是这条线的正门：[docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager/)。）这份名单还漏了压轴的一位：DeepSeek V4 的混合注意力一层住着四类缓存、账本页宽四种，是这条线上最重的病例，本节单独立案（见后文「DeepSeek V4 立案」）。
 
 **Mamba 与状态空间模型**（SSM）：把「记住全部历史」从「每 token 存一对 K/V」换成「把历史压进一个固定形状的状态张量」，像 RNN 一样边走边压缩，序列再长它的「缓存」也不长一个字节（Mamba 论文 arXiv:2312.00752 的摘要账：5× 于 Transformer 的推理吞吐、序列长度线性伸缩）。主流落地是混合：Jamba（arXiv:2403.19887）按 attention : Mamba = 1:7 掺层，账面收益 "an 8x smaller KV cache compared to a vanilla Transformer"（256K 上下文 4 GB 对纯 Transformer 32 GB）。对账本的意义：Mamba 层进账本时报的是 `MambaSpec`，页大小由**状态形状**决定、不随 block_size 缩放。注意它不是 KV cache，账本科目不同，这个差别马上在「页统一」处收账。
 
+### 共用一张表的两难：浪费还是损坏
+
+「一张块表伺候不了」值得拆开论证，不是懒洋洋的工程取舍：本节整套规矩（分桶、等量、页统一）都由它倒推。直觉一句：一栋楼装一套总水表，按最省水的住户停水，24 小时热水的高层当场断供；按最费水的住户供水，省水住户的账单白交。块表同理，一张表只有一种回收语义，全按全历史或全按窗口，两个方向各有各的坏法。
+
+全按全历史（都不回收）：窗外 KV 白占到请求结束。它的现实形态下一小节就会实跑：`--disable-hybrid-kv-cache-manager` 把滑窗层全部提升成全注意力，warning 原话自认 "we do not enable any optimizations for saving KV cache memory"。白占有实数（场景取自「门多紧」的混合门：窗 512、块 16、4096-token 序列，SWA 层按 full 语义要 256 块、回收感知只要 33 块）：一张表的世界里每请求白占 223 块，省的只剩计算侧。浪费，但账是对的。
+
+全按窗口（都回收）：这一侧坏的是正确性。full 层每个历史 token 对每个后续 query 都可见（全注意力的定义），把它的旧块也当窗外账收走，两笔坏账同时发生：仍在读的 token 落到 NULL 占位页，丢历史；块已归池转租给别的请求，跨请求串写。回收安全的前提是「被收块对后续任何计算不可见」（后文「SWA 的还账方式」立这条不变量），全注意力类型把这条前提焊死在代码里：管家（每组一个的类型专属缓存管理员，按 spec 查注册表选，装配见「两把尺子与装配」）报跳过的 `get_num_skipped_tokens`（报「多少 token 已滑出窗口、不再被读」的方法）在全注意力管家那里不覆写、基类恒返 0，从不还账。强行统一成窗口语义，等于把它没有的「窗外」强加给它。
+
+<!-- trace: m17 -->
+| 假想世界 | 一张块表的样子 | 后果 | 证据锚 |
+|---|---|---|---|
+| 都不回收 | 全模型按 full 语义一张表（`--disable-hybrid-kv-cache-manager` 的现实形态） | 窗外 KV 白占到请求结束，省的只剩计算侧；SWA 层 4096 序列白占 223 块（256−33） | kv_cache_utils.py:L1568-L1589 warning 原话；下一小节分组表末行已实跑 |
+| 都按窗口回收 | 滑窗语义统治全表，full 层的旧块也当窗外账收走、原位换 NULL | 仍在读的 token 落到 NULL 页＝丢历史；块归池转租他人＝跨请求串写，正确性当场损坏 | 回收安全的前提是「被收块对后续任何计算不可见」（后文回收一节的不变量）；full 管家 get_num_skipped_tokens 恒 0（基类默认 return 0）正是这条前提的代码形态 |
+| 分表分管家（现实） | 每组一张私有块表＋类型专属管家：full 组全长持有、SWA 组窗外整块回收 | 账目两清、各语义无损；新代价是跨类型命中语义 | 管家按 spec 查注册表选（get_manager_for_kv_cache_spec）；跨类型命中只干净支持 full＋恰好一种其它（kv_cache_utils.py:L1189-L1194），[第 15 章](../../ch15-prefix-caching/narrative/chapter.md)正片 |
+
+结论：**分表是唯一无损解**。可见性不同就必须分表；分了表的组还要共享同一个块池，于是有等页、等量一整套规矩，下一小节起逐条立。新代价也随即而生：多张表之后「哪些请求能认领哪些块」的命中语义变复杂，跨类型命中官方只干净支持全注意力加恰好一种其它类型（原文见下一小节末六条假设的第 6 条），正片是[第 15 章](../../ch15-prefix-caching/narrative/chapter.md)。
+
 ### 分桶等量：合租分房的规矩
 
-类型不一的层要共用一个池，规矩是什么？`get_kv_cache_groups`（kv_cache_utils.py:L1781-L1852）的答案：**同型层合桶，桶切成等大的组**。为什么组要等大？因为池里的块是等大的物理页，一个块 id 要在每层有一页。「每组每块物理字节数相等」是一池共享的硬约束，等量化组是它的直接推论：
+类型不一的层要共用一个池，规矩是什么？`get_kv_cache_groups`（kv_cache_utils.py:L1781-L1852）进门先做一次四路分诊：全部层同一个 spec，一组了事；spec 异型但同型（每块要的 token 槽数相同）也并成一组；再往下问一条 DeepSeek V4 专属的元组打包路径（后文「DeepSeek V4 立案」）；都不中才落到本小节的通用等页路径。Gemma3、gpt-oss 这类页宽全等的混排都走第四路，规矩一句话：**同型层合桶，桶切成等大的组**。为什么组要等大？上一小节刚论证可见性不同必须分表；分了表的组仍共享同一个块号空间（一个 BlockPool，块 id 全池通用），块 id 租给哪个组，物理上就是那个组的组内每层各一页，每块的物理字节便与租它的组无关：先统一页宽（下一节「页统一」），再要求每组层数相等。共享块号 ⇒ 等页 ⇒ 等量组，「每组每块物理字节数相等」这条硬约束是三环的中间一站：
 
 ```python
 # vllm/v1/core/kv_cache_utils.py:L1233-L1280 · _get_kv_cache_groups_uniform_page_size
@@ -557,7 +574,7 @@ def generate_scheduler_kv_cache_config(
     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
 ```
 
-四个决策。**组大小默认取各类型层数的最小值**：开源混合模型都是 n:1 模式，那个「1」（全局层的层数）天然是组大小。**1.5 启发式**：层数比不大时取 max 免得 padding 过多，12 SW + 13 full 补成 13/13（padding 1 层），比按 min=12 切（full 桶要补 11 层到 24）划算得多；padding 层白占显存，warning 原话 "may waste at most N% KV cache memory" 把账打给你。**PP 交错分派** `layers[i::num_groups]`：按步长切片入组，让流水线每个 stage 都有活干，不出空组。**落点**是 `KVCacheGroupSpec`，每组 = 同型层名表 + 合并后的代表 spec。四个场景实跑：
+四个决策。**组大小默认取各类型层数的最小值**：开源混合模型都是 n:1 模式，那个「1」（全局层的层数）天然是组大小。**1.5 启发式**：层数比不大时取 max 免得 padding 过多，12 SW + 13 full 补成 13/13（padding 1 层），比按 min=12 切（full 桶要补 11 层到 24）划算得多；padding 层白占显存，warning 原话 "may waste at most N% KV cache memory" 把账打给你。**PP 交错分派** `layers[i::num_groups]`：按步长切片入组，让流水线每个 stage 都有活干，不出空组（DeepSeek V4 第三路切桶组用的是同一个交错技巧，`layer_tuples[i::num_tuple_groups]`，见「DeepSeek V4 立案」）。**落点**是 `KVCacheGroupSpec`，每组 = 同型层名表 + 合并后的代表 spec。四个场景实跑：
 
 <!-- trace: m5 -->
 | 场景 | 分桶层数 | 组大小 | 分组结果 | 代价/账 |
@@ -573,7 +590,7 @@ def generate_scheduler_kv_cache_config(
 
 最后一行「disable 回退」是这条路的退路，今天仍在：`--disable-hybrid-kv-cache-manager` 时 `unify_hybrid_kv_cache_specs`（kv_cache_utils.py:L1568-L1589）把滑窗 spec 全部提升成全注意力：一张表、实现简单，代价是 warning 原话直说的："we do not enable any optimizations for saving KV cache memory (e.g., dropping the KV cache outside the sliding window). The compute of layers like sliding window is still saved."，窗口外的 KV 白占显存（省下的只剩计算侧）。
 
-等字节这条硬约束的完整清单在 `_get_kv_cache_groups_uniform_page_size` 的 docstring 里（kv_cache_utils.py:L1169-L1198），六条假设：每组每块物理字节相等（不同大小的块混住会碎片化）、组内同 block_size、每 token 每层字节由模型定（当前只支持各层相同）、每组层数相同（padding 补齐）、组内同注意力类型、以及官方自认的第六条：跨类型的最长命中决策 "only supports one attention type or two types of full-attention plus exactly one another type"（那套决策的门道是[第 15 章](../../ch15-prefix-caching/narrative/chapter.md)的戏）。
+等字节这条硬约束的完整清单在 `_get_kv_cache_groups_uniform_page_size` 的 docstring 里（kv_cache_utils.py:L1169-L1198），六条假设：每组每块物理字节相等（不同大小的块混住会碎片化）、组内同 block_size、每 token 每层字节由模型定（当前只支持各层相同）、每组层数相同（padding 补齐）、组内同注意力类型、以及官方自认的第六条：跨类型的最长命中决策 "only supports one attention type or two types of full-attention plus exactly one another type"（那套决策的门道是[第 15 章](../../ch15-prefix-caching/narrative/chapter.md)的戏）。作用域也要说破：这六条管的是等页路径（docstring 就挂在 `_get_kv_cache_groups_uniform_page_size` 上），四路分诊在更早处就把不满足者引去了别路；第 3 条「每 token 每层字节相同」的爆表者是 DeepSeek V4，六种形态、四种页宽，两节之后单独立案看它怎么被第三路接走。
 
 ### 页统一：只收标准托盘
 
@@ -636,9 +653,109 @@ def generate_scheduler_kv_cache_config(
 
 Mamba 那行 93.75% 的浪费是极端例（状态页远小于注意力页时的代价）；真实混合模型靠 Mamba 状态够大让页自然接近，pad 的浪费小得多。
 
+### DeepSeek V4 立案：四种户型与第三条分组路径
+
+等页路径的三条出路都指向同一个终点：所有层落到同一个最大页。可真有一户人家，四种页宽互不凑整、又不是 stride 索引层，会怎样？按上一节的规矩答案该是 NotImplementedError 拒收，但这户人家是 DeepSeek V4（DeepSeek 的混合注意力旗舰，也是本章混合组化的主打实例），vLLM 没有拒收它，而是为它单开了第三条分组路径。先认识住户：V4 的主 KV 用 MLA（multi-head latent attention，多头潜在注意力：训练学一对下/上投影，把每 token 的 K、V 联合压进一个低秩潜在向量再缓存，DeepSeek-V2 起的省显存路数，数学与 584 B 特形在[第 24 章](../../ch24-primer-attn-variants/narrative/chapter.md)立过），层按压缩比分两族：C4（compress_ratio＝4）与 C128（＝128），压缩比即每 cr 个 token 的 KV 压成一份存储的省显存比（逐层配置表 attention.py:L210-L213）。每个 C4/C128 层向账本交的缓存不止一份，共四类：主 KV（后缀 A，全历史）、索引器 KV（后缀 I，为每个 query 挑少量相关 token 的稀疏检索缓存）、每层一挂的滑窗缓存（每层构造一个，attention.py:L319-L325）、压缩器状态（把窗口内历史压进固定小状态的滚动缓冲）。四类缓存、六种形态、四种页宽，这就是前面预告的「最重的病例」；前面两位混合前辈 Gemma3、gpt-oss 是同一户型两种作息（页宽全等），V4 住的是四种户型。
+
+先把户口本抄下来（取证口径：页宽由 v0.27.1 的 spec 类按 V4 自报点参数直接构造、读 `page_size_bytes` 得到；分组走查为对 kv_cache_utils.py:L1592-L1754 的逐行转写，行号即凭据。窗口 2048 为示教代入，源码只读 `config.sliding_window`（attention.py:L206）、实值随权重发布；11 C4＋10 C128＋21 滑窗的层数取自源码注释自带的示例，下文有原文）。六种形态里 spec 家族只有两支：MLAAttentionSpec（MLA 型，主 KV 与索引器报它）与 SlidingWindowMLASpec（V4 新设的滑窗型，滑窗缓存与压缩器状态报它）。页宽账的底数是每槽 584 B＝448 B NoPE（不带位置编码的潜在分量）＋128 B RoPE（带旋转位置编码的分量）＋8 B fp8 scale（块量化的缩放字节），kv_cache_interface.py:L408-L413；对齐一律取 576 的倍数：
+
+<!-- trace: m16 -->
+| 缓存 | spec 家族 | 块大小 / 压缩比 | 原始页 → 对齐后页 | 账本语义 | 组归宿 |
+|---|---|---|---|---|---|
+| 滑窗缓存（每层一挂） | SlidingWindowMLASpec | 64 / 1 | 64 槽 × 584 B = 37376 → 37440 | 滑窗回收·窗 2048（示教代入） | SWA 桶组（21 层 → 切 2 组 11+10） |
+| C4A 主 KV | MLAAttentionSpec | 256 / 4 | 64 槽 × 584 B = 37376 → 37440 | 全历史 | MLA 元组组（[C4I,C4A,C128] × 11） |
+| C4I 索引器 KV | MLAAttentionSpec | 256 / 4 | 64 槽 × 132 B = 8448 → 8640 | 全历史 | MLA 元组组 |
+| C128A 主 KV | MLAAttentionSpec | 256 / 128 | 2 槽 × 584 B = 1168 → 1728 | 全历史 | MLA 元组组（10 层配 11 元组） |
+| C4 压缩器状态 | SlidingWindowMLASpec | 4 / 1 | 4 槽 × 8192 B = 32768 → 32832 | 滑窗回收·窗 8 | C4 状态桶组（11 层 → 1 组） |
+| C128 压缩器状态 | SlidingWindowMLASpec | 8 / 1 | 8 槽 × 4096 B = 32768 → 32832 | 滑窗回收·窗 128 | C128 状态桶组（10 层 → 1 组） |
+| 判定 | — | — | 页宽 4 种：37440 / 8640 / 1728 / 32832 | SlidingWindowMLASpec 在场＋页宽多于一种 → 走第三路 | 共 5 组：元组组 1 ＋ 桶组 4 |
+
+表中主 KV 的块大小 256 来自 V4 后端族的 preferred 声明（`get_preferred_block_size` 返回 256，sparse_swa.py:L119-L121，协商链在执行篇）。最扎眼的是 37440 出现了两次：滑窗缓存（块 64、压缩比 1）与 C4A 主 KV（块 256、压缩比 4）同页。同字节、异窗口，这不是巧合是设计，注释原话给证：
+
+```python
+# vllm/v1/attention/backends/mla/sparse_swa.py:L77-L82 · DeepseekV4SWACache.__init__
+        # Block size is constrained by tensor sharing between SWA and C4A KV blocks.
+        # Since both block types share the same physical tensor, they must use the
+        # same page size. The C4A KV block shape [256//4, head_dim] = [64, head_dim]
+        # determines the SWA block size of 64 tokens per block.
+        # TODO(yifan): make SWA block size automatically determined and configurable.
+        self.block_size = 64
+```
+
+两类块共享同一张物理张量，所以必须同页：C4A 的块形 [256//4, 584] 反过来把滑窗块的 block_size 定在 64 token（TODO 注释自认这层耦合是待解的硬编码）。两族压缩器状态同页 32832 同理（compressor.py:L177-L183：状态与 KV 共享物理张量，C4 块形 [4, 8192]、C128 块形 [8, 4096]）。对账本的意义：页宽的多样性不是待统一的麻烦，是模型侧显存复用的刻意设计，等页路径的 unify 反而接不住它。
+
+第三路的门牌挂在分诊处。分发梯子先逐路走读一遍（每路的判据、住户、产出），源码在前：
+
+```python
+# vllm/v1/core/kv_cache_utils.py:L1802-L1819 · get_kv_cache_groups（四路分诊）
+    if is_kv_cache_spec_uniform(kv_cache_spec):
+        # KV cache of all layers are the same, which is true for
+        # most models. Allocate the same amount of memory for
+        # each layer.
+        return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+    elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
+        # All layers need the same number of token slots (e.g., all layers are
+        # full attention, or all layers are sliding window attention with the
+        # same window size). Put all layers into one group.
+        return _get_kv_cache_groups_uniform_type(uniform_spec)
+    elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):
+        # DeepseekV4 case: All layers need the same number of token slots,
+        # yet some layers are full attention while others are sliding window
+        # attention in different sizes. Need to group layers into multiple
+        # UniformTypeKVCacheSpecs.
+        kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+        _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
+        return kv_cache_groups
+```
+
+逐路走读：
+
+- **第一路·全同 spec**（L1802-L1806）：全部层交上来一模一样，`_get_kv_cache_groups_uniform_spec` 一组了事。多数单型模型的日常，本章开头到「一份账喂两侧」的 uniform 例子走的都是它。
+- **第二路·同型异宽**（L1807-L1811）：spec 不全同但同型（每块要的 token 槽数相同），`UniformTypeKVCacheSpecs.from_specs`（UniformTypeKVCacheSpecs＝同型 spec 的打包容器，kv_cache_interface.py:L837-L849）把全部层并成 **一个元组组**：每层一户、组的页＝成员页之和（kv_cache_interface.py:L848）。住户是 DeepSeek V3.2：主 KV（656 B/token 的 MLA 特形，kv_cache_interface.py:L414-L416）与索引器 KV（132 B/token）同为 compress_ratio 1 的 MLA 型、只是每 token 字节不同，并成一组照样一张表，「spec 异型就得多组」的直觉由它证伪。
+- **第三路·V4 专属元组路**（L1812-L1819）：判据是「SlidingWindowMLASpec 在场＋页宽多于一种」，目前唯一住户是 DeepSeek V4。装包三步：`group_and_unify_kv_cache_specs`（L1592-L1632）分桶（MLA 全家一桶、滑窗族按 (block_size, window) 分桶）→ `_get_kv_cache_groups_uniform_groups`（L1670-L1754）按层元组打包 → `_approximate_gcd`（L1635-L1667）对齐各桶元组数，下文逐步拆。
+- **第四路·通用等页**（L1821-L1841）：前三路都不中才落到这里，先抽出 hidden-state 层（HiddenStateCacheSpec，缓存的不是 K/V 而是隐状态的一族层）再 unify 页宽、分桶等量，前两小节的正片；Gemma3、gpt-oss 这类页宽全等的混排走它。
+
+[第 15 章](../../ch15-prefix-caching/narrative/chapter.md)讲跨类型命中时会回来对这张全貌。V4 在梯子上逐级下落：第一路显然不中（六种形态两族家族）；第二路也不收，MLA 全家（压缩比大于 1，每块只要少量槽）与滑窗族（每 token 一槽）本就不同型，滑窗族内部还再分三种窗口 2048、8、128，「窗口大小不同的滑窗不是同一型」是该类 docstring 的原文（kv_cache_interface.py:L840-L842）。（消歧一句：第三路注释首句 "All layers need the same number of token slots" 不能按字面读成「各层每块槽数相等」：C4 主 KV 与索引器 64 槽、C128 主 KV 2 槽、两族压缩器状态 4/8 槽并不等；分路的真正依据在后半句，同为 token 槽型缓存的层里混了全历史与三种窗口，装不进第二路的「同型」单组。）落到第三路的判据，两个 guard 都是先验检查：
+
+```python
+# vllm/v1/core/kv_cache_utils.py:L1599-L1607 · group_and_unify_kv_cache_specs
+    if not any(
+        isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
+    ):
+        return None
+
+    # SlidingWindowMLASpec models with uniform page sizes don't need tuple packing.
+    page_sizes = {spec.page_size_bytes for spec in kv_cache_spec.values()}
+    if len(page_sizes) <= 1:
+        return None
+```
+
+没有 SlidingWindowMLASpec 就 return None 落回等页路径；页宽只有一种也 return None（uniform 页宽的滑窗模型不必打包）。V4 的户口必然双条件命中：六种形态里三种报 SlidingWindowMLASpec、页宽实测四种（函数 docstring 自报家门："Currently, this is only used for DeepseekV4"）。反过来问：若硬把 V4 塞进等页路径会怎样？三种小页 32832、8640、1728 没有一个整除最大页 37440，unify 的出路只剩 pad，而 pad 只留给 MambaSpec 与按 stride 索引的层；即便 unify 抛出 NotImplementedError，分配兜底 `_try_get_full_allocation_fallback_groups` 见到 SlidingWindowMLASpec 直接 return None（kv_cache_utils.py:L1540-L1544）。第三路不是优化，是唯一可行解。
+
+第三路怎么分组？`_get_kv_cache_groups_uniform_groups`（kv_cache_utils.py:L1670-L1754）按注释自带的示例层数走，注释值得逐字读：
+
+```python
+# vllm/v1/core/kv_cache_utils.py:L1691-L1697 · _get_kv_cache_groups_uniform_groups
+    # We define a layer tuple as a group of layers with different page sizes, and
+    # one UniformTypeKVCacheSpecs contains a list of layer tuples.
+    # For example, if we have 11 C4 layers and 10 C128 layers, we can define a layer
+    # tuple as [C4I, C4A, C128], and the full_mla_group will contain "11" layer tuples.
+    # The other uniform KV cache specs will be similarly partitioned into layer tuples.
+    # Say we have 21 SWA layers, all with the same page size, then we will have "21"
+    # layer tuples.
+```
+
+元组（layer tuple）＝一组不同页宽的层拼成的最小整租单元。走查结果五组：**MLA 元组组**一个，C4I、C4A、C128A 共 32 份 spec 全体并入，11 个 [C4I, C4A, C128] 元组（C128A 只有 10 层、天然短一截），组的页＝32 份 spec 页之和 524160 B，一个块号＝组内每层各一页；**滑窗族**按 (block_size, window) 分桶（L1613-L1618），三种形态恰好三个键：21 个滑窗缓存 (64, 2048) 一桶、C4 状态 (4, 8) 一桶、C128 状态 (8, 128) 一桶；桶内再对齐元组数，`_approximate_gcd` 取总 padding 最小的公约数（L1635-L1667：各组的元组数 11、21、11、10，取 11），滑窗桶 21 凑 22 后按 `layer_tuples[i::num_tuple_groups]` 交错切成 11+10 两组，C128 状态桶 10 凑 11 补 1，两族压缩器状态各成 1 组。组间断言是打包正确性的哨兵：MLA 桶必须纯 MLA（L1681-L1685）、滑窗桶必须纯 SlidingWindowMLASpec（L1711-L1715）、桶内每个页宽的层数必须相同（L1726-L1729）。硬约束也从「每组每块字节相等」换成了「块号在重叠打包布局里各有落点」：五组共用一条块号轴，物理块步长取各组页宽的最大值，每组在自己偏移上密排、组间布局允许重叠，因为一个块 id 同一时刻只归一组（`_get_packed_kv_cache_layout`，L1283-L1305；张量侧落点下一小节的第三型布局再接）。
+
+边界三句话收束：584 B 特形与 compress_ratio 的数学[第 24 章](../../ch24-primer-attn-variants/narrative/chapter.md)已立，本章只消费结论；模型侧三件套（索引器、压缩器、滑窗缓存）与打包张量布局的正片，归拆读 DeepSeek-V4 的专章与 MLA 展开章；开 MTP（multi-token prediction，DeepSeek 的多头预测投机头）时，最后一层的滑窗缓存所在组会被标注 `is_eagle_group`（`_annotate_eagle_groups_deepseek_v4`，kv_cache_utils.py:L1757-L1778），草稿层怎么混编进宿主组归投机解码线。账本侧本章已给全：四类缓存、六种形态、四种页宽、五组户口，第三路全须全尾。
+
+![DeepSeek V4 的账本户口：六种形态、四种页宽、第三条分组路径](../diagrams/ch14-fig-v4-ledger-census.png)
+
+> *图注：L0「调度 · 显存账本」列池内组化层的边界放大（对应 L2 章图中排拍片①的外沿，与「混合分桶与等量化组」一图互补：那张是等页路径的正例，本图画路径外的 V4）。左：六种形态的页宽条，主 KV 与滑窗缓存同享 37440 B（同一张物理张量），索引器 8640、C128A 主 KV 1728、两族压缩器状态 32832，共 4 种页宽，六条假设第 3 条（每 token 每层字节相同）当场破。右：第三路的分组结果（源码注释示例 11 C4 ＋ 10 C128 ＋ 21 滑窗），MLA 全家 32 层打包成 [C4I,C4A,C128] × 11 个元组，组的页＝32 份 spec 页之和（524160 B，一个块号＝组内每层各一页），滑窗族按 (block_size, window) 分桶：21 个滑窗缓存切 11+10 两组、压缩器状态各自成组，共 5 组；组间页宽不必相等，块号靠重叠打包布局（一个块 id 同一时刻只归一组）各有落点。等页组化到 V4 为止，元组打包的正片归拆读 DeepSeek-V4 的专章。*
+
 ### 张量怎么共享：一个房间三个门牌
 
-组切好了、页统一了，剩下的物理问题是：块池张量怎么摆？`get_kv_cache_config_from_groups`（kv_cache_utils.py:L1361-L1443）有三种布局，通用分支的方案注释里那张 ASCII 图值得逐字读：
+组切好了、页统一了（或像 DeepSeek V4 那样换了条路分组），剩下的物理问题是：块池张量怎么摆？`get_kv_cache_config_from_groups`（kv_cache_utils.py:L1361-L1443）有三种布局，通用分支的方案注释里那张 ASCII 图值得逐字读：
 
 ```python
 # vllm/v1/core/kv_cache_utils.py:L1411-L1437 · get_kv_cache_config_from_groups
@@ -671,7 +788,7 @@ Mamba 那行 93.75% 的浪费是极端例（状态页远小于注意力页时的
             )
 ```
 
-方案一句话：**group_size 个内存池，每个池由每组各出一层合租**。上面例子里 full.0 / sw.0 / sw.1 共享一张张量、full.1 / sw.2 共享另一张（sw.1 组只有一层，第二池就没有它）。为什么敢共享？注释原话给了答案："As layers of different groups have different block table, they will use different parts of the shared Tensor"——**一个 block_id 同一时刻只归一个组用**（块一经分给某组的请求，就只出现在那个组的私有块表里），共享的是房间面积，不是钥匙。`num_blocks = available // page // group_size` 在这里再除一次组内层数。单组异宽布局（同型但页宽不同的层挤在一组，下文 m7 表第二行的「单组异宽」就是它）走「逐层各一张张量」按页分账；还有一族 packed 重叠布局让多层的缓存物理上别名重叠（特定模型家族的特化路径，点到为止）。三组两池的实跑：
+方案一句话：**group_size 个内存池，每个池由每组各出一层合租**。上面例子里 full.0 / sw.0 / sw.1 共享一张张量、full.1 / sw.2 共享另一张（sw.1 组只有一层，第二池就没有它）。为什么敢共享？注释原话给了答案："As layers of different groups have different block table, they will use different parts of the shared Tensor"——**一个 block_id 同一时刻只归一个组用**（块一经分给某组的请求，就只出现在那个组的私有块表里），共享的是房间面积，不是钥匙。`num_blocks = available // page // group_size` 在这里再除一次组内层数。单组异宽布局（同型但页宽不同的层挤在一组，下文表第二行的「单组异宽」就是它）走「逐层各一张张量」按页分账；还有一族 packed 重叠布局让多层的缓存物理上别名重叠，上一小节 DeepSeek V4 五组共轴的落点正是它（一个块 id 同一时刻只归一组、组间布局可重叠，张量的完整刀法归拆读 DeepSeek-V4 的专章）。三组两池的实跑：
 
 <!-- trace: m7 -->
 | 布局 | group_size | 张量数 | 每张量共享者 | 尺寸 |
@@ -936,7 +1053,7 @@ def resolve_kv_cache_block_sizes(
         self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
 ```
 
-只收**整块**（窗外 token 数整除块大小），块表开头一段逆序 free 归池、**原位换 null_block 占位**。为什么必须占位而不是把表缩短？位置不变量：块表第 i 项恒对应第 i×block_size 个 token（[第 13 章](../../ch13-paged-kv/narrative/chapter.md)的槽位恒等式靠它）。占位保住对齐，注意力 kernel 照表读、读到 NULL 的位置本来就在窗外、根本不会读。null 块在池里也是特判户：
+只收**整块**（窗外 token 数整除块大小），块表开头一段逆序 free 归池、**原位换 null_block 占位**。为什么必须占位而不是把表缩短？位置不变量：块表第 i 项恒对应第 i×block_size 个 token（[第 13 章](../../ch13-paged-kv/narrative/chapter.md)的槽位恒等式靠它）。占位保住对齐，注意力 kernel 照表读、读到 NULL 的位置本来就在窗外、根本不会读。这套还账还是**每组各演各的**：组化给了每组一张私有块表，同一个请求在 full 组的表里全长在册、一个 NULL 都没有，在 SWA 组的表里开头早已是一排 NULL，两张表各按各的语义记账、互不越界（「一张表的两难」里「分表是唯一无损解」的兑现正在此处；DeepSeek V4 的五组户口同理，full 管家与滑窗管家各收各的账）。null 块在池里也是特判户：
 
 ```python
 # vllm/v1/core/block_pool.py:L187-L191 · BlockPool.__init__
@@ -1042,6 +1159,18 @@ def resolve_kv_cache_block_sizes(
 > *图注：L0「调度 · 显存账本」列内 Scheduler 与 KVCacheManager 接缝的准入门放大（对应 L2 章图中排拍片⑥）。上：SWA 请求逐 chunk 推进，窗外块每步先回收归池，实持块从 2 涨到 4 就封顶（cap=5 留了 +1 的块首错位余量），序列再长实持也不涨；下：混合模型过准入门，full 组按整序列 256 块、SWA 组被夹到 33 块，总 289 ≤ 999 放行；不夹则要按 512 算，1000 块的池并发从约 3.4 条掉到约 2 条。cap 由 spec 的同一个方法算出，启动期定池大小、运行期放请求进门共用，单源，漂移即 #39734 死锁。*
 
 混合门那行就是第二幕的修复现场：夹取后同一池子的并发从约 2 条救回约 3.4 条。拿 #39734 的场景心算（示意推演，非 issue 原文数字）：一条 100k prompt 按全长要 cdiv(100000,16) ≈ 6250 块；窗口 1024、块 16、在途按一个 16-token chunk 计的 SWA 层，回收感知稳态只要 cdiv(1023+16,16)+1 = 66 块。6250 与 66 的鸿沟，被一个公式抹平。与前文混合布局表那行的 257（cap=cdiv(min(511+8192,4096),16)+1）对照，差别只在 `max_in_flight_tokens` 一个代入值：在途 0 时窗口项生效得 33，在途 8192 时 max_model_len 顶住得 257。
+
+门立完了，把「一个池子多张账」的收益合成一笔看。一张表的世界里，每请求的账必须按最保守的语义（全历史）摊给全部层；分组后是各组各按各的语义封顶再求和，差距由回收型组的「封顶不随长度涨」单调拉开。三个静态口径加一个动态口径，各兑现一次：
+
+<!-- trace: m18 -->
+| 口径 | 一张表（最保守语义说了算） | 组化后（各组各按各的语义） | 落账 |
+|---|---|---|---|
+| 4096-token 请求过准入门（窗 512、在途 0、池 1000） | full 256 + SWA 按全长 256 = 512 | full 256 + SWA 夹到 33 = 289 | 并发 1.9531 → 3.4602（同池 1000） |
+| 死锁修复场景 100000-token prompt（窗 1024、在途 16） | 按全长 cdiv(100000,16) = 6250 块 | 回收感知 cdiv(1023+16,16)+1 = 66 块 | 6250 → 66：鸿沟被单源公式抹平 |
+| 混合容量核算（在途 8192 顶到 max_len 4096、池 1024） | —（uniform 无此形态） | full 256 + cap 257 = 513 | 并发 1.9961（对照 uniform：每请求 256 → 4.0） |
+| 运行期还账（decode 推进中） | full 管家从不还账（skipped 恒 0） | SWA 组每步窗外整块归池：实持 4→3→2→1 | 池 free 回升 3→4→5→6（前文推进一~三） |
+
+第三行要诚实读：在途 8192 顶住 max_model_len 时 cap 257 只比全长 256 多 1，这一景分组几乎没省（并发 1.9961 对 uniform 的 4.0）；窗口真正发力在两头：在途小时（准入门那行的 33），序列长时（32768 长度 full 组要 2048 块、SWA 组封顶 545）。最后一行补上动态半边：full 组从不还账，SWA 组每步把窗外整块还回池里，省显存不是准入时的一笔折扣，是运行期每拍都在发生的还账。512 对 289、6250 对 66、513 对 256：三个口径三个数，背后是同一个公式，这就是 PR #40946 单源化的全部含义。
 
 ### 第三道：水位，吞吐换稳定
 
