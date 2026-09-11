@@ -1,0 +1,1067 @@
+{
+  "chapter_id": "ch30-grammar-compilation",
+  "part": "VII",
+  "title": "约束解码 I：语法编译",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "chapter_kind": "code",
+  "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。Part VII 第 2 章（l0_zoom=采样列结构化输出组）。上游已立：ch29 站 1 的 apply_grammar_bitmask 交接点（『logits 已被改过』的窗口采样侧）+ 站 5 allowed_token_ids 白名单（『不带 FSM 的粗粒结构化输出，下一章的位掩码是它的完全体』）；ch9 站 4 埋 F6（get_grammar_bitmask 在五拍里的位置 + 掩码窗口不变式 + 『这张每 token 一位的允许表从哪来？语法怎么编译成状态机、状态机怎么逐拍填表、xgrammar 与 guidance 两个后端怎么选』）；ch11 已立 RequestStatus 阻塞态/skipped_waiting/晋级机制全貌（本章复用同一套机制、只讲语法门这一个实例）；ch2 已立前端 Processor/SamplingParams 校验面。本章伏笔任务：收 F6（planted=9, paid=30）——回收『语法→FSM』『后端怎么选』两问 + 编译时序（异步门）；『逐拍填表+两段式窗口』由 ch31 接力收尾。",
+  "hook_suggestion": "「一句『必须输出合法 JSON』或一条正则，怎么变成每个采样位置上『哪些 token 合法』的判定？复杂 schema 的编译是毫秒到百毫秒级的 CPU 密集活，而 EngineCore 是单线程忙循环——没编译完的请求凭什么既不进批、又拖不住别人一个 token？编译要是干脆失败了呢？xgrammar、guidance、outlines、lm-format-enforcer 四家状态机都吃同一份契约，凭什么全引擎只许装一家、auto 又按什么顺序降级？」（从 Part VII hook『128000 个 logits 选谁出门，过 9 道关卡』+ 章主题语法编译 + deepread/model-sample.json why_chains[4][5] 的 pain（编译 CPU 密集阻塞关键路径打爆 TTFT / 重试不保证终止 / vocab 13 万枚举拼不进批管线）+ F6 伏笔原文提炼为真问题）",
+  "scope_note": "主线 = **语法对象的一生**（站 1-8）：六选一参数 → 前端校验选后端（含 choice→EBNF 原地改写）→ 进门即阻塞 WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR → IO 线程异步起编（线程池半 CPU）→ 工作线程编译成 xgrammar FSM → 入 skipped_waiting 侧队不挡人 → 每拍 100µs 探测晋级（失败=Exception→只杀单请求）→ 掩码之下采样（ch9/ch29 已立，一笔带过）→ 调度器用真采样 token 推进 FSM（accept_tokens；思考模型先过 should_advance/trim 门）→ 交棒 get_grammar_bitmask。三个横切面：(A) 语法→FSM（introduces 之一，m6）：xgrammar 编译五分派、GrammarMatcher(max_rollback_tokens=num_speculative_tokens)、编译缓存生态（m10：xgrammar 库内 LRU+512MB 字节预算 / outlines 内存 LRU+可选 SQLite / guidance 无 / vLLM 侧零去重）、ReDoS 超时护栏（m19）。(B) 后端生态（introduces 之二，m3/m4/m5/m18/m20）：两层 ABC（引擎级 Backend 三方法 / 请求级 Grammar 六方法）、auto 降级阶梯与校验期改写、四后端同契约对照（能力矩阵藏在分派里 / rollback_lag / LMFE 拒 spec）、引擎级单后端+_backend_was_auto 记账。(C) 异步编译门（introduces 之三，m11-m15）：线程池选半 CPU 的理由、Future 100µs 非阻塞探测与 Future→成品/Exception 原地替换、编译失败隔离（grammar_compile_error_reqs→FINISHED_ERROR）、external_launcher 回退同步（多 rank 确定性）、线程安全不变式（就绪单调）。边界：掩码批装配/并行填充/spec 窗口预推进+rollback/ndarray 跨进程/pinned H2D/apply_token_bitmask_inplace/两段式 GPU 窗口/should_fill_bitmask（fill 侧思考门）→ ch31；RejectionSampler/draft/validate_tokens 的 spec 调用点（scheduler.py:L2163/L2192）→ ch32/33（本章只在 m8 点名语义）；采样 9 步 → ch29；阻塞态机制全貌 → ch11；detokenize/输出回程 → ch9。",
+  "code_spine": [
+    "vllm/sampling_params.py:L72-L122 — StructuredOutputsParams：六选一约束（json/regex/choice/grammar/json_object/structural_tag）+ __post_init__ 互斥校验 + all_constraints_none",
+    "vllm/sampling_params.py:L753-L770 — SamplingParams.verify：前端校验入口（InputProcessor 调，vllm/v1/engine/input_processor.py:L104）",
+    "vllm/sampling_params.py:L923-L1086 — _validate_structured_outputs：diffusion/无 tokenizer 拒单 + 后端冲突检查 + 内容校验 + 显式后端分支 + auto 降级阶梯（xgrammar→guidance/outlines）",
+    "vllm/v1/structured_output/backend_xgrammar.py:L272-L363 — validate_xgrammar_grammar：校验期试编 + choice→EBNF / lark→EBNF 原地改写 + xgrammar 能力矩阵预检（has_xgrammar_unsupported_json_features L225-L269）",
+    "vllm/v1/request.py:L87-L114 — Request 挂 StructuredOutputRequest、初始态直接置 WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR",
+    "vllm/v1/engine/core.py:L969-L991 — preprocess_add_request：输入 IO 线程调 grammar_init（注释原话线程安全论证）",
+    "vllm/v1/structured_output/__init__.py:L114-L175 — grammar_init：惰性建唯一后端 + 提交 ThreadPoolExecutor（external_launcher 回退同步且异常也包 Future）",
+    "vllm/v1/structured_output/__init__.py:L177-L192 — _create_grammar：工作线程读 structured_output_key → backend.compile_grammar（失败经 Future 传调度器）",
+    "vllm/v1/structured_output/backend_xgrammar.py:L37-L126 — XgrammarBackend：TokenizerInfo → GrammarCompiler(cache_enabled, 字节预算) → compile_grammar 五分派 → GrammarMatcher FSM",
+    "vllm/v1/structured_output/request.py:L22-L103 — StructuredOutputRequest：Future/成品/Exception 三态 + _check_grammar_completion 100µs 探测 + grammar property + structured_output_key 归一",
+    "vllm/v1/core/sched/scheduler.py:L2051-L2062 — _is_blocked_waiting_status + _enqueue_waiting_request：阻塞态进 skipped_waiting 侧队",
+    "vllm/v1/core/sched/scheduler.py:L698-L722 — schedule() WAITING 相位窥队头：每拍尝试晋级、未就绪 prepend 回侧队",
+    "vllm/v1/core/sched/scheduler.py:L2678-L2712 — _try_promote_blocked_waiting_request：grammar 就绪→WAITING；Exception→grammar_compile_error_reqs",
+    "vllm/v1/core/sched/scheduler.py:L1954-L1968 — update_from_output 尾部收账：编译失败集合→finish_requests(FINISHED_ERROR) 只杀单请求",
+    "vllm/v1/core/sched/scheduler.py:L1817-L1843 — update_from_output 推进块：should_advance→trim_reasoning_for_advance→accept_tokens；拒收=引擎 bug→FINISHED_ERROR+resumable=False",
+    "vllm/v1/core/sched/scheduler.py:L1646-L1668 — get_grammar_bitmask：本章交棒点（批装配归 ch31）"
+  ],
+  "stations": [
+    {
+      "n": 1,
+      "where": "vllm/sampling_params.py:L923-L1086（入口 verify L755-L770 ← input_processor.py:L104）",
+      "what": "前端校验·选后端：六选一互斥早已强制（L72-L126）；diffusion/无 tokenizer 拒单（L937-L951）；引擎单后端冲突检查+_backend_was_auto 记账（L953-L966）；auto 阶梯先试 xgrammar、失败降 guidance/outlines（L1043-L1086）；校验期**原地改写请求**：choice→EBNF（backend_xgrammar.py:L293-L303）、lark→EBNF（L327-L335）——引擎侧分派因此无 CHOICE 分支"
+    },
+    {
+      "n": 2,
+      "where": "vllm/v1/request.py:L87-L114",
+      "what": "建请求·进门即阻塞：StructuredOutputRequest.from_sampling_params 挂上（无约束则 None）；带约束的生成请求初始 status 直接=WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR（不是 WAITING）——门在出生那一刻就关上"
+    },
+    {
+      "n": 3,
+      "where": "vllm/v1/engine/core.py:L969-L991 → __init__.py:L114-L175",
+      "what": "IO 线程·异步起编：preprocess_add_request 调 grammar_init（不占忙循环；注释原话 'grammar_init is only invoked in input processing thread'）；首次调用惰性构造全引擎唯一后端；executor.submit 把 Future 挂进请求（external_launcher 回退同步、异常也包成 Future 同形）"
+    },
+    {
+      "n": 4,
+      "where": "vllm/v1/structured_output/__init__.py:L177-L192 → backend_xgrammar.py:L78-L126",
+      "what": "工作线程·编译成 FSM：_create_grammar 读 (枚举,规格串) 键→compile_grammar 五分派（REGEX 带 ReDoS 超时）→ GrammarMatcher(max_rollback_tokens=num_speculative_tokens) 逐 token 状态机；GrammarCompiler 缓存+512MB 预算；失败 raise——异常经 Future 传回调度器"
+    },
+    {
+      "n": 5,
+      "where": "vllm/v1/core/sched/scheduler.py:L2213-L2235 → L2050-L2062",
+      "what": "入侧队·不挡人：add_request 后 _enqueue_waiting_request 见阻塞态（与 REMOTE_KVS/STREAMING_REQ 共用）→ 进 skipped_waiting 侧队而非正常 waiting——没编译完的请求不参与正常调度，别人的 token 一个不耽误"
+    },
+    {
+      "n": 6,
+      "where": "vllm/v1/core/sched/scheduler.py:L698-L722 → L2678-L2712 → request.py:L50-L59",
+      "what": "每拍窥队·100µs 探测→晋级或失败：schedule() WAITING 相位窥队头试晋级——result(timeout=0.0001) 非阻塞取 Future：超时=没编好回侧队（忙等变体）；成品→status=WAITING 当拍入批；Exception→grammar_compile_error_reqs→FINISHED_ERROR 只杀这一个（L1954-L1968），引擎照常服务"
+    },
+    {
+      "n": 7,
+      "where": "vllm/v1/core/sched/scheduler.py:L1817-L1843",
+      "what": "采样后推进 FSM：update_from_output 用**本步真正采出的 token** 推进——should_advance（非思考模型快真）→ trim_reasoning_for_advance（剔除混入的思考 token，#44006）→ accept_tokens；拒收即引擎 bug：FINISHED_ERROR+resumable=False（掩码之下不该采出非法 token=fill→sample→accept 环的闭合不变式；采样本身=ch9 ④/ch29 已立）"
+    },
+    {
+      "n": 8,
+      "where": "vllm/v1/core/sched/scheduler.py:L1646-L1668",
+      "what": "交棒：get_grammar_bitmask 收集本拍非 prefill 中段的结构化请求 id 序列，转手 grammar_bitmask 装配（is_prefill_chunk：切块 prefill 还在消化 prompt 不算掩码）；GrammarOutput(request_ids, ndarray) 的算/传/盖与两段式 GPU 窗口全部归 ch31——本章到『FSM 活着、能被推进』为止"
+    }
+  ],
+  "stations_note": "站号 = 一个带结构化约束的请求流经『语法编译子系统』的顺序：第 1 站在前端进程（请求还没进引擎）；第 2-8 站在引擎进程（IO 线程→工作线程→调度器）。正文按讲解需要编排——建议先立『位掩码不是重试』的原理基座（m1，回收 F6 的『表从哪来』之问），再走一生主线 2→6（进门阻塞→异步编译→门控晋级），插后端生态横切面（m3-m5/m18），然后编译深挖（m6-m10），收在推进与交棒（m16-m17/m22）。第 7 站的采样动作本身是 ch9/ch29 的领地，本章只见 token 回流",
+  "key_classes": [
+    {
+      "name": "StructuredOutputsParams",
+      "file": "vllm/sampling_params.py:L72",
+      "responsibility": "用户面约束描述：json/regex/choice/grammar/json_object/structural_tag 六选一（__post_init__ 双向互斥校验）+ 三个开关；私有 _backend/_backend_was_auto 只许 Processor 校验期写"
+    },
+    {
+      "name": "StructuredOutputRequest",
+      "file": "vllm/v1/structured_output/request.py:L22",
+      "responsibility": "请求级容器：params + _grammar（Future | 成品 | Exception | None 三态演进）+ 思考模型字段（reasoning_ended/reasoning_end_token_index/reasoner）；grammar property 对外抹平 Future 与成品、is_grammar_ready v0.27.1 仍零 in-tree 调用者；structured_output_key 是每请求 cached_property（不是跨请求缓存键）"
+    },
+    {
+      "name": "StructuredOutputManager",
+      "file": "vllm/v1/structured_output/__init__.py:L35",
+      "responsibility": "引擎级编排者：惰性构造唯一后端、把编译提交线程池（grammar_init/_create_grammar）、思考门（should_advance/trim_reasoning_for_advance 本章；should_fill_bitmask 归 ch31）、批掩码装配（grammar_bitmask 归 ch31）"
+    },
+    {
+      "name": "StructuredOutputGrammar (ABC)",
+      "file": "vllm/v1/structured_output/backend_types.py:L31",
+      "responsibility": "请求级契约六方法：accept_tokens（推进）/validate_tokens（试走不推进）/rollback（投机口子）/fill_bitmask（与采样的唯一接口）/is_terminated/reset（v0.27.1 零 in-tree 调用者）"
+    },
+    {
+      "name": "StructuredOutputBackend (ABC)",
+      "file": "vllm/v1/structured_output/backend_types.py:L99",
+      "responsibility": "引擎级契约三方法：compile_grammar / allocate_token_bitmask / destroy；vllm_config/tokenizer/vocab_size 三字段固定四个后端的构造签名（重资源归引擎级）"
+    },
+    {
+      "name": "StructuredOutputOptions / StructuredOutputKey",
+      "file": "vllm/v1/structured_output/backend_types.py:L19",
+      "responsibility": "六种约束形态枚举 + (枚举, 规格字符串) 可哈希键类型——编译分派的开关"
+    },
+    {
+      "name": "XgrammarBackend / XgrammarGrammar",
+      "file": "vllm/v1/structured_output/backend_xgrammar.py:L36 / L136",
+      "responsibility": "默认后端：GrammarCompiler(cache_enabled=True, 字节预算) 编译 + 五分派产 CompiledGrammar，包 GrammarMatcher(max_rollback_tokens=num_speculative_tokens) 作逐 token FSM；六方法参考实现"
+    },
+    {
+      "name": "GuidanceBackend / GuidanceGrammar",
+      "file": "vllm/v1/structured_output/backend_guidance.py:L88 / L143",
+      "responsibility": "llguidance 后端（auto 阶梯第二选择）：LLMatcher 消费 token；rollback_lag（EOS 后回滚少退一格）与 terminated 语义是四后端分歧的代表例；serialize_guidance_grammar 把六形统一序列化成 guidance 语法（含原生的 choice 支持）"
+    },
+    {
+      "name": "OutlinesBackend / OutlinesGrammar",
+      "file": "vllm/v1/structured_output/backend_outlines.py:L53 / L112",
+      "responsibility": "outlines_core 后端：一切先转正则再编 DFA Index（缓存键=词表哈希+正则串，内存 LRU(128)/可选 SQLite）；只认 JSON/REGEX/CHOICE 三形；is_terminated 故意延迟一步让 EOS 还能发出"
+    },
+    {
+      "name": "LMFormatEnforcerBackend / LMFormatEnforcerGrammar",
+      "file": "vllm/v1/structured_output/backend_lm_format_enforcer.py:L95 / L44",
+      "responsibility": "不持状态机：current_tokens_prefix 前缀列表按需查 get_allowed_tokens（fill 时才物化行）；撑不住 rollback 深度→compile_grammar 对 max_rollback_tokens>0 显式抛错拒投机；auto 阶梯从不选它"
+    },
+    {
+      "name": "RequestStatus",
+      "file": "vllm/v1/request.py:L348",
+      "responsibility": "请求状态枚举；WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR 是本章的『门』（三个阻塞态之一，ch11 已立机制）"
+    },
+    {
+      "name": "StructuredOutputsConfig",
+      "file": "vllm/config/structured_outputs.py:L18",
+      "responsibility": "引擎级配置：backend（默认 auto）/disable_any_whitespace/disable_additional_properties（均只支持部分后端）/reasoning_parser/enable_in_reasoning——引擎侧后端冲突检查的对照基准"
+    },
+    {
+      "name": "GrammarOutput",
+      "file": "vllm/v1/core/sched/output.py（scheduler 交棒产物）",
+      "responsibility": "(structured_output_request_ids, ndarray[int32]) 二元组：本章终点/下一章起点，掩码行序契约的载体（ch31 主角）"
+    }
+  ],
+  "data_flow": [
+    "【来源】deepread/model-sample.json contracts[5]『结构化输出三段契约』①③ 段 + data_flow 步 3/8（② 段掩码装配归 ch31）；锚点已对 v0.27.1 逐行现核。以下按站序展开：",
+    "1. 前端（站1）：InputProcessor 调 SamplingParams.verify（input_processor.py:L104 → sampling_params.py:L753-L770）→ _validate_structured_outputs（L923）：auto 阶梯先 validate_xgrammar_grammar（试编+可能原地改写 choice→EBNF），ValueError 则降 guidance/outlines，结果写 params._backend、_backend_was_auto=True（L1044-L1083）。不合法请求进引擎前就被拒。",
+    "2. 进引擎（站2-3）：IO 线程 preprocess_add_request 构造 Request——StructuredOutputRequest 挂上、status=WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR（request.py:L87-L114）；grammar_init 惰性建后端 + executor.submit(_create_grammar)（core.py:L969-L991 → __init__.py:L114-L175）。写者=输入线程（grammar_init）与编译线程（Future 兑现），读者=调度线程（100µs 探测）。",
+    "3. 编译（站4）：工作线程 _create_grammar 读 key → backend.compile_grammar（__init__.py:L177-L192 → backend_xgrammar.py:L78-L126）→ XgrammarGrammar(matcher=GrammarMatcher(...)) 存进 Future。编译器/词表归引擎级 Backend（跨请求共享+缓存），状态机归请求级（独立推进）——两层契约的物理呈现。",
+    "4. 门控（站5-6）：调度器 add_request 把阻塞态请求分进 skipped_waiting（scheduler.py:L2050-L2062）；每拍 schedule() WAITING 相位窥队头试晋级（L698-L722 → L2678-L2712）：grammar property 探 Future（request.py:L50-L59）——成品→WAITING（当拍可入批）；Exception→grammar_compile_error_reqs→update_from_output 尾部 FINISHED_ERROR 只杀单请求（L1954-L1968）。",
+    "5. 推进（站7）：update_from_output 用本步真采样 token 推进 FSM（scheduler.py:L1817-L1843：should_advance→trim_reasoning_for_advance→accept_tokens）——FSM 状态的唯一写者是调度器线程；拒收=FINISHED_ERROR+resumable=False。",
+    "6. 交棒（站8）：下一拍 get_grammar_bitmask（scheduler.py:L1646-L1668）→ StructuredOutputManager.grammar_bitmask 装配 → GrammarOutput(request_ids, ndarray) 经 sample_tokens RPC 传 worker（② 段全链 = ch31）。"
+  ],
+  "why_chains": [
+    {
+      "id": "WC1",
+      "card": "deepread/model-sample.json why_chains[4]（四要素原样；v0.27.1 锚点已复核一致）",
+      "v3_scope": "solution 的**编译侧**（语法→FSM、四后端、编译缓存、位掩码作为产物表示）= 本章；**落地侧**（批装配/并行填充/ndarray 跨进程/worker 侧重排+apply_token_bitmask_inplace）= ch31",
+      "decision": "结构化输出 = 语法编译成 FSM + 位掩码预过滤（采样前把非法 token 的 logits 打成 -inf），而不是采样后重试或逐请求 CPU 枚举",
+      "old_design": "朴素做法：a) 生成→校验→重采样循环（每步多轮 GPU 前向，延迟成倍）；b) 每步在 CPU 枚举合法 token id 列表传给采样器（v0 早期 outlines 集成形态，合法集是 list[int]）。",
+      "pain": "vocab 13 万，枚举/序列化合法 token 集合本身就有 O(V) 开销且无法与批处理 GPU 管线拼合；逐请求 CPU masking 逐 token 串行；重试路径根本不保证有限步终止。",
+      "solution": "语法→FSM：JSON Schema/regex/EBNF/structural_tag 编译成 xgrammar FSM（vllm/v1/structured_output/backend_xgrammar.py:L78-L126，GrammarCompiler 带 LRU+字节预算缓存 cache_limit_bytes=VLLM_XGRAMMAR_CACHE_MB（L65-L70））；每步 matcher.fill_next_token_bitmask 在预分配 [max_batch*(1+max_spec), ceil(V/32)] int32 位掩码上标记下一步不合法 token（vllm/v1/structured_output/__init__.py:L232-L234 分配预算、L194-L205 填充与全允许（-1）兜底）；掩码以 numpy 跨进程传 worker（L356-L359 注释：ndarray 序列化比 tensor 高效）；worker 侧先按自己批序+spec 偏移重排、pinned H2D，再 xgr.apply_token_bitmask_inplace 在 logits 上原位置 -inf（vllm/v1/structured_output/utils.py:L113-L161；非语法请求行以 -1 预填=补码全 1=全允许——xgrammar 位掩码约定 bit=1=允许、全 0 位才被 -inf，-1 即不设限兜底，非语法请求畅通无阻，L126-L131；调度器侧同义兜底 _full_mask=-1，__init__.py:L58、L201-L205）。v0.27 后端从 xgrammar 独苗扩成 4 选 1：xgrammar/guidance/outlines/lm-format-enforcer（__init__.py:L129-L164，引擎级单后端，注释明说不支持逐请求）；regex 编译加 ReDoS 超时（utils.py:L48-L83，防嵌套量词指数爆炸）；outlines 加 SQLite 磁盘索引缓存（utils.py:L218-L301，防 pickle 任意代码执行）。",
+      "cost": "① 引擎级单后端，全引擎只能一种（L124-L127 注释原话）；② FSM 活在调度器进程，每步一次 CPU FSM walk + H2D 传输（批>128 且无 spec 时并行填充，__init__.py:L60-L68、L244-L271）；③ 位掩码常驻 max_num_seqs*(1+num_spec)*ceil(V/32)*4B（128k vocab 下每行 16KB）；④ xgrammar 不支持的 JSON 特性（multipleOf/uniqueItems/非标 format 等）直接拒单（backend_xgrammar.py:L225-L269）；⑤ 掩码对 logits 的 -inf 写入发生在采样管线之前——与惩罚/bad_words 的先后顺序是隐式契约。",
+      "errata": "勘误（对抗自核，源头 deepread 卡 why_chains[4] 同步修正）：solution 初版两处把 -1 注成『禁』——尾句『非语法请求行初始化为 -1 全禁、正常不会被采到』与中段『L194-L205 填充与全禁兜底』——均语义颠倒（已一并改正）。xgrammar 约定 bit=1=允许；int32 的 -1 补码全 1=全允许=不设限。源码三处互证：① 调度器 _full_mask=torch.tensor(-1)（__init__.py:L58），_fill_bitmasks 对『本步不填掩码的行』（如思考段中的请求）fill_(_full_mask)（L201-L205）——若 -1=全禁，思考期请求会一个 token 都采不出；② outlines/LMFE 的 allocate_token_bitmask 默认 torch.full(...,-1)（backend_outlines.py:L99-L105、backend_lm_format_enforcer.py:L141-L147）；③ worker 侧重排基底张量 torch.full(...,-1)（utils.py:L126-L131），只有结构化请求行被覆写成语法行（L134-L141）。『正常不会被采到』亦不成立：非语法行的 logits 每拍照常被采样，只是盖的是全允许行（或不在 indices 内），等于不受约束。writer 必须按修正后口径讲。"
+    },
+    {
+      "id": "WC2",
+      "card": "deepread/model-sample.json why_chains[5]（四要素原样；锚点已对 v0.27.1 复核——scheduler._is_blocked_waiting_status L2051-L2056、晋级 L2695-L2705、update_from_output accept 实际区间 L1817-L1843（卡内尾数 L1845 差 2 行，已对 pin 现核修正）",
+      "v3_delta": "v0.27.1 相对卡内叙述的两处精确化（本次逐行现核）：① 编译失败不再只靠『编译完才可见』——异常以 Exception 形态存进 _grammar（request.py:L57-L58），晋级检查识别后 grammar_compile_error_reqs→FINISHED_ERROR 只杀单请求（scheduler.py:L2701-L2703、L1954-L1968）；② 同步分支（external_launcher）也把异常包进 Future（__init__.py:L169-L174），两条路径对下游同形",
+      "decision": "语法编译异步化 + 调度状态门：grammar 没编译完的请求不进批、不挡别人",
+      "old_design": "同步编译：请求带 schema 到达 → 阻塞编译完 → 才能调度；编译期间引擎空转。",
+      "pain": "复杂 schema 编译是 CPU 密集（毫秒到百毫秒级，随嵌套深度），阻塞在关键路径直接打爆 TTFT，且一个慢 schema 请求拖住整个引擎循环。",
+      "solution": "grammar_init 在输入处理线程把编译提交 ThreadPool（vllm/v1/engine/core.py:L986-L990 线程安全注释：'grammar_init is only invoked in input processing thread'；structured_output/__init__.py:L166-L174；线程数=半数 CPU L70-L77）；StructuredOutputRequest._grammar 存 Future，_check_grammar_completion 用 result(timeout=0.0001) 非阻塞探测（vllm/v1/structured_output/request.py:L50-L59）；未就绪请求置 WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR 进 skipped_waiting 侧队（vllm/v1/core/sched/scheduler.py:L2051-L2056 _is_blocked_waiting_status），就绪后晋升回 WAITING（L2695-L2705）。采完样由调度器推进 FSM：update_from_output 里 should_advance 检查后 grammar.accept_tokens（scheduler.py:L1817-L1843）——FSM 状态的唯一写者是调度器线程。v0.27 大扩：thinking 模型联动成为 bug 高发区——should_fill_bitmask/should_advance 判「思考段结束后语法才生效」（__init__.py:L361-L439），reasoning_end_token_index + trim_reasoning_for_advance 处理「一步内混思考 token+语法 token」的边界（L462-L486，修复 #44006/#42452 的产物）；spec 窗口的预推进+rollback 在 grammar_bitmask 内完成（L296-L350：对 scheduled_spec_decode_tokens 逐 token fill+accept，最后 grammar.rollback(state_advancements) 回退到实际接受数）。",
+      "cost": "100µs 轮询是忙等变体（每步每请求一次探测）；external_launcher（torchrun 每 rank 一个调度器）下各 rank 的门迁移时间会漂移、破坏确定性假设 → 该模式回退同步编译（__init__.py:L46-L55 注释原话）；thinking 联动的 mid-window 边界（推理结束点落在 spec draft 窗口中间）逻辑复杂，git 上连串 bugfix 实证其脆弱性。"
+    },
+    {
+      "id": "WC3",
+      "card": "deepread/engine-loop.json why_chains[4]『循环四段顺序 schedule→execute→sample→update，慢操作全部挪出循环体』（节选引用——为『编译为什么不在忙循环里』提供所属纪律）",
+      "v3_scope": "本链中 grammar 相关两拍：『Request 构造 + grammar 编译在 input socket IO 线程完成（core.py:L1715-L1721）』= 本章站 3 的位置正当性；『③ get_grammar_bitmask 塞进 GPU 前向窗口』= ch31",
+      "decision": "忙循环是单线程（run_busy_loop 只有一个 Python 线程驱动一切），任何阻塞都让 GPU 空转——一切可能慢的活要么前置、要么挪出循环体",
+      "old_design": "朴素单线程引擎（v0 LLMEngine.step 的形态）：tokenize/调度/前向/采样/后处理全在一个同步循环里，做一步等一步。",
+      "pain": "一步 forward 只有几十毫秒（2048-8192 token 预算量级）；10ms 串行 CPU 杂务 ≈ 20%+ 吞吐损失；结构化输出的 grammar 编译若在采样前串行算，每拍白加一段 CPU 时间。",
+      "solution": "core.py:L584-L614 step() 精确排布 + 循环外缘同一纪律：Request 构造和语法编译在 IO 线程完成（core.py:L1715-L1721 调 preprocess_add_request L969-L991，docstring 原话 'allow request initialization running in parallel with Model forward'）；ZMQ 收发在守护 IO 线程；detokenize 在前端进程；空闲时阻塞 input_queue.get 而非空转。",
+      "cost": "IO 线程化要求 grammar_init 的线程安全论证（注释原话自证）；调度器侧须配套『阻塞态→侧队→每拍探测』的门控机制（WC2），机制的复杂度没有消失、只是换了住处。"
+    }
+  ],
+  "theory": [
+    "为什么必须『采样前掩码』而不是『生成后修复』（F6 回收的原理基座）：设词表 V，语法在状态 s 下的合法集 A(s) ⊆ V。自由采样从 softmax 分布 p 抽样，落在 V\\A(s) 的概率一般非零；一旦落错，后续所有 token 都在一条回不到合法态的轨迹上（掩码每步只保证当下位置合法，但接受后 FSM 前进、下一步继续约束——链式保证整串在语言内）。重试法解的是『最近合法串』问题，既无唯一解也不保证有限步终止（WC1 pain 的形式化）。掩码法把分布替换成 A(s) 上重整的条件分布——对语言模型分布做逐步条件化。落地锚：ch9 已实测同一行 logits 盖掩码前后 argmax 从 5 号翻到 4 号（F6 窗口图）。",
+    "位掩码的表示与代价账：一行 = ceil(V/32) 个 int32（xgrammar allocate_token_bitmask 按 vocab_size 分配，__init__.py:L232-L234 给 max_num_seqs*(1+num_spec) 行预算）。V=128k 词表 → 4096 个 int32 = 16KB/行；对比逐 token 的 fp32 logits（128k×4B=512KB）恰是 1/32——位打包正是它能在每步热路径跨进程+H2D 的原因。全 1（-1 补码）=全允许：xgrammar 约定 bit=1=允许、0 才被 -inf——outlines/LMFE 的 allocate_token_bitmask 用 torch.full(...,-1) 构造（backend_outlines.py:L99-L105、backend_lm_format_enforcer.py:L141-L147）、调度器侧 _full_mask=-1 兜底本步不填掩码的行（__init__.py:L58、L201-L205）、worker 侧重排基底张量也以 -1 预填（utils.py:L126-L131，只有结构化行被覆写，L134-L141）——三处同一条约定：-1 即不设限，非语法行畅通无阻（它们的 logits 每拍照常被采样，只是不受约束）。",
+    "编译期 vs 运行期的代价分离：语法编译要为 FSM 每个状态算出词表上的可接受集合，是一次性 O(语法规模×词表规模) 量级的 CPU 密集代价；fill_bitmask 是每步 O(行宽) 的写入+一次传输。异步编译（WC2）把前者移出关键路径，编译缓存（m10）在同 schema 请求间摊薄它——『毫秒级一次性』换『每步 16KB』，这是本章命门的定量解释。（无容器运行环境，正文不得给未实测的毫秒数；deepread 卡的『毫秒到百毫秒级』作为设计者定性判断引用。）",
+    "fill→sample→accept 环的闭合不变式：掩码保证采样只能落在 A(s)，所以 accept_tokens 对采出的 token 必然成功——失败即引擎 bug（源码自己承认：backend_xgrammar.py:L162-L167 logger.error 'Please file an issue'；scheduler.py:L1837-L1844 'Unexpected: grammar rejected tokens … Terminating request'+resumable=False）。这条不变式同时解释了为什么 update_from_output 才是 FSM 的唯一写者：只有那里拿着『真正落定』的 token。",
+    "validate_tokens 的『试走再回退』等价性：xgrammar 实现是逐 token accept、计数 k、再 rollback(k)（backend_xgrammar.py:L179-L188）。当且仅当 rollback 是 accept 的精确逆操作时这才等价于『不推进』——而 GrammarMatcher 的回滚深度上限=max_rollback_tokens=num_speculative_tokens，等价性在投机 token 数以内成立。语义分工的调用面：update_from_output 用 accept_tokens 喂真 token；spec 路径用 validate_tokens 试走 draft（scheduler.py:L2163/L2192，展开归 ch32/33）。",
+    "门控正确性=就绪单调+单写者：_grammar 一旦从 Future 换成成品（或 Exception）就不再变回，属性读幂等——『就绪』单调（false→true 不回退），不会出现『晋级后又没编好』的竞态；grammar_init 只在输入线程调用（core.py:L984-L990 注释原话），写 Future 的只有它与编译线程，调度线程只做 Future→成品/Exception 替换。100µs 探测的微妙处：result(timeout=0.0001) 在恰好完成的那次调用直接拿到结果省一轮调度，超时抛 TimeoutError 当作未就绪——忙等变体但每次成本被钳在百微秒级。",
+    "编译失败的隔离语义（v0.27.1 新形态）：异常不抛穿忙循环，而是以 Exception 对象存进 _grammar（request.py:L57-L58）——grammar property 照常返回（类型含 Exception），晋级检查 isinstance 识别后记入 grammar_compile_error_reqs，同拍 update_from_output 尾部 finish_requests(FINISHED_ERROR)（scheduler.py:L1954-L1968）：一个坏 schema 只杀自己，引擎与其余请求无感。对比：若编译在关键路径同步做，一个坏 schema 会以异常打断整拍调度。",
+    "auto 降级阶梯的决策论：xgrammar 是性能最优默认（适配词表的 FSM + 三方里唯一全六形支持），失败原因两类——语法特性不支持（has_xgrammar_unsupported_json_features 预检：multipleOf/uniqueItems/非标 format/patternProperties 等，backend_xgrammar.py:L225-L269）或编译报错；降级顺序 xgrammar→guidance（非 tekken Mistral 或 guidance 也不支持的 schema 则跳到 outlines）——LMFE 永不被 auto 选中（无 rollback 能力、能力面最窄）。能力差异暴露在校验期（拒单）而非运行中段，这是『快速失败』的谱系设计。"
+  ],
+  "mechanisms": [
+    {
+      "id": "m1",
+      "name": "位掩码不是重试：约束解码=采样前把非法 token 打 −inf 的预过滤（F6 回收的原理基座；掩码表示/条件分布论证）",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/structured_output/backend_types.py:L73-L80",
+        "vllm/sampling_params.py:L72-L126"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "note": "ch9 已实测同一行 logits 盖掩码前后 argmax 翻转（F6 窗口图，ch09-fig-bitmask-window）；本章讲『表从哪来』——figure 建议画 schema→FSM→逐位置合法集→位掩码行的概念链（架构性内容回指 L2）"
+    },
+    {
+      "id": "m2",
+      "name": "六种约束形态与一个编译键：StructuredOutputsParams 六选一互斥 + structured_output_key 把 dict/list 归一成 (枚举,字符串) 二元组（可哈希）",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/sampling_params.py:L72-L126",
+        "vllm/v1/structured_output/request.py:L78-L103",
+        "vllm/v1/structured_output/backend_types.py:L19-L28"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "note": "json/choice 的 json.dumps 归一细节；structured_output_key 是每请求 cached_property——**不是**跨请求编译缓存键（m10 纠偏点）"
+    },
+    {
+      "id": "m3",
+      "name": "后端选择在前端校验期定：verify→_validate_structured_outputs 的 auto 降级阶梯（xgrammar→guidance/outlines）+ 引擎配置冲突检查 + 内容预检（空串/空 choice/diffusion 拒单）",
+      "kind": "config",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/sampling_params.py:L923-L966",
+        "vllm/sampling_params.py:L1043-L1086",
+        "vllm/v1/engine/input_processor.py:L104",
+        "vllm/v1/structured_output/backend_xgrammar.py:L225-L269"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "note": "引擎侧 grammar_init 只认 params._backend（__init__.py:L128 注释原话 '_backend is set in Processor._validate_structured_output'）；diffusion 拒单注释点名 #45436（FSM 要求左到右、扩散模型整画布并行去噪）"
+    },
+    {
+      "id": "m4",
+      "name": "校验期不只是选后端，还会**原地改写请求**：choice→EBNF grammar（choice=None/grammar=ebnf）与 lark→EBNF——引擎侧五分派无 CHOICE 分支的原因",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/structured_output/backend_xgrammar.py:L293-L303",
+        "vllm/v1/structured_output/backend_xgrammar.py:L327-L343",
+        "vllm/v1/structured_output/utils.py:L553-L561",
+        "vllm/v1/structured_output/utils.py:L391-L420"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "note": "读者只看引擎侧会误判『CHOICE 不被支持』——必须讲清这次改写；guidance 走另一条路（serialize 原生支持 choice，tp='choice'）——改写是 xgrammar 校验器的行为而非全局"
+    },
+    {
+      "id": "m5",
+      "name": "两层契约：引擎级 Backend ABC（compile_grammar/allocate_token_bitmask/destroy + vllm_config/tokenizer/vocab_size 三字段）与请求级 Grammar ABC（六方法）——『共享编译成果、独立推进状态』的类型化",
+      "kind": "protocol",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/structured_output/backend_types.py:L31-L95",
+        "vllm/v1/structured_output/backend_types.py:L99-L136"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m6",
+      "name": "语法→FSM：xgrammar 编译五分派（JSON/JSON_OBJECT/GRAMMAR/REGEX/STRUCTURAL_TAG）→ CompiledGrammar → GrammarMatcher 逐 token 状态机（max_rollback_tokens=num_speculative_tokens）",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/structured_output/backend_xgrammar.py:L37-L76",
+        "vllm/v1/structured_output/backend_xgrammar.py:L78-L126"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "note": "worked example 建议：微型 schema {\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"}}} 或 choice [\"yes\",\"no\"] → EBNF root ::= \"yes\" | \"no\" → FSM 状态序列 → 位置 0 的合法 token 集；JSON_OBJECT 实为 compile_json_schema('{\"type\": \"object\"}') 的语法糖（L85-L88）；xgrammar 内部（schema→CFG→adaptive FSM→per-state token set）是库内实现，vLLM 侧只见 API——正文按 API 契约讲，不杜撰库内部"
+    },
+    {
+      "id": "m7",
+      "name": "契约六方法的语义分工：accept_tokens（推进）/validate_tokens（试走）/rollback（回退）/fill_bitmask（与采样唯一接口）/is_terminated/reset——为什么恰好是这六个",
+      "kind": "protocol",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/structured_output/backend_types.py:L35-L95",
+        "vllm/v1/structured_output/backend_xgrammar.py:L152-L203"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "note": "reset 在 v0.27.1 全仓零 in-tree 调用者（只有各后端内部 matcher.reset）——契约完整性存在但勿编造使用场景；is_terminated 的四后端语义分歧见 m18"
+    },
+    {
+      "id": "m8",
+      "name": "推进与试走的分离：accept_tokens 改状态（真发生了）、validate_tokens 只问『能不能走通』——xgrammar 的实现=先真 accept 再 rollback(k) 的等价性",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/structured_output/backend_xgrammar.py:L152-L193",
+        "vllm/v1/structured_output/backend_types.py:L49-L60"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "note": "等价性在 max_rollback_tokens 以内成立（见 theory）；spec 路径的 validate_tokens 调用点 scheduler.py:L2163/L2192 归 ch32/33，本章点名即可"
+    },
+    {
+      "id": "m9",
+      "name": "rollback 是为投机解码留的口子：max_rollback_tokens=num_speculative_tokens；outlines 的 Guide(max_rollback=…) 同源；LMFE 撑不住索性 compile 时抛错拒投机",
+      "kind": "protocol",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/structured_output/backend_xgrammar.py:L119-L123",
+        "vllm/v1/structured_output/backend_xgrammar.py:L190-L193",
+        "vllm/v1/structured_output/backend_outlines.py:L88-L97",
+        "vllm/v1/structured_output/backend_lm_format_enforcer.py:L124-L133"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true
+    },
+    {
+      "id": "m10",
+      "name": "编译复用各后端各自为政：xgrammar 库内 LRU+512MB 字节预算（VLLM_XGRAMMAR_CACHE_MB）/outlines 内存 LRU(128)+可选 SQLite 磁盘（VLLM_V1_USE_OUTLINES_CACHE，serde 二进制防 pickle 任意代码执行）/guidance 无编译缓存/LMFE 仅 lru_cache tokenizer_data——vLLM 侧零跨请求去重",
+      "kind": "config",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/structured_output/backend_xgrammar.py:L65-L70",
+        "vllm/v1/structured_output/backend_outlines.py:L54-L71",
+        "vllm/v1/structured_output/utils.py:L282-L301",
+        "vllm/v1/structured_output/request.py:L78-L79"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "note": "纠正常见误解：structured_output_key 只是每请求 cached_property；同 schema 复用完全发生在后端内部、键各不相同；worked example 建议同 schema 双请求在 xgrammar（命中库内缓存）vs guidance（每次重编）的对照"
+    },
+    {
+      "id": "m11",
+      "name": "异步编译门（本章命门之一）：grammar_init 在 IO 线程提交半 CPU 线程池 → Future；请求初始即 WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR、入 skipped_waiting 侧队不挡人；就绪晋级回 WAITING 当拍可入批",
+      "kind": "protocol",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/engine/core.py:L969-L991",
+        "vllm/v1/structured_output/__init__.py:L70-L80",
+        "vllm/v1/structured_output/__init__.py:L166-L175",
+        "vllm/v1/request.py:L109-L114",
+        "vllm/v1/core/sched/scheduler.py:L2051-L2062",
+        "vllm/v1/core/sched/scheduler.py:L2678-L2712"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "note": "线程数=半 CPU 的注释原话（CPU-bound 非 IO-bound，默认 CPU*5 太高）；阻塞态机制全貌 ch11 已立（三个阻塞态共用侧队+晋级），本章讲语法门这一个实例；figure 建议：慢 schema 编译期间引擎继续服务其他请求的时间线"
+    },
+    {
+      "id": "m12",
+      "name": "Future.result(timeout=0.0001) 的『几乎非阻塞』就绪轮询与 Future→成品/Exception 原地替换（grammar property 抹平三态）",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/structured_output/request.py:L50-L75"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "note": "v0.27.1 与 v0.21 的两处差异（见 excerpt elide 注）：Exception 态新增、死代码 status 残留已删；is_grammar_ready v0.27.1 仍零 in-tree 调用者（门控实际走 grammar property）"
+    },
+    {
+      "id": "m13",
+      "name": "编译失败只杀单请求：异常经 Future 以 Exception 形态入 _grammar → 晋升检查识别 → grammar_compile_error_reqs → 同拍 update_from_output 尾部 finish_requests(FINISHED_ERROR)",
+      "kind": "protocol",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/structured_output/__init__.py:L177-L192",
+        "vllm/v1/structured_output/request.py:L57-L58",
+        "vllm/v1/core/sched/scheduler.py:L2695-L2703",
+        "vllm/v1/core/sched/scheduler.py:L1954-L1968"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "note": "对比同步编译：坏 schema 会以异常打断整拍调度——隔离语义是异步化的副产品红利"
+    },
+    {
+      "id": "m14",
+      "name": "external_launcher 回退同步编译（每 TP rank 一个调度器，异步会让 WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR→WAITING 在各 rank 不同时刻发生、破坏确定性→死锁）；v0.27.1 同步分支异常也包 Future 保持下游同形",
+      "kind": "config",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/structured_output/__init__.py:L46-L58",
+        "vllm/v1/structured_output/__init__.py:L169-L174"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m15",
+      "name": "线程安全不变式：grammar_init 只在输入处理线程；就绪单调（Future→成品不回退）；调度线程只做 Future→成品/Exception 替换——源码注释原话自证",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/engine/core.py:L984-L990",
+        "vllm/v1/structured_output/request.py:L50-L59"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m16",
+      "name": "谁在推进语法状态机：update_from_output 用本步真正采出的 token 调 accept_tokens——FSM 状态的唯一写者是调度器线程；拒收=引擎 bug→FINISHED_ERROR+resumable=False",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L1817-L1843"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "note": "fill→sample→accept 环的闭合不变式（theory 4）：掩码保证采样必被接受，accept 失败即链断了——logger.error 'Please file an issue' 与 'Unexpected' 措辞是源码自认"
+    },
+    {
+      "id": "m17",
+      "name": "思考模型联动（推进侧）：should_advance 判『思考段结束后语法才生效』（reasoner None 快返回 True 的常量路径 + reasoning_ended 缓存 + is_reasoning_end_streaming 探测 + #43388 的 new_token_ids 直传修复）；reasoning_end_token_index + trim_reasoning_for_advance 剔除混在同一步的思考 token（#44006）",
+      "kind": "algorithm",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/structured_output/__init__.py:L381-L439",
+        "vllm/v1/structured_output/__init__.py:L442-L486",
+        "vllm/v1/structured_output/request.py:L27-L37"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "note": "fill 侧孪生门 should_fill_bitmask（L361-L379）与 spec 窗口的 mid-window 边界（__init__.py:L296-L350）归 ch31；讲法建议：先立 reasoner=None 常量路径，思考分支按『一步内混思考+语法 token』的边界案例讲"
+    },
+    {
+      "id": "m18",
+      "name": "四后端同契约对照：能力矩阵藏在编译分派里（xgrammar 全六形/outlines 只认 JSON/REGEX/CHOICE/LMFE 四形/guidance 走 serialize 全六形）；is_terminated 语义分歧（xgrammar 缓存标志/guidance EOS+rollback_lag/outlines 故意延迟一步让 EOS 发出/LMFE 看前缀末位）；outlines 一切转正则的路线差异",
+      "kind": "protocol",
+      "difficulty": "core",
+      "source_anchors": [
+        "vllm/v1/structured_output/backend_xgrammar.py:L111-L117",
+        "vllm/v1/structured_output/backend_guidance.py:L108-L131",
+        "vllm/v1/structured_output/backend_outlines.py:L73-L97",
+        "vllm/v1/structured_output/backend_lm_format_enforcer.py:L101-L139",
+        "vllm/v1/structured_output/backend_outlines.py:L119-L123",
+        "vllm/v1/structured_output/backend_guidance.py:L203-L217"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "note": "建议对照表呈现（约束形态×后端 / rollback 能力×后端 / 终态语义×后端）；outlines is_terminated 延迟一步的注释原话（backend_outlines.py:L119-L121）是语义分歧最有趣的一格"
+    },
+    {
+      "id": "m19",
+      "name": "ReDoS 超时护栏：compile_regex_with_timeout 把 regex 编译包进单线程 executor、VLLM_REGEX_COMPILATION_TIMEOUT_S（默认 5s）超时即 ValueError——嵌套量词 (a+)+b 的 DFA 状态空间指数爆炸能把 worker 无限挂死；xgrammar/outlines/LMFE 三家 regex 编译共用此护栏",
+      "kind": "config",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/structured_output/utils.py:L48-L83",
+        "vllm/v1/structured_output/backend_xgrammar.py:L91-L95",
+        "vllm/v1/structured_output/backend_outlines.py:L65-L68",
+        "vllm/v1/structured_output/backend_lm_format_enforcer.py:L110-L114"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true
+    },
+    {
+      "id": "m20",
+      "name": "全引擎单后端：manager 惰性构造后首个请求定型；请求级 _backend 与引擎配置不符直接拒（_backend_was_auto 记账放行复用 params 的情形）；配置级开关的后端限制（disable_any_whitespace 仅 xgrammar/guidance 等）",
+      "kind": "config",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/structured_output/__init__.py:L124-L164",
+        "vllm/sampling_params.py:L953-L966",
+        "vllm/config/structured_outputs.py:L63-L74"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false
+    },
+    {
+      "id": "m21",
+      "name": "位掩码的内存布局与预算：allocate_token_bitmask(max_batch*(1+max_spec), vocab) 的 [行, ceil(V/32)] int32；-1 补码=全允许；每行 16KB（128k vocab）=逐 token fp32 logits 的 1/32——掩码能上热路径的定量理由",
+      "kind": "layout",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/structured_output/__init__.py:L225-L234",
+        "vllm/v1/structured_output/backend_outlines.py:L99-L105",
+        "vllm/v1/structured_output/backend_lm_format_enforcer.py:L141-L147"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "note": "分配预算含 spec 位（+1 是 bonus/非 spec 位）；行的流转（跨进程/H2D/盖 logits）归 ch31，本章只立『产物长什么样』"
+    },
+    {
+      "id": "m22",
+      "name": "交棒点：get_grammar_bitmask 收集本拍结构化请求行序（跳过 prefill 中段）→ grammar_bitmask 装配 → GrammarOutput(request_ids, ndarray)——本章终点/下一章起点",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L1646-L1668"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "note": "ch9 站 4 已嵌同段；is_prefill_chunk 跳过的语义（切块 prefill 还在消化 prompt 不算掩码）；装配内部全归 ch31"
+    }
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/sampling_params.py",
+      "lines": "L72-L126",
+      "code": "class StructuredOutputsParams:\n    # One of these fields will be used to build a logit processor.\n    json: str | dict | None = None\n    regex: str | None = None\n    choice: list[str] | None = None\n    grammar: str | None = None\n    json_object: bool | None = None\n    # These are other options that can be set.\n    disable_any_whitespace: bool = False\n    disable_additional_properties: bool = False\n    whitespace_pattern: str | None = None\n    structural_tag: str | None = None\n\n    _backend: str | None = field(default=None, init=False)\n    \"\"\"CAUTION: Should only be set by Processor._validate_structured_output\"\"\"\n    _backend_was_auto: bool = field(default=False, init=False)\n    \"\"\"CAUTION: Should only be set by Processor._validate_structured_output\"\"\"\n\n    def __post_init__(self):\n        \"\"\"Validate that some fields are mutually exclusive.\"\"\"\n        count = sum(\n            [\n                self.json is not None,\n                self.regex is not None,\n                self.choice is not None,\n                self.grammar is not None,\n                self.json_object is not None,\n                self.structural_tag is not None,\n            ]\n        )\n        if count > 1:\n            raise VLLMValidationError(\n                \"You can only use one kind of structured outputs constraint \"\n                f\"but multiple are specified: {self.__dict__}\"\n            )\n        if count < 1:\n            raise VLLMValidationError(\n                \"You must use one kind of structured outputs constraint \"\n                f\"but none are specified: {self.__dict__}\"\n            )\n\n    def all_constraints_none(self) -> bool:\n        \"\"\"\n        Returns True if all structured-output constraint fields are None.\n        \"\"\"\n        return all(\n            getattr(self, field) is None\n            for field in (\n                \"json\",\n                \"regex\",\n                \"choice\",\n                \"grammar\",\n                \"json_object\",\n                \"structural_tag\",\n            )",
+      "elide": [
+        "L85-L89 的 _backend/_backend_was_auto 私有字段（docstring 标明只许 Processor 校验期写）紧跟其后；L129-L142 的 all_non_structural_tag_constraints_none 服务 structural_tag 特例，可一句话带过"
+      ]
+    },
+    {
+      "path": "vllm/sampling_params.py",
+      "lines": "L949-L966",
+      "code": "        backend = structured_outputs_config.backend\n        if _backend := self.structured_outputs._backend:\n            # Request-level backend selection is not supported.\n            # The values may differ if `params` is reused and was set\n            # to a specific backend based on `auto` behavior in a previous\n            # request. We remember that it was set as a result of `auto`\n            # using the `_backend_was_auto` field set in the params.\n            if backend != _backend and not (\n                backend == \"auto\" and self.structured_outputs._backend_was_auto\n            ):\n                raise VLLMValidationError(\n                    \"Request-level structured output backend selection is not \"\n                    f\"supported. The request specified '{_backend}', but vLLM \"\n                    f\"was initialised with '{backend}'. This error can be \"\n                    \"resolved by removing '_backend' from the request.\"\n                )\n        else:\n            self.structured_outputs._backend = backend",
+      "elide": [
+        "本段前后文：L932-L942 diffusion 模型直接拒单（#45436：FSM 要求左到右采样，扩散模型整画布并行去噪，中途 FSM 拒收=HTTP 500）；L944-L947 无 tokenizer（skip_tokenizer_init）也拒"
+      ]
+    },
+    {
+      "path": "vllm/sampling_params.py",
+      "lines": "L1043-L1086",
+      "code": "        else:\n            # NOTE: backend must be \"auto\" here, because we have\n            # checked supported_backends above.\n            # In this mode, we set opinionated defaults based on what we think\n            # will satisfy the most use cases without having to worry about\n            # this setting. We include fallback behavior here, but not with any\n            # other setting where a specific backend was specified.\n            try:\n                validate_xgrammar_grammar(self)\n                self.structured_outputs._backend = \"xgrammar\"\n            except ValueError:\n                # The request either failed validation\n                # or includes some jsonschema feature(s) that\n                # are not supported in xgrammar.\n\n                skip_guidance = _is_non_tekken_mistral(tokenizer)\n\n                # Check if schema has features unsupported by guidance\n                so_params = self.structured_outputs\n                if not skip_guidance and so_params.json:\n                    if isinstance(so_params.json, str):\n                        schema = json_mod.loads(so_params.json)\n                    else:\n                        schema = so_params.json\n                    skip_guidance = has_guidance_unsupported_json_features(schema)\n\n                if skip_guidance:\n                    # Fall back to outlines if the tokenizer is non-tekken Mistral or\n                    # the schema contains features unsupported by guidance\n                    validate_structured_output_request_outlines(self)\n                    self.structured_outputs._backend = \"outlines\"\n                else:\n                    # Fall back to guidance by default.\n                    validate_guidance_grammar(\n                        self,\n                        tokenizer=_get_llg_tokenizer(tokenizer),\n                    )\n                    self.structured_outputs._backend = \"guidance\"\n            # Remember that this backend was set automatically\n            self.structured_outputs._backend_was_auto = True\n\n        # Run post-init validation. This is also important to ensure subsequent\n        # roundtrip serialization/deserialization won't fail.\n        self.structured_outputs.__post_init__()",
+      "elide": [
+        "本段之前的四个显式后端分支（L1012-L1042：xgrammar 直接验 / guidance 先拒非 tekken Mistral / outlines / lm-format-enforcer）形状类同，各只差一个 validate_* 调用，可一条带过"
+      ]
+    },
+    {
+      "path": "vllm/sampling_params.py",
+      "lines": "L755-L770",
+      "code": "    def verify(\n        self,\n        model_config: ModelConfig,\n        speculative_config: SpeculativeConfig | None,\n        structured_outputs_config: StructuredOutputsConfig | None,\n        tokenizer: TokenizerLike | None,\n    ) -> None:\n        self._validate_logprobs(model_config)\n        self._validate_logit_bias(model_config)\n        self._validate_logits_processors(model_config)\n        self._validate_allowed_token_ids(tokenizer)\n        self._validate_spec_decode(speculative_config)\n        self._validate_diffusion(model_config)\n        self._validate_structured_outputs(\n            model_config, structured_outputs_config, tokenizer\n        )",
+      "elide": [
+        "调用方是前端 InputProcessor（vllm/v1/engine/input_processor.py:L104 params.verify(...)）——『选后端在前端校验期定』的锚"
+      ]
+    },
+    {
+      "path": "vllm/v1/request.py",
+      "lines": "L109-L114",
+      "code": "        elif sampling_params is not None:\n            # Generative models.\n            assert sampling_params.max_tokens is not None\n            self.max_tokens = sampling_params.max_tokens\n            if self.structured_output_request is not None:\n                self.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR",
+      "elide": [
+        "同文件 L87-L89：self.structured_output_request = StructuredOutputRequest.from_sampling_params(sampling_params)（无约束则 None）；L268-L269 use_structured_output property = structured_output_request is not None"
+      ]
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L969-L991",
+      "code": "    def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:\n        \"\"\"Preprocess the request.\n\n        This function could be directly used in input processing thread to allow\n        request initialization running in parallel with Model forward\n        \"\"\"\n        # Note on thread safety: no race condition.\n        # `mm_receiver_cache` is reset at the end of LLMEngine init,\n        # and will only be accessed in the input processing thread afterwards.\n        if self.mm_receiver_cache is not None and request.mm_features:\n            request.mm_features = self.mm_receiver_cache.get_and_update_features(\n                request.mm_features\n            )\n\n        req = Request.from_engine_core_request(request, self.request_block_hasher)\n        if req.use_structured_output:\n            # Note on thread safety: no race condition.\n            # `grammar_init` is only invoked in input processing thread. For\n            # `structured_output_manager`, each request is independent and\n            # grammar compilation is async. Scheduler always checks grammar\n            # compilation status before scheduling request.\n            self.structured_output_manager.grammar_init(req)\n        return req, request.current_wave",
+      "elide": [
+        "函数 docstring 原话 'allow request initialization running in parallel with Model forward'；调用点在输入 IO 线程 core.py:L1718"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/__init__.py",
+      "lines": "L46-L58",
+      "code": "        # When in external_launcher mode, async grammar compilation causes deadlocks\n        # due to external_launcher mode having a scheduler for each TP rank.\n        # Async grammar compilation causes the\n        # WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR → WAITING transition to\n        # happen at different times on different TP ranks,\n        # breaking the determinism assumption that external_launcher relies on.\n        self._use_async_grammar_compilation = (\n            vllm_config.parallel_config.distributed_executor_backend\n            != \"external_launcher\"\n        )\n\n        self._grammar_bitmask: torch.Tensor | None = None\n        self._full_mask = torch.tensor(-1, dtype=torch.int32)",
+      "elide": [
+        "紧随其后的 L60-L68 是 fill_bitmask 并行线程池装配（批>128 且无 spec 才启用）——归 ch31"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/__init__.py",
+      "lines": "L70-L80",
+      "code": "        if not self.vllm_config.model_config.skip_tokenizer_init:\n            # The default max_workers if not specified is the number of\n            # CPUs * 5, which is way too high since these tasks are CPU-bound,\n            # not I/O bound. We also know we would never dominate CPU usage\n            # with just grammar compilation, so we set it to half the number\n            # of CPUs.\n            max_workers = max(1, (multiprocessing.cpu_count() + 1) // 2)\n            self.executor = ThreadPoolExecutor(max_workers=max_workers)\n            self.tokenizer = cached_tokenizer_from_config(\n                model_config=self.vllm_config.model_config\n            )",
+      "elide": [
+        "其后 L81-L97：reasoning parser 插件装配（reasoner_cls）与 enable_in_reasoning——思考门 m17 的构造侧，reasoner_cls=None（无推理解析器的模型）是真实常量路径"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/__init__.py",
+      "lines": "L114-L175",
+      "code": "    def grammar_init(self, request: \"Request\") -> None:\n        if request.structured_output_request is None:\n            return\n\n        if TYPE_CHECKING:\n            assert (\n                request.sampling_params is not None\n                and request.sampling_params.structured_outputs is not None\n            )\n\n        # Initialize the backend the first time it is needed.\n        #\n        # NOTE: We only support a single backend. We do NOT support different\n        # backends on a per-request basis in V1 (for now, anyway...).\n        # _backend is set in Processor._validate_structured_output\n        if self.backend is None:\n            assert request.sampling_params is not None\n            backend = request.sampling_params.structured_outputs._backend\n            vocab_size = self.vllm_config.model_config.get_vocab_size()\n            if backend == \"xgrammar\":\n                self.backend = XgrammarBackend(\n                    self.vllm_config,\n                    tokenizer=self.tokenizer,\n                    vocab_size=vocab_size,\n                )\n            elif backend == \"guidance\":\n                self.backend = GuidanceBackend(\n                    self.vllm_config,\n                    tokenizer=self.tokenizer,\n                    vocab_size=vocab_size,\n                )\n            elif backend == \"outlines\":\n                from vllm.v1.structured_output.backend_outlines import OutlinesBackend\n\n                self.backend = OutlinesBackend(\n                    self.vllm_config,\n                    tokenizer=self.tokenizer,\n                    vocab_size=vocab_size,\n                )\n            elif backend == \"lm-format-enforcer\":\n                from vllm.v1.structured_output.backend_lm_format_enforcer import (  # noqa: E501\n                    LMFormatEnforcerBackend,\n                )\n\n                self.backend = LMFormatEnforcerBackend(\n                    self.vllm_config,\n                    tokenizer=self.tokenizer,\n                    vocab_size=vocab_size,\n                )\n            else:\n                raise ValueError(f\"Unsupported structured output backend: {backend}\")\n\n        grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar\n        if self._use_async_grammar_compilation:\n            grammar = self.executor.submit(self._create_grammar, request)\n        else:\n            try:\n                grammar = self._create_grammar(request)\n            except Exception as e:\n                grammar = Future()\n                grammar.set_exception(e)\n        request.structured_output_request.grammar = grammar",
+      "elide": [
+        "guidance/outlines/lm-format-enforcer 三个 elif 分支（L139-L162）与 xgrammar 分支形状完全相同（只换类名，后两者函数内惰性 import），正文一条带过即可"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/__init__.py",
+      "lines": "L166-L175",
+      "code": "        grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar\n        if self._use_async_grammar_compilation:\n            grammar = self.executor.submit(self._create_grammar, request)\n        else:\n            try:\n                grammar = self._create_grammar(request)\n            except Exception as e:\n                grammar = Future()\n                grammar.set_exception(e)\n        request.structured_output_request.grammar = grammar",
+      "elide": [
+        "同步分支（external_launcher）v0.27.1 也不再裸返回：编译异常被包进一个 set_exception 的 Future——两条路径对下游呈现同一形状（异常也能经 100µs 探测被调度器看到）"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/__init__.py",
+      "lines": "L177-L192",
+      "code": "    def _create_grammar(self, request: \"Request\") -> StructuredOutputGrammar:\n        struct_request = request.structured_output_request\n        assert struct_request is not None\n        # Note that the request was validated in the engine core client,\n        # so at this point we know it is a supported type of request. Grammar\n        # compilation may still fail; the Future carries that error to the\n        # scheduler so it can fail only this request.\n        try:\n            request_type, grammar_spec = struct_request.structured_output_key\n            assert self.backend is not None\n            return self.backend.compile_grammar(request_type, grammar_spec)\n        except Exception:\n            logger.exception(\n                \"Failed to compile grammar for request %s\", request.request_id\n            )\n            raise",
+      "elide": [
+        "注释块是 v0.27.1 新话术：'Grammar compilation may still fail; the Future carries that error to the scheduler so it can fail only this request'——编译失败隔离（m13）的源头表述"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/request.py",
+      "lines": "L21-L48",
+      "code": "@dataclasses.dataclass\nclass StructuredOutputRequest:\n    params: StructuredOutputsParams\n    _grammar: (\n        Future[StructuredOutputGrammar] | StructuredOutputGrammar | Exception | None\n    ) = None\n    reasoning_ended: bool | None = None\n    # Absolute index into the request's all_token_ids of the last reasoning\n    # token (the reasoning-end marker). Tokens at or before this index are\n    # reasoning content and must never be fed to the grammar. Only set when\n    # reasoning ends in a step whose tokens the scheduler advances immediately\n    # (structural tags + speculative decoding, see #42452).\n    reasoning_end_token_index: int | None = None\n    reasoning_parser_kwargs: dict[str, Any] | None = None\n    # Cached per request; do not share reasoning parsers across requests because\n    # their behavior can depend on reasoning_parser_kwargs.\n    reasoner: \"ReasoningParser | None\" = None\n\n    @staticmethod\n    def from_sampling_params(\n        sampling_params: SamplingParams | None,\n    ) -> \"StructuredOutputRequest | None\":\n        if sampling_params is None:\n            return None\n        params = sampling_params.structured_outputs\n        if not params or params.all_constraints_none():\n            return None\n        return StructuredOutputRequest(params=params)",
+      "elide": [
+        "reasoning_ended / reasoning_end_token_index / reasoner 三字段服务思考模型联动（m17）：reasoning_end_token_index 的注释点名 #42452（structural tags + spec decode 的修复）"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/request.py",
+      "lines": "L50-L79",
+      "code": "    def _check_grammar_completion(self) -> bool:\n        if isinstance(self._grammar, Future):\n            try:\n                # We will check whether the future is ready within 100 us\n                self._grammar = self._grammar.result(timeout=0.0001)\n            except TimeoutError:\n                return False\n            except Exception as e:\n                self._grammar = e\n        return True\n\n    @property\n    def is_grammar_ready(self) -> bool:\n        return self._check_grammar_completion()\n\n    @property\n    def grammar(self) -> StructuredOutputGrammar | Exception | None:\n        if not self._check_grammar_completion():\n            return None\n        return cast(StructuredOutputGrammar | Exception | None, self._grammar)\n\n    @grammar.setter\n    def grammar(\n        self, grammar: StructuredOutputGrammar | Future[StructuredOutputGrammar]\n    ) -> None:\n        self._grammar = grammar\n\n    @functools.cached_property\n    def structured_output_key(self) -> StructuredOutputKey:\n        return get_structured_output_key(self.params)",
+      "elide": [
+        "v0.27.1 与 v0.21 的差异点：① _grammar 类型多了 Exception 态（编译失败存异常对象，不再抛出）；② v0.21 里那行无人读的 self.status = RequestStatus.WAITING 残留已删——真实跃迁只发生在调度器 _try_promote_blocked_waiting_request"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/request.py",
+      "lines": "L82-L103",
+      "code": "def get_structured_output_key(params: StructuredOutputsParams) -> StructuredOutputKey:\n    if params.json is not None:\n        if not isinstance(params.json, str):\n            json_str = json.dumps(params.json)\n        else:\n            json_str = params.json\n        return StructuredOutputOptions.JSON, json_str\n    if params.json_object:\n        return StructuredOutputOptions.JSON_OBJECT, \"\"\n    if params.regex is not None:\n        return StructuredOutputOptions.REGEX, params.regex\n    if params.choice is not None:\n        if not isinstance(params.choice, str):\n            json_str = json.dumps(params.choice)\n        else:\n            json_str = params.choice\n        return StructuredOutputOptions.CHOICE, json_str\n    if params.grammar is not None:\n        return StructuredOutputOptions.GRAMMAR, params.grammar\n    if params.structural_tag is not None:\n        return StructuredOutputOptions.STRUCTURAL_TAG, params.structural_tag\n    raise ValueError(\"No valid structured output parameter found\")",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/structured_output/backend_types.py",
+      "lines": "L19-L28",
+      "code": "class StructuredOutputOptions(enum.Enum):\n    JSON = enum.auto()\n    JSON_OBJECT = enum.auto()\n    REGEX = enum.auto()\n    GRAMMAR = enum.auto()\n    CHOICE = enum.auto()\n    STRUCTURAL_TAG = enum.auto()\n\n\nStructuredOutputKey = tuple[StructuredOutputOptions, str]",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/structured_output/backend_types.py",
+      "lines": "L31-L95",
+      "code": "class StructuredOutputGrammar(ABC):\n    \"\"\"Request-level backend for structured output requests.\"\"\"\n\n    @abstractmethod\n    def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:\n        \"\"\"\n        Determines whether the provided tokens are accepted for the\n        given request.\n\n        Args:\n            request_id (str): The unique identifier for the request.\n            tokens (list[int]): A list of token IDs to evaluate.\n\n        Returns:\n            bool: True if the tokens are accepted, False otherwise.\n        \"\"\"\n\n    @abstractmethod\n    def validate_tokens(self, tokens: list[int]) -> list[int]:\n        \"\"\"\n        Validates the provided tokens against the grammar.\n        Will not advance the FSM.\n\n        Args:\n            tokens (list[int]): A list of token IDs to validate.\n\n        Returns:\n            list[int]: A list of accepted token IDs. Will be a prefix\n                of the input tokens, and empty if none are accepted.\n        \"\"\"\n\n    @abstractmethod\n    def rollback(self, num_tokens: int) -> None:\n        \"\"\"\n        Rolls back the state of the grammar by a specified number of tokens.\n        Will also revert counters for the number of processed tokens.\n\n        Args:\n            num_tokens (int): The number of tokens to roll back.\n        \"\"\"\n\n    @abstractmethod\n    def fill_bitmask(self, bitmask: \"torch.Tensor\", batch_index: int) -> None:\n        \"\"\"\n        Fills the bitmask for a specific batch index.\n\n        Args:\n            bitmask (torch.Tensor): The bitmask to fill\n            batch_index (int): The index in the bitmask to fill\n        \"\"\"\n\n    @abstractmethod\n    def is_terminated(self) -> bool:\n        \"\"\"\n        Checks whether the structured output process has terminated.\n\n        Returns:\n            bool: True if the process is terminated, False otherwise.\n        \"\"\"\n\n    @abstractmethod\n    def reset(self):\n        \"\"\"\n        Resets the state of the structured output grammar.\n        \"\"\"",
+      "elide": [
+        "六个 @abstractmethod 的 docstring 是契约的正式文本（accept/validate/rollback/fill/is_terminated/reset）——正文逐方法解读就对着这份 docstring"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/backend_types.py",
+      "lines": "L99-L136",
+      "code": "class StructuredOutputBackend(ABC):\n    \"\"\"Engine-level backend for structured output requests.\"\"\"\n\n    vllm_config: VllmConfig\n    tokenizer: TokenizerLike\n    vocab_size: int\n\n    @abstractmethod\n    def compile_grammar(\n        self, request_type: StructuredOutputOptions, grammar_spec: str\n    ) -> StructuredOutputGrammar:\n        \"\"\"\n        Compiles a grammar specification into a structured output grammar.\n\n        Args:\n            request_type (StructuredOutputOptions): The type of structured\n                output request.\n            grammar_spec (str): The grammar specification to compile.\n\n        Returns:\n            StructuredOutputGrammar: The compiled structured output grammar.\n        \"\"\"\n\n    @abstractmethod\n    def allocate_token_bitmask(self, max_num_seqs: int) -> \"torch.Tensor\":\n        \"\"\"\n        Allocates a token bitmask for the specified maximum number of sequences.\n\n        Args:\n            max_num_seqs (int): The maximum number of sequences for which\n                to allocate the bitmask.\n        \"\"\"\n\n    @abstractmethod\n    def destroy(self):\n        \"\"\"\n        Backend-specific cleanup.\n        \"\"\"",
+      "elide": [
+        "三个 dataclass 字段 vllm_config/tokenizer/vocab_size 固定了全部四个后端的构造签名——『重资源归引擎级』的类型化表达"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/backend_xgrammar.py",
+      "lines": "L60-L75",
+      "code": "        else:\n            tokenizer_info = xgr.TokenizerInfo.from_huggingface(\n                self.tokenizer,\n                vocab_size=self.vocab_size,\n            )\n        self.compiler = xgr.GrammarCompiler(\n            tokenizer_info,\n            max_threads=8,\n            cache_enabled=True,\n            cache_limit_bytes=vllm.envs.VLLM_XGRAMMAR_CACHE_MB * 1024 * 1024,\n        )\n\n        self.num_speculative_tokens = 0\n        if self.vllm_config.speculative_config is not None:\n            self.num_speculative_tokens = (\n                self.vllm_config.speculative_config.num_speculative_tokens",
+      "elide": [
+        "前半 L42-L59 是 Mistral/tekken 分词器的手工 TokenizerInfo 兼容分支（RAW/BYTE_FALLBACK vocab_type）——tokenizer 兼容细节，一句话带过；cache_limit_bytes=VLLM_XGRAMMAR_CACHE_MB*1024*1024（envs 默认 512MB，envs.py:L1561）是 v0.27.1 的字节预算缓存（v0.21 无此参数）"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/backend_xgrammar.py",
+      "lines": "L78-L126",
+      "code": "    def compile_grammar(\n        self, request_type: StructuredOutputOptions, grammar_spec: str\n    ) -> StructuredOutputGrammar:\n        if request_type == StructuredOutputOptions.JSON:\n            ctx = self.compiler.compile_json_schema(\n                grammar_spec, any_whitespace=not self.disable_any_whitespace\n            )\n        elif request_type == StructuredOutputOptions.JSON_OBJECT:\n            ctx = self.compiler.compile_json_schema(\n                '{\"type\": \"object\"}', any_whitespace=not self.disable_any_whitespace\n            )\n        elif request_type == StructuredOutputOptions.GRAMMAR:\n            ctx = self.compiler.compile_grammar(grammar_spec)\n        elif request_type == StructuredOutputOptions.REGEX:\n            ctx = compile_regex_with_timeout(\n                self.compiler.compile_regex,\n                grammar_spec,\n            )\n        elif request_type == StructuredOutputOptions.STRUCTURAL_TAG:\n            s_tag = json.loads(grammar_spec)\n            if \"structures\" in s_tag:\n                # Falling back to deprecated method of compiling structural tag\n                tags = [\n                    xgr.StructuralTagItem(\n                        begin=s[\"begin\"],\n                        schema=json.dumps(s[\"schema\"]),\n                        end=s[\"end\"],\n                    )\n                    for s in s_tag[\"structures\"]\n                ]\n                ctx = self.compiler.compile_structural_tag(tags, s_tag[\"triggers\"])\n            else:\n                ctx = self.compiler.compile_structural_tag(grammar_spec)\n        else:\n            logger.error(\n                \"Validation should have already occurred. Please file an issue.\"\n            )\n            raise ValueError(\n                f\"grammar is not of valid supported types. ({request_type!s})\"\n            )\n\n        return XgrammarGrammar(\n            matcher=xgr.GrammarMatcher(\n                ctx,\n                max_rollback_tokens=self.num_speculative_tokens,\n            ),\n            vocab_size=self.vocab_size,\n            ctx=ctx,\n        )",
+      "elide": [
+        "REGEX 分支的 compile_regex_with_timeout 是 v0.27.1 新增的 ReDoS 超时护栏（m19）；STRUCTURAL_TAG 的 deprecated 分支（L98-L108 structures/triggers 拆解）可略；注意**没有 CHOICE 分支**——校验期已把 choice 原地改写成 EBNF grammar（m4/m10 注记的『五分派』）"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/backend_xgrammar.py",
+      "lines": "L135-L203",
+      "code": "@dataclass\nclass XgrammarGrammar(StructuredOutputGrammar):\n    # NOTE: This would be a generic-enough class for\n    # supporting different backends, in the future.\n    # For now, just xgrammar.\n    #\n    # https://xgrammar.mlc.ai/docs/api/python/index.html#xgrammar.GrammarMatcher.find_jump_forward_string\n    # for jump-forward decoding\n\n    vocab_size: int\n    matcher: xgr.GrammarMatcher = field(hash=False)\n    ctx: xgr.CompiledGrammar = field(hash=False)\n    num_processed_tokens: int = field(\n        default_factory=lambda: 0, repr=False, hash=False, init=False\n    )\n    _is_terminated: bool = field(default=False, repr=False, hash=False)\n\n    def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:\n        \"\"\"Accepts a list of tokens and advances the FSM.\n\n        Returns True if the FSM was advanced successfully.\n        Returns False if the FSM failed to advance.\n        \"\"\"\n        if self._is_terminated:\n            return False\n        for token in tokens:\n            if not self.matcher.accept_token(token):\n                logger.error(\n                    \"Failed to advance FSM for request %s \"\n                    \"for tokens %s. Please file an issue.\",\n                    request_id,\n                    token,\n                )\n                return False\n            self.num_processed_tokens += 1\n        self._is_terminated = self.matcher.is_terminated()\n        return True\n\n    def validate_tokens(self, tokens: list[int]) -> list[int]:\n        \"\"\"Checks if the list of tokens are accepted by the FSM in sequence.\n        Will not advance the FSM.\n\n        Returns the prefix list of tokens that are accepted by the FSM.\n        \"\"\"\n        accepted_tokens = []\n        for token in tokens:\n            if self.matcher.accept_token(token):\n                accepted_tokens.append(token)\n            else:\n                break\n        if len(accepted_tokens) > 0:\n            # Rollback the FSM to the initial state\n            self.matcher.rollback(len(accepted_tokens))\n        return accepted_tokens\n\n    def rollback(self, num_tokens: int) -> None:\n        self.matcher.rollback(num_tokens)\n        self.num_processed_tokens -= num_tokens\n        self._is_terminated = self.matcher.is_terminated()\n\n    def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:\n        self.matcher.fill_next_token_bitmask(bitmask, idx)\n\n    def is_terminated(self) -> bool:\n        return self._is_terminated\n\n    def reset(self):\n        self.num_processed_tokens = 0\n        self.matcher.reset()",
+      "elide": [
+        "类头 NOTE 注释（L137-L142）点名 jump-forward decoding 的官方文档链接——vLLM 尚未启用的快速通道，可作展望一句；六方法即 StructuredOutputGrammar ABC 的参考实现"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/backend_xgrammar.py",
+      "lines": "L272-L303",
+      "code": "def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:\n    \"\"\"Validate that the request is supported by structured output.\n\n    Raises ValueError if the request is not supported.\n    \"\"\"\n    if sampling_params.structured_outputs is None:\n        return\n\n    so_params = sampling_params.structured_outputs\n\n    if so_params.regex:\n        try:\n            compile_regex_with_timeout(\n                xgr.Grammar.from_regex,\n                so_params.regex,\n            )\n        except Exception as err:\n            raise ValueError(\n                f\"Failed to transform regex into a grammar: {err}\"\n            ) from err\n\n    if so_params.choice:\n        choice_grammar = choice_as_grammar(so_params.choice)\n        try:\n            xgr.Grammar.from_ebnf(choice_grammar)\n        except Exception as err:\n            raise ValueError(\n                f\"Failed to transform choices into a grammar: {err}\"\n            ) from err\n        so_params.choice = None\n        so_params.grammar = choice_grammar\n        return",
+      "elide": [
+        "本函数其余部分（L305-L364）：json 分支（json.loads + has_xgrammar_unsupported_json_features 预检 + from_json_schema 试编）、grammar 分支（grammar_is_likely_lark 则 convert_lark_to_ebnf 原地转换再 from_ebnf 试编）、structural_tag 分支——形状与 choice 分支同构：**试编 + 原地改写/预检**；regex 分支 L282-L291 已含在本段（from_regex 试编，同样走超时护栏）"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/utils.py",
+      "lines": "L48-L83",
+      "code": "def compile_regex_with_timeout(fn: Callable[[str], _T], pattern: str) -> _T:\n    \"\"\"Run a regex compilation callable with a timeout.\n\n    Prevents ReDoS attacks where adversarial regex patterns (e.g. nested\n    quantifiers like ``(a+)+b``) cause exponential DFA state-space explosion,\n    hanging the inference worker indefinitely.\n\n    Args:\n        fn: Single-argument callable that takes the pattern and performs\n            the regex compilation.\n        pattern: The regex pattern string, passed to *fn* and included in\n            timeout error messages.\n\n    Raises:\n        ValueError: If compilation exceeds the configured timeout.\n    \"\"\"\n    timeout = envs.VLLM_REGEX_COMPILATION_TIMEOUT_S\n    if timeout <= 0:\n        return fn(pattern)\n\n    executor = ThreadPoolExecutor(max_workers=1)\n    future = executor.submit(fn, pattern)\n    try:\n        result = future.result(timeout=timeout)\n    except TimeoutError:\n        future.cancel()\n        executor.shutdown(wait=False, cancel_futures=True)\n        raise ValueError(\n            f\"Regex compilation timed out after {timeout}s. \"\n            \"The pattern may be too complex or contain constructs that \"\n            \"cause exponential state-space explosion (e.g. nested \"\n            f\"quantifiers). Pattern: {pattern[:200]}\"\n        ) from None\n    else:\n        executor.shutdown(wait=False)\n        return result",
+      "elide": [
+        "docstring 原话点名攻击面：嵌套量词如 (a+)+b 引起 DFA 状态空间指数爆炸、把推理 worker 无限挂死；超时 VLLM_REGEX_COMPILATION_TIMEOUT_S 默认 5s（envs.py:L1566-L1568）；xgrammar（compile_regex）、outlines（oc.Index）、LMFE（RegexParser）三家的 regex 编译都套这同一个护栏"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/utils.py",
+      "lines": "L553-L561",
+      "code": "def choice_as_grammar(choice: list[str]) -> str:\n    def escape_ebnf_string(s: str) -> str:\n        \"\"\"Escape special characters in a EBNF string.\"\"\"\n        # Escape double quotes and backslashes\n        return re.sub(r'([\"\\\\])', r\"\\\\\\1\", s)\n\n    escaped_choices = (escape_ebnf_string(c) for c in choice)\n    grammar = \"root ::= \" + \" | \".join(f'\"{c}\"' for c in escaped_choices)\n    return grammar",
+      "elide": [
+        "产出即一条 EBNF：root ::= \"A\" | \"B\" | \"C\"（双引号/反斜杠转义）；与 grammar_is_likely_lark（L391-L420，判定 ::=-缺位即 Lark）+ convert_lark_to_ebnf（L423-L550）同属校验期改写工具箱"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L2050-L2062",
+      "code": "    @staticmethod\n    def _is_blocked_waiting_status(status: RequestStatus) -> bool:\n        return status in (\n            RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR,\n            RequestStatus.WAITING_FOR_REMOTE_KVS,\n            RequestStatus.WAITING_FOR_STREAMING_REQ,\n        )\n\n    def _enqueue_waiting_request(self, request: Request) -> None:\n        if self._is_blocked_waiting_status(request.status):\n            self.skipped_waiting.add_request(request)\n        else:\n            self.waiting.add_request(request)",
+      "elide": [
+        "三个阻塞态共用同一套『skipped_waiting 侧队 → 晋级检查』机制（ch11 已立机制全貌，本章只讲语法这一个实例）；add_request 的入口分流在 scheduler.py:L2230 调 _enqueue_waiting_request（L2091 的另一调用点在 _handle_stopped_request 内，流式会话收尾路径，非新请求入口）"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L700-L710",
+      "code": "                # try to promote blocked statuses while traversing skipped queue.\n                if self._is_blocked_waiting_status(\n                    request.status\n                ) and not self._try_promote_blocked_waiting_request(request):\n                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:\n                        logger.debug(\n                            \"%s is still in WAITING_FOR_REMOTE_KVS state.\",\n                            request_id,\n                        )\n                    request_queue.pop_request()\n                    step_skipped_waiting.prepend_request(request)",
+      "elide": [
+        "这是 schedule() WAITING 收新相位（L684 起）里对队头的处理：未就绪 → pop 出来 prepend 回本拍侧队、continue 窥下一个；队选择 _select_waiting_queue_for_scheduling（L2064-L2074）FCFS 下 skipped_waiting 优先窥"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L2678-L2703",
+      "code": "    def _try_promote_blocked_waiting_request(self, request: Request) -> bool:\n        \"\"\"\n        Try to promote a blocked waiting request back to schedulable states.\n        \"\"\"\n        if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:\n            # finished_recving_kv_req_ids is populated during\n            # update_from_output(), based on worker-side connector signals\n            # in KVConnectorOutput.finished_recving\n            if request.request_id not in self.finished_recving_kv_req_ids:\n                return False\n            self._update_waiting_for_remote_kv(request)\n            if request.num_preemptions:\n                request.status = RequestStatus.PREEMPTED\n            else:\n                request.status = RequestStatus.WAITING\n            return True\n\n        if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:\n            structured_output_req = request.structured_output_request\n            if not structured_output_req or structured_output_req.grammar is None:\n                return False\n            if isinstance(structured_output_req.grammar, Exception):\n                self.grammar_compile_error_reqs.add(request.request_id)\n                return False\n            request.status = RequestStatus.WAITING\n            return True",
+      "elide": [
+        "开头的 WAITING_FOR_REMOTE_KVS 分支（L2683-L2694，P/D KV 传输域）与结尾 WAITING_FOR_STREAMING_REQ 分支可各一条带过；语法分支三个出口：grammar None→False（还没编完）/Exception→记账 grammar_compile_error_reqs（只杀这一个请求）/成品→status=WAITING"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1954-L1972",
+      "code": "        error_req_ids = set(self.grammar_compile_error_reqs)\n        self.grammar_compile_error_reqs.clear()\n        if failed_kv_load_req_ids and not self.recompute_kv_load_failures:\n            error_req_ids.update(failed_kv_load_req_ids)\n\n        if error_req_ids:\n            error_reqs = self.finish_requests(\n                error_req_ids, RequestStatus.FINISHED_ERROR\n            )\n            for request in error_reqs:\n                outputs[request.client_index].append(\n                    EngineCoreOutput(\n                        request_id=request.request_id,\n                        new_token_ids=[],\n                        finish_reason=request.get_finished_reason(),\n                        events=request.take_events(),\n                        trace_headers=request.trace_headers,\n                    )\n                )",
+      "elide": [
+        "发生在 update_from_output 尾部（同一拍内收账）：finish_requests(FINISHED_ERROR) + 空的 EngineCoreOutput（finish_reason 带回前端）；failed_kv_load_req_ids 是 KV 传输失败的同路合并，可一句带过"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1817-L1843",
+      "code": "            if new_token_ids and self.structured_output_manager.should_advance(\n                request, new_token_ids=new_token_ids\n            ):\n                struct_output_request = request.structured_output_request\n                assert struct_output_request is not None\n                grammar = struct_output_request.grammar\n                assert isinstance(grammar, StructuredOutputGrammar)\n                # new_token_ids can be a mixed block of reasoning content, then\n                # the reasoning end marker, then the start of the grammar content.\n                # Trim the reasoning content so the grammar only sees grammar content.\n                advance_token_ids = (\n                    self.structured_output_manager.trim_reasoning_for_advance(\n                        request, new_token_ids\n                    )\n                )\n                if advance_token_ids and not grammar.accept_tokens(\n                    req_id, advance_token_ids\n                ):\n                    logger.error(\n                        \"Unexpected: grammar rejected tokens %s for request %s. \"\n                        \"Terminating request.\",\n                        advance_token_ids,\n                        req_id,\n                    )\n                    request.status = RequestStatus.FINISHED_ERROR\n                    request.resumable = False\n                    stopped = True",
+      "elide": [
+        "本块在 update_from_output 的逐请求循环里（L1808-L1811 的 _update_request_with_output 判停之后）：采样真正落定的 token 才喂给 FSM；assert isinstance(grammar, StructuredOutputGrammar)——此处若还是 Future/Exception 会在更早的门被拦，走不到这"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1646-L1668",
+      "code": "    def get_grammar_bitmask(\n        self, scheduler_output: SchedulerOutput\n    ) -> GrammarOutput | None:\n        # Collect list of scheduled request ids that use structured output.\n        # The corresponding rows of the bitmask will be in this order.\n        if not scheduler_output.has_structured_output_requests:\n            return None\n\n        structured_output_request_ids = [\n            req_id\n            for req_id in scheduler_output.num_scheduled_tokens\n            if (req := self.requests.get(req_id))\n            and (req.use_structured_output and not req.is_prefill_chunk)\n        ]\n        if not structured_output_request_ids:\n            return None\n\n        bitmask = self.structured_output_manager.grammar_bitmask(\n            self.requests,\n            structured_output_request_ids,\n            scheduler_output.scheduled_spec_decode_tokens,\n        )\n        return GrammarOutput(structured_output_request_ids, bitmask)",
+      "elide": [
+        "本章交棒点：ch9 站 4 已嵌过同一段（同一个函数）；结构化请求行序以 num_scheduled_tokens 迭代序为准、跳过 prefill 中段（is_prefill_chunk）；grammar_bitmask 的批装配/并行填充/spec 窗口（__init__.py:L212-L359）全部归 ch31"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/__init__.py",
+      "lines": "L381-L439",
+      "code": "    def should_advance(\n        self,\n        request: \"Request\",\n        new_token_ids: list[int] | None = None,\n    ) -> bool:\n        if not request.use_structured_output:\n            return False\n\n        # To determine whether we can advance the FSM.\n        # Supports thinking usage where we skip the reasoning components.\n        if TYPE_CHECKING:\n            assert request.structured_output_request is not None\n            assert request.structured_output_request.grammar is not None\n        # by default, we should always advance\n        # for cases that don't use thinking mode.\n        reasoner = self._get_reasoner(request)\n        if reasoner is None:\n            return True\n\n        # if the model needs structured in reasoning, we should advance\n        if self.enable_in_reasoning:\n            return True\n\n        structured_req = request.structured_output_request\n        if structured_req.reasoning_ended:\n            return True\n\n        # Check if reasoning ends in *this* step.\n        # When the caller passes new_token_ids (the tokens that were just\n        # appended this step), use it directly as the delta window. The\n        # placeholder-derived fallback assumes num_output_placeholders ==\n        # len(new_token_ids), which breaks under async scheduling + spec\n        # decode when some drafts are rejected (#43388): the placeholder\n        # count remains > 0 after the step and the computed delta window\n        # starts past the reasoning-end marker.\n        all_token_ids = request.all_token_ids\n        if new_token_ids:\n            # The tokens were already appended this step, so the step window\n            # starts exactly len(new_token_ids) from the end.\n            start = len(all_token_ids) - len(new_token_ids)\n            delta_ids: Iterable[int] = new_token_ids\n        else:\n            delta_from = request.num_computed_tokens - request.num_output_placeholders\n            start = (\n                delta_from\n                if delta_from >= 0\n                else max(len(all_token_ids) + delta_from, 0)\n            )\n            delta_ids = itertools.islice(all_token_ids, start, None)\n        if reasoner.is_reasoning_end_streaming(all_token_ids, delta_ids):\n            structured_req.reasoning_ended = True\n\n            # Record the boundary so the scheduler can exclude reasoning tokens.\n            end_index = self._find_reasoning_end_index(reasoner, all_token_ids, start)\n\n            structured_req.reasoning_end_token_index = end_index\n            return True\n\n        return False",
+      "elide": [
+        "非思考模型（reasoner None）在 L396-L398 快返回 True——先立这条常量路径再讲思考分支；#43388 注释点名 async+spec 下占位数 delta 窗口算错的旧 bug（new_token_ids 直传路径就是它的修复）；_find_reasoning_end_index（L442-L460）为定位思考结束 token 的辅助，正文可只引签名"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/__init__.py",
+      "lines": "L462-L486",
+      "code": "    def trim_reasoning_for_advance(\n        self, request: \"Request\", new_token_ids: list[int]\n    ) -> list[int]:\n        \"\"\"Drops reasoning content from tokens about to advance the grammar.\n\n        When reasoning ends mid-step (see should_advance), the step's output\n        still contains reasoning tokens up to and including the end marker.\n        Those are not grammar content: feeding them to accept_tokens makes\n        the grammar reject the marker and kills the request (#44006).\n\n        Returns:\n            The suffix of ``new_token_ids`` that follows the reasoning-end\n            marker. Steps fully after the boundary are returned unchanged.\n        \"\"\"\n        structured_req = request.structured_output_request\n        if structured_req is None:\n            return new_token_ids\n        end_idx = structured_req.reasoning_end_token_index\n        if end_idx is None:\n            return new_token_ids\n        first_idx = len(request.all_token_ids) - len(new_token_ids)\n        num_reasoning = end_idx + 1 - first_idx\n        if num_reasoning <= 0:\n            return new_token_ids\n        return new_token_ids[num_reasoning:]",
+      "elide": [
+        "docstring 点名 #44006：思考段收尾与语法内容混在同一步输出里，把思考 token 喂进 accept_tokens 会让语法拒收、杀死请求——这就是 m17 存在的理由；fill 侧的孪生门 should_fill_bitmask（L361-L379）归 ch31"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/backend_guidance.py",
+      "lines": "L158-L214",
+      "code": "    def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:\n        \"\"\"Accepts a list of tokens and advances the parser.\n\n        Returns True if the parser was advanced successfully.\n        Returns False if the parser failed to advance.\n        \"\"\"\n\n        if self.ll_tokenizer.eos_token in tokens:\n            if self.ll_matcher.is_stopped() and not self.terminated:\n                self.rollback_lag = 1\n            self.terminated = True\n\n        if self.ll_matcher.is_stopped():\n            return True\n\n        # TODO - Add jump decoding support in the future:\n        # self.ll_matcher.compute_ff_bytes() - this should always work\n        # self.ll_matcher.compute_ff_tokens() - this only works for\n        #   \"canonical\" tokenizers\n        # For conversion between the two, see\n        # https://github.com/guidance-ai/llguidance/blob/main/docs/fast_forward.md\n\n        r = self.ll_matcher.consume_tokens(tokens)\n\n        self.check_error()\n\n        return r\n\n    def validate_tokens(self, tokens: list[int]) -> list[int]:\n        \"\"\"Checks if the list of tokens are accepted by the parser in sequence.\n        Will not advance the parser.\n\n        Returns the prefix list of tokens that are accepted by the parser.\n        \"\"\"\n        if len(tokens) == 0:\n            return []\n        if self.ll_matcher.is_stopped():\n            return []\n\n        num_tokens = self.ll_matcher.validate_tokens(tokens)\n\n        self.check_error()\n\n        return tokens[:num_tokens]\n\n    def rollback(self, num_tokens: int) -> None:\n        if num_tokens > 0:\n            self.ll_matcher.rollback(num_tokens - self.rollback_lag)\n            self.terminated = False\n            self.rollback_lag = 0\n            self.check_error()\n\n    def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:\n        # this will automatically return [EOS] mask if the matcher is stopped\n        # or otherwise in an error state\n        llguidance_torch.fill_next_token_bitmask(self.ll_matcher, bitmask, idx)\n        self.check_error()",
+      "elide": [
+        "同一契约的第二实现：llguidance 的 LLMatcher；rollback_lag（EOS 后回滚少退一格）是四后端语义分歧的最好例证；TODO 注释点名的 jump-forward（compute_ff_bytes/tokens）与 xgrammar 类头 NOTE 呼应"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/backend_outlines.py",
+      "lines": "L52-L97",
+      "code": "@dataclass\nclass OutlinesBackend(StructuredOutputBackend):\n    def __post_init__(self):\n        self.vocabulary = get_outlines_vocabulary(self.tokenizer)\n        self.cache = get_outlines_cache()\n\n    def _compile_index(\n        self, regex_string: str, vocabulary: OutlinesVocabulary\n    ) -> oc.Index:\n        cache_key = f\"{vocabulary._hash}_{regex_string}\"\n        if cache_key in self.cache:\n            return self.cache[cache_key]\n\n        index = compile_regex_with_timeout(\n            lambda pat: oc.Index(pat, vocabulary.inner),\n            regex_string,\n        )\n        self.cache[cache_key] = index\n\n        return index\n\n    def compile_grammar(\n        self, request_type: StructuredOutputOptions, grammar_spec: str\n    ) -> StructuredOutputGrammar:\n        if request_type == StructuredOutputOptions.JSON:\n            regex = json_schema.build_regex_from_schema(grammar_spec)\n        elif request_type == StructuredOutputOptions.REGEX:\n            regex = grammar_spec\n        elif request_type == StructuredOutputOptions.CHOICE:\n            choices = ast.literal_eval(grammar_spec)\n            choices = [regex_escape(c) for c in choices]\n            regex = \"(\" + \"|\".join(choices) + \")\"\n        else:\n            raise ValueError(\n                f\"Invalid request type for Outlines backend ({request_type!s})\"\n            )\n        index = self._compile_index(regex, self.vocabulary)\n        max_rollback_tokens = (\n            self.vllm_config.speculative_config.num_speculative_tokens\n            if self.vllm_config.speculative_config is not None\n            else 0\n        )\n        return OutlinesGrammar(\n            vocab_size=self.vocab_size,\n            guide=oc.Guide(index, max_rollback=max_rollback_tokens),\n        )",
+      "elide": [
+        "outlines 的路线：**一切先转正则**（JSON schema→build_regex_from_schema、choice→regex_escape 交替），再编成 outlines_core 的 DFA Index；缓存键 f\"{vocabulary._hash}_{regex_string}\"（L61），双层缓存见 utils.py 的 get_outlines_cache；oc.Index 构造同样套 ReDoS 超时护栏（L65-L68）"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/backend_lm_format_enforcer.py",
+      "lines": "L124-L139",
+      "code": "        max_rollback_tokens = (\n            self.vllm_config.speculative_config.num_speculative_tokens\n            if self.vllm_config.speculative_config is not None\n            else 0\n        )\n\n        if max_rollback_tokens > 0:\n            raise ValueError(\n                \"LM Format Enforcer backend does not support speculative tokens\"\n            )\n\n        token_enforcer = lmformatenforcer.TokenEnforcer(\n            tokenizer_data=self.tokenizer_data,\n            parser=character_level_parser,\n        )\n        return LMFormatEnforcerGrammar(token_enforcer)",
+      "elide": [
+        "LMFE 不持状态机：LMFormatEnforcerGrammar 拿 current_tokens_prefix 前缀列表按需查 get_allowed_tokens（fill 时才物化行）——撑不住 rollback 深度，索性显式拒绝投机解码；其 compile 分派只认 JSON/JSON_OBJECT/REGEX/CHOICE 四形"
+      ]
+    },
+    {
+      "path": "vllm/v1/structured_output/utils.py",
+      "lines": "L282-L301",
+      "code": "def get_outlines_cache():\n    \"\"\"Get the Cache instance to be used for index caching\"\"\"\n\n    cache_dir = get_outlines_cache_path()\n    if envs.VLLM_V1_USE_OUTLINES_CACHE:\n        logger.warning(\n            \"Enabling outlines cache. This is an unbounded on-disk \"\n            \"cache. It may consume a lot of disk space and should \"\n            \"not be used with untrusted clients.\"\n        )\n        cache = OutlinesDiskCache(cache_dir)\n        outlines_version = importlib.metadata.version(\"outlines_core\")\n\n        cached_version = cache.get(\"__version__\", None)\n        if cached_version != outlines_version:\n            cache.clear()\n        cache.set(\"__version__\", outlines_version)\n        return cache\n\n    return LRUCache(maxsize=128)",
+      "elide": [
+        "默认内存 LRUCache(128)；VLLM_V1_USE_OUTLINES_CACHE=1 时换 OutlinesDiskCache（L218-L279）：SQLite 落盘 + outlines_core 原生 serde 二进制（docstring 原话 'instead of pickle, eliminating arbitrary code execution risk'——反序列化任意代码执行风险）+ outlines_core 版本变更即清库；警告原话自认『无界磁盘缓存、不该对不可信客户端开启』"
+      ]
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "Mistral/tekken 分词器兼容分支：backend_xgrammar.py:L42-L59 的手工 TokenizerInfo 构造（RAW/BYTE_FALLBACK/stop_token_ids/add_prefix_space）与 backend_guidance.py:L97-L106 的 mistral ll_tokenizer 三分支（精简版固定走 xgr.TokenizerInfo.from_huggingface / llguidance_hf.from_tokenizer）。注意 sampling_params 侧的 _is_non_tekken_mistral 判定与 skip_guidance 逻辑**保留不动**（删它要动 auto 阶梯控制流，得不偿失）",
+        "why_safe": "只影响 TokenizerInfo/LLTokenizer 的构造方式，编译→FSM→门控主控制流不变；非 Mistral 模型即走这条路径"
+      },
+      {
+        "what": "structural_tag 的 deprecated 编译路径：backend_xgrammar.py:L96-L110 的 structures/triggers 拆解分支与 validate_xgrammar_grammar 里 L345-L361 的同款 deprecated 分支（精简版只走 compile_structural_tag(grammar_spec) / from_structural_tag(str) 新路径）",
+        "why_safe": "同一入口的旧格式兼容分支，新路径已覆盖语义；其余五种约束形态不受影响"
+      },
+      {
+        "what": "批掩码装配整块：grammar_bitmask（structured_output/__init__.py:L212-L359）+ _fill_bitmasks（L194-L205）+ _async_submit_fill_bitmask（L207-L210）+ executor_for_fillmask 装配与 fill_bitmask_parallel_threshold/batch_size 配置（L60-L68）+ _grammar_bitmask/_full_mask 字段 + should_fill_bitmask（L361-L379，fill 侧思考门）",
+        "why_safe": "ch31 主场（掩码装配/并行填充/spec 窗口预推进+rollback/ndarray/行序契约）。本章终点=『FSM 编译好、能被调度器推进』；调度侧 get_grammar_bitmask（scheduler.py:L1646-L1668）作为交棒只在 dossier 内嵌展示、不进精简版调度器文件——v2 ch31 即此边界，lint_fidelity 对 must_keep 不含它"
+      },
+      {
+        "what": "outlines 与 lm-format-enforcer 两后端完整实现（backend_outlines.py / backend_lm_format_enforcer.py 全文；sampling_params 引用的 validate_structured_output_request_outlines 定义在 backend_outlines.py:L171、validate_structured_output_request_lm_format_enforcer 在 backend_lm_format_enforcer.py:L153）及 utils.py 中仅服务 outlines 的辅助：OutlinesVocabulary/_reduced_vocabulary/get_outlines_vocabulary/get_outlines_cache_path/OutlinesDiskCache/get_outlines_cache（utils.py:L178-L301）。**sampling_params.py 侧配套删（与上述文件一体，防 import 断链）**：① 两段 import——L1004-L1006（backend_lm_format_enforcer 的 validate_structured_output_request_lm_format_enforcer）与 L1007-L1009（backend_outlines 的 validate_structured_output_request_outlines）；guidance（L1000-L1003）与 xgrammar（L1010）两段 import 保留。② 两个显式后端分支——L1031-L1033（elif backend 为 outlines）与 L1034-L1042（elif backend 为 lm-format-enforcer）；xgrammar（L1012-L1014）与 guidance（L1015-L1030）显式分支保留。③ auto 阶梯内的 outlines 降级支——L1069-L1073（if skip_guidance: 头 + 两行注释 + validate_structured_output_request_outlines(self) + _backend 赋 outlines 两句）删除，else 体（L1074-L1080 guidance 兜底）提升为直线。**auto 阶梯骨架保留不动**：try validate_xgrammar_grammar→except ValueError→skip_guidance 计算（L1058-L1067，_is_non_tekken_mistral + has_guidance_unsupported_json_features 两判据——『Mistral/tekken 兼容分支』删除条目既定保留；精简版中其值不再分流，是降级判据的纯计算证据）→validate_guidance_grammar 兜底→_backend_was_auto=True（L1082）。④ grammar_init 内 outlines/lm-format-enforcer 两 elif 分支（__init__.py:L145-L162，含惰性 import）同步删；else raise ValueError 的非法后端防御（L163-L164）保留",
+        "why_safe": "正文以 xgrammar 深挖、guidance 作第二实现证明契约可替换；outlines/LMFE 走 dossier 内嵌真源码对照（_compile_index/compile_grammar 分派与 LMFE 拒 spec 两段已嵌）。删除后精简版 sampling_params 只认 xgrammar/guidance 两显式后端，auto 阶梯以 guidance 为唯一兜底。已知行为差异（正文 m18 对照表给全量真相，勿掩盖）：非 tekken Mistral 分词器或 guidance 不支持的 schema，真实源码降 outlines，精简版会经 validate_guidance_grammar 报错拒单。③的 else 体提升是本条目唯一控制流改动：skip_guidance 计算保留但消费它的 if 已删，值弃用不影响 xgrammar→guidance 主线（显式 guidance 分支 L1016 的非 tekken Mistral 拒单仍在，显式路径不受影响）；②③④删完后无任何残余 import/调用指向已删两文件，精简版可编译可跑"
+      },
+      {
+        "what": "reasoning parser 的装配段：structured_output/__init__.py:L81-L93 的 reasoning_parser_plugin import 与 reasoning_parser 查表构造（reasoner_cls 停留在 L43 的 None 初值）；_get_reasoner/should_advance/trim_reasoning_for_advance/_find_reasoning_end_index 四个方法本体**原样保留**",
+        "why_safe": "reasoner_cls=None 是源码真实路径（不配 reasoning_parser 的模型即此），should_advance 走 L396-L398 的 reasoner-None 快返回；思考分支在精简版不可达但控制流结构原样（delete 批准的只是构造段，方法本体在 must_keep）"
+      },
+      {
+        "what": "serialize_guidance_grammar 的 STRUCTURAL_TAG 分支（backend_guidance.py:L258-L282）",
+        "why_safe": "guidance 只作契约可替换性的第二实现；structural_tag 主线走 xgrammar。能力矩阵全量真相由 dossier 对照表（m18）给出"
+      },
+      {
+        "what": "logger 调用、TYPE_CHECKING 断言块、# type: ignore 注释、类头 NOTE 的 jump-forward 展望注释",
+        "why_safe": "纯工程装饰，无控制流影响"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "StructuredOutputsParams",
+        "why": "用户面入口：六选一互斥 + _backend/_backend_was_auto 落点"
+      },
+      {
+        "symbol": "__post_init__",
+        "why": "六选一互斥校验（count>1/count<1 双向报错）——writer 断言『六选一』要有源码对照"
+      },
+      {
+        "symbol": "all_constraints_none",
+        "why": "from_sampling_params 判『无约束』的依据，入口机制证据"
+      },
+      {
+        "symbol": "_backend",
+        "why": "后端选择的落点字段，连接前端校验与引擎侧构造（grammar_init 读它）"
+      },
+      {
+        "symbol": "_backend_was_auto",
+        "why": "记账位：复用 params 不误报后端冲突（verify 的放行条件）"
+      },
+      {
+        "symbol": "_validate_structured_outputs",
+        "why": "前端校验主体：拒单+冲突检查+auto 阶梯"
+      },
+      {
+        "symbol": "verify",
+        "why": "校验入口（InputProcessor 调用点即『前端校验期』的锚）"
+      },
+      {
+        "symbol": "validate_xgrammar_grammar",
+        "why": "auto 阶梯第一试 + choice→EBNF/lark→EBNF 原地改写的唯一发生地；删则 CHOICE 路径崩（compile 分派无 CHOICE 分支）"
+      },
+      {
+        "symbol": "has_xgrammar_unsupported_json_features",
+        "why": "xgrammar 能力矩阵预检（multipleOf/uniqueItems/format/patternProperties），auto 降级的判据之一"
+      },
+      {
+        "symbol": "choice_as_grammar",
+        "why": "choice→EBNF 改写链条一环，与 validate_xgrammar_grammar 同进退"
+      },
+      {
+        "symbol": "grammar_is_likely_lark",
+        "why": "lark 判定（无 ::= 即 Lark），改写链条的前半"
+      },
+      {
+        "symbol": "convert_lark_to_ebnf",
+        "why": "lark→EBNF 转换本体（校验期改写的第二例）"
+      },
+      {
+        "symbol": "compile_regex_with_timeout",
+        "why": "ReDoS 超时护栏（m19），xgrammar REGEX 分派直接调用"
+      },
+      {
+        "symbol": "StructuredOutputOptions",
+        "why": "六形态枚举：structured_output_key 第一元与编译分派开关"
+      },
+      {
+        "symbol": "StructuredOutputKey",
+        "why": "(枚举,字符串) 键类型——读者要懂它为何可哈希"
+      },
+      {
+        "symbol": "StructuredOutputGrammar",
+        "why": "请求级契约 ABC，本章骨架"
+      },
+      {
+        "symbol": "accept_tokens",
+        "why": "推进状态机——FSM 生命的核心动词、update_from_output 调用"
+      },
+      {
+        "symbol": "validate_tokens",
+        "why": "『不推进的试走』——与 accept 的语义分离是本章要点"
+      },
+      {
+        "symbol": "rollback",
+        "why": "投机解码口子；xgrammar 侧 num_processed_tokens 成对回退"
+      },
+      {
+        "symbol": "fill_bitmask",
+        "why": "契约与采样的唯一接口——语法在这里变成掩码（装配归 ch31，方法本体在）"
+      },
+      {
+        "symbol": "is_terminated",
+        "why": "语法终态判据，决定还要不要继续掩码"
+      },
+      {
+        "symbol": "reset",
+        "why": "六方法之一，缺则 ABC 不完整。**注：v0.27.1 全仓零 in-tree 调用者**（仅各后端内部 matcher.reset），writer 勿编造使用场景"
+      },
+      {
+        "symbol": "StructuredOutputBackend",
+        "why": "引擎级契约 ABC（三字段+三方法）"
+      },
+      {
+        "symbol": "compile_grammar",
+        "why": "『一段语法怎么变成对象』的落点，章标题的动词"
+      },
+      {
+        "symbol": "allocate_token_bitmask",
+        "why": "掩码张量形状与所有权在此定（m21），与 ch31 的接缝"
+      },
+      {
+        "symbol": "destroy",
+        "why": "后端级清理，契约完整性"
+      },
+      {
+        "symbol": "StructuredOutputManager",
+        "why": "引擎级编排者：惰性建后端+异步编译发起方"
+      },
+      {
+        "symbol": "grammar_init",
+        "why": "命门：惰性建后端 + 提交线程池（IO 线程独占调用）"
+      },
+      {
+        "symbol": "_create_grammar",
+        "why": "线程池工作函数：key→compile_grammar 一跳 + 失败经 Future 传调度器"
+      },
+      {
+        "symbol": "_use_async_grammar_compilation",
+        "why": "external_launcher 同步回退开关（m14）"
+      },
+      {
+        "symbol": "executor",
+        "why": "ThreadPoolExecutor 实例——异步编译的物理载体（半 CPU）"
+      },
+      {
+        "symbol": "StructuredOutputRequest",
+        "why": "请求级容器：Future/成品/Exception 三态共存点"
+      },
+      {
+        "symbol": "_check_grammar_completion",
+        "why": "timeout=0.0001 非阻塞轮询——门控核心实现（m12）"
+      },
+      {
+        "symbol": "is_grammar_ready",
+        "why": "对外就绪查询。**注：v0.27.1 仍零 in-tree 调用者**（门控实际走 grammar property），勿写成『调度器调用的接口』"
+      },
+      {
+        "symbol": "grammar",
+        "why": "property/setter——调度器实际读的就是它（晋级检查），抹平 Future 与成品"
+      },
+      {
+        "symbol": "structured_output_key",
+        "why": "cached_property：每请求编译键（**不是**跨请求缓存键——m10 纠偏点）"
+      },
+      {
+        "symbol": "get_structured_output_key",
+        "why": "六形态→二元组归一函数，含 json.dumps 归一细节"
+      },
+      {
+        "symbol": "WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR",
+        "why": "本章的『门』——真实枚举名（不是 WAITING_FOR_FSM）"
+      },
+      {
+        "symbol": "use_structured_output",
+        "why": "request.py:L268-L269 property=structured_output_request is not None；preprocess_add_request 分支条件"
+      },
+      {
+        "symbol": "XgrammarBackend",
+        "why": "默认后端，深挖主线"
+      },
+      {
+        "symbol": "XgrammarGrammar",
+        "why": "六方法参考实现"
+      },
+      {
+        "symbol": "GrammarCompiler",
+        "why": "cache_enabled+字节预算的编译器——编译复用的真实所在"
+      },
+      {
+        "symbol": "GrammarMatcher",
+        "why": "逐 token 状态机本体"
+      },
+      {
+        "symbol": "max_rollback_tokens",
+        "why": "回滚深度=投机 token 数（m9 证据）"
+      },
+      {
+        "symbol": "num_processed_tokens",
+        "why": "推进计数，rollback 成对回退——状态成对维护的证据"
+      },
+      {
+        "symbol": "GuidanceBackend",
+        "why": "第二实现，证明契约可替换"
+      },
+      {
+        "symbol": "GuidanceGrammar",
+        "why": "同上；validate_tokens 走 ll_matcher.validate_tokens 的另一实现形态"
+      },
+      {
+        "symbol": "rollback_lag",
+        "why": "guidance EOS 后回滚少退一格——同契约异实现的最好例证"
+      },
+      {
+        "symbol": "serialize_guidance_grammar",
+        "why": "六形→guidance 语法的统一序列化（guidance 原生支持 choice 的证据，与 xgrammar 的改写路线对照）"
+      },
+      {
+        "symbol": "_is_blocked_waiting_status",
+        "why": "门控调度侧一半：阻塞态判定（三态共用机制，ch11 已立、本章实例化）"
+      },
+      {
+        "symbol": "_try_promote_blocked_waiting_request",
+        "why": "门控另一半：grammar 就绪→WAITING；Exception→grammar_compile_error_reqs"
+      },
+      {
+        "symbol": "grammar_compile_error_reqs",
+        "why": "编译失败记账集合（m13）：只杀单请求的隔离机制"
+      },
+      {
+        "symbol": "should_advance",
+        "why": "推进侧思考门（m17）：reasoner None 快返回的常量路径必须可跑"
+      },
+      {
+        "symbol": "trim_reasoning_for_advance",
+        "why": "剔除混入思考 token（#44006）——m17 的另一半"
+      },
+      {
+        "symbol": "reasoning_end_token_index",
+        "why": "思考结束边界标记（#42452），should_advance 写、trim 读"
+      },
+      {
+        "symbol": "_is_non_tekken_mistral",
+        "why": "sampling_params.py:L191 模块级函数：auto 阶梯 skip_guidance 第一判据（L1058）+ guidance 显式分支拒非 tekken Mistral（L1016）——两处消费；『Mistral/tekken 兼容分支』删除条目既定保留，此处入账使 lint_fidelity 可检测"
+      },
+      {
+        "symbol": "has_guidance_unsupported_json_features",
+        "why": "backend_guidance.py:L49：auto 阶梯的 guidance 能力预检（skip_guidance 第二判据，L1062-L1067 的 schema 特性扫描）——阶梯骨架保留的证据，删则 skip_guidance 计算断链"
+      },
+      {
+        "symbol": "validate_guidance_grammar",
+        "why": "backend_guidance.py:L293：auto 阶梯唯一兜底（L1076）+ guidance 显式分支（L1027）共用——删则 auto 阶梯断"
+      },
+      {
+        "symbol": "_get_reasoner",
+        "why": "structured_output/__init__.py:L99：should_advance 的第一跳（reasoner None 快返回的常量路径 L396-L398）；『reasoning parser 装配段』删除条目言明四方法本体保留，原 must_keep 漏登"
+      },
+      {
+        "symbol": "_find_reasoning_end_index",
+        "why": "structured_output/__init__.py:L442：should_advance 定位思考结束边界（调用点 L434，写 reasoning_end_token_index 于 L436）；同上漏登"
+      },
+      {
+        "symbol": "preprocess_add_request",
+        "why": "vllm/v1/engine/core.py:L969：站 3 入口、grammar_init 的唯一调用点（L984-L990 线程安全注释所在）——精简版 core 侧骨架必须留"
+      }
+    ]
+  },
+  "foreshadow_due": {
+    "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号旧账，不跑）",
+    "should_plant": [],
+    "should_payoff": [
+      "F6 grammar bitmask 窗口（planted=9, paid=30）"
+    ],
+    "note": "F6 回收义务（ch9 站 4 原文）：『这张「每 token 一位的允许表」从哪来？语法怎么编译成状态机、状态机怎么逐拍填表、xgrammar 与 guidance 两个后端怎么选，Part VII 约束解码两章回收』+ ch29 结尾『那张 [batch, vocab] 的 0/1 掩码是从哪来的？用户给的是一段 JSON schema 或一条正则，它怎么变成每个位置上「哪些 token 合法」的判定？编译要不要抢在首 token 之前完成？』。本章回收：语法→FSM（m6）、后端怎么选（m3/m18）、编译时序=异步门（m11-m15）；『逐拍填表+两段式 GPU 窗口』由 ch31 接力收尾（F6 允许写『回收·前半』口径，图面/正文注明 ch31 收尾）。ch9 另留的一张账单（重叠版调度下缺 token 的延迟采样旁路 → Part III 末章/ch12）不归本章。本章不埋新伏笔（F7-F10 均非 30）。"
+  },
+  "cross_refs": {
+    "back": [
+      "ch29 Sampler 9 步（../../ch29-sampler-pipeline/narrative/chapter.md）——站 1 apply_grammar_bitmask 交接点（『logits 已被改过』）、站 5 allowed_token_ids=『不带 FSM 的粗粒结构化输出』",
+      "ch9 EngineCore 五拍（../../ch09-engine-core-step-loop/narrative/chapter.md）——站 4 埋 F6：get_grammar_bitmask 位置+窗口不变式+实测翻位图",
+      "ch11 请求生命周期（阻塞态/skipped_waiting/晋级机制全貌）——本章复用同一套机制讲语法门",
+      "ch2 请求的一生（前端 Processor/SamplingParams 校验面）——站 1 的属地"
+    ],
+    "forward_text_only": "下一章（约束解码 II：bitmask 落地）讲 grammar_bitmask 的批装配与并行填充、spec 窗口预推进+rollback、GrammarOutput 的 ndarray 跨进程、worker 侧重排+pinned H2D、apply_token_bitmask_inplace 与两段式 execute GPU 窗口、should_fill_bitmask（fill 侧思考门）。正文用纯文字『下一章』指代，不写 markdown 链接。"
+  },
+  "l2_spec": "book/cartography/l2-specs/ch30.json（stations 与本档案 stations 同一份账本）"
+}
