@@ -1,0 +1,1061 @@
+{
+  "chapter_id": "ch38-openai-serving-multiturn",
+  "part": "VIII",
+  "title": "服务面：OpenAI 协议与多轮",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "chapter_kind": "code",
+  "hook_suggestion": "「引擎 37 章都拆完了，可用户敲的是 curl 不是 Python：一个 HTTP POST 怎么变成引擎请求、token 流又怎么变回 OpenAI 的 JSON 与 SSE？协议是无状态的——客户端每轮把全部历史原样重发，服务端凭什么不把重复前缀重算一遍、第二轮的 TTFT 不爆炸？推理模型这一轮的『思考』，下一轮的 prompt 里该留还是该丢——gpt-oss 用 analysis/commentary/final 三条通道把这件事写进了格式本身？还有那个最现实的：用户关掉浏览器的一瞬间，还在 GPU 上逐 token 烧的请求，谁去叫停？」（从 Part VIII hook『真实服务不止一个引擎』+ 章主题 serving 层/多轮/harmony + deepread/api-entry.json why_chains[6][4] 与 contracts 死亡传播段提炼为真问题；F5 断连反向 abort 本章回收）",
+  "scope_note": "本章解读 API 进程的「前门」——OpenAI 兼容服务层。主线 = 一个多轮 chat 请求在服务层的完整旅程：FastAPI 路由与装饰器 → ChatCompletionRequest 协议定型（to_sampling_params / output_kind 入口声明）→ handler 编排（Parser 装配 / 引擎健康预检 / request_id）→ 渲染交棒（非和谐 chat 模板回指 ch6；和谐 harmony 多轮编码本章展开）→ reasoning_ended 多轮预判 → engine_client.generate（EngineClient 抽象面，ch4 已立）→ 流式生成器逐 token 分拣（DelegatingParser 两阶段状态机 / HarmonyParser 三通道）→ SSE data 帧出门 / 非流式聚合 → 断连反向 abort 的 HTTP 层全貌（F5 回收）。旁线 = 启动链（先绑 socket → build_app → init_app_state → serve_http）与关停（drain/abort + watchdog）。边界：AsyncLLM 内部（add_request/双登记/output_handler/collector/detokenizer）ch4/ch6/ch7 已讲透，本章自 generate() 的 AsyncGenerator 消费侧接手；chat 模板与多模态渲染内部归 ch6（非和谐路径黑盒回指）；logprobs 组装归 ch8；ZMQ 拓扑归 ch5、多 API server/client_index 归 ch34（F3/F4 已回收）；/v1/responses 与 anthropic/cohere 面只在「API 面家族」一节点名不展开；beam_search、batch 端点、Mistral 特例、kimi_k2 id 连续性按 delete/省略处理。",
+  "code_spine": [
+    "vllm/entrypoints/openai/chat_completion/api_router.py:L40-L74 —— 站 1：POST /v1/chat/completions 路由 + @with_cancellation/@load_aware_call + 三分支返回（JSONResponse / StreamingResponse）",
+    "vllm/entrypoints/serve/utils/api_utils.py:L37-L94 —— 站 10 前半：listen_for_disconnect + with_cancellation 竞速（F5 HTTP 端）",
+    "vllm/entrypoints/openai/chat_completion/serving.py:L192-L218 —— 站 2：render_chat_request（_check_model + errored 预检）",
+    "vllm/entrypoints/openai/chat_completion/serving.py:L235-L387 —— 站 2/5/6/7：_create_chat_completion 编排主体（parser→render→request_id→max_tokens→to_sampling_params→reasoning_ended→generate→按 stream 分流）",
+    "vllm/renderers/online_renderer.py:L145-L218 —— 站 3：render_chat（tool_choice 门控 + 非和谐/和谐分支）",
+    "vllm/renderers/online_renderer.py:L220-L267 —— 站 4：_make_request_with_harmony（preamble + 历史编码 + render_for_completion）",
+    "vllm/entrypoints/openai/parser/harmony_utils.py:L206-L457 —— 站 4：harmony 消息编解码全家（parse_chat_inputs_to_harmony_messages / auto_drop_analysis_messages / parse_chat_input_to_harmony_message / render_for_completion / get_streamable_parser_for_assistant）",
+    "vllm/entrypoints/openai/chat_completion/protocol.py:L646-L734 —— 站 5：to_sampling_params（output_kind by stream；stop_token_ids 合并）",
+    "vllm/entrypoints/serve/utils/api_utils.py:L170-L206 —— 站 5：get_max_tokens 四方取 min",
+    "vllm/entrypoints/openai/chat_completion/serving.py:L331-L341 → vllm/v1/engine/async_llm.py:L383-L384 —— 站 6：reasoning_ended 三分支预判并盖进 EngineCoreRequest 过线",
+    "vllm/parser/abstract_parser.py:L44-L59 —— StreamState（每流一份的解析游标）",
+    "vllm/parser/abstract_parser.py:L801-L940 —— 站 8：DelegatingParser.parse_delta 两阶段状态机（prompt_reasoning_checked → 推理段 → 转段 → 工具段 → 直通/收口）",
+    "vllm/parser/parser_manager.py:L75-L140 —— 站 2：ParserManager.get_parser 组合工厂（is_harmony 恒返 HarmonyParser）",
+    "vllm/parser/harmony.py:L63-L79 —— harmony 三通道映射表（_SegmentType.from_channel_and_recipient）",
+    "vllm/parser/harmony.py:L136-L177 —— flush：流收口与 HarmonyError 错误恢复（final 通道兜底重解码）",
+    "vllm/parser/harmony.py:L237-L370 —— 站 8：HarmonyParser.parse_delta + process_chunk（逐 token 喂 StreamableParser 出 Segment）",
+    "vllm/entrypoints/openai/chat_completion/serving.py:L422-L842 —— 站 8/9：chat_completion_stream_generator（首块 role → parse_delta → data 帧 → usage 末块 → 错误帧 → [DONE]）",
+    "vllm/entrypoints/openai/chat_completion/serving.py:L844-L1138 —— 站 9 平行路：chat_completion_full_generator（聚合 + parser.parse 一次成型 + Client disconnected）",
+    "vllm/v1/engine/async_llm.py:L596-L617 —— 站 10：generate 消费循环 + CancelledError/GeneratorExit → abort",
+    "vllm/v1/engine/async_llm.py:L729-L741 → vllm/v1/engine/output_processor.py:L494-L515 —— 站 10：abort 两跳 + ABORT 终态解阻塞",
+    "vllm/entrypoints/openai/api_server.py:L620-L655 —— 启动链：setup_server 先绑 socket（先于引擎，避 ray 端口竞态）",
+    "vllm/entrypoints/openai/api_server.py:L751-L789 —— 启动链：run_server → run_server_worker（async with build_async_engine_client → build_and_serve → await shutdown_task）",
+    "vllm/entrypoints/openai/api_server.py:L189-L352 · L355-L482 —— 启动链：build_app（FastAPI(lifespan) + 路由族注册 + 异常处理器四层 + 中间件）+ init_app_state（engine_client/OnlineRenderer/各 serving 对象挂 state）",
+    "vllm/entrypoints/launcher.py:L26-L165 —— 关停：serve_http（server_task + watchdog_task + handle_shutdown：drain/abort 两模式）",
+    "vllm/entrypoints/launcher.py:L168-L190 —— 看门狗：watchdog_loop 每 5s engine.errored → server.should_exit（流式生成器吞异常的兜底）",
+    "vllm/entrypoints/generate/api_router.py:L21-L54 —— API 面家族：六张协议壳共享同一 engine_client/OnlineRenderer"
+  ],
+  "stations": [
+    {
+      "n": 1,
+      "where": "chat_completion/api_router.py:L40-L53",
+      "what": "HTTP 进门：POST /v1/chat/completions → @with_cancellation + @load_aware_call 的 create_chat_completion——handler 任务与断连监听任务从第一行起就在竞速（F5 的 HTTP 端）；返回值三分支：ErrorResponse→JSONResponse(错误码)、ChatCompletionResponse→JSONResponse、异步生成器→StreamingResponse(text/event-stream)"
+    },
+    {
+      "n": 2,
+      "where": "chat_completion/serving.py:L235-L262",
+      "what": "handler 编排头：per-request Parser 实例化（ParserManager.get_parser 装配，gpt_oss 恒为 HarmonyParser）→ render_chat_request：_check_model(404) → errored 预检（流式 200 在生成前发出，死讯必须前置暴露）→ request_id = 'chatcmpl-' + X-Request-Id 头或 random_uuid"
+    },
+    {
+      "n": 3,
+      "where": "online_renderer.py:L145-L218",
+      "what": "渲染交棒：tool_choice 门控（无 tool parser 时 auto/required/named 直接 400）；非和谐→validate_chat_template + preprocess_chat（chat 模板+tokenize，ch6 黑盒）；和谐（model_type=='gpt_oss'）→ parser.adjust_request + _make_request_with_harmony"
+    },
+    {
+      "n": 4,
+      "where": "parser/harmony_utils.py:L206-L267 · L351-L457",
+      "what": "harmony 多轮编码：preamble（system：reasoning_effort/起始日期；developer：函数工具表）→ parse_chat_inputs_to_harmony_messages 逐消息映射（assistant 正文→final、reasoning→analysis、tool_calls→commentary+recipient=functions.{name}、tool 结果→commentary to=assistant）→ auto_drop_analysis_messages 只留最后一个 final 之后的思考 → render_for_completion 出 token ids"
+    },
+    {
+      "n": 5,
+      "where": "chat_completion/protocol.py:L646-L734",
+      "what": "协议定型：get_max_tokens 四方取 min（max_model_len−输入长/请求值/server 默认/平台上限）→ to_sampling_params：HTTP 字段装成 SamplingParams；stream 二值映射 output_kind=DELTA/FINAL_ONLY（ch7 三态契约的入口声明处）；server 默认 stop_token_ids（源码注释举 gpt-oss 的 </call> 为例）与请求值合并去重"
+    },
+    {
+      "n": 6,
+      "where": "chat_completion/serving.py:L331-L341 → async_llm.py:L383-L384",
+      "what": "多轮推理预判：reasoning_ended 三分支——include_reasoning=False→True；Mistral grammar→True；否则 parser.is_reasoning_end(prompt_token_ids)（多轮历史尾部若停在未闭合思考块内，生成就从思考里续）→ 盖进 EngineCoreRequest 过线；parse 侧对偶 = abstract_parser.py:L813-L825 首拍 prompt_reasoning_checked/adjust_initial_state_from_prompt"
+    },
+    {
+      "n": 7,
+      "where": "chat_completion/serving.py:L343-L357",
+      "what": "发车：generator = engine_client.generate(engine_input, sampling_params, sub_request_id, lora/priority/dp_rank/trace_headers/reasoning_ended)——只建协程不驱动，SSE 循环首个 async for 才真正 add_request（ch2/ch4 已立）；OpenAI 层只面向 EngineClient 抽象编程（engine/protocol.py:L41-L99）"
+    },
+    {
+      "n": 8,
+      "where": "chat_completion/serving.py:L485-L627",
+      "what": "流式收件与分拣：async for res（ch7 单槽邮箱 yield 的 RequestOutput）；首拍留底 num_cached_tokens；首块只发 role 空 delta；逐 output → parser.parse_delta 两阶段状态机（reasoning 段→转段→tool 段）/ 无 parser 直通 content；harmony 走三通道分拣（process_chunk 逐 token 喂 StreamableParser）；空 delta 首拍跳过（chunked prefill 不发空块）"
+    },
+    {
+      "n": 9,
+      "where": "chat_completion/serving.py:L690-L842",
+      "what": "SSE 出门：yield f\"data: {json}\\n\\n\" 逐帧；finish_reason 仲裁（tools_streamed→'tool_calls'）；system_fingerprint 只盖终止块；include_usage 末块带 prompt_tokens_details.cached_tokens（多轮前缀缓存的协议级回执）；错误也只能走 data 帧（200 已发）；'data: [DONE]\\n\\n' 收尾。平行路：非流式 L844-L1138 async for 聚合 + parser.parse 一次成型 + ChatCompletionResponse"
+    },
+    {
+      "n": 10,
+      "where": "serve/utils/api_utils.py:L52-L94 → async_llm.py:L611-L617 → L729-L741",
+      "what": "断连反向 abort（F5 回收）：listen_for_disconnect 胜出 → handler/流生成器被 cancel → generate 捕 CancelledError/GeneratorExit → abort(q.request_id, internal=True) 两跳：本进程移状态 + 投 finish_reason=ABORT 终态解阻塞在等消费者（output_processor.py:L494-L515）→ 跨进程 ABORT 停算释放 KV；非流式全量路径捕 CancelledError 返回 'Client disconnected'（serving.py:L862-L863）"
+    }
+  ],
+  "stations_note": "站号 = 一个多轮流式 chat 请求流经服务层代码的顺序（第 10 站为异常路径：客户端断连才走）；启动/关停链（api_server/launcher）不在站号内——它是「站 0」的舞台搭建与拆除，south 区呈现。正文按讲解需要编排：建议先立服务层鸟瞰（启动链 + 一图），再走站 1-7 的下行（进门→渲染→发车），随后站 8-9 的流式主戏（分拣 + SSE 出门 + 非流式对照），收在站 10 的 F5 回收（断连全链）与 WC5 多轮经济学回执。",
+  "key_classes": [
+    {
+      "name": "OpenAIServingChat",
+      "file": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "responsibility": "chat/completions 的 handler 主体（继承 GenerateBaseServing）：构造期经 ParserManager 装配 parser_cls（gpt_oss 恒 HarmonyParser）；_create_chat_completion 编排渲染→request_id→参数→generate→按 stream 分流；chat_completion_stream_generator 出 SSE、chat_completion_full_generator 出完整 JSON。"
+    },
+    {
+      "name": "OnlineRenderer",
+      "file": "vllm/renderers/online_renderer.py",
+      "responsibility": "在线渲染适配层：render_chat 做 tool_choice 门控后二分——非和谐走 preprocess_chat（chat 模板，ch6）/ 和谐走 _make_request_with_harmony（harmony 编码）；构造期同样装配 parser（use_harmony 由 model_type=='gpt_oss' 判定）；warmup 预热模板。"
+    },
+    {
+      "name": "HarmonyParser",
+      "file": "vllm/parser/harmony.py",
+      "responsibility": "DelegatingParser 特化子类：基于 openai_harmony StreamableParser 逐 token 解析 gpt-oss 输出；_SegmentType 把 analysis/commentary/final 三通道 + recipient 三分拣为 reasoning/content/tool_calls；process_chunk 出 Segment 流、parse_delta 组装 DeltaMessage、flush 收口与错误恢复；adjust_request 把结构化输出折叠进 final 通道 StructuralTag。"
+    },
+    {
+      "name": "Parser / DelegatingParser",
+      "file": "vllm/parser/abstract_parser.py",
+      "responsibility": "统一解析抽象：把 reasoning parser 与 tool parser 组合进一个接口（版本归属：统一层早于 v0.21.0 基线已落地——#32712（2026-02）；本章基线 v0.27.1 窗口内的新增是 harmony.py 的 HarmonyParser、kimi_k3、engine_based 流式，不是统一层本身）；DelegatingParser.parse_delta 两阶段状态机（StreamState 游标：prompt_reasoning_checked/reasoning_ended/tool_call_text_started）；非和谐模型的默认实现。"
+    },
+    {
+      "name": "ParserManager",
+      "file": "vllm/parser/parser_manager.py",
+      "responsibility": "组合工厂：按 tool/reasoning 两个名字从各自注册表取类，动态组装一个 DelegatingParser 子类；is_harmony 恒返 HarmonyParser；kimi_k3 特化子类；都不配返 None（无 parser，流式直通 content）。"
+    },
+    {
+      "name": "ChatCompletionRequest",
+      "file": "vllm/entrypoints/openai/chat_completion/protocol.py",
+      "responsibility": "OpenAI chat 协议的 pydantic 模型（HTTP JSON 的类型层）；to_sampling_params 把协议字段装成 SamplingParams——stream→output_kind 二值映射是三态契约的入口声明；extract_structured_outputs 归一 response_format/json_schema 等约束。"
+    },
+    {
+      "name": "with_cancellation / listen_for_disconnect",
+      "file": "vllm/entrypoints/serve/utils/api_utils.py",
+      "responsibility": "断连竞速装饰器（F5 的 HTTP 端）：handler 任务与断连监听任务 asyncio.wait(FIRST_COMPLETED)；返回 StreamingResponse 后监听移交响应对象。"
+    },
+    {
+      "name": "build_async_engine_client(_from_engine_args)",
+      "file": "vllm/entrypoints/openai/api_server.py",
+      "responsibility": "EngineClient 生命周期边界：AsyncEngineArgs → AsyncLLM.from_vllm_config（ch4 在线面入口），async with 保证任何退出路径 shutdown；多 API server 时携 client_count/client_index。"
+    },
+    {
+      "name": "serve_http / watchdog_loop / terminate_if_errored",
+      "file": "vllm/entrypoints/launcher.py",
+      "responsibility": "uvicorn 启动与优雅关停：server_task + watchdog_task + handle_shutdown（SIGINT/SIGTERM → engine.shutdown(timeout) → should_exit；timeout==0 为 abort 模式否则 drain）；watchdog 每 5s 检引擎死、兜底流式生成器吞异常的场景。"
+    },
+    {
+      "name": "EngineClient",
+      "file": "vllm/engine/protocol.py",
+      "responsibility": "handler 依赖的抽象协议（ABC）：generate/encode/abort/check_health/pause_resume/shutdown 等方法面 + renderer/input_processor/model_config 暴露；AsyncLLM 是全仓唯一实现——OpenAI 层只面向此抽象编程（ch4 站 1 已立）。"
+    }
+  ],
+  "data_flow": [
+    "总述：本章数据流 = deepread/api-entry.json data_flow 的服务层段（第 1-5 步：HTTP 进门→校验/参数→渲染→generate 只建协程→SSE 首个 async for 驱动）+ 回程消费段（第 11-13 步：generate 消费循环→SSE 组装→断连 abort），中间引擎段（第 6-10 步）ch2/ch5/ch7 已立不重挖；harmony 分支为本章新增段（站 4），按站号账本重排如下：",
+    "1. uvicorn 收 POST /v1/chat/completions → create_chat_completion（api_router.py:L51-L53，@with_cancellation 已挂断连竞速）→ pydantic 解析 ChatCompletionRequest。",
+    "2. OpenAIServingChat._create_chat_completion（serving.py:L235-L262）：Parser 实例化 → render_chat_request：_check_model + errored 预检 → online_renderer.render_chat。",
+    "3. 渲染（online_renderer.py:L145-L218）：非和谐 → preprocess_chat（chat 模板 + tokenize，ch6 四步流水，renderer 线程池）；和谐 → _make_request_with_harmony（L220-L267）：preamble + parse_chat_inputs_to_harmony_messages + auto_drop_analysis_messages → render_for_completion 出 prompt token ids → tokens_input。",
+    "4. 参数定型（serving.py:L283-L307）：sub_request_id → get_max_tokens → to_sampling_params（output_kind=DELTA/FINAL_ONLY；stop_token_ids 合并）。",
+    "5. 多轮推理预判（serving.py:L331-L341）：reasoning_ended 三分支 → generate 过线时盖进 EngineCoreRequest（async_llm.py:L383-L384）。",
+    "6. 发车（serving.py:L343-L357）：engine_client.generate 只建协程；SSE 生成器首个 async for 驱动 AsyncLLM.generate → add_request →（ch4 双登记 / ch6 过线）。",
+    "7. 回程消费（serving.py:L485-L627）：async for res（ch7 站 5-13 的出口：output_handler 分块 → 单槽邮箱 → yield）→ 首块 role；逐 output → parser.parse_delta（abstract_parser.py:L801-L940 / harmony.py:L237-L329）→ DeltaMessage。",
+    "8. 出门（serving.py:L690-L842）：ChatCompletionStreamResponse → model_dump_json → 'data: {json}\\n\\n' → usage 末块（cached_tokens 回执）→ 'data: [DONE]\\n\\n'；非流式平行路（L844-L1138）：聚合末个 RequestOutput → parser.parse 一次成型 → ChatCompletionResponse。",
+    "9. 断连（api_utils.py:L37-L94）：listen_for_disconnect 胜出 → cancel → async_llm.py:L611-L617 abort(internal=True) → L729-L741 两跳（output_processor.py:L494-L515 投 ABORT 终态解阻塞 + 跨进程停算）；非流式 serving.py:L862-L863 'Client disconnected'。"
+  ],
+  "why_chains": [
+    {
+      "id": "WC1",
+      "card": "deepread/api-entry.json why_chains[6]",
+      "decision": "客户端断连 = 取消 generate 协程 = 反向 abort：把「没人看的请求」从引擎里抠掉（F5 本章回收）",
+      "old_design": "v0 AsyncStream.generator 在 GeneratorExit 时 cancel（依赖生成器被关闭才触发）；HTTP 层没有主动监听断连的统一机制。",
+      "pain": "HTTP 客户端中途断开（用户关页面、超时、重试换路）后，若不显式 abort，引擎会继续为幽灵请求逐 token 烧 GPU——batch 场景下这是真实吞吐损失：每个断连请求白白占一个 batch 位直到 max_tokens。",
+      "solution": "三层接力：① 路由层 with_cancellation 让 handler 任务与 listen_for_disconnect 竞速，断连则 cancel handler（vllm/entrypoints/serve/utils/api_utils.py:L52-L94 与 L37-L49——v0.27.1 已从 entrypoints/utils.py 移到 serve/utils/；挂在 POST /v1/chat/completions 上，chat_completion/api_router.py:L51-L53）；② StreamingResponse 取消传导为 generate() 的 CancelledError/GeneratorExit → await self.abort(q.request_id, internal=True)（async_llm.py:L611-L616）；③ abort 两跳落地（async_llm.py:L729-L738）——本进程 OutputProcessor.abort_requests 移状态并给 collector 放一条 finish_reason=ABORT 的终态输出（output_processor.py:L494-L515，防止还在等的消费者卡死），再 engine_core.abort_requests_async 跨进程通知引擎停算。非流式全量路径同样接 CancelledError → 'Client disconnected' 错误响应（chat_completion/serving.py:L862-L863）。ch7 站 14 已埋引擎侧半句话；本章补全 HTTP 层全貌：StreamingResponse 接管断连监听（with_cancellation docstring 原话 'In the case where a StreamingResponse is returned by the handler, this wrapper will stop listening for disconnects and instead the response object will start listening for disconnects'）与时序竞争细节（abort 终态依赖 collector 存活，与 generate finally q.close() 的竞争由内部 id 幂等兜住）。",
+      "cost": "每请求多一个竞速任务（listen_for_disconnect 持续读 receive 通道）；abort 是异步的——断连到引擎真停之间还差一次 IPC + 引擎当前 step，期间仍会算出若干废 token（浪费有界但不为零）；with_cancellation 的安全前提是 body 已被 FastAPI 读走（docstring 明言 unsafe elsewhere）。"
+    },
+    {
+      "id": "WC2",
+      "card": "deepread/api-entry.json why_chains[4]",
+      "decision": "RequestOutputKind 三态契约——使用面在入口声明消费方式，本章是 chat 面的声明处：stream=True→DELTA、stream=False→FINAL_ONLY",
+      "old_design": "v0 没有这个维度——引擎对每个请求每步都产完整输出，流式与否的差异全靠 API 层消化；v1 初版的 SamplingParams 也没有 output_kind（PR 历史中后补）。",
+      "pain": "离线批处理与非流式 HTTP 根本不需要每 token 的中间输出——照样生产、照样跨进程传、照样排队，是每 token 每请求的纯浪费（CPU + IPC + 内存）；流式 SSE 恰恰相反，要的就是增量。",
+      "solution": "chat_completion/protocol.py:L722-724：to_sampling_params 里 output_kind=(RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY)——同一个 handler，流式/非流式只是入口处一个二值声明；OutputProcessor 照单裁剪（FINAL_ONLY 且未完→中间输出零构造，ch7 m13 已立裁剪侧）。非流式 full_generator 因此敢 async for 聚合只留最后一个（它就是全部）；流式逐 delta 出门。",
+      "cost": "所有下游（logprobs 切片、metrics）都要感知这个轴；与 n>1 扇出（ch7 m15）和 stream_interval 节流叠加时分支组合变多；两路代码（stream_generator vs full_generator）在 serving 层各写一遍 finish_reason 仲裁——协议同构但实现分叉。"
+    },
+    {
+      "id": "WC3",
+      "card": "deepread/api-entry.json contracts「死亡传播」段 + launcher.py 源码注释（本章拼装）",
+      "decision": "流式的错误语义：200 已发不可改码 → 三道防线把死讯送到客户端——渲染前 errored 预检、流中错误降级为 data 帧、watchdog 兜底关停",
+      "old_design": "朴素做法：等生成器抛异常让框架回 500。流式下行不通——FastAPI 在 handler 返回 StreamingResponse 时就发出 200 状态行，之后异常只能断流或塞进流里。",
+      "pain": "流式 200 与真正开始生成之间有时序差：客户端拿到 200 却等不到任何 token，无法区分慢与死；StreamingResponse 生成器吞掉异常后 uvicorn 也不会自杀，服务器带死引擎空转（launcher.py:L171-172 docstring 原话 'Needed to trigger shutdown if an exception arises is StreamingResponse() generator'）。",
+      "solution": "三道防线钉在代码里：① render_chat_request 里 errored 预检抛 dead_error（chat_completion/serving.py:L211-215，注释原话 'This is required for the streaming case, where we return a success status before we actually start generating text :)'——死讯赶在 200 之前变 5xx）；② 流中错误降级为 data 帧（serving.py:L835-L842：GenerationError→流式错误 JSON、其他异常→create_streaming_error_response，随后 [DONE] 收尾）；③ watchdog 每 5s 检 engine.errored and not is_running → server.should_exit（launcher.py:L168-L190，VLLM_KEEP_ALIVE_ON_ENGINE_DEATH 可关）。错误层级（PR #49665）：请求级 VLLMClientError 不上抛为引擎死；EngineDeadError/EngineGenerateError 全局。",
+      "cost": "每个请求渲染前多一次 errored 检查；流式客户端必须读到 [DONE] 并检查 data 帧里的 error 字段才能发现失败（协议负担转嫁给客户端）；watchdog 是 5s 粒度的粗防线——引擎死后最多 5s 空转窗口。"
+    },
+    {
+      "id": "WC4",
+      "card": "本章现核（vllm/parser/harmony.py + vllm/entrypoints/openai/parser/harmony_utils.py，deepread 卡未覆盖 harmony 协议层）",
+      "decision": "harmony 三通道：把「思考/正文/工具调用」从文本猜测升级为协议字段——模型输出用 <|channel|>analysis|commentary|final + recipient 声明自己在哪条通道对谁说话，服务层入口编码、出口分拣",
+      "old_design": "OpenAI 经典单通道：模型只吐一段文本，reasoning 靠各家模型私有的 <think></think> 标签事后切（vllm/reasoning/ 一族 ReasoningParser 就是干这个的），tool 靠文本约定（XML/JSON 标记）猜（vllm/tool_parsers/ 一族）；多轮历史里思考与正文混在一条 content 字符串里重发。",
+      "pain": "事后解析是猜测：流式时 '<' 到 '<tool_call>' 逐字符到达，解析器要维护跨 token 的文本缓冲；标签没闭合/模型不守约定就解析失败；多轮重发时上一轮的思考内容进 prompt 会污染上下文（模型会被自己的旧思考带偏），但单通道协议里服务端分不出去。",
+      "solution": "gpt-oss 的 harmony 格式把通道写进 token 流本身（特殊 token <|channel|>/<|message|>/<|start|>/<|end|>，openai_harmony 库 StreamableParser 逐 token 解析状态）：入口侧 _make_request_with_harmony（online_renderer.py:L220-L267）+ parse_chat_input_to_harmony_message（harmony_utils.py:L351-L446）把多轮 messages 重编码为带 channel/recipient 的 Message（assistant 正文→final、reasoning→analysis、tool_calls→commentary+to=functions.{name}、tool 结果→commentary to=assistant）；出口侧 HarmonyParser._SegmentType.from_channel_and_recipient（parser/harmony.py:L63-L79）三分拣：analysis→reasoning、final 或无 recipient 的 commentary→content、有函数 recipient 的 commentary→tool_calls；流式逐 token process_chunk（L331-L370）出 Segment(delta)，message 完成出 completed_message；多轮丢思考 auto_drop_analysis_messages（harmony_utils.py:L227-L256）只留最后一个 final 之后的 analysis。",
+      "cost": "前端多一整套 Message 编解码（openai_harmony 依赖）；历史必须忠实还原通道——客户端若用别的客户端轮换对话，通道信息丢失；structured outputs 要折进 final 通道的 StructuralTag（_adjust_output_format，parser/harmony.py:L550-L586）而不是独立 json_schema； reasoning_effort/start_date 等系统字段进了 prompt（非确定性来源，VLLM_SYSTEM_START_DATE 钉死）。"
+    },
+    {
+      "id": "WC5",
+      "card": "协议事实 + 本章现核（serving.py usage 回执链；deepread/api-entry.json data_flow 第 2/11 步的 num_cached_tokens 侧）",
+      "decision": "多轮无状态：OpenAI 协议把会话状态完全推给客户端——服务端每轮把全部 messages 重新渲染成完整 prompt，靠前缀缓存吸收重复前缀，并把命中数作为回执写进 usage",
+      "old_design": "朴素替代：服务端保存会话历史（有状态 session），新轮只发增量。OpenAI 协议没有 session 概念——messages 数组每轮全量重发。",
+      "pain": "有状态服务端：会话粘性挡水平扩展与故障恢复、服务端内存随会话数无界增长；但无状态朴素实现下，第 k 轮 prompt 长 O(k)，每轮 prefill O(全长)——多轮对话 TTFT 随轮次线性劣化，重复前缀反复重算。",
+      "solution": "vLLM 的答案分两层：调度层前缀缓存（ch15 已立：块哈希命中免算）+ 服务层回执——每轮照常全量重渲染（站 3），首拍 RequestOutput.num_cached_tokens 携带命中数（serving.py:L496 留底），include_usage 时写进 usage.prompt_tokens_details.cached_tokens（serving.py:L772-L777；非流式 L1065-L1070）——客户端能直接看见这一轮多少 prompt token 是缓存命中的。思考内容的多轮去留由模型协议自答：harmony 丢旧 analysis（WC4），<think> 系模型历史里通常已无思考段（客户端拿到的是解析后的 content）。",
+      "cost": "带宽与重渲染：每轮 O(全长) 上行 + renderer 线程池全量 tokenize（ch6 已立的卸载点）；prompt 随轮次增长最终撞 max_model_len（get_max_tokens 四方取 min 的存在理由之一）；缓存命中要求前缀逐块一致——system prompt 或历史被改一字，后面全部 miss。"
+    },
+    {
+      "id": "WC6",
+      "card": "本章现核（vllm/parser/abstract_parser.py + parser_manager.py；统一层早于 v0.21.0 基线已落地——2026-02 #32712 起步，v0.21.0 tag 已含两文件（git cat-file 核实）；v0.21→v0.27 窗口的新增是 harmony.py 全新文件（#45171）/kimi_k3/engine_based 流式，而非统一层本身）",
+      "decision": "统一 Parser 层：reasoning parser 与 tool parser 组合成一个 Parser（DelegatingParser 两阶段状态机 + StreamState），而不是 serving 层各调各的",
+      "old_design": "两套独立解析器族（vllm/reasoning/ 一族 + vllm/tool_parsers/ 一族），serving 层分别实例化、分别调用 extract_reasoning_streaming 与 extract_tool_calls_streaming，跨两族的状态（先思考后工具的转段）散落在 handler 代码里。",
+      "pain": "组合行为跨两个状态机：流式时必须先判断当前 token 属于思考段还是工具段才能路由到正确的解析器——转段点（</think> 后紧跟 <tool_call>）两侧的 token 归属最容易错；每接入一个新模型要写两遍胶水；流式/非流式两套调用点再乘一遍。",
+      "solution": "vllm/parser/abstract_parser.py:L86 Parser 抽象统一接口（parse/parse_delta/adjust_request/is_reasoning_end）；DelegatingParser（L371）默认实现两阶段状态机：StreamState（L45-L59）记 reasoning_ended/tool_call_text_started/prompt_reasoning_checked 等游标，parse_delta（L801-L940）先推理段后工具段、转段时截 token 换轨（extract_content_ids + 重置 previous_text）；ParserManager.get_parser（parser_manager.py:L75-L140）组合工厂；模型特化子类（HarmonyParser/KimiK3Parser）覆盖默认行为。serving 层只剩一个调用点：delta_message = parser.parse_delta(...)（serving.py:L615-L621）。",
+      "cost": "类树加深（五层：Parser→DelegatingParser→特化子类）；StreamState 每流一份、engine_based 模式下游标语义不同（advance/commit 双行为）；kimi_k2 的 tool_call_id 连续性要求跨多轮数历史调用数（history_tool_call_cnt）——状态机的负担又多一项。"
+    }
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/api_router.py",
+      "lines": "L40-L74",
+      "code": "@router.post(\r\n    \"/v1/chat/completions\",\r\n    dependencies=[Depends(validate_json_request)],\r\n    responses={\r\n        HTTPStatus.OK.value: {\"content\": {\"text/event-stream\": {}}},\r\n        HTTPStatus.BAD_REQUEST.value: {\"model\": ErrorResponse},\r\n        HTTPStatus.NOT_FOUND.value: {\"model\": ErrorResponse},\r\n        HTTPStatus.INTERNAL_SERVER_ERROR.value: {\"model\": ErrorResponse},\r\n        HTTPStatus.NOT_IMPLEMENTED.value: {\"model\": ErrorResponse},\r\n    },\r\n)\r\n@with_cancellation\r\n@load_aware_call\r\nasync def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):\r\n    metrics_header_format = raw_request.headers.get(\r\n        ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, \"\"\r\n    )\r\n    handler = chat(raw_request)\r\n    if handler is None:\r\n        raise NotImplementedError(\"The model does not support Chat Completions API\")\r\n\r\n    generator = await handler.create_chat_completion(request, raw_request)\r\n\r\n    if isinstance(generator, ErrorResponse):\r\n        return JSONResponse(\r\n            content=generator.model_dump(), status_code=generator.error.code\r\n        )\r\n\r\n    elif isinstance(generator, ChatCompletionResponse):\r\n        return JSONResponse(\r\n            content=generator.model_dump(),\r\n            headers=metrics_header(metrics_header_format),\r\n        )\r\n\r\n    return StreamingResponse(content=generator, media_type=\"text/event-stream\")\r",
+      "what": "HTTP 进门（站 1）：POST /v1/chat/completions 的路由与装饰器——@with_cancellation 让 handler 任务与断连监听任务竞速（F5 的 HTTP 端）；返回值三分支：ErrorResponse→JSONResponse(错误码)、ChatCompletionResponse→JSONResponse、异步生成器→StreamingResponse(text/event-stream)。同一文件的 /v1/chat/completions/batch（L77-102）是批量面，略。",
+      "elide": [
+        "responses= 字典只是 OpenAPI 文档声明，与运行时无关，可一句带过。",
+        "batch 端点（L77-102）与 metrics_header（orca 负载回执头）非主线。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/serve/utils/api_utils.py",
+      "lines": "L37-L94",
+      "code": "async def listen_for_disconnect(request: Request) -> None:\r\n    \"\"\"Returns if a disconnect message is received\"\"\"\r\n    while True:\r\n        message = await request.receive()\r\n        if message[\"type\"] == \"http.disconnect\":\r\n            # If load tracking is enabled *and* the counter exists, decrement\r\n            # it. Combines the previous nested checks into a single condition\r\n            # to satisfy the linter rule.\r\n            if getattr(\r\n                request.app.state, \"enable_server_load_tracking\", False\r\n            ) and hasattr(request.app.state, \"server_load_metrics\"):\r\n                request.app.state.server_load_metrics -= 1\r\n            break\r\n\r\n\r\ndef with_cancellation(handler_func):\r\n    \"\"\"Decorator that allows a route handler to be cancelled by client\r\n    disconnections.\r\n\r\n    This does _not_ use request.is_disconnected, which does not work with\r\n    middleware. Instead this follows the pattern from\r\n    starlette.StreamingResponse, which simultaneously awaits on two tasks- one\r\n    to wait for an http disconnect message, and the other to do the work that we\r\n    want done. When the first task finishes, the other is cancelled.\r\n\r\n    A core assumption of this method is that the body of the request has already\r\n    been read. This is a safe assumption to make for fastapi handlers that have\r\n    already parsed the body of the request into a pydantic model for us.\r\n    This decorator is unsafe to use elsewhere, as it will consume and throw away\r\n    all incoming messages for the request while it looks for a disconnect\r\n    message.\r\n\r\n    In the case where a `StreamingResponse` is returned by the handler, this\r\n    wrapper will stop listening for disconnects and instead the response object\r\n    will start listening for disconnects.\r\n    \"\"\"\r\n\r\n    # Functools.wraps is required for this wrapper to appear to fastapi as a\r\n    # normal route handler, with the correct request type hinting.\r\n    @functools.wraps(handler_func)\r\n    async def wrapper(*args, **kwargs):\r\n        # The request is either the second positional arg or `raw_request`\r\n        request = args[1] if len(args) > 1 else kwargs[\"raw_request\"]\r\n\r\n        handler_task = asyncio.create_task(handler_func(*args, **kwargs))\r\n        cancellation_task = asyncio.create_task(listen_for_disconnect(request))\r\n\r\n        done, pending = await asyncio.wait(\r\n            [handler_task, cancellation_task], return_when=asyncio.FIRST_COMPLETED\r\n        )\r\n        for task in pending:\r\n            task.cancel()\r\n\r\n        if handler_task in done:\r\n            return handler_task.result()\r\n        return None\r\n\r\n    return wrapper\r",
+      "what": "断连竞速双任务（F5 回收的核心一）：listen_for_disconnect 持续读 request.receive() 等 http.disconnect 消息；with_cancellation 把 handler 包成任务与监听任务 asyncio.wait(FIRST_COMPLETED) 竞速——先完成者取消另一个。docstring 三条要点原话：不用 request.is_disconnected（与中间件不合）；沿 starlette.StreamingResponse 模式；返回 StreamingResponse 后监听移交响应对象。注意 v0.27.1 该文件已从 entrypoints/utils.py 移到 serve/utils/api_utils.py。",
+      "elide": [
+        "listen_for_disconnect 里的 server_load_metrics 计数递减（L42-48）是负载追踪侧路，删。",
+        "load_aware_call（L101-146）是 --enable-server-load-tracking 的装饰器，与主线正交，可整段省。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "lines": "L192-L218",
+      "code": "    async def render_chat_request(\r\n        self,\r\n        request: ChatCompletionRequest,\r\n    ) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:\r\n        \"\"\"\r\n        Validate the model and preprocess a chat completion request.\r\n\r\n        Delegates preprocessing logic to OnlineRenderer, adding the\r\n        engine-aware checks (LoRA model validation, engine health).\r\n\r\n        Returns:\r\n            A tuple of (conversation, engine_inputs) on success,\r\n            or an ErrorResponse on failure.\r\n        \"\"\"\r\n        error_check_ret = await self._check_model(request)\r\n        if error_check_ret is not None:\r\n            logger.error(\"Error with model %s\", error_check_ret)\r\n            return error_check_ret\r\n\r\n        # If the engine is dead, raise the engine's DEAD_ERROR.\r\n        # This is required for the streaming case, where we return a\r\n        # success status before we actually start generating text :).\r\n        if self.engine_client.errored:\r\n            raise self.engine_client.dead_error\r\n\r\n        return await self.online_renderer.render_chat(request)\r\n\r",
+      "what": "handler 编排头（站 2）：render_chat_request = _check_model（模型名/LoRA，404）→ 引擎健康预检——errored 即抛 dead_error，注释原话 'This is required for the streaming case, where we return a success status before we actually start generating text :)'（流式 200 在生成开始前发出，死讯必须前置暴露）→ 交棒 online_renderer.render_chat。",
+      "elide": []
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "lines": "L235-L262",
+      "code": "    async def _create_chat_completion(\r\n        self,\r\n        request: ChatCompletionRequest,\r\n        raw_request: Request | None = None,\r\n    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:\r\n        # Streaming response\r\n        tokenizer = self.renderer.tokenizer\r\n        assert tokenizer is not None\r\n        chat_template_kwargs = self._effective_chat_template_kwargs(request)\r\n        parser: Parser | None = None\r\n        if self.parser_cls is not None:\r\n            parser = self.parser_cls(\r\n                tokenizer,\r\n                request.tools,\r\n                chat_template_kwargs=chat_template_kwargs,\r\n                model_config=self.model_config,\r\n            )\r\n        result = await self.render_chat_request(request)\r\n        if isinstance(result, ErrorResponse):\r\n            return result\r\n\r\n        conversation, engine_inputs = result\r\n\r\n        request_id = (\r\n            f\"chatcmpl-{self._base_request_id(raw_request, request.request_id)}\"\r\n        )\r\n\r\n        request_metadata = RequestResponseMetadata(request_id=request_id)\r",
+      "what": "_create_chat_completion 头（站 2）：构造 per-request Parser 实例（ParserManager 组合出的 parser_cls，harmony 模型恒为 HarmonyParser）→ render_chat_request（上一段）→ request_id = 'chatcmpl-' + _base_request_id（X-Request-Id 头优先，否则 random_uuid；engine/serving.py:L117-126）。",
+      "elide": [
+        "L262 RequestResponseMetadata 挂 raw_request.state（中间件聚合 usage 用），一句带过。"
+      ]
+    },
+    {
+      "path": "vllm/renderers/online_renderer.py",
+      "lines": "L145-L218",
+      "code": "        # Check if tool parsing is unavailable (common condition)\r\n        tool_parsing_unavailable = (\r\n            tool_parser is None\r\n            and not is_mistral_tokenizer(tokenizer)\r\n            and not self.use_harmony\r\n        )\r\n\r\n        # Validate tool_choice when tool parsing is required but unavailable\r\n        if tool_parsing_unavailable and request.tool_choice not in (\r\n            None,\r\n            \"none\",\r\n        ):\r\n            if request.tool_choice == \"auto\" and not self.enable_auto_tools:\r\n                # for hf tokenizers, \"auto\" tools requires\r\n                # --enable-auto-tool-choice and --tool-call-parser\r\n                return self.create_error_response(\r\n                    '\"auto\" tool choice requires '\r\n                    \"--enable-auto-tool-choice and --tool-call-parser to be set\"\r\n                )\r\n            elif request.tool_choice != \"auto\":\r\n                # \"required\" or named tool requires tool parser\r\n                if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):\r\n                    tool_choice_desc = f'function \"{request.tool_choice.function.name}\"'\r\n                else:\r\n                    tool_choice_desc = f'\"{request.tool_choice}\"'\r\n                return self.create_error_response(\r\n                    f\"tool_choice={tool_choice_desc} requires \"\r\n                    \"--tool-call-parser to be set\"\r\n                )\r\n\r\n        if request.tools is None or (\r\n            request.tool_choice == \"none\" and self.exclude_tools_when_tool_choice_none\r\n        ):\r\n            tool_dicts = None\r\n        else:\r\n            tool_dicts = [tool.model_dump() for tool in request.tools]\r\n\r\n        if not self.use_harmony:\r\n            # Common case.\r\n            error_check_ret = self.validate_chat_template(\r\n                request_chat_template=request.chat_template,\r\n                chat_template_kwargs=request.chat_template_kwargs,\r\n                trust_request_chat_template=self.trust_request_chat_template,\r\n            )\r\n            if error_check_ret is not None:\r\n                return error_check_ret\r\n\r\n            conversation, engine_inputs = await self.preprocess_chat(\r\n                request,\r\n                request.messages,\r\n                default_template=self.chat_template,\r\n                default_template_content_format=self.chat_template_content_format,\r\n                default_template_kwargs=self.default_chat_template_kwargs,\r\n                tool_dicts=tool_dicts,\r\n                parser=self.parser,\r\n                skip_mm_cache=skip_mm_cache,\r\n            )\r\n        else:\r\n            # For GPT-OSS.\r\n            if self.parser is not None:\r\n                # HarmonyParser doesn't need chat_template_kwargs\r\n                # TODO: Unify adjust_request() call with non-harmony branch\r\n                self.parser(\r\n                    self.renderer.get_tokenizer(),\r\n                    request.tools,\r\n                    model_config=self.model_config,\r\n                ).adjust_request(request=request)\r\n\r\n            should_include_tools = tool_dicts is not None\r\n            conversation, engine_inputs = self._make_request_with_harmony(\r\n                request, should_include_tools\r\n            )\r\n\r\n        return conversation, engine_inputs\r",
+      "what": "渲染交棒（站 3）：tool_choice 门控——没有 tool parser（且非 Mistral、非 harmony）时 auto/required/named 直接 400 报错（'requires --tool-call-parser'）；非和谐分支 validate_chat_template（--trust-request-chat-template 开关）→ preprocess_chat（chat 模板+tokenize，内部归 ch6）；和谐分支（use_harmony = model_type=='gpt_oss'）→ parser.adjust_request → _make_request_with_harmony。注意 render_chat 同时返回 (conversation, engine_inputs)——conversation 留给 echo/role 用。",
+      "elide": [
+        "Mistral 重序列化 L138-143（maybe_serialize_tool_calls 等三行）特定 tokenizer 边角，略。",
+        "preprocess_chat 内部（L379-477：build_chat_params/render_chat_async/adjust_request 尾巴）= ch6 渲染四步流水，本章黑盒回指。"
+      ]
+    },
+    {
+      "path": "vllm/renderers/online_renderer.py",
+      "lines": "L220-L267",
+      "code": "    def _make_request_with_harmony(\r\n        self,\r\n        request: ChatCompletionRequest,\r\n        should_include_tools: bool = True,\r\n    ):\r\n        \"\"\"Build Harmony (GPT-OSS) messages and engine prompt from a chat request.\"\"\"\r\n        reuse_ids = _reused_prompt_token_ids(request)\r\n        if reuse_ids:\r\n            # Decode-side token reuse: feed the forwarded ids straight to the\r\n            # engine. Harmony has no adjust_request hook to preserve.\r\n            engine_input = tokens_input(reuse_ids, cache_salt=request.cache_salt)\r\n            return [], [engine_input]\r\n\r\n        messages: list[OpenAIMessage] = []\r\n\r\n        # because of issues with pydantic we need to potentially\r\n        # re-serialize the tool_calls field of the request\r\n        # for more info: see comment in `maybe_serialize_tool_calls`\r\n        _mt.maybe_serialize_tool_calls(request)  # type: ignore[arg-type]\r\n\r\n        chat_messages = list(request.messages)\r\n        instructions, chat_messages = extract_instructions_from_messages(chat_messages)\r\n\r\n        # Add system message.\r\n        # NOTE: In Chat Completion API, browsing is enabled by default\r\n        # if the model supports it. TODO: Support browsing.\r\n        assert not self.supports_browsing\r\n        assert not self.supports_code_interpreter\r\n        if (reasoning_effort := request.reasoning_effort) == \"none\":\r\n            raise ValueError(f\"Harmony does not support {reasoning_effort=}\")\r\n        tools = request.tools if should_include_tools else None\r\n        messages.extend(\r\n            build_harmony_preamble(\r\n                instructions=instructions,\r\n                tools=tools,  # type: ignore[arg-type]\r\n                reasoning_effort=reasoning_effort,\r\n                with_custom_tools=should_include_tools,\r\n            )\r\n        )\r\n\r\n        # Add remaining conversation messages.\r\n        messages.extend(parse_chat_inputs_to_harmony_messages(chat_messages))\r\n\r\n        # Render prompt token ids.\r\n        prompt_token_ids = render_for_completion(messages)\r\n        engine_input = tokens_input(prompt_token_ids, cache_salt=request.cache_salt)\r\n\r\n        return messages, [engine_input]\r",
+      "what": "harmony 渲染（站 4 前半）：_make_request_with_harmony——剥出首个 system/developer 消息为 instructions → build_harmony_preamble（system 消息带 reasoning_effort/对话起始日期 + developer 消息带函数工具表）→ parse_chat_inputs_to_harmony_messages 把剩余多轮历史转 harmony Message → render_for_completion 编码出 token ids。decode 侧 P/D token 复用（L226-231）是 ch36 已立的旁路，略。",
+      "elide": [
+        "_reused_prompt_token_ids 分支（L226-231）= P/D 分离 decode 侧复用，归 ch36。",
+        "_mt.maybe_serialize_tool_calls（L238）Mistral 兼容，略。",
+        "supports_browsing/code_interpreter 断言（L246-247）：Chat Completion 面不支持浏览/代码解释器（Responses API 才有），一句带过。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/openai/parser/harmony_utils.py",
+      "lines": "L206-L256",
+      "code": "def parse_chat_inputs_to_harmony_messages(chat_msgs: list) -> list[Message]:\r\n    \"\"\"\r\n    Parse a list of messages from request.messages in the Chat Completion API to\r\n    Harmony messages.\r\n    \"\"\"\r\n    msgs: list[Message] = []\r\n    tool_id_names: dict[str, str] = {}\r\n\r\n    # Collect tool id to name mappings for tool response recipient values\r\n    for chat_msg in chat_msgs:\r\n        for tool_call in chat_msg.get(\"tool_calls\", []):\r\n            tool_id_names[tool_call.get(\"id\")] = tool_call.get(\"function\", {}).get(\r\n                \"name\"\r\n            )\r\n\r\n    for chat_msg in chat_msgs:\r\n        msgs.extend(parse_chat_input_to_harmony_message(chat_msg, tool_id_names))\r\n\r\n    return msgs\r\n\r\n\r\ndef auto_drop_analysis_messages(msgs: list[Message]) -> list[Message]:\r\n    \"\"\"\r\n    Harmony models expect the analysis messages (representing raw chain of thought) to\r\n    be dropped after an assistant message to the final channel is produced from the\r\n    reasoning of those messages.\r\n\r\n    The openai-harmony library does this if the very last assistant message is to the\r\n    final channel, but it does not handle the case where we're in longer multi-turn\r\n    conversations and the client gave us reasoning content from previous turns of\r\n    the conversation with multiple assistant messages to the final channel in the\r\n    conversation.\r\n\r\n    So, we find the index of the last assistant message to the final channel and drop\r\n    all analysis messages that precede it, leaving only the analysis messages that\r\n    are relevant to the current part of the conversation.\r\n    \"\"\"\r\n    last_assistant_final_index = -1\r\n    for i in range(len(msgs) - 1, -1, -1):\r\n        msg = msgs[i]\r\n        if msg.author.role == \"assistant\" and msg.channel == \"final\":\r\n            last_assistant_final_index = i\r\n            break\r\n\r\n    cleaned_msgs: list[Message] = []\r\n    for i, msg in enumerate(msgs):\r\n        if i < last_assistant_final_index and msg.channel == \"analysis\":\r\n            continue\r\n        cleaned_msgs.append(msg)\r\n\r\n    return cleaned_msgs\r",
+      "what": "harmony 多轮编码（站 4 中）：parse_chat_inputs_to_harmony_messages 先扫一遍历史建 tool_call_id→函数名映射（tool 结果消息要靠它找到 recipient），再逐消息转换；auto_drop_analysis_messages——多轮下只保留最后一个 final 通道助手消息**之后**的 analysis（旧轮思考整段丢弃），docstring 原话点名 'longer multi-turn conversations'。",
+      "elide": []
+    },
+    {
+      "path": "vllm/entrypoints/openai/parser/harmony_utils.py",
+      "lines": "L351-L410",
+      "code": "def parse_chat_input_to_harmony_message(\r\n    chat_msg, tool_id_names: dict[str, str] | None = None\r\n) -> list[Message]:\r\n    \"\"\"\r\n    Parse a message from request.messages in the Chat Completion API to\r\n    Harmony messages.\r\n    \"\"\"\r\n    tool_id_names = tool_id_names or {}\r\n\r\n    if not isinstance(chat_msg, dict):\r\n        # Handle Pydantic models\r\n        chat_msg = chat_msg.model_dump(exclude_none=True)\r\n\r\n    role = chat_msg.get(\"role\")\r\n    msgs: list[Message] = []\r\n\r\n    # Assistant message with tool calls\r\n    tool_calls = chat_msg.get(\"tool_calls\", [])\r\n\r\n    if role == \"assistant\" and tool_calls:\r\n        content = flatten_input_text_content(chat_msg.get(\"content\"))\r\n        if content:\r\n            commentary_msg = Message.from_role_and_content(Role.ASSISTANT, content)\r\n            commentary_msg = commentary_msg.with_channel(\"commentary\")\r\n            msgs.append(commentary_msg)\r\n\r\n        reasoning = chat_msg.get(\"reasoning\")\r\n        if reasoning:\r\n            analysis_msg = Message.from_role_and_content(Role.ASSISTANT, reasoning)\r\n            analysis_msg = analysis_msg.with_channel(\"analysis\")\r\n            msgs.append(analysis_msg)\r\n\r\n        for call in tool_calls:\r\n            func = call.get(\"function\", {})\r\n            name = func.get(\"name\", \"\")\r\n            arguments = func.get(\"arguments\", \"\") or \"\"\r\n            msg = Message.from_role_and_content(Role.ASSISTANT, arguments)\r\n            msg = msg.with_channel(\"commentary\")\r\n            msg = msg.with_recipient(f\"functions.{name}\")\r\n            # Officially, this should be `<|constrain|>json` but there is not clear\r\n            # evidence that improves accuracy over `json` and some anecdotes to the\r\n            # contrary. Further testing of the different content_types is needed.\r\n            msg = msg.with_content_type(\"json\")\r\n            msgs.append(msg)\r\n        return msgs\r\n\r\n    # Tool role message (tool output)\r\n    if role == \"tool\":\r\n        tool_call_id = chat_msg.get(\"tool_call_id\", \"\")\r\n        name = tool_id_names.get(tool_call_id, \"\")\r\n        content = flatten_input_text_content(chat_msg.get(\"content\")) or \"\"\r\n\r\n        msg = (\r\n            Message.from_author_and_content(\r\n                Author.new(Role.TOOL, f\"functions.{name}\"), content\r\n            )\r\n            .with_channel(\"commentary\")\r\n            .with_recipient(\"assistant\")\r\n        )\r\n        return [msg]\r",
+      "what": "harmony 多轮编码（站 4 后）：parse_chat_input_to_harmony_message 的消息级映射——assistant 带 tool_calls：content→commentary、reasoning→analysis、每个调用→commentary 通道 + recipient='functions.{name}' + content_type='json'；tool 角色结果→Author('functions.{name}') 发往 commentary、recipient='assistant'。通道/收件人是写进 prompt 的协议字段，不是事后解析的猜测。",
+      "elide": [
+        "L411-446 的普通 assistant（带 reasoning 先发 analysis 再发 final）/user/system 分支同构，可省或压缩呈现。",
+        "render_for_completion（L449-457）+ get_streamable_parser_for_assistant（L460-461）共 13 行：前者 render_conversation_for_completion 出 token ids（auto_drop_analysis=False——因为已手动 drop 过），后者造出口侧 StreamableParser。正文可并入站 4 一并讲。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/protocol.py",
+      "lines": "L674-L734",
+      "code": "        # Merge server-default stop_token_ids (e.g., model-specific tokens\r\n        # like </call> for gpt-oss) with any request-specified ones\r\n        stop_token_ids = self.stop_token_ids\r\n        default_stop_ids = default_sampling_params.get(\"stop_token_ids\")\r\n        if default_stop_ids:\r\n            if not stop_token_ids:\r\n                stop_token_ids = list(default_stop_ids)\r\n            else:\r\n                stop_token_ids = list(\r\n                    dict.fromkeys([*stop_token_ids, *default_stop_ids])\r\n                )\r\n\r\n        prompt_logprobs = self.prompt_logprobs\r\n        if prompt_logprobs is None and self.echo:\r\n            prompt_logprobs = self.top_logprobs\r\n\r\n        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}\r\n        if self.kv_transfer_params:\r\n            # Pass in kv_transfer_params via extra_args\r\n            extra_args[\"kv_transfer_params\"] = self.kv_transfer_params\r\n        if self.ec_transfer_params:\r\n            # Pass in ec_transfer_params via extra_args\r\n            extra_args[\"ec_transfer_params\"] = self.ec_transfer_params\r\n        return SamplingParams.from_optional(\r\n            n=self.n,\r\n            presence_penalty=self.presence_penalty,\r\n            frequency_penalty=self.frequency_penalty,\r\n            repetition_penalty=repetition_penalty,\r\n            temperature=temperature,\r\n            top_p=top_p,\r\n            top_k=top_k,\r\n            min_p=min_p,\r\n            seed=self.seed,\r\n            stop=self.stop,\r\n            stop_token_ids=stop_token_ids,\r\n            logprobs=(\r\n                self.top_logprobs\r\n                if self.logprobs and not self.logprob_token_ids\r\n                else None\r\n            ),\r\n            prompt_logprobs=prompt_logprobs,\r\n            logprob_token_ids=self.logprob_token_ids or None,\r\n            ignore_eos=self.ignore_eos,\r\n            max_tokens=max_tokens,\r\n            min_tokens=self.min_tokens,\r\n            skip_special_tokens=self.skip_special_tokens,\r\n            spaces_between_special_tokens=self.spaces_between_special_tokens,\r\n            include_stop_str_in_output=self.include_stop_str_in_output,\r\n            output_kind=(\r\n                RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY\r\n            ),\r\n            stream_interval=self.stream_interval,\r\n            structured_outputs=self.extract_structured_outputs(),\r\n            logit_bias=self.logit_bias,\r\n            bad_words=self.bad_words,\r\n            thinking_token_budget=self.thinking_token_budget,\r\n            allowed_token_ids=self.allowed_token_ids,\r\n            extra_args=extra_args or None,\r\n            skip_clone=True,  # Created fresh per request, safe to skip clone\r\n            repetition_detection=self.repetition_detection,\r\n        )\r",
+      "what": "协议定型（站 5）：to_sampling_params 尾段——server 默认 stop_token_ids 与请求自带合并去重（dict.fromkeys 保序）；注释举 gpt-oss 的 </call> 为例（protocol.py:L674-675 原文）是意图性举例而非内置默认——default_sampling_params 出自 model_config.get_diff_sampling_param()（serving.py:L163 → config/model.py:L1615-L1622 白名单仅 repetition_penalty/temperature/top_k/top_p/min_p/max_new_tokens 六项，无 stop_token_ids），故 default_stop_ids 现恒 None、合并分支当前不触发，注释描述的是该机制的设计意图；output_kind=(DELTA if stream else FINAL_ONLY)（ch7 三态契约的使用面入口声明处）；SamplingParams.from_optional(... skip_clone=True)（每请求新建、免克隆）。",
+      "elide": [
+        "L651-673 的 repetition_penalty/temperature/top_p/top_k/min_p 五连默认值合并，讲一处模式即可。",
+        "prompt_logprobs←echo（L686-688）与 vllm_xargs/kv_transfer_params 透传（L690-696）归 ch8/ch36，略。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "lines": "L283-L307",
+      "code": "            sub_request_id = (\r\n                request_id if len(engine_inputs) == 1 else f\"{request_id}_{i}\"\r\n            )\r\n\r\n            max_tokens = get_max_tokens(\r\n                max_model_len,\r\n                request.max_completion_tokens\r\n                if request.max_completion_tokens is not None\r\n                else request.max_tokens,\r\n                self._extract_prompt_len(engine_input),\r\n                self.default_sampling_params,\r\n                self.override_max_tokens,\r\n                truncate_prompt_tokens=request.truncate_prompt_tokens,\r\n            )\r\n\r\n            sampling_params: SamplingParams | BeamSearchParams\r\n            if request.use_beam_search:\r\n                sampling_params = request.to_beam_search_params(\r\n                    max_tokens, self.default_sampling_params\r\n                )\r\n            else:\r\n                sampling_params = request.to_sampling_params(\r\n                    max_tokens,\r\n                    self.default_sampling_params,\r\n                )\r",
+      "what": "参数定型调用点（站 5）：sub_request_id（多 engine_input 才加 _i 后缀，本章主线 n=1 直用 request_id）→ get_max_tokens（api_utils.py:L170-206：max_model_len−输入长、请求值、server 默认、平台上限四方取 min）→ to_sampling_params。",
+      "elide": []
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "lines": "L331-L362",
+      "code": "                if not request.include_reasoning:\r\n                    reasoning_ended = True\r\n                elif request._grammar_from_parser:\r\n                    # The Mistral grammar already includes an optional\r\n                    # `think?` rule that handles both reasoning and\r\n                    # non-reasoning outputs.\r\n                    reasoning_ended = True\r\n                elif parser is not None and parser.reasoning_parser is not None:\r\n                    reasoning_ended = parser.is_reasoning_end(prompt_token_ids or [])\r\n                else:\r\n                    reasoning_ended = None\r\n\r\n                generator = self.engine_client.generate(\r\n                    engine_input,\r\n                    sampling_params,\r\n                    sub_request_id,\r\n                    lora_request=lora_request,\r\n                    trace_headers=trace_headers,\r\n                    priority=request.priority,\r\n                    data_parallel_rank=data_parallel_rank,\r\n                    reasoning_ended=reasoning_ended,\r\n                    reasoning_parser_kwargs={\r\n                        \"chat_template_kwargs\": chat_template_kwargs,\r\n                    }\r\n                    if parser is not None and parser.reasoning_parser is not None\r\n                    else None,\r\n                )\r\n\r\n            generators.append(generator)\r\n\r\n        assert len(generators) == 1\r\n        (result_generator,) = generators\r",
+      "what": "多轮推理预判与发车（站 6-7）：reasoning_ended 三分支——include_reasoning=False→True（用户不要思考，引擎直接当已结束）；Mistral grammar 自带 think?→True；有 reasoning parser→parser.is_reasoning_end(prompt_token_ids)（prompt 尾部判定：多轮历史若停在未闭合思考块内，生成就从思考里续）→ 随 generate 过线（async_llm.py:L383-384 盖进 EngineCoreRequest，引擎侧据此延迟启用结构化输出窗口）。generator = engine_client.generate(...) 只建协程不驱动；n>1 主线断言 len==1。",
+      "elide": [
+        "beam_search 分支（L298-302、L322-329）自成一套多 beam 调度，整段删。",
+        "trace_headers（L316-320）与 reasoning_parser_kwargs 透传一句带过。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "lines": "L485-L542",
+      "code": "            async for res in result_generator:\r\n                last_res = res\r\n                if res.prompt_token_ids is not None:\r\n                    num_prompt_tokens = len(res.prompt_token_ids)\r\n                    if res.encoder_prompt_token_ids is not None:\r\n                        num_prompt_tokens += len(res.encoder_prompt_token_ids)\r\n\r\n                # We need to do it here, because if there are exceptions in\r\n                # the result_generator, it needs to be sent as the FIRST\r\n                # response (by the try...catch).\r\n                if first_iteration:\r\n                    num_cached_tokens = res.num_cached_tokens\r\n                    num_cache_creation_tokens = res.num_cache_creation_tokens\r\n                    # Send first response for each request.n (index) with\r\n                    # the role\r\n                    role = self.get_chat_request_role(request)\r\n\r\n                    # ``res.prompt`` is the rendered chat-templated prompt\r\n                    prompt_text = res.prompt if request.return_prompt_text else None\r\n\r\n                    # NOTE num_choices defaults to 1 so this usually executes\r\n                    # once per request\r\n                    for i in range(num_choices):\r\n                        choice_data = ChatCompletionResponseStreamChoice(\r\n                            index=i,\r\n                            delta=DeltaMessage(\r\n                                role=role,\r\n                                content=\"\",\r\n                            ),\r\n                            logprobs=None,\r\n                            finish_reason=None,\r\n                        )\r\n\r\n                        # return prompt_token_ids at the first chunk ever\r\n                        chunk = ChatCompletionStreamResponse(\r\n                            id=request_id,\r\n                            object=chunk_object_type,\r\n                            created=created_time,\r\n                            choices=[choice_data],\r\n                            model=model_name,\r\n                            prompt_token_ids=(\r\n                                res.prompt_token_ids\r\n                                if request.return_token_ids\r\n                                else None\r\n                            ),\r\n                            prompt_text=prompt_text,\r\n                        )\r\n\r\n                        # if continuous usage stats are requested, add it\r\n                        if include_continuous_usage:\r\n                            chunk.usage = UsageInfo(\r\n                                prompt_tokens=num_prompt_tokens,\r\n                                completion_tokens=0,\r\n                                total_tokens=num_prompt_tokens,\r\n                            )\r\n\r\n                        data = chunk.model_dump_json(exclude_unset=True)\r\n                        yield f\"data: {data}\\n\\n\"\r",
+      "what": "流式收件（站 8 前半）：async for res in result_generator——首拍 num_cached_tokens/num_cache_creation_tokens 留底（多轮前缀缓存回执，站 9 的 usage 细节要用）；首块只发 role 空 delta（OpenAI 协议：流先声明 assistant 角色，后续块只追加增量）。双实例化注记（防叙事漂移）：流式生成器入口 L455-L468 会按 num_choices 重新实例化一批 parser（parsers 列表——逐 delta 分拣的 StreamState 真正持有者，站 8 后半的 parsers[i] 即它）；_create_chat_completion L240-L247 造的那只在流式路上只用于 L331-L341 reasoning_ended 预判、且不传入流式生成器签名（chat_completion_stream_generator 无 parser 参数，L364-L375）——两批是独立实例；非流式路才经 parser= 参数复用 _create 的实例（L385）。叙事勿写成「同一实例流全程」。",
+      "elide": [
+        "echo 分支（L546-579）回显尾消息内容，非主线可删。",
+        "prompt_token_ids/prompt_text 回传（L525-531）与 continuous usage（L533-539）按需一句带过。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "lines": "L581-L627",
+      "code": "                for output in res.outputs:\r\n                    i = output.index\r\n                    parser = parsers[i]\r\n                    if finish_reason_sent[i]:\r\n                        continue\r\n\r\n                    if request.logprobs and (\r\n                        request.top_logprobs is not None or request.logprob_token_ids\r\n                    ):\r\n                        assert output.logprobs is not None, \"Did not output logprobs\"\r\n                        logprobs = self._create_chat_logprobs(\r\n                            token_ids=output.token_ids,\r\n                            top_logprobs=output.logprobs,\r\n                            tokenizer=tokenizer,\r\n                            num_output_top_logprobs=request.top_logprobs,\r\n                            logprob_token_ids=request.logprob_token_ids,\r\n                            return_as_token_id=request.return_tokens_as_token_ids,\r\n                        )\r\n                    else:\r\n                        logprobs = None\r\n\r\n                    delta_text = output.text\r\n\r\n                    if (\r\n                        not delta_text\r\n                        and not output.token_ids\r\n                        and not previous_num_tokens[i]\r\n                    ):\r\n                        # Chunked prefill case, don't return empty chunks\r\n                        continue\r\n\r\n                    delta_message: DeltaMessage | None\r\n\r\n                    if parser is not None:\r\n                        delta_message = parser.parse_delta(\r\n                            delta_text=delta_text,\r\n                            delta_token_ids=as_list(output.token_ids),\r\n                            request=request,\r\n                            prompt_token_ids=res.prompt_token_ids,\r\n                            finished=output.finish_reason is not None,\r\n                        )\r\n                        if delta_message is not None and delta_message.tool_calls:\r\n                            tools_streamed[i] = True\r\n\r\n                    # handle streaming just a content delta (no parsers)\r\n                    else:\r\n                        delta_message = DeltaMessage(content=delta_text)\r",
+      "what": "流式分拣（站 8 后半）：逐 output → 有 parser 走 parser.parse_delta(delta_text, delta_token_ids, ..., finished=)——把模型原始 token 流改写成 DeltaMessage(reasoning/content/tool_calls)；无 parser 直通 DeltaMessage(content=delta_text)；空 delta 且无 token 且首拍（chunked prefill）跳过不发空块；hide_stream_metadata（include_reasoning=False 时）压掉 logprobs/token_ids——防止解码出的 token 文本从 logprob 旁路泄漏思考内容。",
+      "elide": [
+        "logprobs 组装（L587-600）归 ch8。",
+        "enable_log_outputs 的 delta 日志块（L659-684）观测侧路，删。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "lines": "L690-L761",
+      "code": "                    if output.finish_reason is None:\r\n                        # Send token-by-token response for each request.n\r\n                        choice_data = ChatCompletionResponseStreamChoice(\r\n                            index=i,\r\n                            delta=delta_message,\r\n                            logprobs=logprobs,\r\n                            finish_reason=None,\r\n                            token_ids=(\r\n                                as_list(output.token_ids) if include_token_ids else None\r\n                            ),\r\n                        )\r\n\r\n                    # if the model is finished generating\r\n                    else:\r\n                        # check for error finish reason and abort streaming\r\n                        # finish_reason='error' indicates a retryable error\r\n                        self._raise_if_error(output.finish_reason, request_id)\r\n\r\n                        # Send the finish response for each request.n only once\r\n                        # In OpenAI's API, when a tool is called, the\r\n                        # finish_reason is:\r\n                        # \"tool_calls\" for \"auto\" or \"required\" tool calls,\r\n                        # and \"stop\" for named tool calls.\r\n                        if tools_streamed[i] and not tool_choice_function_name:\r\n                            finish_reason_ = \"tool_calls\"\r\n                        else:\r\n                            finish_reason_ = (\r\n                                output.finish_reason if output.finish_reason else \"stop\"\r\n                            )\r\n                        choice_data = ChatCompletionResponseStreamChoice(\r\n                            index=i,\r\n                            delta=delta_message,\r\n                            logprobs=logprobs,\r\n                            finish_reason=finish_reason_,\r\n                            stop_reason=output.stop_reason,\r\n                            token_ids=(\r\n                                as_list(output.token_ids) if include_token_ids else None\r\n                            ),\r\n                        )\r\n\r\n                        finish_reason_sent[i] = True\r\n\r\n                    choice_data = maybe_filter_parallel_tool_calls(choice_data, request)\r\n                    chunk = ChatCompletionStreamResponse(\r\n                        id=request_id,\r\n                        object=chunk_object_type,\r\n                        created=created_time,\r\n                        choices=[choice_data],\r\n                        model=model_name,\r\n                    )\r\n                    # Stamp the fingerprint on terminal chunks only (those with\r\n                    # finish_reason set). When ``include_usage`` is on, the\r\n                    # trailing usage chunk below overrides this as the true\r\n                    # final message.\r\n                    if (\r\n                        not include_usage\r\n                        and self.system_fingerprint is not None\r\n                        and choice_data.finish_reason is not None\r\n                    ):\r\n                        chunk.system_fingerprint = self.system_fingerprint\r\n\r\n                    # handle usage stats if requested & if continuous\r\n                    if include_continuous_usage:\r\n                        completion_tokens = previous_num_tokens[i]\r\n                        chunk.usage = UsageInfo(\r\n                            prompt_tokens=num_prompt_tokens,\r\n                            completion_tokens=completion_tokens,\r\n                            total_tokens=num_prompt_tokens + completion_tokens,\r\n                        )\r\n\r\n                    data = chunk.model_dump_json(exclude_unset=True)\r\n                    yield f\"data: {data}\\n\\n\"\r",
+      "what": "SSE 出门（站 9 前半）：未完→finish_reason=None 的增量块；完→_raise_if_error（finish_reason=='error' 抛 GenerationError）+ finish_reason 仲裁（tools_streamed 且非 named choice→'tool_calls'，OpenAI 协议约定）+ system_fingerprint 只盖终止块；chunk.model_dump_json(exclude_unset=True) → yield f\"data: {data}\\n\\n\"。",
+      "elide": [
+        "continuous usage（L751-758）与 token_ids 回传（L686-688）非主线。",
+        "maybe_filter_parallel_tool_calls（L732）并行工具调用过滤，一句带过。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "lines": "L765-L815",
+      "code": "            if include_usage:\r\n                completion_tokens = sum(previous_num_tokens)\r\n                final_usage = UsageInfo(\r\n                    prompt_tokens=num_prompt_tokens,\r\n                    completion_tokens=completion_tokens,\r\n                    total_tokens=num_prompt_tokens + completion_tokens,\r\n                )\r\n                final_usage.prompt_tokens_details = _make_prompt_tokens_details(\r\n                    self.enable_prompt_tokens_details,\r\n                    num_cached_tokens,\r\n                    num_cache_creation_tokens,\r\n                    mm_token_counts,\r\n                )\r\n\r\n                # In streaming, metrics ride on this final usage chunk, which is\r\n                # only emitted when usage reporting is enabled (i.e.\r\n                # ``stream_options.include_usage=true`` or\r\n                # ``--enable-force-include-usage``).\r\n                stream_per_request_metrics: PerRequestTimingMetrics | None = None\r\n                if (\r\n                    self.enable_per_request_metrics\r\n                    # See note in chat_completion_full_generator: suppress for n>1.\r\n                    and (request.n or 1) == 1\r\n                ):\r\n                    last_metrics = last_res.metrics if last_res is not None else None\r\n                    stream_per_request_metrics = build_per_request_timing_metrics(\r\n                        last_metrics, completion_tokens\r\n                    )\r\n\r\n                final_usage_chunk = ChatCompletionStreamResponse(\r\n                    id=request_id,\r\n                    object=chunk_object_type,\r\n                    created=created_time,\r\n                    choices=[],\r\n                    model=model_name,\r\n                    usage=final_usage,\r\n                    system_fingerprint=self.system_fingerprint,\r\n                    metrics=stream_per_request_metrics,\r\n                )\r\n                final_usage_data = final_usage_chunk.model_dump_json(\r\n                    exclude_unset=True, exclude_none=True\r\n                )\r\n                yield f\"data: {final_usage_data}\\n\\n\"\r\n\r\n            # report to FastAPI middleware aggregate usage across all choices\r\n            num_completion_tokens = sum(previous_num_tokens)\r\n            request_metadata.final_usage_info = UsageInfo(\r\n                prompt_tokens=num_prompt_tokens,\r\n                completion_tokens=num_completion_tokens,\r\n                total_tokens=num_prompt_tokens + num_completion_tokens,\r\n            )\r",
+      "what": "SSE 出门（站 9 中）：include_usage 末块——completion_tokens=sum(previous_num_tokens)，prompt_tokens_details.cached_tokens=首拍留底的 num_cached_tokens（多轮前缀缓存的协议级回执：客户端能看见这一轮有多少 prompt token 命中了缓存）；final_usage_info 回填给中间件聚合。",
+      "elide": [
+        "per_request_metrics（L783-792）计时指标，可省。",
+        "enable_log_outputs 收尾日志（L817-833），删。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "lines": "L835-L842",
+      "code": "        except GenerationError as e:\r\n            yield f\"data: {self._convert_generation_error_to_streaming_response(e)}\\n\\n\"\r\n        except Exception as e:\r\n            logger.exception(\"Error in chat completion stream generator.\")\r\n            data = self.create_streaming_error_response(e)\r\n            yield f\"data: {data}\\n\\n\"\r\n        # Send the final done message after all response.n are finished\r\n        yield \"data: [DONE]\\n\\n\"\r",
+      "what": "SSE 出门（站 9 末）：错误也只能是 data 帧——GenerationError→流式错误 JSON、其他异常→create_streaming_error_response，最后 'data: [DONE]\\n\\n' 哨兵收尾。200 已发出，状态码不可再改（WC3）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/entrypoints/openai/chat_completion/serving.py",
+      "lines": "L844-L871",
+      "code": "    async def chat_completion_full_generator(\r\n        self,\r\n        request: ChatCompletionRequest,\r\n        result_generator: AsyncIterator[RequestOutput],\r\n        request_id: str,\r\n        model_name: str,\r\n        conversation: list[ConversationMessage],\r\n        tokenizer: TokenizerLike,\r\n        request_metadata: RequestResponseMetadata,\r\n        parser: Parser | None = None,\r\n        mm_token_counts: dict[str, int] | None = None,\r\n    ) -> ErrorResponse | ChatCompletionResponse:\r\n        created_time = int(time.time())\r\n        final_res: RequestOutput | None = None\r\n\r\n        try:\r\n            async for res in result_generator:\r\n                final_res = res\r\n        except asyncio.CancelledError:\r\n            return self.create_error_response(\"Client disconnected\")\r\n\r\n        if final_res is None:\r\n            return self.create_error_response(\r\n                \"No output received from the engine.\",\r\n                err_type=\"InternalServerError\",\r\n                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,\r\n            )\r\n\r",
+      "what": "非流式分支头（站 9 平行路）：chat_completion_full_generator——async for 聚合只留最后一个 RequestOutput（FINAL_ONLY 语义下它就是完整结果）；except asyncio.CancelledError → create_error_response('Client disconnected')（F5 非流式半边）；final_res 为 None → 500 'No output received'。",
+      "elide": []
+    },
+    {
+      "path": "vllm/parser/abstract_parser.py",
+      "lines": "L44-L59",
+      "code": "@dataclass\r\nclass StreamState:\r\n    \"\"\"Mutable state for ``Parser.parse_delta()``. One per stream.\"\"\"\r\n\r\n    reasoning_ended: bool = False\r\n    tool_call_text_started: bool = False\r\n    prompt_reasoning_checked: bool = False\r\n    previous_text: str = \"\"\r\n    previous_token_ids: list[int] = field(default_factory=list)\r\n    history_tool_call_cnt: int = 0\r\n    history_tool_call_cnt_initialized: bool = False\r\n    tool_call_id_type: str = \"random\"\r\n    # only used for \"required\" and \"named tool\" choices,\r\n    # tracks whether function name has been fully returned in the stream yet\r\n    function_name_returned: bool = False\r\n    engine_based: bool = False\r",
+      "what": "StreamState：每条流一份的可变状态——reasoning_ended（当前是否已出思考段）、tool_call_text_started、prompt_reasoning_checked（prompt 尾部推理检查是否已做）、previous_text/token_ids（非 engine_based 时前端重放全量文本）、history_tool_call_cnt（kimi_k2 的 tool_call_id 连续性：多轮历史里的调用数决定本轮流出的 id 序号）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/parser/abstract_parser.py",
+      "lines": "L801-L830",
+      "code": "    def parse_delta(\r\n        self,\r\n        delta_text: str,\r\n        delta_token_ids: list[int],\r\n        request: ChatCompletionRequest | ResponsesRequest,\r\n        prompt_token_ids: list[int] | None = None,\r\n        *,\r\n        finished: bool,\r\n    ) -> DeltaMessage | None:\r\n        self._initialize_history_tool_call_cnt(request)\r\n        state = self._stream_state\r\n\r\n        if not state.prompt_reasoning_checked and prompt_token_ids is not None:\r\n            state.prompt_reasoning_checked = True\r\n            if self._reasoning_parser is None or self.is_reasoning_end(\r\n                prompt_token_ids\r\n            ):\r\n                state.reasoning_ended = True\r\n            else:\r\n                # Reasoning is still open at the end of the prompt; let the\r\n                # reasoning parser adjust its initial parsing state so the\r\n                # first generated tokens are classified correctly.\r\n                self._reasoning_parser.adjust_initial_state_from_prompt(\r\n                    prompt_token_ids\r\n                )\r\n\r\n        current_text, current_token_ids = state.advance(delta_text, delta_token_ids)\r\n        delta_message: DeltaMessage | None = None\r\n        reasoning_transitioned = False\r\n\r",
+      "what": "parse_delta 头 + 多轮 prompt 检查（站 6 的 parse 侧对偶）：首拍若 prompt_token_ids 不为 None——is_reasoning_end(prompt) 为真（或无 reasoning parser）→ reasoning_ended=True；否则调 adjust_initial_state_from_prompt 让 parser 校正初始解析状态（'chat template leaves the prompt inside an open reasoning channel' 的场景——多轮续写从思考内部开始）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/parser/abstract_parser.py",
+      "lines": "L831-L871",
+      "code": "        # Reasoning extraction\r\n        if self._in_reasoning_phase(state):\r\n            delta_message = self.extract_reasoning_streaming(\r\n                previous_text=state.previous_text,\r\n                current_text=current_text,\r\n                delta_text=delta_text,\r\n                previous_token_ids=state.previous_token_ids,\r\n                current_token_ids=current_token_ids,\r\n                delta_token_ids=delta_token_ids,\r\n            )\r\n            reasoning_parser = self._reasoning_parser\r\n            if reasoning_parser is not None and reasoning_parser.engine_based_streaming:\r\n                should_transition = (\r\n                    reasoning_parser.has_engine_confirmed_reasoning_end()\r\n                )\r\n            else:\r\n                should_transition = self.is_reasoning_end_streaming(\r\n                    current_token_ids, delta_token_ids\r\n                )\r\n            if should_transition:\r\n                state.reasoning_ended = True\r\n                reasoning_transitioned = True\r\n                current_token_ids = self.extract_content_ids(delta_token_ids)\r\n                # Flush whenever the reasoning parser is engine-based (not only\r\n                # when _engine_based is True): it buffers the post-marker text\r\n                # (e.g. the \"<\" of \"<tool_call>\"), surfaced via finish_streaming().\r\n                flush_delta = (\r\n                    reasoning_parser.finish_streaming()  # type: ignore[union-attr, attr-defined]\r\n                    if reasoning_parser is not None\r\n                    and reasoning_parser.engine_based_streaming\r\n                    else None\r\n                )\r\n                current_text = (\r\n                    (delta_message.content if delta_message else None) or \"\"\r\n                ) + ((flush_delta.content if flush_delta else None) or \"\")\r\n                if self._engine_based:\r\n                    if delta_message and self._tool_parser is not None:\r\n                        delta_message.content = None\r\n                else:\r\n                    delta_text = current_text\r\n\r",
+      "what": "推理阶段与转段：在推理段→extract_reasoning_streaming 出 reasoning delta；is_reasoning_end_streaming 命中→reasoning_ended=True、extract_content_ids 截掉结尾 marker token、engine_based 流还从 finish_streaming() 取缓冲尾巴（'<' of '<tool_call>'）。转段发生在流内：一条 delta 可能同时带 reasoning 尾巴与 content 开头。",
+      "elide": [
+        "engine_based 分支（L842-870 的 should_transition 两种判定与 flush 细节）讲一种即可，另一种注一句。"
+      ]
+    },
+    {
+      "path": "vllm/parser/abstract_parser.py",
+      "lines": "L872-L925",
+      "code": "        # Tool call extraction\r\n        if self._in_tool_call_phase(state):\r\n            if not state.tool_call_text_started:\r\n                state.tool_call_text_started = True\r\n                state.previous_text = \"\"\r\n                state.previous_token_ids = []\r\n                delta_text = current_text\r\n                delta_token_ids = current_token_ids\r\n\r\n            reasoning_from_this_batch = (\r\n                delta_message.reasoning if delta_message else None\r\n            )\r\n\r\n            delta_message, state.function_name_returned = (\r\n                self._extract_tool_calls_streaming(\r\n                    previous_text=state.previous_text,\r\n                    current_text=current_text,\r\n                    delta_text=delta_text,\r\n                    previous_token_ids=state.previous_token_ids,\r\n                    current_token_ids=current_token_ids,\r\n                    delta_token_ids=delta_token_ids,\r\n                    request=request,  # type: ignore[arg-type]\r\n                    tool_call_idx=state.history_tool_call_cnt,\r\n                    tool_call_id_type=state.tool_call_id_type,\r\n                    function_name_returned=state.function_name_returned,\r\n                )\r\n            )\r\n\r\n            if reasoning_from_this_batch:\r\n                if delta_message is None:\r\n                    delta_message = DeltaMessage(reasoning=reasoning_from_this_batch)\r\n                elif not delta_message.reasoning:\r\n                    delta_message.reasoning = reasoning_from_this_batch\r\n\r\n            if (\r\n                delta_message\r\n                and delta_message.tool_calls\r\n                and delta_message.tool_calls[0].id is not None\r\n            ):\r\n                state.history_tool_call_cnt += 1\r\n\r\n        # No phase active: pass through as content.\r\n        # Skip when reasoning just ended in this delta — the engine already\r\n        # consumed the end-of-reasoning marker (e.g. </think>) and\r\n        # delta_text still contains the raw marker text.\r\n        if (\r\n            delta_message is None\r\n            and not reasoning_transitioned\r\n            and not self._in_reasoning_phase(state)\r\n            and not self._in_tool_call_phase(state)\r\n        ):\r\n            delta_message = DeltaMessage(content=delta_text)\r\n\r\n        state.commit(current_text, current_token_ids)\r",
+      "what": "工具阶段与直通：reasoning_ended 后进工具段——首次进段重置 previous_text/token_ids（工具文本从头数）；本批 reasoning delta 合并进工具 delta 消息；既无推理也无工具 parser→直通 DeltaMessage(content=delta_text)；state.commit 推进游标；finished→finalize_generation（流提前终止时把未标完成的思考提升为 content + 补发未流出的工具参数）。",
+      "elide": [
+        "_extract_tool_calls_streaming 内部（named/required/auto 三态与 function_name_returned 跟踪，L644-719）按 tool_choice 一句分类即可，穷举分支删。"
+      ]
+    },
+    {
+      "path": "vllm/parser/harmony.py",
+      "lines": "L63-L95",
+      "code": "class _SegmentType(Enum):\r\n    TOOL = auto()\r\n    REASONING = auto()\r\n    CONTENT = auto()\r\n    IGNORE = auto()\r\n\r\n    @staticmethod\r\n    def from_channel_and_recipient(\r\n        channel: str | None, recipient: str | None\r\n    ) -> _SegmentType:\r\n        if recipient and is_function_recipient(recipient):\r\n            return _SegmentType.TOOL\r\n        if channel == \"analysis\":\r\n            return _SegmentType.REASONING\r\n        if channel == \"final\" or (channel == \"commentary\" and recipient is None):\r\n            return _SegmentType.CONTENT\r\n        return _SegmentType.IGNORE\r\n\r\n\r\nclass Segment(NamedTuple):\r\n    channel: str | None\r\n    recipient: str | None\r\n    delta: str\r\n    completed_message: Message | None = None\r\n\r\n\r\n@dataclass\r\nclass ChunkResult:\r\n    segments: list[Segment]\r\n    reasoning_token_count: int\r\n\r\n\r\nclass HarmonyParser(DelegatingParser):\r",
+      "what": "harmony 三通道映射表（本章 introduces 核心）：_SegmentType.from_channel_and_recipient——recipient 是函数（functions.*）→TOOL；channel=='analysis'→REASONING；'final' 或 'commentary' 无 recipient→CONTENT；其余→IGNORE。三条通道 analysis/commentary/final + 收件人 recipient 构成 gpt-oss 的输出协议：模型自己用 <|channel|>…<|message|> 特殊 token 声明自己在哪条通道说话、说给谁听。",
+      "elide": []
+    },
+    {
+      "path": "vllm/parser/harmony.py",
+      "lines": "L331-L370",
+      "code": "    def process_chunk(self, token_ids: Sequence[int]) -> ChunkResult:\r\n        if not token_ids:\r\n            return ChunkResult(segments=[], reasoning_token_count=0)\r\n\r\n        segments: list[Segment] = []\r\n        reasoning_token_count = 0\r\n        for token_id in token_ids:\r\n            self._harmony_parser.process(token_id)\r\n            channel = self._harmony_parser.current_channel\r\n            recipient = self._normalize_recipient(\r\n                self._harmony_parser.current_recipient\r\n            )\r\n            delta = self._harmony_parser.last_content_delta or \"\"\r\n            completed_message = self._poll_completed_message()\r\n\r\n            if completed_message is not None:\r\n                self._current_message_tokens.clear()\r\n            else:\r\n                self._current_message_tokens.append(token_id)\r\n\r\n            if channel == \"analysis\" or (\r\n                channel == \"commentary\" and recipient is not None\r\n            ):\r\n                reasoning_token_count += 1\r\n\r\n            segments.append(\r\n                Segment(\r\n                    channel=channel,\r\n                    recipient=recipient,\r\n                    delta=delta,\r\n                    completed_message=completed_message,\r\n                )\r\n            )\r\n\r\n            # TODO: Optionally merge and suppress empty Segments\r\n\r\n        return ChunkResult(\r\n            segments=segments,\r\n            reasoning_token_count=reasoning_token_count,\r\n        )\r",
+      "what": "harmony 流式分拣（站 8 的 harmony 路）：process_chunk 逐 token 喂 openai_harmony 的 StreamableParser——每 token 取 current_channel/current_recipient/last_content_delta 组成一个 Segment；message 完成（_poll_completed_message）则产出 completed_message 并清空 _current_message_tokens（错误恢复用留底）。analysis 或 commentary→函数 计入 reasoning_token_count（思考预算）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/parser/harmony.py",
+      "lines": "L237-L329",
+      "code": "    def parse_delta(\r\n        self,\r\n        delta_text: str,\r\n        delta_token_ids: list[int],\r\n        request: ChatCompletionRequest | ResponsesRequest,\r\n        prompt_token_ids: list[int] | None = None,\r\n        *,\r\n        finished: bool,\r\n    ) -> DeltaMessage | None:\r\n        prev_recipient = self._normalize_recipient(\r\n            self._harmony_parser.current_recipient\r\n        )\r\n        result = self.process_chunk(delta_token_ids)\r\n        if finished:\r\n            flushed_segments = self.flush()\r\n            if flushed_segments:\r\n                result.segments.extend(flushed_segments)\r\n        combined_content = \"\"\r\n        combined_reasoning = \"\"\r\n        tool_messages: list[DeltaToolCall] = []\r\n\r\n        for segment in result.segments:\r\n            if segment.completed_message is not None:\r\n                prev_recipient = None\r\n                continue\r\n\r\n            segment_type = _SegmentType.from_channel_and_recipient(\r\n                segment.channel, segment.recipient\r\n            )\r\n            match segment_type:\r\n                case _SegmentType.REASONING if self.reasoning_parser:\r\n                    combined_reasoning += segment.delta\r\n                case _SegmentType.CONTENT:\r\n                    combined_content += segment.delta\r\n                case _SegmentType.TOOL if self.tool_parser:\r\n                    assert segment.recipient is not None\r\n                    if prev_recipient != segment.recipient:\r\n                        tool_name = extract_function_from_recipient(segment.recipient)\r\n                        tool_messages.append(\r\n                            DeltaToolCall(\r\n                                # HarmonyParser does not use _stream_state;\r\n                                # \"random\" tool_call_id_type is always used\r\n                                id=make_tool_call_id(),\r\n                                type=\"function\",\r\n                                function=DeltaFunctionCall(\r\n                                    name=tool_name,\r\n                                    arguments=segment.delta,\r\n                                ),\r\n                                index=self._next_tool_call_index,\r\n                            )\r\n                        )\r\n                        self._next_tool_call_index += 1\r\n                        prev_recipient = segment.recipient\r\n                    elif segment.delta:\r\n                        idx = self._next_tool_call_index - 1\r\n                        if tool_messages:\r\n                            tool_msg = tool_messages[-1]\r\n                            assert tool_msg.index == idx\r\n                            fn = tool_msg.function\r\n                            assert fn is not None and fn.arguments is not None\r\n                            fn.arguments += segment.delta\r\n                        else:\r\n                            tool_messages.append(\r\n                                DeltaToolCall(\r\n                                    index=idx,\r\n                                    function=DeltaFunctionCall(arguments=segment.delta),\r\n                                )\r\n                            )\r\n\r\n        if finished:\r\n            self._next_tool_call_index = 0\r\n\r\n        if not combined_content and not combined_reasoning and not tool_messages:\r\n            return None\r\n\r\n        delta_message = DeltaMessage()\r\n        if combined_content:\r\n            delta_message.content = combined_content\r\n        if combined_reasoning:\r\n            delta_message.reasoning = combined_reasoning\r\n        if tool_messages:\r\n            delta_message.tool_calls = tool_messages\r\n\r\n        # Suppress reasoning deltas if not requested\r\n        if delta_message and not request.include_reasoning:\r\n            delta_message.reasoning = None\r\n\r\n            # If only reasoning was in the message (no content, no tool_calls)\r\n            # skip emitting entirely\r\n            if not delta_message.content and not delta_message.tool_calls:\r\n                return None\r\n\r\n        return delta_message\r",
+      "what": "harmony parse_delta：按 Segment 分拣——REASONING 累积 combined_reasoning；CONTENT 累积 combined_content；TOOL 且 recipient 变化→开一个新 DeltaToolCall(index 自增)，同 recipient 后续 delta 拼进上一调用的 arguments（流式工具参数增量）；finished 时 flush() 强制收口；include_reasoning=False 时压掉 reasoning 且纯 reasoning 批次整块不发。",
+      "elide": [
+        "flush 的 HarmonyError 错误恢复（L136-177）：以 final 通道 + _current_message_tokens 重解码兜底，正文一句带过（excerpt 未含，锚点 L136-L177）。"
+      ]
+    },
+    {
+      "path": "vllm/parser/parser_manager.py",
+      "lines": "L75-L140",
+      "code": "    @classmethod\r\n    def get_parser(\r\n        cls,\r\n        tool_parser_name: str | None = None,\r\n        reasoning_parser_name: str | None = None,\r\n        enable_auto_tools: bool = False,\r\n        model_name: str | None = None,\r\n        is_harmony: bool = False,\r\n    ) -> type[Parser] | None:\r\n        \"\"\"\r\n        Get a Parser that handles both reasoning and tool parsing.\r\n\r\n        Composes individual reasoning and tool parsers into a single\r\n        DelegatingParser subclass.\r\n\r\n        Args:\r\n            tool_parser_name: The name of the tool parser.\r\n            reasoning_parser_name: The name of the reasoning parser.\r\n            enable_auto_tools: Whether auto tool choice is enabled.\r\n            model_name: The model name for parser-specific warnings.\r\n            is_harmony: Whether the selected model uses the Harmony format.\r\n                        If True, HarmonyParser is always returned.\r\n\r\n        Returns:\r\n            A Parser class, or None if neither parser is specified.\r\n        \"\"\"\r\n        if not tool_parser_name and not reasoning_parser_name:\r\n            return None\r\n\r\n        reasoning_parser_cls = cls.get_reasoning_parser(reasoning_parser_name)\r\n        tool_parser_cls = cls.get_tool_parser(\r\n            tool_parser_name, enable_auto_tools, model_name\r\n        )\r\n\r\n        if reasoning_parser_cls is None and tool_parser_cls is None:\r\n            return None\r\n\r\n        if is_harmony:\r\n            from vllm.parser.harmony import HarmonyParser\r\n\r\n            HarmonyParser.reasoning_parser_cls = reasoning_parser_cls\r\n            HarmonyParser.tool_parser_cls = tool_parser_cls\r\n            return HarmonyParser\r\n\r\n        if reasoning_parser_name == \"kimi_k3\" or tool_parser_name == \"kimi_k3\":\r\n            from vllm.parser.kimi_k3 import KimiK3Parser\r\n\r\n            r_cls = reasoning_parser_cls\r\n            t_cls = tool_parser_cls\r\n\r\n            class _KimiK3Parser(KimiK3Parser):\r\n                reasoning_parser_cls = r_cls\r\n                tool_parser_cls = t_cls\r\n\r\n            return _KimiK3Parser\r\n\r\n        from vllm.parser.abstract_parser import DelegatingParser\r\n\r\n        r_cls = reasoning_parser_cls\r\n        t_cls = tool_parser_cls\r\n\r\n        class _Parser(DelegatingParser):\r\n            reasoning_parser_cls = r_cls\r\n            tool_parser_cls = t_cls\r\n\r\n        return _Parser\r",
+      "what": "Parser 工厂（站 2 的装配处）：get_parser——两轴（tool_parser_name × reasoning_parser_name）从各自注册表取类，组合成一个 DelegatingParser 子类；is_harmony（model_type=='gpt_oss'）恒返 HarmonyParser（把两组件类钉在其上）；kimi_k3 特化子类；都不配→None（纯文本模型无 parser，流式直通 content）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L596-L617",
+      "code": "            while not finished:\r\n                # Note: drain queue without await if possible (avoids\r\n                # task switching under load which helps performance).\r\n                out = q.get_nowait() or await q.get()\r\n\r\n                # Note: both OutputProcessor and EngineCore handle their\r\n                # own request cleanup based on finished.\r\n                assert isinstance(out, RequestOutput)\r\n                finished = out.finished\r\n                if out is not STREAM_FINISHED:\r\n                    yield out\r\n\r\n        # If the request is disconnected by the client, generate()\r\n        # is cancelled or the generator is garbage collected. So,\r\n        # we abort the request if we end up here.\r\n        except (asyncio.CancelledError, GeneratorExit):\r\n            if q is not None:\r\n                await self.abort(q.request_id, internal=True)\r\n            if self.log_requests:\r\n                logger.info(\"Request %s aborted.\", request_id)\r\n            raise\r\n\r",
+      "what": "F5 回收·引擎侧接棒：generate() 消费循环（ch7 站 13 已立——q.get_nowait() or await q.get()）+ except (asyncio.CancelledError, GeneratorExit) → await self.abort(q.request_id, internal=True)——注释原话 'If the request is disconnected by the client, generate() is cancelled or the generator is garbage collected. So, we abort the request if we end up here.'。本章补的是 HTTP 层怎么把取消传导到这一行。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/async_llm.py",
+      "lines": "L729-L741",
+      "code": "    async def abort(\r\n        self, request_id: str | Iterable[str], internal: bool = False\r\n    ) -> None:\r\n        \"\"\"Abort RequestId in OutputProcessor and EngineCore.\"\"\"\r\n\r\n        request_ids = (\r\n            (request_id,) if isinstance(request_id, str) else as_list(request_id)\r\n        )\r\n        all_request_ids = self.output_processor.abort_requests(request_ids, internal)\r\n        await self.engine_core.abort_requests_async(all_request_ids)\r\n\r\n        if self.log_requests:\r\n            logger.info(\"Aborted request(s) %s.\", \",\".join(request_ids))\r",
+      "what": "abort 两跳（F5）：①本进程 OutputProcessor.abort_requests（移 RequestState + 外→内映射 + 投终态）②await engine_core.abort_requests_async（跨进程 ABORT 消息让引擎停算、释放 KV）。internal=True 表示给的是内部 id（单删；外部 id 会展开其全部内部 id——ch7 m22 已立双轨）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/output_processor.py",
+      "lines": "L494-L515",
+      "code": "        request_ids_to_abort = []\r\n        for request_id in internal_req_ids:\r\n            req_state = self.request_states.pop(request_id, None)\r\n            if req_state is not None:\r\n                self.lora_states.request_finished(request_id, req_state.lora_name)\r\n                request_ids_to_abort.append(request_id)\r\n                # Produce final abort output.\r\n                if req_state.queue is not None and (\r\n                    request_output := req_state.make_request_output(\r\n                        new_token_ids=[],\r\n                        # Set pooling_output is not None to\r\n                        # correctly enter the abort pooling branch\r\n                        pooling_output=EMPTY_CPU_TENSOR\r\n                        if req_state.detokenizer is None\r\n                        else None,\r\n                        finish_reason=FinishReason.ABORT,\r\n                        stop_reason=None,\r\n                        kv_transfer_params=None,\r\n                        ec_transfer_params=None,\r\n                    )\r\n                ):\r\n                    req_state.queue.put(request_output)\r",
+      "what": "ABORT 终态解阻塞（F5 时序竞争细节）：abort_requests 给仍在等的消费者投一条 finish_reason=ABORT、new_token_ids=[] 的终态 RequestOutput——没有这条，断连后还在 await q.get() 的 generate 协程会永远挂死；generate 的 finally q.close() 与本投递的竞争由内部 id 幂等性兜住（ch7 已立）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/entrypoints/openai/api_server.py",
+      "lines": "L620-L655",
+      "code": "@instrument(span_name=\"API server setup\")\r\ndef setup_server(args, *, reuse_port: bool):\r\n    \"\"\"Validate API server args and create the server socket.\"\"\"\r\n\r\n    log_version_and_model(logger, VLLM_VERSION, args.model)\r\n    log_non_default_args(args)\r\n\r\n    if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:\r\n        ToolParserManager.import_tool_parser(args.tool_parser_plugin)\r\n\r\n    if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:\r\n        ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)\r\n\r\n    validate_api_server_args(args)\r\n\r\n    # workaround to make sure that we bind the port before the engine is set up.\r\n    # This avoids race conditions with ray.\r\n    # see https://github.com/vllm-project/vllm/issues/8204\r\n    if args.uds:\r\n        sock = create_server_unix_socket(args.uds)\r\n    else:\r\n        sock_addr = (args.host or \"\", args.port)\r\n        sock = create_server_socket(sock_addr, reuse_port=reuse_port)\r\n\r\n    # workaround to avoid footguns where uvicorn drops requests with too\r\n    # many concurrent requests active\r\n    set_ulimit()\r\n\r\n    if args.uds:\r\n        listen_address = f\"unix:{args.uds}\"\r\n    else:\r\n        addr, port = sock_addr\r\n        is_ssl = args.ssl_keyfile and args.ssl_certfile\r\n        host_part = f\"[{addr}]\" if is_valid_ipv6_address(addr) else addr or \"0.0.0.0\"\r\n        listen_address = f\"http{'s' if is_ssl else ''}://{host_part}:{port}\"\r\n    return listen_address, sock\r",
+      "what": "启动链·先绑 socket（站 0）：setup_server——校验 parser 名 → 绑端口**先于**引擎启动（注释原话 'workaround to make sure that we bind the port before the engine is set up. This avoids race conditions with ray.'，issue #8204）→ set_ulimit 防 uvicorn 高并发丢请求 → SIGTERM 临时 handler（初始化期可被打断）。",
+      "elide": [
+        "uds/ipv6/ssl 的 listen_address 拼串（L648-654）一句带过。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/openai/api_server.py",
+      "lines": "L751-L789",
+      "code": "async def run_server(args, **uvicorn_kwargs) -> None:\r\n    \"\"\"Run a single-worker API server.\"\"\"\r\n\r\n    decorate_logs(\"APIServer\", skip_if_decorated=True)\r\n\r\n    # Interrupt initialization if SIGTERM arrives before uvicorn installs its\r\n    # own signal handlers. Once uvicorn is running it replaces this.\r\n    def _interrupt_init(*_) -> None:\r\n        raise KeyboardInterrupt(\"terminated\")\r\n\r\n    signal.signal(signal.SIGTERM, _interrupt_init)\r\n\r\n    listen_address, sock = setup_server(args, reuse_port=False)\r\n    await run_server_worker(listen_address, sock, args, **uvicorn_kwargs)\r\n\r\n\r\nasync def run_server_worker(\r\n    listen_address, sock, args, client_config=None, **uvicorn_kwargs\r\n) -> None:\r\n    \"\"\"Run a single API server worker.\"\"\"\r\n\r\n    if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:\r\n        ToolParserManager.import_tool_parser(args.tool_parser_plugin)\r\n\r\n    if args.reasoning_parser_plugin and len(args.reasoning_parser_plugin) > 3:\r\n        ReasoningParserManager.import_reasoning_parser(args.reasoning_parser_plugin)\r\n\r\n    async with build_async_engine_client(\r\n        args,\r\n        client_config=client_config,\r\n    ) as engine_client:\r\n        shutdown_task = await build_and_serve(\r\n            engine_client, listen_address, sock, args, **uvicorn_kwargs\r\n        )\r\n    # NB: Await server shutdown only after the backend context is exited\r\n    try:\r\n        await shutdown_task\r\n    finally:\r\n        sock.close()\r",
+      "what": "启动链·顶层编排（站 0）：run_server（decorate_logs + SIGTERM + setup_server）→ run_server_worker：async with build_async_engine_client（内部 AsyncEngineArgs → AsyncLLM.from_vllm_config，即 ch4 的在线面入口；退出上下文即 shutdown）→ build_and_serve（build_app → init_app_state → serve_http，返回 shutdown_task）——注释原话 'NB: Await server shutdown only after the backend context is exited'：先退引擎上下文、再等 HTTP 关停。",
+      "elide": []
+    },
+    {
+      "path": "vllm/entrypoints/launcher.py",
+      "lines": "L107-L146",
+      "code": "    shutdown_event = asyncio.Event()\r\n\r\n    def signal_handler() -> None:\r\n        if shutdown_event.is_set():\r\n            return\r\n        logger.info_once(\"[shutdown] API server: shutdown triggered\")\r\n        shutdown_event.set()\r\n\r\n    async def dummy_shutdown() -> None:\r\n        pass\r\n\r\n    loop.add_signal_handler(signal.SIGINT, signal_handler)\r\n    loop.add_signal_handler(signal.SIGTERM, signal_handler)\r\n\r\n    async def handle_shutdown() -> None:\r\n        await shutdown_event.wait()\r\n\r\n        engine_client = app.state.engine_client\r\n        timeout = engine_client.vllm_config.shutdown_timeout\r\n        mode = \"abort\" if timeout == 0 else \"drain\"\r\n\r\n        logger.info(\r\n            \"[shutdown] API server: stopping engine client mode=%s timeout=%ss\",\r\n            mode,\r\n            timeout,\r\n        )\r\n\r\n        await loop.run_in_executor(\r\n            None, partial(engine_client.shutdown, timeout=timeout)\r\n        )\r\n        logger.info_once(\"[shutdown] API server: engine client stopped\")\r\n\r\n        server.should_exit = True\r\n        logger.info_once(\"[shutdown] API server: signalling HTTP server shutdown\")\r\n        server_task.cancel()\r\n        watchdog_task.cancel()\r\n        if ssl_cert_refresher:\r\n            ssl_cert_refresher.stop()\r\n\r\n    shutdown_task = loop.create_task(handle_shutdown())\r",
+      "what": "关停（站 0）：serve_http 内嵌 handle_shutdown——SIGINT/SIGTERM → shutdown_event → engine_client.shutdown(timeout)（run_in_executor 包裹：同步阻塞调用不卡事件循环）→ server.should_exit + cancel server/watchdog。timeout==0 → mode='abort'（立即杀），否则 'drain'（排空在飞请求）。",
+      "elide": [
+        "ssl_cert_refresher（L143-144）与端口占用排查（L151-162）非主线。"
+      ]
+    },
+    {
+      "path": "vllm/entrypoints/launcher.py",
+      "lines": "L168-L190",
+      "code": "async def watchdog_loop(server: uvicorn.Server, engine: EngineClient):\r\n    \"\"\"\r\n    # Watchdog task that runs in the background, checking\r\n    # for error state in the engine. Needed to trigger shutdown\r\n    # if an exception arises is StreamingResponse() generator.\r\n    \"\"\"\r\n    VLLM_WATCHDOG_TIME_S = 5.0\r\n    while True:\r\n        await asyncio.sleep(VLLM_WATCHDOG_TIME_S)\r\n        terminate_if_errored(server, engine)\r\n\r\n\r\ndef terminate_if_errored(server: uvicorn.Server, engine: EngineClient):\r\n    \"\"\"\r\n    See discussions here on shutting down a uvicorn server\r\n    https://github.com/encode/uvicorn/discussions/1103\r\n    In this case we cannot await the server shutdown here\r\n    because handler must first return to close the connection\r\n    for this request.\r\n    \"\"\"\r\n    engine_errored = engine.errored and not engine.is_running\r\n    if not envs.VLLM_KEEP_ALIVE_ON_ENGINE_DEATH and engine_errored:\r\n        server.should_exit = True\r",
+      "what": "看门狗（WC3 第三道防线）：watchdog_loop 每 5s 检查 engine.errored and not engine.is_running → server.should_exit=True——docstring 点名 'if an exception arises is StreamingResponse() generator'：流式生成器吞掉异常后 uvicorn 不会自杀，需要外部兜底（VLLM_KEEP_ALIVE_ON_ENGINE_DEATH 可关）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/entrypoints/generate/api_router.py",
+      "lines": "L21-L54",
+      "code": "def register_generate_api_routers(app: FastAPI):\r\n    from vllm.entrypoints.openai.chat_completion.api_router import (\r\n        attach_router as register_chat_api_router,\r\n    )\r\n\r\n    register_chat_api_router(app)\r\n\r\n    from vllm.entrypoints.openai.responses.api_router import (\r\n        attach_router as register_responses_api_router,\r\n    )\r\n\r\n    register_responses_api_router(app)\r\n\r\n    from vllm.entrypoints.openai.completion.api_router import (\r\n        attach_router as register_completion_api_router,\r\n    )\r\n\r\n    register_completion_api_router(app)\r\n\r\n    from vllm.entrypoints.anthropic.api_router import (\r\n        attach_router as register_anthropic_api_router,\r\n    )\r\n\r\n    register_anthropic_api_router(app)\r\n\r\n    from vllm.entrypoints.cohere.api_router import (\r\n        attach_router as register_cohere_api_router,\r\n    )\r\n\r\n    register_cohere_api_router(app)\r\n\r\n    from .generative_scoring.api_router import register_generative_scoring_api_router\r\n\r\n    register_generative_scoring_api_router(app)\r",
+      "what": "API 面家族（m18）：register_generate_api_routers 一次性挂上 chat / responses / completion / anthropic / cohere / generative_scoring 六张面——它们共享同一个 engine_client 与 OnlineRenderer，只是协议壳不同；本章主线只拆 chat 面，其余按同构点到为止。",
+      "elide": []
+    }
+  ],
+  "theory": [
+    "SSE 帧语法与「200 已提交」不变量：每条消息 = 'data: ' + JSON + '\\n\\n'（media_type=text/event-stream），终止哨兵 'data: [DONE]\\n\\n'；HTTP 状态行随头块先行发出，StreamingResponse 返回即 200——此后错误只能降级为 data 帧里的 error 对象（WC3）。推论：errored 预检必须前移到渲染前（200 之前），流内错误客户端要读到 [DONE] 才能确认失败。",
+    "多轮 token 经济学：无状态协议下第 k 轮 prompt 长度 O(k)、总传输 O(k²)；前缀缓存把每轮 prefill 从 O(全长) 降到 O(新增后缀)——服务层证据链 = RequestOutput.num_cached_tokens（首拍留底 serving.py:L496）→ usage.prompt_tokens_details.cached_tokens（L772-L777 / L1065-L1070）。缓存命中的前提是前缀逐块一致：system prompt 或历史改一字，其后全部 miss（ch15 块哈希语义）。",
+    "推理连续性的 one-bit 状态：多轮历史尾部决定生成起点——prompt 停在未闭合思考块内则首 token 属于 reasoning。该事实在两处各算一遍：serving 层预判（is_reasoning_end(prompt_token_ids)，随请求过线给引擎侧结构化输出窗口用）与 parse 层首拍（prompt_reasoning_checked → adjust_initial_state_from_prompt 校正解析初态）——同一事实、两个消费者，所以两处都要算。",
+    "harmony 流式分拣的增量性：StreamableParser 逐 token process，message 完成事件与文本 delta 事件分离（Segment.delta vs Segment.completed_message）——通道切换点由特殊 token 天然界定，无需文本猜测；错误恢复有界：HarmonyError 时以 _current_message_tokens（本条消息的 token 留底）重解码塞进 final 通道，不丢内容但可能丢通道语义。",
+    "abort 的有界浪费窗口（HTTP 视角叠加 ch7 引擎视角）：断连检测（receive 通道唤醒，竞速任务）→ CancelledError 调度延迟 → abort 两跳（1 次 IPC + 引擎当前 step ≤ 一个 forward）——三层延迟均有界；非流式路径更省：handler 直接返回错误响应，无需等消费者侧状态机收口。"
+  ],
+  "mechanisms": [
+    {
+      "id": "m1",
+      "name": "服务层启动链：run_server → setup_server 先绑 socket（先于引擎，避 ray 端口竞态 #8204）→ async with build_async_engine_client（AsyncLLM.from_vllm_config + 退出即 shutdown）→ build_and_serve（build_app 路由族+异常处理器四层 → init_app_state 挂各 serving 对象 → serve_http）；NB 注释：先退引擎上下文再等 HTTP 关停",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/entrypoints/openai/api_server.py:L621-L655",
+        "vllm/entrypoints/openai/api_server.py:L751-L789",
+        "vllm/entrypoints/openai/api_server.py:L189-L216",
+        "vllm/entrypoints/openai/api_server.py:L355-L461"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m2",
+      "name": "HTTP 进门与装饰器：@with_cancellation（断连竞速，F5 前置）+ @load_aware_call + validate_json_request；handler 返回值三分流（ErrorResponse/ChatCompletionResponse→JSONResponse，生成器→StreamingResponse(text/event-stream)）",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/entrypoints/openai/chat_completion/api_router.py:L40-L74",
+        "vllm/entrypoints/serve/utils/api_utils.py:L348-L354"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m3",
+      "name": "协议定型 to_sampling_params：HTTP 字段→SamplingParams 的完整装配；stream 二值映射 output_kind（ch7 三态契约的入口声明处）；server 默认 stop_token_ids 与请求值合并去重（注释举 gpt-oss 的 </call> 为例系意图性举例——get_diff_sampling_param 白名单无此项，default 现恒 None）；get_max_tokens 四方取 min",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/entrypoints/openai/chat_completion/protocol.py:L646-L734",
+        "vllm/entrypoints/serve/utils/api_utils.py:L170-L206"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m4",
+      "name": "handler 编排 _create_chat_completion：Parser 实例化（每请求一份）→ render_chat_request（_check_model 404 + errored 预检赶在 200 之前）→ request_id='chatcmpl-'+X-Request-Id/random_uuid → 按 stream 分流两生成器",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/entrypoints/openai/chat_completion/serving.py:L235-L262",
+        "vllm/entrypoints/serve/engine/serving.py:L117-L126"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m5",
+      "name": "SSE 流式生成器：首块 role 空 delta → 逐 delta data 帧 → finish_reason 仲裁（tools_streamed→'tool_calls'，named choice→'stop'）→ system_fingerprint 只盖终止块 → include_usage 末块 → 错误也走 data 帧（200 已发）→ [DONE] 收尾",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/entrypoints/openai/chat_completion/serving.py:L422-L842"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m6",
+      "name": "非流式 full_generator：async for 聚合只留最后一个 RequestOutput（FINAL_ONLY 语义）→ parser.parse 一次成型（reasoning/content/tool_calls）→ tool_choice 分支树组装 ChatMessage → ChatCompletionResponse + UsageInfo",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/entrypoints/openai/chat_completion/serving.py:L844-L1138"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m7",
+      "name": "断连反向 abort 三层接力（F5 回收）：with_cancellation 双任务竞速（StreamingResponse 接管监听）→ CancelledError/GeneratorExit → abort(internal=True) 两跳：本进程投 finish_reason=ABORT 终态解阻塞在等消费者 + 跨进程停算释放 KV；非流式 'Client disconnected'",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/entrypoints/serve/utils/api_utils.py:L37-L94",
+        "vllm/v1/engine/async_llm.py:L611-L617",
+        "vllm/v1/engine/async_llm.py:L729-L741",
+        "vllm/v1/engine/output_processor.py:L494-L515",
+        "vllm/entrypoints/openai/chat_completion/serving.py:L859-L863"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m8",
+      "name": "引擎死的服务面表现（三道防线）：渲染前 errored 预检抛 dead_error（200 之前）→ 流中错误降级 data 帧 → watchdog 每 5s 兜底 server.should_exit；优雅关停 drain/abort 两模式（timeout==0 即 abort）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/entrypoints/openai/chat_completion/serving.py:L211-L215",
+        "vllm/entrypoints/openai/chat_completion/serving.py:L835-L842",
+        "vllm/entrypoints/launcher.py:L168-L190",
+        "vllm/entrypoints/launcher.py:L121-L146"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m9",
+      "name": "统一 Parser 层与流式分拣状态机：ParserManager 组合工厂；DelegatingParser.parse_delta 两阶段（推理段→转段截 token→工具段重置游标）+ StreamState（reasoning_ended/tool_call_text_started/prompt_reasoning_checked）；转段时一条 delta 可能同时带 reasoning 尾巴与 content 开头",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/parser/abstract_parser.py:L801-L940",
+        "vllm/parser/abstract_parser.py:L45-L59",
+        "vllm/parser/parser_manager.py:L75-L140"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m10",
+      "name": "多轮推理连续性：serving 层 reasoning_ended 三分支预判（include_reasoning=False→True / Mistral grammar→True / is_reasoning_end(prompt_token_ids)）随请求过线（引擎侧结构化输出窗口用）；parse 层首拍 prompt_reasoning_checked → adjust_initial_state_from_prompt 校正初态——prompt 尾部决定生成起点在不在思考内",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/entrypoints/openai/chat_completion/serving.py:L331-L341",
+        "vllm/v1/engine/async_llm.py:L383-L384",
+        "vllm/parser/abstract_parser.py:L813-L825",
+        "vllm/reasoning/abs_reasoning_parsers.py:L190-L199"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m11",
+      "name": "harmony 三通道分拣（本章 introduces）：_SegmentType.from_channel_and_recipient——analysis→REASONING、final 或无 recipient 的 commentary→CONTENT、functions.*→TOOL；process_chunk 逐 token 喂 StreamableParser 出 Segment(delta/completed_message)；reasoning_token_count 只计 analysis 与函数 commentary",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/parser/harmony.py:L63-L79",
+        "vllm/parser/harmony.py:L331-L370",
+        "vllm/parser/harmony.py:L237-L329"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m12",
+      "name": "harmony 渲染侧多轮编码：preamble（system：reasoning_effort/起始日期 + developer：函数工具表）→ parse_chat_input_to_harmony_message 消息级映射（assistant→final、reasoning→analysis、tool_calls→commentary+to=functions.{name}+content_type=json、tool 结果→commentary to=assistant）→ render_for_completion 编码 token ids",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/renderers/online_renderer.py:L220-L267",
+        "vllm/entrypoints/openai/parser/harmony_utils.py:L312-L348",
+        "vllm/entrypoints/openai/parser/harmony_utils.py:L351-L446",
+        "vllm/entrypoints/openai/parser/harmony_utils.py:L449-L457"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m13",
+      "name": "多轮丢思考：auto_drop_analysis_messages——找到最后一个 final 通道助手消息，丢弃其前的全部 analysis（openai_harmony 库只处理最后一轮，多 final 的长对话由 vLLM 手动 drop；docstring 点名 longer multi-turn conversations）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/entrypoints/openai/parser/harmony_utils.py:L227-L256"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m14",
+      "name": "多轮无状态经济学回执：协议零会话状态、每轮全量重渲染（ch6 模板/ch15 前缀缓存吸收）；服务层回执链 num_cached_tokens（首拍留底）→ usage.prompt_tokens_details.cached_tokens（流式末块与非流式都回）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/entrypoints/openai/chat_completion/serving.py:L495-L497",
+        "vllm/entrypoints/openai/chat_completion/serving.py:L765-L807",
+        "vllm/entrypoints/openai/chat_completion/serving.py:L1060-L1070"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m15",
+      "name": "harmony 结构化输出折叠：_adjust_output_format 把 response_format/json_schema/regex/grammar 统一折成 final 通道的 StructuralTag（reasoning-aware：analysis 仍允许），清空原 response_format——约束只作用于最终答案通道，思考不受限",
+      "kind": "config",
+      "source_anchors": [
+        "vllm/parser/harmony.py:L550-L586",
+        "vllm/parser/harmony.py:L513-L547"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m16",
+      "name": "tool_choice 协议分支：auto/none/required/named 四态——无 tool parser 时三者直接 400（render_chat 门控）；流式 tools_streamed→finish_reason='tool_calls'（named choice 例外→'stop'，OpenAI 协议约定）；DelegatingParser._extract_tool_calls 三态组装（named 直接包/required JSON 数组校验/auto 走 tool parser）",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/renderers/online_renderer.py:L145-L173",
+        "vllm/entrypoints/openai/chat_completion/serving.py:L703-L731",
+        "vllm/parser/abstract_parser.py:L417-L509"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m17",
+      "name": "隐藏 reasoning 的泄漏防护：include_reasoning=False 时 hide_stream_metadata 压掉 logprobs/token_ids（解码出的 token 文本会从 logprob 条目或裸 token id 泄漏思考内容）；纯 reasoning 批次整块不发",
+      "kind": "config",
+      "source_anchors": [
+        "vllm/entrypoints/openai/chat_completion/serving.py:L642-L655",
+        "vllm/parser/harmony.py:L320-L329"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m18",
+      "name": "API 面家族（同构枚举）：register_generate_api_routers 一次挂 chat/responses/completion/anthropic/cohere/generative_scoring 六张面，共享同一 engine_client 与 OnlineRenderer；/v1/completions 是无 messages/无 parser 的最简对照面",
+      "kind": "protocol",
+      "source_anchors": [
+        "vllm/entrypoints/generate/api_router.py:L21-L54"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m19",
+      "name": "空块跳过：chunked prefill 首拍 delta 为空且无 token 时 continue 不发空 chunk；delta_message 为 None（parser 未准备好/token 是控制符）也不发——SSE 帧密度与引擎拍解耦",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/entrypoints/openai/chat_completion/serving.py:L604-L656"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "beam_search 全家（GenerateBaseServing 的 BeamSearchOnlineMixin 调用点 serving.py:L298-L302、L322-L329 与 beam_search/online.py），及 to_beam_search_params（protocol.py:L621-L637）",
+        "why_safe": "自成一套多 beam 调度（离线 beam_search/ 的循环复用），与 chat 流式/非流式主线正交；删后普通采样请求控制流不变。"
+      },
+      {
+        "what": "logprobs 组装全家：_create_chat_logprobs/_get_top_logprobs（serving.py:L1140-L1231）、流式与非流式的 logprobs 分支（L587-L600、L885-L898）",
+        "why_safe": "ch8 已专门讲；保留 logprobs 字段占位（None）不影响流式/非流式骨架。注意保留 hide_stream_metadata 对 logprobs 的置 None（m17 泄漏防护，是独立逻辑）。"
+      },
+      {
+        "what": "echo 分支（流式 L544-L579、非流式 L1038-L1051）",
+        "why_safe": "echo 回显输入侧内容，OpenAI chat 协议冷门参数；删后首块 role/末块 finish 主干完整。"
+      },
+      {
+        "what": "continuous usage（include_continuous_usage 每块 usage，L533-L539、L570-L575、L751-L758）与 per_request metrics（L783-L792、L1074-L1084）",
+        "why_safe": "stream_options 的可选增强与计时指标；保留 include_usage 末块主线即可代表 usage 语义。"
+      },
+      {
+        "what": "enable_log_outputs/enable_log_deltas 的全部日志块（L659-L684、L817-L833、L1106-L1136）",
+        "why_safe": "可观测性侧路，不改变请求语义。"
+      },
+      {
+        "what": "Mistral 特例：maybe_serialize_tool_calls/truncate_tool_call_ids/validate_request_params（online_renderer.py:L138-L143）、_grammar_from_parser 分支（serving.py:L333-L337）、is_mistral_* 判定（preprocess_chat 内）",
+        "why_safe": "特定 tokenizer 的兼容层；普通 HF tokenizer 路径不经过。"
+      },
+      {
+        "what": "kimi_k2 的 tool_call_id 连续性：count_history_tool_calls/_initialize_history_tool_call_cnt（abstract_parser.py:L166-L177）与 _make_tool_call_id 的 kimi_k2 分支（L405-L415）",
+        "why_safe": "tool_call_id_type=='random'（默认）时全部短路；kimi_k2 特定模型约定。保留 StreamState.history_tool_call_cnt 字段本身。"
+      },
+      {
+        "what": "routed_experts 编码（serving.py:L1011-L1015）与多模态 usage 细分的采集：_get_mm_token_counts 本体（serving.py:L71-L85）及其唯一调用点 L279（删后 L276 的 mm_token_counts 保持初值 None 流入两生成器，纯减法不破 _make_prompt_tokens_details 的四参签名）。显式豁免——_make_prompt_tokens_details 本体（L88-L107）与其两处调用点（流式 L772-L777 / 非流式 L1065-L1070）原样保留，不在本删除项内：cached_tokens 回执装配是 m14/WC5 承诺的主线",
+        "why_safe": "纯文本请求 mm_placeholders 恒空：删采集点后 mm_token_counts=None，_make_prompt_tokens_details 照常装配 cached_tokens/created_cache_tokens（multimodal_tokens=None）——usage 回执主线控制流不变；routed_experts 是 MoE 路由观测字段，删后响应语义不变。"
+      },
+      {
+        "what": "build_app 中 chat/completion 之外的条件路由（pooling/transcription/realtime/sagemaker/elastic_ep/scale_out/fault_tolerance/dev/endpoint 插件）与中间件家族（ScalingMiddleware/XRequestIdMiddleware/log_response/args.middleware 动态导入，api_server.py:L224-L351）",
+        "why_safe": "平行 API 面与部署可选项；generate 任务主线只依赖 chat 面 + CORS + 异常处理器。"
+      },
+      {
+        "what": "init_app_state 中非 generate 分支（transcription/realtime/pooling/Live）与 OnlineDerenderer/ServingTokenization/anthropic/cohere 的实例化（generate/api_router.py 的对应段落）",
+        "why_safe": "与 chat 主线无关的平行服务对象；保留 OpenAIServingChat + OnlineRenderer + openai_serving_models 三件即可。"
+      },
+      {
+        "what": "ssl 家族（launcher/api_server 的 ssl_* 参数与 SSLCertRefresher）、uds/ipv6 分支、set_ulimit、h11 限制、dp_supervisor 多 API server 启动面",
+        "why_safe": "部署可选项；ch34 已回收多 API server（client_index 路由），本章单进程 TCP 主线不触及。"
+      },
+      {
+        "what": "kv_transfer/ec_transfer 拒绝清理 _with_kv_transfer_rejection_cleanup（serving.py:L231-L233 → generate/base/serving.py:L218-L250）与 _reused_prompt_token_ids decode 复用分支（online_renderer.py:L50-L60、L226-L231、L415-L424）",
+        "why_safe": "P/D 分离（ch36）专属；无 kv_transfer_params 的普通请求直接 return await awaitable。"
+      },
+      {
+        "what": "harmony 的 structural tag 组装细节：get_harmony_structural_tag/_assemble_tag/_params_to_final_content（harmony.py:L390-L547），保留 _adjust_output_format 的折叠骨架（L550-L586）",
+        "why_safe": "xgrammar StructuralTag 语法树的逐 Tag 构造归 ch30 结构化输出域；本章只需『约束折进 final 通道』这一层折叠语义。"
+      },
+      {
+        "what": "Responses API（vllm/entrypoints/openai/responses/ 全目录）与 anthropic/cohere 面",
+        "why_safe": "平行协议壳（m18 一句枚举即可）；与 chat 面共享引擎面与 renderer，删除不影响 chat 主线。"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "OpenAIServingChat",
+        "why": "全章 handler 主体。"
+      },
+      {
+        "symbol": "_create_chat_completion",
+        "why": "编排主干：parser→render→request_id→params→generate→分流。"
+      },
+      {
+        "symbol": "render_chat_request",
+        "why": "_check_model + errored 预检（WC3 第一道防线）所在。"
+      },
+      {
+        "symbol": "chat_completion_stream_generator",
+        "why": "SSE 主路径（m5）。"
+      },
+      {
+        "symbol": "chat_completion_full_generator",
+        "why": "非流式聚合主路径（m6）+ 'Client disconnected'（F5 非流式半边）。"
+      },
+      {
+        "symbol": "_raise_if_error",
+        "why": "流中 finish_reason=='error' 抛 GenerationError（m5/m8 错误帧前置检查；generate/base/serving.py:L170，调用点 serving.py:L706 流式 / L881 非流式）。"
+      },
+      {
+        "symbol": "to_sampling_params",
+        "why": "协议定型（m3）；output_kind 入口声明处。"
+      },
+      {
+        "symbol": "get_max_tokens",
+        "why": "四方取 min 的输出预算（api_utils.py）。"
+      },
+      {
+        "symbol": "with_cancellation",
+        "why": "断连竞速装饰器（F5/m7 核心）。"
+      },
+      {
+        "symbol": "listen_for_disconnect",
+        "why": "竞速另一半。"
+      },
+      {
+        "symbol": "create_chat_completion",
+        "why": "路由 handler（api_router 与 serving 同名两处，分流落点）。"
+      },
+      {
+        "symbol": "StreamingResponse",
+        "why": "SSE 出口（media_type=text/event-stream）。"
+      },
+      {
+        "symbol": "ChatCompletionStreamResponse",
+        "why": "流式 chunk 协议模型。"
+      },
+      {
+        "symbol": "ChatCompletionResponse",
+        "why": "非流式协议模型。"
+      },
+      {
+        "symbol": "DeltaMessage",
+        "why": "流式增量载体（reasoning/content/tool_calls）。"
+      },
+      {
+        "symbol": "RequestOutputKind",
+        "why": "output_kind 二值映射的目标枚举（回指 ch7）。"
+      },
+      {
+        "symbol": "UsageInfo",
+        "why": "用量聚合 + cached_tokens 回执载体。"
+      },
+      {
+        "symbol": "OnlineRenderer",
+        "why": "渲染交棒 + use_harmony 判定。"
+      },
+      {
+        "symbol": "render_chat",
+        "why": "站 3 二分分支所在。"
+      },
+      {
+        "symbol": "_make_request_with_harmony",
+        "why": "harmony 渲染主入口（m12）。"
+      },
+      {
+        "symbol": "parse_chat_inputs_to_harmony_messages",
+        "why": "多轮历史→harmony Message（m12）。"
+      },
+      {
+        "symbol": "parse_chat_input_to_harmony_message",
+        "why": "消息级映射（tool_calls→commentary recipient）。"
+      },
+      {
+        "symbol": "auto_drop_analysis_messages",
+        "why": "多轮丢思考（m13）。"
+      },
+      {
+        "symbol": "render_for_completion",
+        "why": "harmony 编码出 token ids 的落点。"
+      },
+      {
+        "symbol": "build_harmony_preamble",
+        "why": "harmony preamble 装配（system：instructions/reasoning_effort/起始日期 + developer：函数工具表；m12 站 4 起点，harmony_utils.py:L312）。"
+      },
+      {
+        "symbol": "extract_instructions_from_messages",
+        "why": "从 messages 剥出首个 system/developer 为 instructions（m12 入口，harmony_utils.py:L281）。"
+      },
+      {
+        "symbol": "ParserManager",
+        "why": "组合工厂（WC6）。"
+      },
+      {
+        "symbol": "get_parser",
+        "why": "is_harmony 恒返 HarmonyParser 的分支。"
+      },
+      {
+        "symbol": "Parser",
+        "why": "统一解析抽象基类。"
+      },
+      {
+        "symbol": "adjust_request",
+        "why": "Parser 接口的请求改写钩子：和谐分支折 StructuralTag（m15）；render_chat 渲染前调用（online_renderer.py:L204-L209；abstract_parser.py:L273/L511 两处同名定义都保留）。"
+      },
+      {
+        "symbol": "DelegatingParser",
+        "why": "默认两阶段实现（WC6/m9）。"
+      },
+      {
+        "symbol": "StreamState",
+        "why": "流式解析游标（m9）。"
+      },
+      {
+        "symbol": "parse_delta",
+        "why": "流式分拣主方法（abstract 与 harmony 两处同名——都要保留）。"
+      },
+      {
+        "symbol": "is_reasoning_end_streaming",
+        "why": "流式转段判定（m9；abstract_parser.py:L726，基类 L196）。"
+      },
+      {
+        "symbol": "extract_content_ids",
+        "why": "转段时截掉结尾 marker token 换轨（m9 转段点；abstract_parser.py:L733，基类 L212）。"
+      },
+      {
+        "symbol": "_in_reasoning_phase",
+        "why": "两阶段状态机的推理相位判定（m9；abstract_parser.py:L738）。"
+      },
+      {
+        "symbol": "_in_tool_call_phase",
+        "why": "两阶段状态机的工具相位判定（m9；abstract_parser.py:L743）。"
+      },
+      {
+        "symbol": "prompt_reasoning_checked",
+        "why": "多轮 prompt 尾部推理检查（m10）。"
+      },
+      {
+        "symbol": "adjust_initial_state_from_prompt",
+        "why": "思考内续写的初态校正（m10）。"
+      },
+      {
+        "symbol": "HarmonyParser",
+        "why": "harmony 出口分拣主体。"
+      },
+      {
+        "symbol": "_SegmentType",
+        "why": "三通道映射表（m11，本章 introduces 的核心符号）。"
+      },
+      {
+        "symbol": "from_channel_and_recipient",
+        "why": "映射函数本体。"
+      },
+      {
+        "symbol": "process_chunk",
+        "why": "逐 token 喂 StreamableParser（m11）。"
+      },
+      {
+        "symbol": "Segment",
+        "why": "harmony 流式分拣载体（channel/recipient/delta/completed_message；m11，harmony.py:L82）。"
+      },
+      {
+        "symbol": "ChunkResult",
+        "why": "process_chunk 的返回（segments + reasoning_token_count 思考预算计数；m11，harmony.py:L90）。"
+      },
+      {
+        "symbol": "flush",
+        "why": "harmony 收口与错误恢复。"
+      },
+      {
+        "symbol": "reasoning_ended",
+        "why": "多轮推理预判（m10，serving.py:L331-L341 与 EngineCoreRequest 字段）。"
+      },
+      {
+        "symbol": "is_reasoning_end",
+        "why": "prompt 尾部判定。"
+      },
+      {
+        "symbol": "generate",
+        "why": "EngineClient 抽象面发车点 + async_llm 消费循环（站 7/10）。"
+      },
+      {
+        "symbol": "abort",
+        "why": "abort 两跳（F5 回收，async_llm.py:L729-L741）。"
+      },
+      {
+        "symbol": "abort_requests",
+        "why": "ABORT 终态解阻塞（output_processor.py）。"
+      },
+      {
+        "symbol": "build_async_engine_client_from_engine_args",
+        "why": "AsyncLLM 生命周期边界（m1）。"
+      },
+      {
+        "symbol": "run_server_worker",
+        "why": "顶层编排：async with 引擎 → build_and_serve → await shutdown_task。"
+      },
+      {
+        "symbol": "setup_server",
+        "why": "先绑 socket 的启动序（m1）。"
+      },
+      {
+        "symbol": "build_app",
+        "why": "FastAPI 装配中心。"
+      },
+      {
+        "symbol": "init_app_state",
+        "why": "serving 对象挂 state 的连接点。"
+      },
+      {
+        "symbol": "serve_http",
+        "why": "uvicorn 启动 + 优雅关停中枢。"
+      },
+      {
+        "symbol": "handle_shutdown",
+        "why": "SIGINT/SIGTERM → drain/abort（serve_http 内嵌函数，精简版保留其主体逻辑）。"
+      },
+      {
+        "symbol": "watchdog_loop",
+        "why": "引擎死兜底（WC3 第三道防线）。"
+      },
+      {
+        "symbol": "terminate_if_errored",
+        "why": "errored→should_exit 判定。"
+      },
+      {
+        "symbol": "register_generate_api_routers",
+        "why": "API 面家族枚举（m18）。"
+      },
+      {
+        "symbol": "EngineClient",
+        "why": "handler 面向的抽象协议（ch4 已立，本章回指锚）。"
+      }
+    ]
+  },
+  "foreshadow_due": {
+    "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，不跑）",
+    "should_plant": [],
+    "should_payoff": [
+      {
+        "id": "F5",
+        "text": "断连反向 abort",
+        "planted": 7,
+        "paid": 38,
+        "how": "ch7 站 14/m18 已埋引擎侧半句话（async_llm.py:L611-L616 → L729-L738 两跳 + 『引擎那一侧收到 abort 之后发生什么，到第 38 章服务面再展开』钩子）。本章站 10/m7 展开 HTTP 层全貌：with_cancellation 双任务竞速与『StreamingResponse 接管监听』的交接语义（api_utils.py:L37-L94 docstring 原话）、非流式 Client disconnected 响应（serving.py:L862-L863）、abort 终态输出与 generate finally q.close() 的时序竞争（output_processor.py:L494-L515，幂等兜底）、abort 有界浪费窗口的 HTTP+引擎两层叠加。writer 在站 10 开头显式回收：『ch7 埋下的半句话，这里补全 HTTP 端』。"
+      }
+    ],
+    "note": "pedagogy-plan.foreshadows 全表 10 条（F1-F10）：无 planted=38；paid=38 仅 F5。邻章衔接（非伏笔账本，正文点名即可）：EngineClient 抽象面/generate 消费循环回指 ch4；chat 模板与 tokenize 回指 ch6；output_kind 三态/单槽邮箱/collector/stop-string 回指 ch7；logprobs 回指 ch8；前缀缓存与 num_cached_tokens 语义回指 ch15；多 API server/client_index 回指 ch34（F3/F4 已在那里回收）；P/D decode 复用分支回指 ch36。"
+  },
+  "l2_spec": "book/cartography/l2-specs/ch38.json（stations 与本档案 stations 同一份账本）"
+}
