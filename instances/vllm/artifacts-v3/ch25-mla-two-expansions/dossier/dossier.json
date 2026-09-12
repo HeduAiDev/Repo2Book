@@ -1,0 +1,912 @@
+{
+ "chapter_id": "ch25",
+ "part": "VI",
+ "title": "MLA 的两种展开",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "chapter_kind": "code",
+ "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。配对 primer = ch24（注意力变体数学：MHA/GQA/MQ 与 MLA 低秩压缩的数学已在 ch24 立，本章只做代码落地，不重推数学）。本章把 L0 的『模型层 MLA 框』打开：同一个 MLA 注意力层，prefill 段把 576 维潜向量上投影成 128 头完整 K/V 按 MHA 算（算力友好），decode 段把 q 先乘进潜空间、576 维当单头 MQA 算（带宽友好）——同一数学、两种算法、同一次前向里混批分流；再讲 MLA 层自报的特形 KVCacheSpec 怎么驱动 hybrid 组化（一池多组），收在 DSV4 第三代（上下文压缩 compress_ratio=4 + fp8_ds_mla 584B 布局）。indexer/稀疏注意力机制归 ch26，量化数学归 ch27，MoE 拼装归 ch28。",
+ "hook_suggestion": "「ch24 的数学说 MLA 把每 token 的 KV 压到 576 维潜向量——但注意力要的是 128 个头各自的 K 和 V，512 维潜向量怎么变出 128×(128+64) 的 K 和 128×128 的 V？答案藏在源码里：同一层有两条相反的展开路线——prefill 把潜向量『上投影』成完整 K/V 再做标准 MHA（kv_b_proj，算得多、读得少时划算），decode 反过来把每个头的 q 『吸收』进潜空间、576 维当单头 MQA 做、输出再上投影（W_UK/W_UV 两份重排权重副本常驻）。两条路线在**同一次前向**里按 token 分段执行——谁在什么时刻划的这条线？划错了会怎样？KV cache 只存 576 维，那 prefill 要用的完整 K/V 是从哪冒出来的、爆不爆显存？」（从 Part VI hook『Attention 是插座不是实现』+ 本章 introduces『MHA 展开 vs MQA 吸收/hybrid 组化』+ deepread/model-sample why_chains[10] 的 solution/cost 段提炼）",
+ "scope_note": "本章四幕：(A) 装配幕（站 1-4，一生一次）= DeepseekV2DecoderLayer 三岔选型（deepseek_v2.py:L1233-L1237）→ DeepseekV2MLAAttention 投影装配（L1006-L1066：fused_qkv_a_proj 低秩下投影融合 / kv_a_layernorm / kv_b_proj / o_proj）→ MLAModules 打包交 MultiHeadLatentAttentionWrapper（mla.py:L110-L127，PluggableLayer 注册位 L35）→ 权重吸收重排 process_weights_after_loading（mla_attention.py:L994-L1100：kv_b_proj 拆 W_UK/W_UV、重排成 W_UK_T(N,P,L)/W_UV(N,L,V) 两份 bmm 副本）。(B) spec 自报与组化幕（站 5-6，启动期）= MLAAttention.get_kv_cache_spec 报 MLAAttentionSpec(num_kv_heads=1, head_size=576)（mla_attention.py:L1140-L1152）→ gpu_model_runner.get_kv_cache_spec 逐层收集（L7800-L7832）→ get_kv_cache_groups 四级分组（kv_cache_utils.py:L1781-L1852；ch14 已立『一组一管理器共享一池』，本章给 MLA 侧的实测：DSV4 一个模型三类子缓存——MLAAttentionSpec/SlidingWindowMLASpec/indexer cache——全靠模型层逐层自报）。(C) 每拍前置幕（站 7-8）= _may_reorder_batch 把持久批重排成 decode→short_extend→long_extend→prefill 四区（gpu_model_runner.py:L1115-L1137 + backends/utils.py:L665；threshold=各组 builder 自报最小值，FlashMLA=128/FA-MLA=512）→ MLACommonMetadataBuilder.build 用 split_decodes_and_prefills 找边界产 num_decodes/num_decode_tokens（mla_attention.py:L2056-L2063）。(D) 前向幕（站 9-13）= Wrapper.forward 外层低秩链（mla.py:L150-L226）→ MLAAttention.forward 写 576 潜向量进分页 cache（L647-L654）→ forward_impl 按 num_mqa_tokens=num_decode_tokens 切两段（L771-L772）：MHA 段 impl.forward_mha（kv_b_proj 上投影+chunked workspace 64k+merge_attn_states，L2581-L2666）、MQA 段 bmm 吸收+impl.forward_mqa+_v_up_proj（L831-L949）。DSV4 第三代作收束演化（compress_ratio=4、fp8_ds_mla 584B=448 fp8 NoPE+128 bf16 RoPE+8 scale、o_lora_rank/o_groups、统一 head_dim=512 记法——get_mla_dims 双格式 L1499-L1530）。越界不碰：indexer/稀疏 MLA 的 top-k 机制（ch26）、量化数学与融合输出量化门（ch27）、MoE/超连接残差/MTP（ch28）、后端选择优先级表（ch21 已立）、DCP/PCP 分布式路径（Part VIII 视角）。",
+ "one_line": "MLA 层把每 token KV 压进 576 维潜向量（vs DSV3 若 MHA 128×(192+128)=40960，71 倍），代价是注意力每次都要先『展开』：prefill（Sq/Skv≈1，算力富余）用 kv_b_proj 把潜向量上投影成完整 K/V 做标准 MHA——上投影会物化大张量，用 64k-token workspace 分块 + LSE merge 兜住；decode（Sq/Skv 小，带宽瓶颈）反向把每头 q 乘 W_UK^T 吸收进潜空间、576 维当单头 MQA 做、输出再乘 W_UV 上投影——W_UK/W_UV 以重排副本常驻（权重存两份）。两条数学等价的路线在同一次前向里按 token 混批分流：runner 按后端自报阈值把批重排成 decode→prefill、builder 数出 num_decode_tokens、forward_impl 在 token 维切一刀。MLA 自报特形 MLAAttentionSpec（num_kv_heads=1、head_size=576、fp8_ds_mla 时 584B/token），驱动 hybrid 组化一池多组（DSV4：压缩层/SWA 滑窗/indexer 三类子缓存同池）；DSV4 再加 compress_ratio=4 上下文压缩与统一 head_dim=512 记法。",
+ "code_spine": [
+  "vllm/model_executor/models/deepseek_v2.py:L959-L1066  DeepseekV2MLAAttention：模型侧 MLA 层装配者——fused_qkv_a_proj（W_DQ|W_DKV+W_KR 融合下投影，DeepSeekV2FusedQkvAProjLinear L912）/ kv_a_proj_with_mqa 二选一 → q 侧低秩链（q_a_layernorm+q_b_proj）→ kv_a_layernorm + kv_b_proj + o_proj",
+  "vllm/model_executor/models/deepseek_v2.py:L1233-L1237  DeepseekV2DecoderLayer 选型三岔：use_mha（老 Deepseek）/ model_config.use_mla（DeepseekV2MLAAttention）/ 普通注意力——use_mla 属性在 vllm/config/model.py:L1791-L1792（is_deepseek_mla 且未被 VLLM_MLA_DISABLE）",
+  "vllm/model_executor/layers/mla.py:L34-L36  MultiHeadLatentAttentionWrapper：@PluggableLayer.register('multi_head_latent_attention') 的可插拔外层（OOT 平台后门），MLAModules(L14-L31) 打包全部投影注入",
+  "vllm/model_executor/layers/mla.py:L150-L226  Wrapper.forward：q 低秩链（fused_qkv_a_proj→split→q_a_layernorm→q_b_proj→view[Sq,N,P+R]）+ KV 压缩（split [kv_lora_rank, rope]、kv_a_layernorm 只打 kv_c、k_pe 加 head 维）+ RoPE 只作用 rope 段（L201-L203）→ mla_attn(q, kv_c_normed, k_pe) → o_proj",
+  "vllm/model_executor/layers/attention/mla_attention.py:L347-L598  MLAAttention 内层插座：__init__ 断言后端 is_mla（L423-L426）、get_attn_backend(use_mla=True) 选 MLA 家族（L429-L436）、static_forward_context 注册（L516-L518）、prefill_backend 第二家族装配（L520-L550）",
+  "vllm/model_executor/layers/attention/mla_attention.py:L601-L685  MLAAttention.forward：直调平台取 attn_metadata/slot_mapping → impl.do_kv_cache_update 写 576 潜向量 → forward_impl（算子版 unified_mla_kv_cache_update L1179-L1229 / unified_mla_attention_with_output L1233+）",
+  "vllm/model_executor/layers/attention/mla_attention.py:L687-L992  forward_impl：裁 num_actual_tokens → num_mqa_tokens=num_decode_tokens / num_mha_tokens=其余（L771-L772）→ MHA 段 impl.forward_mha（L820-L829）→ MQA 段 bmm 吸收+forward_mqa+_v_up_proj（L831-L949）",
+  "vllm/model_executor/layers/attention/mla_attention.py:L994-L1111  process_weights_after_loading：kv_b_proj 权重 .T 拆 W_UK/W_UV（L1033-L1035）→ replace_parameter 成 W_UV(N,L,V)/W_UK_T(N,P,L) bmm 副本（L1094-L1096）——吸收路线的权重预重排",
+  "vllm/model_executor/layers/attention/mla_attention.py:L1140-L1174  get_kv_cache_spec → MLAAttentionSpec(num_kv_heads=1, head_size=kv_lora_rank+qk_rope_head_dim) + _v_up_proj bmm 形状账",
+  "vllm/model_executor/layers/attention/mla_attention.py:L1360-L1397  MLACommonBackend 家族基类：get_kv_cache_shape=(num_blocks, block_size, head_size) 不拆 K/V 维、get_supported_head_sizes=[320,576]、is_mla()=True",
+  "vllm/model_executor/layers/attention/mla_attention.py:L1399-L1491  MLACommonPrefill/Decode/CommonMetadata：num_decodes/num_decode_tokens/num_prefills 三计数（L1475-L1477）+ ChunkedContextMetadata（workspace 切片账本）",
+  "vllm/model_executor/layers/attention/mla_attention.py:L1499-L1530  get_mla_dims：DSV4 统一 head_dim=512 记法（有 compress_ratios 字段）与 DSV2/V3 分离字段记法双格式兼容",
+  "vllm/model_executor/layers/attention/mla_attention.py:L1776-L2159  MLACommonMetadataBuilder：reorder_batch_threshold 阈值声明（L1800）、determine_chunked_prefill_workspace_size 定容（L1803-L1831）、build→split_decodes_and_prefills 分流（L2056-L2063）→ chunked context 元数据",
+  "vllm/model_executor/layers/attention/mla_attention.py:L2235-L2666  MLACommonBaseImpl：_compute_prefill_context 分块 gather+上投影+merge（L2301-L2422）与 forward_mha（L2581-L2666：kv_b_proj 上投影 → prefill 后端 → merge_attn_states）",
+  "vllm/model_executor/layers/attention/mla_attention.py:L2669-L2753  MLACommonImpl：decode 后端共享基（forward_mqa 抽象 L2746-L2753）",
+  "vllm/v1/attention/backends/utils.py:L564-L635  split_decodes_and_prefills：批序约定 decode→short_extend→long_extend→prefill 下找边界，四计数返回",
+  "vllm/v1/attention/backends/utils.py:L665-L724+  reorder_batch_to_split_decodes_and_prefills：四区互斥划分+换位，把持久批排成 MLA 要的形状",
+  "vllm/v1/worker/gpu_model_runner.py:L1115-L1137  _may_reorder_batch：每拍 _prepare_inputs 前调（L1518），threshold=calculate_reorder_batch_threshold 取各组最小（L7220-L7238）",
+  "vllm/v1/worker/gpu_model_runner.py:L7800-L7832  runner.get_kv_cache_spec：遍历 static_forward_context 的 AttentionLayerBase 逐层收 spec（含 backend.indexes_kv_by_block_stride 回填）——分组原料",
+  "vllm/v1/core/kv_cache_utils.py:L1781-L1852  get_kv_cache_groups：uniform spec → uniform type → DSV4 grouped → 页大小归一多组——hybrid 组化的四级分流",
+  "vllm/v1/kv_cache_interface.py:L389-L468  MLAAttentionSpec：cache_dtype_str/compress_ratio/alignment/model_version + real_page_size_bytes 的 584B/656B 特账 + merge 断言（组内四字段必须全同）",
+  "vllm/models/deepseek_v4/attention.py:L123-L349  DeepseekV4Attention（第三代 ABC）：compress_ratios 逐层解析（L210-L213）、fused_wqa_wkv/wo_a/wo_b 低秩投影（L226-L262）、indexer 仅 compress_ratio==4 层（L276-L297）、SWA 子缓存（L319-L325）、compressor 装配（L337-L348）",
+  "vllm/models/deepseek_v4/attention.py:L655-L674  DSV4 get_kv_cache_spec：compress_ratio>1 报 MLAAttentionSpec(compress_ratio=…, alignment=576/512, model_version='deepseek_v4')；≤1 返回 None（SWA 段由子缓存另报）",
+  "vllm/v1/attention/backends/mla/sparse_swa.py:L56-L107  DeepseekV4SWACache：以独立 prefix 注册 static_forward_context、自报 SlidingWindowMLASpec——一层注意力拆多个 KV 子缓存的实证",
+  "vllm/v1/attention/backends/mla/prefill/registry.py:L34-L57  MLAPrefillBackendEnum：MLA 的第二套后端家族（FLASH_ATTN/FLASHINFER/TRTLLM_RAGGED/TOKENSPEED_MLA/ROCM_AITER_FA）——decode 与 prefill 各选各的",
+  "vllm/v1/attention/backends/mla/flashmla.py:L118-L122  FlashMLAMetadataBuilder 自报 reorder_batch_threshold=128（注释 'process small prefills with decode pathway'；FA-MLA 同款=512 flashattn_mla.py:L117-L118）"
+ ],
+ "stations": [
+  {
+   "n": 1,
+   "where": "vllm/model_executor/models/deepseek_v2.py:L1233-L1237",
+   "what": "选型三岔：DecoderLayer 装配时按 config 选注意力类——老 Deepseek（MHA）/ model_config.use_mla（DeepseekV2MLAAttention）/ 普通注意力。use_mla=is_deepseek_mla 且未禁用（config/model.py:L1791-L1792）——MLA 不是运行时开关，是装配期就定死的层类型"
+  },
+  {
+   "n": 2,
+   "where": "vllm/model_executor/models/deepseek_v2.py:L1010-L1066",
+   "what": "投影装配：fused_qkv_a_proj 一个 MergedColumnParallelLinear 同时做 q 侧下投影（hidden→q_lora_rank 1536）与 KV 侧压缩（hidden→kv_lora_rank+rope 576）；再配 q_a_layernorm/q_b_proj（q 低秩链）、kv_a_layernorm、kv_b_proj（512→128×(128+128) 上投影）、o_proj——低秩链在模型层就是六块标准积木"
+  },
+  {
+   "n": 3,
+   "where": "vllm/model_executor/layers/mla.py:L110-L127",
+   "what": "Wrapper 装配：投影打包成 MLAModules 注入 MultiHeadLatentAttentionWrapper，内层构造 MLAAttention 插座（prefix=…attn、kv_b_proj 引用一并交接——吸收重排要靠它拿权重）。插座 __init__ 断言后端 is_mla、注册 static_forward_context（mla_attention.py:L516-L518）"
+  },
+  {
+   "n": 4,
+   "where": "vllm/model_executor/layers/attention/mla_attention.py:L994-L1100",
+   "what": "权重吸收重排（装配收尾，一生一次）：process_weights_after_loading 把 kv_b_proj 权重转置拆成 W_UK(512,N,128)/W_UV(512,N,128)，重排成 W_UV(N,512,128) 与 W_UK_T(N,128,512) 两份 bmm 副本常驻——prefill 走原 kv_b_proj、decode 走副本，同一份权重两种形状存两份（显存代价明码标价）"
+  },
+  {
+   "n": 5,
+   "where": "vllm/model_executor/layers/attention/mla_attention.py:L1140-L1152",
+   "what": "KV spec 自报：get_kv_cache_spec 报 MLAAttentionSpec(num_kv_heads=1, head_size=kv_lora_rank+qk_rope_head_dim=576)——潜向量不拆 K/V、单『头』；cache_dtype_str 原样透传（fp8_ds_mla 等特布局的字节账在 spec 侧算）"
+  },
+  {
+   "n": 6,
+   "where": "vllm/v1/core/kv_cache_utils.py:L1781-L1852",
+   "what": "spec 收集与 hybrid 组化（启动期）：runner.get_kv_cache_spec（gpu_model_runner.py:L7800-L7832）遍历 static_forward_context 逐层收 spec → get_kv_cache_groups 四级分流（全同 spec 一组 / 全同 token 槽数一组 / DSV4 grouped 多组 / 页大小归一多组）。DSV4 实测：压缩层 MLAAttentionSpec(compress_ratio=4) + SWA 子缓存 SlidingWindowMLASpec + indexer cache 同池分组——ch14 的『一组一管理器』在 MLA 侧的兑现"
+  },
+  {
+   "n": 7,
+   "where": "vllm/v1/worker/gpu_model_runner.py:L1115-L1137",
+   "what": "每拍批重排：_may_reorder_batch 在 _prepare_inputs 前把持久批排成 decode→short_extend→long_extend→prefill 四区（backends/utils.py:L665 的互斥划分+换位）；threshold 取全部 KV 组 builder 自报的最小值（L7220-L7238）——FlashMLA 报 128『小 prefill 也走 decode 路径』、FA-MLA 报 512"
+  },
+  {
+   "n": 8,
+   "where": "vllm/model_executor/layers/attention/mla_attention.py:L2056-L2063",
+   "what": "builder 分流：MLACommonMetadataBuilder.build 调 split_decodes_and_prefills（decode_threshold=reorder_batch_threshold）数出 num_decodes/num_decode_tokens——批已被第 7 站排好，这里只找边界线在哪一行 token"
+  },
+  {
+   "n": 9,
+   "where": "vllm/model_executor/layers/mla.py:L150-L226",
+   "what": "外层前向：q 低秩链（fused_qkv_a_proj→split→q_a_layernorm→q_b_proj→view[Sq,N,P+R]）、KV 侧 split [512,64]+kv_a_layernorm 只打 kv_c、RoPE 只作用 rope 段（q[...,128:] 与 k_pe；nope 段不旋转——低秩可吸收的前提）、indexer 位（稀疏归 ch26）→ 交 mla_attn(q, kv_c_normed, k_pe)"
+  },
+  {
+   "n": 10,
+   "where": "vllm/model_executor/layers/attention/mla_attention.py:L647-L654",
+   "what": "写腿：impl.do_kv_cache_update 把本步新 token 的 576 维潜向量（kv_c_normed+k_pe 拼接）照 slot_mapping 散写进分页 cache——MLA 的 cache 里自始至终只有潜向量，没有任何完整 K/V"
+  },
+  {
+   "n": 11,
+   "where": "vllm/model_executor/layers/attention/mla_attention.py:L771-L772",
+   "what": "分流决策：num_mqa_tokens = attn_metadata.num_decode_tokens；num_mha_tokens = q.size(0) − num_mqa_tokens——token 维切一刀（批已重排：前段 decode/短 extend、后段 prefill），两条数学等价的路线就此分岔"
+  },
+  {
+   "n": 12,
+   "where": "vllm/model_executor/layers/attention/mla_attention.py:L2581-L2666",
+   "what": "MHA 展开腿（prefill 段）：kv_b_proj 把新 token 潜向量上投影成 per-head K/V（W_UK/W_UV 在此用原形状）→ prefill 后端算新 token 段；有历史上下文时 _compute_prefill_context（L2301）按 64k workspace 分块 gather 潜向量→上投影→算一块，merge_attn_states 按 LSE 精确合并——上投影大张量永不整段物化"
+  },
+  {
+   "n": 13,
+   "where": "vllm/model_executor/layers/attention/mla_attention.py:L874-L919",
+   "what": "MQA 吸收腿（decode 段）：torch.bmm(q_nope, W_UK_T) 把每头 q 的 nope 段乘进潜空间（L888）→ 与 rope 段拼成 [B,N,512+64] → impl.forward_mqa 以单 KV『头』的 MQA kernel 直接读分页 cache（L919）→ _v_up_proj 乘 W_UV 上投影回 V 维（L949）——576 维 cache 不动，权重跟着 q 走"
+  }
+ ],
+ "stations_note": "站号 = MLA 层生命周期四幕的流经顺序：第 1-4 站装配幕（选型→投影装配→Wrapper/插座→权重吸收重排；无请求在场、一生一次）；第 5-6 站 spec 自报与组化幕（启动期，KV 池按它分组定形）；第 7-8 站每拍前置幕（批重排→builder 数边界）；第 9-13 站前向幕（一拍之内：外层低秩链→写 576 潜向量→切一刀→MHA 腿/MQA 腿）。正文按讲解需要编排——建议先立『两种展开』的数学（文件头文档站 5 的伪码即真相源），再进装配幕（1-4），沿一拍前向（9-13）走读两腿，批重排（7-8）作为『切的那一刀是谁画的』回补，收在 spec/组化（5-6）与 DSV4 第三代。与前后章衔接：ch24 primer 已立低秩压缩数学（本章不重推）；ch21 站 1-5 的后端选择优先级表覆盖本章站 3 的 get_attn_backend(use_mla=True)（选择机制归 ch21、MLA 家族的特殊性归本章）；ch22 的 block_table/slot_mapping 是站 10/13 的寻址底座；ch26 消费站 9 的 indexer 位与 DSV4 压缩层；ch14 的『一组一管理器』被站 6 兑现。",
+ "key_classes": [
+  {
+   "name": "DeepseekV2MLAAttention",
+   "file": "vllm/model_executor/models/deepseek_v2.py",
+   "responsibility": "模型侧 MLA 层装配者（DSV2/V3/V3.2 通用）：装六块投影积木（fused_qkv_a_proj 或 kv_a_proj_with_mqa / q_a_layernorm / q_b_proj / kv_a_layernorm / kv_b_proj / o_proj），打包 MLAModules 交给 Wrapper；V3.2 稀疏变体在此挂 Indexer（机制归 ch26）。选型由 DecoderLayer 三岔决定（L1233-L1237）。"
+  },
+  {
+   "name": "MultiHeadLatentAttentionWrapper",
+   "file": "vllm/model_executor/layers/mla.py",
+   "responsibility": "MLA 外层（@PluggableLayer.register('multi_head_latent_attention')——OOT 平台可整体替换的后门）。forward 做全部『展开前的预处理』：q 低秩链、KV 压缩+解耦 RoPE、然后交内层插座；o_proj 收尾。本章站 9 的舞台。"
+  },
+  {
+   "name": "MLAAttention",
+   "file": "vllm/model_executor/layers/attention/mla_attention.py",
+   "responsibility": "MLA 内层插座（nn.Module+AttentionLayerBase）：__init__ 选 MLA 后端家族（断言 is_mla）并装配第二套 prefill 后端；forward 写 KV（do_kv_cache_update）+ 调 forward_impl；process_weights_after_loading 做吸收重排；get_kv_cache_spec 自报特形 spec。两种展开的分岔点（num_mqa/num_mha）长在它的 forward_impl 里。"
+  },
+  {
+   "name": "MLACommonImpl / MLACommonBaseImpl",
+   "file": "vllm/model_executor/layers/attention/mla_attention.py",
+   "responsibility": "decode 后端共享基类：MLACommonBaseImpl 提供 dense-MHA prefill（_compute_prefill_context 分块循环 + forward_mha），MLACommonImpl 加 forward_mqa 抽象（FlashMLA/FlashInfer-MLA/Triton-MLA 等子类各自实现 decode kernel）。『两种展开』的前半段（吸收 bmm、上投影）在插座公共代码，后半段（kernel）归后端子类。"
+  },
+  {
+   "name": "MLAPrefillBackend（家族）",
+   "file": "vllm/v1/attention/backends/mla/prefill/registry.py",
+   "responsibility": "MLA 的第二套后端家族（prefill 专用）：FLASH_ATTN/FLASHINFER/TRTLLM_RAGGED/TOKENSPEED_MLA/ROCM_AITER_FA 五选一，get_mla_prefill_backend 按 attention_config.mla_prefill_backend + 算力代选择——decode 后端与 prefill 后端各选各的（v0.27 新增的第二选择轴）。"
+  },
+  {
+   "name": "MLACommonMetadata / MLACommonPrefillMetadata / MLACommonDecodeMetadata",
+   "file": "vllm/model_executor/layers/attention/mla_attention.py",
+   "responsibility": "MLA 专属批元数据：在 Common 之上加 num_decodes/num_decode_tokens/num_prefills 三计数（混批分流的账）与 ChunkedContextMetadata（workspace 分块切片账本：cu_seq_lens/starts/token_to_seq/has_empty_context）。"
+  },
+  {
+   "name": "MLACommonMetadataBuilder",
+   "file": "vllm/model_executor/layers/attention/mla_attention.py",
+   "responsibility": "MLA 的 metadata builder：声明 reorder_batch_threshold（让 runner 替它重排批）、build 里 split_decodes_and_prefills 数边界、装配 chunked context 元数据与 workspace（determine_chunked_prefill_workspace_size 定容）。"
+  },
+  {
+   "name": "MLAAttentionSpec / SlidingWindowMLASpec",
+   "file": "vllm/v1/kv_cache_interface.py",
+   "responsibility": "MLA 特形 KVCacheSpec：num_kv_heads=1、head_size=576（潜向量+rope）；MLA 专属字段 cache_dtype_str/compress_ratio/alignment/model_version；real_page_size_bytes 对 fp8_ds_mla 走 584B/656B 特账；merge 断言组内四字段全同——KV 分组的等价类判据。"
+  },
+  {
+   "name": "DeepseekV4Attention（ABC）+ 平台子类",
+   "file": "vllm/models/deepseek_v4/attention.py",
+   "responsibility": "第三代 MLA 层：平台无关基类装 fused_wqa_wkv/wo_a/wo_b 低秩投影、逐层 compress_ratio、SWA 子缓存、compressor；forward_mqa/_o_proj/backend_cls 由 nvidia/amd/xpu 子类实现（硬件隔离新布局，ch23 已立）。get_kv_cache_spec 按 compress_ratio 分层自报。"
+  },
+  {
+   "name": "DeepseekV4SWACache / DeepseekV4IndexerCache",
+   "file": "vllm/v1/attention/backends/mla/sparse_swa.py · vllm/models/deepseek_v4/attention.py",
+   "responsibility": "DSV4 的 KV 子缓存层：以独立 prefix 注册进 static_forward_context、各自自报 spec（SlidingWindowMLASpec / indexer 专用 MLAAttentionSpec）——一个注意力层拆出多个 KV 子缓存、全部进同一分组原料池的实证。indexer 机制归 ch26。"
+  },
+  {
+   "name": "DeepseekCompressor",
+   "file": "vllm/models/deepseek_v4/compressor.py",
+   "responsibility": "DSV4 上下文压缩器（compress_ratio>1 层）：compress→norm→RoPE→store 一条龙（triton 融合核），每 compress_ratio 个 token 写一格压缩潜向量——cache 总量÷4 的执行者。"
+  },
+  {
+   "name": "split_decodes_and_prefills / reorder_batch_to_split_decodes_and_prefills",
+   "file": "vllm/v1/attention/backends/utils.py",
+   "responsibility": "混批分流的两半：后者把持久批物理重排成 decode→short_extend→long_extend→prefill 四区（runner 每拍调用），前者在已排好的批上数边界（num_decodes/num_decode_tokens）——『同一前向两段数学』的批形准备。"
+  }
+ ],
+ "data_flow": "一拍 MLA 前向（混批：既有 prefill chunk 又有 decode；深读卡 model-sample data_flow 步 2 的 MLA 替换版，runner 侧通道引用卡原文）：\n1. _may_reorder_batch（gpu_model_runner.py:L1115，调用于 L1518 _prepare_inputs 前）→ reorder_batch_to_split_decodes_and_prefills（backends/utils.py:L665）四区重排持久批——decode→short_extend→long_extend→prefill，threshold=各组 builder 自报最小值（FlashMLA=128）。\n2. _build_attention_metadata → MLACommonMetadataBuilder.build（mla_attention.py:L2005）：split_decodes_and_prefills（L2056-L2063）数出 num_decodes/num_decode_tokens；prefill 段装配 chunked_context 元数据（workspace 切片账 L2089-L2101）→ MLACommonMetadata 按层名铺进 forward context（通道=ch21 站 9-10）。\n3. 模型前向逐层到 DeepseekV2MLAAttention.forward（deepseek_v2.py:L1188-L1194 透传）→ Wrapper.forward（mla.py:L150-L226）：q 低秩链产 q[Sq,N,P+R]、KV 侧产 kv_c_normed[Sq,512]+k_pe[Sq,1,64]。\n4. MLAAttention.forward（mla_attention.py:L601-L685）：impl.do_kv_cache_update 把 576 潜向量写分页 cache（L647-L654）→ forward_impl。\n5. forward_impl（L687）：裁 num_actual_tokens → num_mqa_tokens=num_decode_tokens（L771）。\n6a. MHA 段（num_mha_tokens>0）：impl.forward_mha（L820→L2581-L2666）——新 token kv_b_proj 上投影→prefill 后端；历史上下文 _compute_prefill_context（L2301-L2422）分块 gather→上投影→算块→merge_attn_states 合并。\n6b. MQA 段（num_mqa_tokens>0）：bmm 吸收（L874-L891）→ impl.forward_mqa（L919，后端 kernel 读分页 cache）→ _v_up_proj（L949）。\n7. 两段写回同一 output 缓冲（token 维前/后段）→ Wrapper o_proj → 返回 hidden 流。（启动期前置：站 4 权重吸收重排 + 站 6 spec 收集分组——get_kv_cache_spec（gpu_model_runner.py:L7800）→ get_kv_cache_groups（kv_cache_utils.py:L1781）→ KV 池按组定形，ch14 的账本吃这份 spec。）",
+ "why_chains": [
+  {
+   "source_card": "deepread/model-sample.json why_chains[10]（MLA 三代演化）——本章主链",
+   "decision": "MLA 三代演化：KV cache 只存压缩潜向量；prefill/decode 两种相反的展开策略（MHA 展开 vs MQA 吸收）；DSV4 再上上下文压缩+fp8_ds_mla 自定义布局",
+   "old_design": "MHA/GQA：每 token 缓存 K、V 各 num_kv_heads×head_dim。DSV3 若 128 头 MHA，每 token 每 layer 需 128×(192+128)=40960 元素；Llama-70B GQA（8 KV 头×128 维）也要 2048。KV cache 总量是长上下文并发的第一瓶颈——PagedAttention（分页）只解决碎片与共享，不降低每 token 总量。",
+   "pain": "长上下文批量并发的显存天花板：KV cache 装不下 → 要么砍 batch 要么砍上下文。DSV2 论文（arXiv:2405.04434，mla_attention.py:L28-L29 引用）把 KV 低秩压缩进潜空间。",
+   "solution": "DSV2/V3 世代（vllm/model_executor/layers/attention/mla_attention.py）：cache 只存 kv_lora_rank(512)+qk_rope_head_dim(64)=576 元素/token/layer（header 数学文档 L17-L100：Sq/Skv 比值决定路径、W_DQ/W_UQ/W_DKV/W_UK/W_UV 矩阵账本 L45-L70）；prefill（Sq/Skv≈1）compute-friendly MHA 路径——kv_b_proj 把潜向量上投影成完整 K/V 再标准 attention（forward_mha 调用点 L820-L829）；decode（Sq/Skv 小）data-movement-friendly MQA 路径——q 侧先乘吸收权重进潜空间、576 维当 MQA 做、输出再上投影（forward L601 内 num_mha_tokens/num_mqa_tokens 分流 L771-L772，吸收 bmm L860+——同一前向内 prefill/decode token 混批分流，比 v0.21 的两条独立 forward 更优雅）；过程权重存重排副本 W_UK/W_UV（process_weights_after_loading L994-L1040，split 在 L1033）；get_mla_dims 兼容统一 head_dim 与分离字段两种记法（L1501+）。DSV4 第三代（vllm/models/deepseek_v4/attention.py）：统一 head_dim=512 语义、fp8_ds_mla UE8M0 块缩放 uint8 布局 584B/token（448 NoPE+128 RoPE+8 scale，vllm/v1/kv_cache_interface.py:L409-L413）、compress_ratio=4 上下文压缩（仅 C4A 层带 indexer 选 top-k，attention.py:L207-L213、L277-L297）、输出侧 o_lora_rank/o_groups 低秩（L200-L262）、alignment 576B 页对齐（L663-L674）；DSV3.2 稀疏 MLA 656B 布局（kv_cache_interface.py:L414-L416）；IndexCache 缓存 indexer 打分结果跨轮复用（attention.py:L677+ DeepseekV4IndexerCache）。",
+   "cost": "① prefill 上投影要物化 [Skv, N, P+V] 大张量 → chunked prefill workspace 分块 + LSE merge（determine_chunked_prefill_workspace_size，mla_attention.py:L590-L600；git df71917cf 'Optimize workspace reuse for eager break, 3.9% E2E TTFT improvement' 实证这块代价真实存在且有专人优化，vllm/models/deepseek_v4/eager_scratch.py 即其产物）；② 同层两条数值路径，正确性靠 merge_attn_states 对齐；③ 特形 KV 与所有通用后端不兼容 → MLA 需要独立 backend 家族（MLAAttentionSpec 的 cache_dtype_str/alignment/compress_ratio 字段就是给 KV 账本分组的）；④ 记法漂移的税由框架侧吃（get_mla_dims 双格式兼容）；⑤ compress_ratio>1 的层读写都要经过压缩器（DeepseekCompressor），cache 命中/共享语义与普通层不同。"
+  },
+  {
+   "source_card": "deepread/memory-kv.json why_chains[6]（混合注意力模型一组一管理器）——本章 hybrid 组化幕的背景链",
+   "decision": "混合注意力模型：一个 BlockPool、每组一张块表、null_block 占位、不动点收敛的多组最长命中",
+   "old_design": "早期 v1 只有一张块表；混合模型（Gemma3 5:1 SWA:full、LLaMA4 3:1 local:full、Mamba 混合）要么不支持，要么退化为「全部按 full attention 分配」。这条退路今天仍在：--disable-hybrid-kv-cache-manager 时 unify_hybrid_kv_cache_specs 打 warning 原话「we do not enable any optimizations for saving KV cache memory (e.g., dropping the KV cache outside the sliding window)」（kv_cache_utils.py:L1568-L1589）。",
+   "pain": "SWA 层只需要窗口内 token，按 full 分配时窗口外的块全在白占显存——混合模型的可用并发被显存虚耗直接卡死。",
+   "solution": "按 KVCacheSpec 把层分成 kv_cache_groups（get_kv_cache_groups，kv_cache_utils.py:L1781-L1852），每组一个 SingleTypeKVCacheManager 子类（spec→manager 注册表 single_type_kv_cache_manager.py:L1836-L1942），各组共用一个 BlockPool（kv_cache_coordinator.py:L90-L96；硬约束=每组每块物理字节数相等，假设清单 kv_cache_utils.py:L1169-L1198）。",
+   "cost": "（ch14 已详立；本章取其 MLA 面）DSV4 是这条链的最大用户：压缩层（MLAAttentionSpec compress_ratio=4）、SWA 滑窗层（SlidingWindowMLASpec）、indexer cache 三类 spec 同池分组；MLAAttentionSpec.merge 断言组内 cache_dtype_str/compress_ratio/model_version/block_stride 全同（kv_cache_interface.py:L429-L468）——模型层自报什么 spec，直接决定这层落进哪个组、跟谁共享池。"
+  },
+  {
+   "source_card": "deepread/model-sample.json why_chains[9]（模型定义层=纯拼装，Attention 是插座）——本章装配幕的背景链",
+   "decision": "模型定义层 = 平台无关层的纯拼装（模型文件只做层组装 + 权重名映射，attention 是插座不是实现）+ v0.27 新政：旗舰架构走 vllm/models/<name>/ 硬件隔离布局",
+   "old_design": "HF modeling_*.py 每个模型自带注意力实现与 KV 管理；vLLM 旧世代 model_executor/models/ 扁平目录，一个 .py 塞全部平台分支（DSV4 迁移动机：git 287471b99 '[Model Refactoring] Migrate DeepSeek V4 to vllm/models/ [1/N]' #43004，2026-05）。",
+   "pain": "新架构 = 重写一遍 attention+TP+量化胶水；同一 FlashAttention kernel 要为几十个模型各改一遍；平台分支（CUDA/ROCm/XPU）混在同一文件越长越不可维护——DSV4 这种深度依赖平台 kernel（FlashMLA/FlashInfer sparse/MegaMoE）的模型在扁平布局里已经没法读。",
+   "solution": "（MLA 相关面）MLA 层同样走插座：模型文件只装投影积木（deepseek_v2.py:L1006-L1066），MLAAttention 插座选 MLA 后端家族（mla_attention.py:L423-L436 断言 is_mla）；外层 Wrapper 本身是 PluggableLayer 注册点（vllm/model_executor/layers/mla.py:L35）——OOT 平台后门。",
+   "cost": "（MLA 相关面）接入税重：MLA 作者要同时懂投影积木 + 两套后端家族（decode/prefill 各一）+ 特形 spec 自报 + 吸收重排；PluggableLayer 注册点（logits_processor.py:L22、mla.py:L35）是 OOT 平台后门，进一步分叉实现来源；新旧两套布局并存（DSV3.2 走扁平 deepseek_v2、DSV4 走 vllm/models/deepseek_v4），读者要能分辨（ch23 已立分辨法）。"
+  }
+ ],
+ "embed_excerpts": [
+  {
+   "path": "vllm/model_executor/models/deepseek_v2.py",
+   "lines": "L1226-L1238",
+   "what": "DecoderLayer 选型三岔：老 Deepseek（MHA）/ use_mla（DeepseekV2MLAAttention）/ 非 MLA 分流——模型层按 config 决定本层是普通注意力还是 MLA 层",
+   "code": "        kv_lora_rank = getattr(config, \"kv_lora_rank\", 0)\n        use_mha = config.model_type == \"deepseek\" or all(\n            dim == 0 for dim in (qk_nope_head_dim, qk_rope_head_dim)\n        )\n\n        self.use_mha = use_mha\n\n        if use_mha:\n            attn_cls = DeepseekAttention\n        elif model_config.use_mla:\n            attn_cls = DeepseekV2MLAAttention\n        else:\n            attn_cls = DeepseekV2Attention",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/models/deepseek_v2.py",
+   "lines": "L1006-L1066",
+   "what": "DeepseekV2MLAAttention 投影装配：fused_qkv_a_proj（W_DQ 与 W_DKV+W_KR 融合为一个 MergedColumnParallelLinear）/ kv_a_proj_with_mqa（无 q 低秩时）→ q 侧低秩链（q_a_layernorm+q_b_proj）→ kv_a_layernorm + kv_b_proj + o_proj——低秩链在模型层就是几块标准积木",
+   "code": "        # Use input_size for projection input dimensions if provided,\n        # otherwise default to hidden_size (used in Eagle3 Deepseek with MLA)\n        proj_input_size = input_size if input_size is not None else self.hidden_size\n\n        if self.q_lora_rank is not None:\n            self.fused_qkv_a_proj = DeepSeekV2FusedQkvAProjLinear(\n                proj_input_size,\n                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],\n                quant_config=quant_config,\n                prefix=f\"{prefix}.fused_qkv_a_proj\",\n            )\n        else:\n            self.kv_a_proj_with_mqa = ReplicatedLinear(\n                proj_input_size,\n                self.kv_lora_rank + self.qk_rope_head_dim,\n                bias=False,\n                quant_config=quant_config,\n                prefix=f\"{prefix}.kv_a_proj_with_mqa\",\n            )\n\n        qrep_enabled = (\n            envs.VLLM_DCP_Q_REPLICATE\n            and vllm_config.parallel_config.decode_context_parallel_size > 1\n            and vllm_config.parallel_config.prefill_context_parallel_size <= 1\n        )\n        q_proj_cls = (\n            DCPGroupColumnParallelLinear if qrep_enabled else ColumnParallelLinear\n        )\n        if self.q_lora_rank is not None:\n            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)\n            self.q_b_proj = q_proj_cls(\n                self.q_lora_rank,\n                self.num_heads * self.qk_head_dim,\n                bias=False,\n                quant_config=quant_config,\n                prefix=f\"{prefix}.q_b_proj\",\n            )\n        else:\n            self.q_proj = q_proj_cls(\n                proj_input_size,\n                self.num_heads * self.qk_head_dim,\n                bias=False,\n                quant_config=quant_config,\n                prefix=f\"{prefix}.q_proj\",\n            )\n        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)\n        self.kv_b_proj = ColumnParallelLinear(\n            self.kv_lora_rank,\n            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),\n            bias=False,\n            quant_config=quant_config,\n            prefix=f\"{prefix}.kv_b_proj\",\n        )\n        self.o_proj = RowParallelLinear(\n            self.num_heads * self.v_head_dim,\n            self.hidden_size,\n            bias=False,\n            reduce_results=reduce_results,\n            quant_config=quant_config,\n            prefix=f\"{prefix}.o_proj\",\n        )",
+   "elide": [
+    "L1026-L1033 qrep（DCP q 复制）分支——分布式专用，正文可省"
+   ]
+  },
+  {
+   "path": "vllm/model_executor/layers/mla.py",
+   "lines": "L110-L127",
+   "what": "Wrapper 装配：把模型侧投影打包成 MLAModules 传入，构造内层 MLAAttention 插座——注意 kv_b_proj 的引用被一并交进插座（后面吸收重排要用它）",
+   "code": "        self.mla_attn = MLAAttention(\n            num_heads=self.num_heads,\n            scale=scale,\n            qk_nope_head_dim=self.qk_nope_head_dim,\n            qk_rope_head_dim=self.qk_rope_head_dim,\n            v_head_dim=self.v_head_dim,\n            q_lora_rank=self.q_lora_rank,\n            kv_lora_rank=self.kv_lora_rank,\n            cache_config=cache_config,\n            quant_config=quant_config,\n            prefix=f\"{prefix}.attn\",\n            kv_b_proj=self.kv_b_proj,\n            dcp_q_replicate=self.dcp_q_replicate,\n            use_sparse=self.is_sparse,\n            indexer=self.indexer,\n            topk_indices_buffer=mla_modules.topk_indices_buffer,\n            non_causal_multi_token_decode=non_causal_multi_token_decode,\n        )",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/layers/mla.py",
+   "lines": "L150-L226",
+   "what": "MultiHeadLatentAttentionWrapper.forward——MLA 外层全程：q 侧低秩链（fused_qkv_a_proj→split→q_a_layernorm→q_b_proj）与 KV 侧压缩（split 512 潜+64 rope→kv_a_layernorm 只打 kv_c）、RoPE 只作用 rope 段（q 的 nope 段与 k_pe 都不动）、indexer 调用位、o_proj 收尾",
+   "code": "    def forward(\n        self,\n        positions: torch.Tensor,\n        hidden_states: torch.Tensor,\n        llama_4_scaling: torch.Tensor | None = None,\n    ) -> torch.Tensor:\n        q_c = None\n        kv_lora = None\n\n        if self.q_lora_rank is not None:\n            assert self.fused_qkv_a_proj is not None, (\n                \"fused_qkv_a_proj is required when q_lora_rank is not None\"\n            )\n            assert self.q_a_layernorm is not None, (\n                \"q_a_layernorm is required when q_lora_rank is not None\"\n            )\n            assert self.q_b_proj is not None, (\n                \"q_b_proj is required when q_lora_rank is not None\"\n            )\n\n            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]\n            q_c, kv_lora = qkv_lora.split(\n                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],\n                dim=-1,\n            )\n            q_c = self.q_a_layernorm(q_c)\n            q_proj_layer = self.q_b_proj\n            q_proj_input = q_c\n        else:\n            assert self.kv_a_proj_with_mqa is not None, (\n                \"kv_a_proj_with_mqa is required when q_lora_rank is None\"\n            )\n            assert self.q_proj is not None, (\n                \"q_proj is required when q_lora_rank is None\"\n            )\n            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]\n            q_proj_layer = self.q_proj\n            q_proj_input = hidden_states\n\n        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)\n        kv_c_normed = self.kv_a_layernorm(kv_c)\n        # Add head dim of 1 to k_pe\n        k_pe = k_pe.unsqueeze(1)\n\n        q = q_proj_layer(q_proj_input)[0]\n        heads = self.num_heads\n        if self.dcp_q_replicate:\n            heads *= q_proj_layer.group_size\n        q = q.view(-1, heads, self.qk_head_dim)\n\n        if self.rotary_emb is not None:\n            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(\n                positions, q[..., self.qk_nope_head_dim :], k_pe\n            )\n\n        if self.indexer and self.is_sparse and not self.skip_topk:\n            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)\n\n        if llama_4_scaling is not None:\n            q *= llama_4_scaling\n\n        q_dcp_replicated = None\n        if self.dcp_q_replicate:\n            q_dcp_replicated, q = q, q_proj_layer._local_view(q)\n\n        attn_out = self.mla_attn(\n            q,\n            kv_c_normed,\n            k_pe,\n            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),\n            q_dcp_replicated=q_dcp_replicated,\n        )\n\n        if self.g_proj is not None:\n            attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()\n\n        return self.o_proj(attn_out)[0]",
+   "elide": [
+    "L159-L187 无 q_lora_rank 分支（kv_a_proj_with_mqa 路径）——对称分支可省",
+    "L196-L213 dcp_q_replicate / llama_4_scaling 分支",
+    "L205-L206 indexer 调用——稀疏 MLA 归 ch26"
+   ]
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/mla_attention.py",
+   "lines": "L13-L31",
+   "what": "文件头数学文档·动机：Sq/Skv 比值决定用 compute-friendly 还是 data-movement-friendly——『同一数学、两种算法』的总纲",
+   "code": "MLA has two possible ways of computing, a data-movement friendly approach and a\ncompute friendly approach. We generally want to use the compute friendly\napproach for \"prefill\" (i.e. the ratio Sq / Skv is relatively large, often near\n1) and the data-movement friendly approach for \"decode\" (i.e. the ratio\nSq / Skv is small, often near 0).\n\nNOTE what we deem small and large is currently determined by if it is labelled\nprefill or decode by the scheduler, but this is something we should probably\ntune.\n\nMain reference: DeepseekV2 paper, and FlashInfer Implementation\n(https://arxiv.org/abs/2405.04434 and https://github.com/flashinfer-ai/flashinfer/pull/551).\n\nDeepseek's MLA attention works the following way:\n* Use a single latent vector to represent the per-token entry of the KV cache.\n* For decode (i.e. the memory friendly approach) the attention \"simulates\" a\nmulti-head attention, while the compute is similar to multi-query attention.\n\nBelow is an example of both paths assuming batch size = 1",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/mla_attention.py",
+   "lines": "L44-L118",
+   "what": "文件头数学文档·两路伪码：W_DQ/W_UQ/W_UK/W_UV 矩阵账本 + forward_mha（上投影成完整 K/V 做标准 MHA）与 forward_mqa（q 侧先乘 W_UK 进潜空间、576 维当 MQA、输出再乘 W_UV）——本章两种展开的数学真相源",
+   "code": "## Vector/Matrix Definitions\n\nh_t         hidden states (input to attention)  shape [Sq, H]\nq_c         latent/compressed Q                 shape [Sq, Lq]\nq_nope      uncompressed Q (no-rope)            shape [Sq, N, P]\nq_pe        uncompressed Q (rope)               shape [Sq, N, R]\nkv_c        latent/compressed KV                shape [Skv, Lkv]\nk_pe        decoupled k position embeddings     shape [Skv, R]\nnew_kv_c    new kv_c from current iter          shape [Sq, Lkv]\nnew_k_pe    new k_pe from current iter          shape [Sq, R]\ncache_kv_c  cached k_c from previous iters      shape [C, Lkv]\ncache_k_pe  cached k_pe from previous iters     shape [C, R]\nW_DQ        project h_t to q_c                  shape [H, Lq]\nW_UQ        project q_c to q_nope               shape [Lq, N * P]\nW_QR        project q_c to q_pe                 shape [Lq, N * R]\nW_DKV       project h_t to kv_c                 shape [H, Lkv]\nW_UK        project kv_c to k_nope              shape [Lkv, N, P]\nW_KR        project h_t to k_pe                 shape [H, R]\nW_UV        project kv_c to v                   shape [Lkv, N, V]\nW_O         project v to h_t                    shape [N * V, H]\n\n\n## Compute Friendly Approach (i.e. \"forward_mha\"):\n\nq_c      = h_t @ W_DQ\nq_nope   = (q_c @ W_UQ).view(Sq, N, P)\nq_pe     = RoPE(q_c @ W_QR).view(Sq, N, R)\nnew_kv_c = h_t @ W_DKV\nnew_k_pe = RoPE(h_t @ W_KR)\nkv_c     = torch.cat([new_kv_c, cache_kv_c], dim=0)\nk_pe     = torch.cat([new_k_pe, cache_k_pe], dim=0)\nk_nope   = (kv_c @ W_UK.view(Lkv, N * P)).view(Skv, N, P)\nv        = (kv_c @ W_UV.view(Lkv, N * V)).view(Skv, N, V)\n\n// MHA with QK headdim = P + R\n//           V headdim = V\n//      sdpa_o shape [Sq, N, V]\nsdpa_o = scaled_dot_product_attention(\n    torch.cat([q_nope, q_pe], dim=-1),\n    torch.cat([k_nope, k_pe.unsqueeze(1).expand(-1, N, -1)], dim=-1),\n    v\n)\nreturn sdpa_o @ W_O\n\nNOTE: in the actual code,\n    `kv_b_proj` is [W_UK; W_UV] concatenated per head\n    `q_b_proj` is [W_UQ; W_QR] concatenated per head\n    `out_proj` is W_O\n\n\n## Data-Movement Friendly Approach (i.e. \"forward_mqa\"):\n\nRuntime\nq_c      = h_t @ W_DQ\nq_nope   = (q_c @ W_UQ).view(-1, N, P)\nql_nope  = einsum(\"snh,lnh->snl\", q_nope, W_UK)\nq_pe     = RoPE(q_c @ W_QR).view(Sq, N, R)\nnew_kv_c = h_t @ W_DKV\nnew_k_pe = RoPE(h_t @ W_KR)\nkv_c     = torch.cat([new_kv_c, cache_kv_c], dim=0)\nk_pe     = torch.cat([new_k_pe, cache_k_pe], dim=0)\n\n// MQA with QK headdim = Lkv + R\n//           V headdim = Lkv\n//      sdpa_o shape [Sq, N, Lkv]\n// NOTE: this is less compute-friendly since Lkv > P\n//       but is more data-movement friendly since its MQA vs MHA\nsdpa_o = scaled_dot_product_attention(\n    torch.cat([ql_nope, q_pe], dim=-1),\n    torch.cat([kv_c, k_pe], dim=-1),\n    kv_c\n)\n\no = einsum(\"snl,lnv->snv\", sdpa_o.reshape(-1, N, Lkv), W_UV)\nreturn o.view(-1, N * V) @ W_O",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/mla_attention.py",
+   "lines": "L746-L812",
+   "what": "forward_impl 分流决策：fp8 cache 视图、裁到 num_actual_tokens，然后 num_mqa_tokens=attn_metadata.num_decode_tokens / num_mha_tokens=其余——同一前向内 prefill/decode token 混批各走各的数学",
+   "code": "        fp8_attention = is_quantized_kv_cache(self.kv_cache_dtype)\n\n        num_actual_toks = attn_metadata.num_actual_tokens\n        if self.use_pcp and self.impl.dcp_world_size > 1 and quant_key is not None:\n            raise NotImplementedError(\n                \"MRV2 MLA PCP+DCP does not support fused output quantization yet.\"\n            )\n\n        # Inputs and outputs may be padded for CUDA graphs\n        output_padded = output\n        output = output[:num_actual_toks, ...]\n        q = q[:num_actual_toks, ...]\n        if q_dcp_replicated is not None:\n            q_dcp_replicated = q_dcp_replicated[:num_actual_toks, ...]\n        k_c_normed = k_c_normed[:num_actual_toks, ...]\n        k_pe = k_pe[:num_actual_toks, ...]\n\n        if fp8_attention and self.kv_cache_dtype != \"fp8_ds_mla\":\n            kv_cache = kv_cache.view(current_platform.fp8_dtype())\n\n        assert (\n            attn_metadata.num_decodes is not None\n            and attn_metadata.num_prefills is not None\n            and attn_metadata.num_decode_tokens is not None\n        )\n        num_mqa_tokens = attn_metadata.num_decode_tokens\n        num_mha_tokens = q.size(0) - num_mqa_tokens\n\n        if self.impl.is_sparse and num_mha_tokens > 0:\n            prefill = getattr(attn_metadata, \"prefill\", None)\n            use_dense_mha = getattr(prefill, \"use_dense_mha\", False)\n            prefill_max_seq_len = attn_metadata.prefill_max_seq_len  # type: ignore[attr-defined]\n            use_masked_mha = (\n                self.prefill_backend is not None\n                and self.impl.masked_mha_available  # type: ignore[attr-defined]\n                and self.impl.dcp_world_size <= 1\n                and prefill is not None\n                and _use_masked_mha(\n                    backend_name=self.attn_backend.get_name(),\n                    tensor_parallel_size=self._vllm_config.parallel_config.tensor_parallel_size,\n                    query_len=prefill.max_query_len,\n                    seq_len=prefill_max_seq_len,\n                )\n            )\n            use_mha = (use_dense_mha or use_masked_mha) and not (\n                self._vllm_config.attention_config.sparse_mla_force_mqa\n            )\n            if not use_mha:\n                num_mqa_tokens = q.size(0)\n                num_mha_tokens = 0\n\n        mha_use_quant_output = (\n            quant_key is not None\n            and self.prefill_backend is not None\n            and self.prefill_backend.supports_quant_output(quant_key)\n            and (\n                not self.impl.is_sparse\n                or attn_metadata.prefill_max_seq_len  # type: ignore[attr-defined]\n                <= attn_metadata.topk_tokens  # type: ignore[attr-defined]\n            )\n            and attn_metadata is not None\n            and attn_metadata.prefill is not None\n            and attn_metadata.prefill.chunked_context is None\n            and self.impl.dcp_world_size <= 1\n        )\n\n        if num_mha_tokens > 0:",
+   "elide": [
+    "L774-L795 稀疏 MLA 的 use_mha 覆写（masked-MHA 阈值表）——indexer 归 ch26",
+    "L797-L810 mha_use_quant_output 融合量化输出门——量化融合归 ch27"
+   ]
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/mla_attention.py",
+   "lines": "L812-L829",
+   "what": "MHA 展开腿调用：q[num_mqa_tokens:] 段交 impl.forward_mha——注意切的是 token 维前缀/后缀，不是请求维",
+   "code": "        if num_mha_tokens > 0:\n            if mha_use_quant_output:\n                mha_output = quant_output\n                mha_output_scale = output_scale\n            else:\n                mha_output = output\n                mha_output_scale = None\n\n            self.impl.forward_mha(  # type: ignore[attr-defined]\n                q[num_mqa_tokens:],\n                k_c_normed[num_mqa_tokens:],\n                k_pe[num_mqa_tokens:],\n                kv_cache,\n                attn_metadata,\n                self._k_scale,\n                output=mha_output[num_mqa_tokens:num_actual_toks],\n                output_scale=mha_output_scale,\n            )",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/mla_attention.py",
+   "lines": "L831-L949",
+   "what": "MQA 吸收腿全程：q 段 split nope/pe → transpose (B,N,P)→(N,B,P) → torch.bmm(q_nope, W_UK_T) 把 per-head q 乘进潜空间（L888）→ 拼 rope 段 → impl.forward_mqa（576 维 MQA kernel，L919）→ _v_up_proj 乘 W_UV 上投影回 V 维（L949）",
+   "code": "        if num_mqa_tokens > 0:\n            if q_dcp_replicated is not None:\n                mqa_q = q_dcp_replicated[:num_mqa_tokens]\n                qrep_decode = True\n            else:\n                mqa_q = q[:num_mqa_tokens]\n                qrep_decode = False\n            mqa_output_slice = output[:num_mqa_tokens]\n\n            mqa_q_nope, mqa_q_pe = mqa_q.split(\n                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1\n            )\n\n            # Convert from (B, N, P) to (N, B, P)\n            mqa_q_nope = mqa_q_nope.transpose(0, 1)\n\n            if self.q_pad_num_heads is not None:\n                B, N, L = mqa_q_pe.shape\n                mqa_pe_padded = mqa_q_pe.new_empty((B, self.q_pad_num_heads, L))\n                mqa_pe_padded.resize_((B, N, L))\n                mqa_pe_padded.copy_(mqa_q_pe)\n                mqa_q_pe = mqa_pe_padded\n\n            if self.is_aiter_triton_fp4_bmm_enabled:\n                from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4\n\n                mqa_ql_nope = batched_gemm_a16wfp4(\n                    mqa_q_nope,\n                    self.W_K,\n                    self.W_K_scale,\n                    transpose_bm=True,\n                    prequant=True,\n                    y_scale=self._q_scale if fp8_attention else None,\n                )\n            elif self.is_aiter_triton_fp8_bmm_enabled:\n                # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)\n                mqa_ql_nope = rocm_aiter_ops.triton_fp8_bmm(\n                    mqa_q_nope,\n                    self.W_K,\n                    self.W_K_scale,\n                    group_size=128,\n                    transpose_bm=True,\n                )\n            else:\n                # Pads the head_dim if necessary (for the underlying kernel)\n                N, B, P = mqa_q_nope.shape\n                W_UK_T = self.W_UK_T_dcp_qrep if qrep_decode else self.W_UK_T\n                assert W_UK_T is not None\n                _, _, L = W_UK_T.shape\n\n                if self.q_pad_num_heads is not None:\n                    mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))\n                    mqa_ql_nope.resize_((N, B, L))\n                else:\n                    mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))\n\n                # Multiply (N, B, P) x (N, P, L) -> (N, B, L)\n                torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)\n\n                # Convert from (N, B, L) to (B, N, L)\n                mqa_ql_nope = mqa_ql_nope.transpose(0, 1)\n\n            if fp8_attention and self.impl.supports_quant_query_input:\n                assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]\n                assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]\n                mqa_q = self._decode_concat_quant_fp8_op(\n                    mqa_ql_nope, mqa_q_pe, self._q_scale\n                )\n            else:\n                mqa_q = (mqa_ql_nope, mqa_q_pe)\n            # concatenate nope + pe -> (B, N, L + P) (fp8 op above may have fused)\n            if self.impl.dcp_world_size > 1:\n                if self.use_pcp:\n                    if self.impl.dcp_world_size > self.impl.pcp_world_size:\n                        if isinstance(mqa_q, tuple):\n                            mqa_q = torch.cat(mqa_q, dim=-1)\n                        mqa_q = get_tp_group().all_gather(mqa_q, dim=1)\n                else:\n                    if isinstance(mqa_q, tuple):\n                        # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)\n                        mqa_q = torch.cat(mqa_q, dim=-1)\n                    if not qrep_decode:\n                        # mqa_q do allgather in head dim.\n                        mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)\n\n            # call decode attn\n            if not self.impl.is_sparse:\n                assert attn_metadata.decode is not None\n            attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]\n\n            # correct dcp attn_out with lse.\n            if self.impl.dcp_world_size > 1:\n                assert lse is not None\n                if self.dcp_a2a:\n                    attn_out = dcp_a2a_lse_reduce(\n                        attn_out,\n                        lse,\n                        get_dcp_group(),\n                        is_lse_base_on_e=self.impl.lse_base_on_e,\n                    )\n                elif self.use_pcp:\n                    attn_out = cp_lse_ag_out_ar(\n                        attn_out,\n                        lse,\n                        get_dcp_group(),\n                        is_lse_base_on_e=self.impl.lse_base_on_e,\n                    )\n                else:\n                    attn_out = cp_lse_ag_out_rs(\n                        attn_out,\n                        lse,\n                        get_dcp_group(),\n                        is_lse_base_on_e=self.impl.lse_base_on_e,\n                    )\n                if self.use_pcp:\n                    attn_out = finalize_mla_pcp_decode(attn_out, self.num_heads)\n\n            # v_up projection\n            self._v_up_proj(attn_out, out=mqa_output_slice)",
+   "elide": [
+    "L847-L852 q_pad_num_heads 头数填充",
+    "L854-L873 ROCm aiter fp4/fp8 bmm 分支",
+    "L893-L914 fp8 拼接与 DCP all-gather",
+    "L922-L946 DCP LSE 归并三分支"
+   ]
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/mla_attention.py",
+   "lines": "L994-L1100",
+   "what": "process_weights_after_loading——权重吸收重排：kv_b_proj 权重转置拆出 W_UK/W_UV（L1033），再以 W_UV.transpose(0,1)（N,L,V）与 W_UK.permute(1,2,0)（N,P,L）两份 bmm 副本常驻（L1094-L1096）——prefill 用原 kv_b_proj、decode 用重排副本，权重存两份",
+   "code": "    def process_weights_after_loading(self, act_dtype: torch.dtype):\n        # we currently do not have quantized bmm's which are needed for\n        # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform\n        # the bmm's in 16-bit, the extra memory overhead of this is fairly low\n        kv_b_proj_weight = get_and_maybe_dequant_weights(\n            self.kv_b_proj, out_dtype=act_dtype\n        ).T\n\n        if self.dcp_q_replicate:\n            # qrep wired here: validate unsupported decode backends once.\n            assert self.q_pad_num_heads in (None, self.num_heads), (\n                \"DCP query replication is unsupported on head-padding MLA \"\n                \"backends (q_pad_num_heads).\"\n            )\n            if (\n                self.is_aiter_triton_fp4_bmm_enabled\n                or self.is_aiter_triton_fp8_bmm_enabled\n            ):\n                raise NotImplementedError(\n                    \"DCP query replication is not implemented for the aiter \"\n                    \"FP4/FP8 MLA BMM paths.\"\n                )\n\n        assert kv_b_proj_weight.shape == (\n            self.kv_lora_rank,\n            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),\n        ), (\n            f\"{kv_b_proj_weight.shape=}, \"\n            f\"{self.kv_lora_rank=}, \"\n            f\"{self.num_heads=}, \"\n            f\"{self.qk_nope_head_dim=}, \"\n            f\"{self.v_head_dim=}\"\n        )\n        kv_b_proj_weight = kv_b_proj_weight.view(\n            self.kv_lora_rank,\n            self.num_heads,\n            self.qk_nope_head_dim + self.v_head_dim,\n        )\n\n        W_UK, W_UV = kv_b_proj_weight.split(\n            [self.qk_nope_head_dim, self.v_head_dim], dim=-1\n        )\n\n        # If kv_b_proj_weight is unquantized, quantize it to mxfp4 if supported\n        if self.is_aiter_triton_fp4_bmm_enabled:\n            from vllm.model_executor.layers.quantization.quark.utils import (\n                quark_quantize_weight_to_mxfp4,\n            )\n\n            self.W_K, self.W_K_scale = quark_quantize_weight_to_mxfp4(W_UK)\n            # Convert from (L, N, P) to (N, L, P)\n            self.W_K = self.W_K.transpose(0, 1)\n            self.W_K_scale = self.W_K_scale.transpose(0, 1)\n\n            self.W_V, self.W_V_scale = quark_quantize_weight_to_mxfp4(\n                W_UV.permute(1, 2, 0)\n            )\n        elif self.is_aiter_triton_fp8_bmm_enabled:\n            W_K = W_UK.transpose(0, 1)  # 16 512 128\n            W_V = W_UV.permute(1, 2, 0)  # 16 128 512\n            self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(\n                W_K, dtype=current_platform.fp8_dtype()\n            )\n            self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(\n                W_V, dtype=current_platform.fp8_dtype()\n            )\n\n            # The kernel operates on non-padded inputs. Hence, pre-compiling\n            # triton kernel to avoid runtime compilation for unseen batch sizes\n            # Pre-compile for batch sizes 1 to 1024 to cover most use-cases.\n            # On DS-R1, this step adds roughly 50s to the model loading time.\n            max_batch_size = 1024  # [ToDo] Find the optimal upper limit\n            pre_compilation_list = list(range(1, max_batch_size + 1))\n            if is_global_first_rank():\n                pre_compilation_list = tqdm(\n                    pre_compilation_list,\n                    desc=\"[Aiter Triton] Pre-compiling fp8 BMM kernel\",\n                    total=max_batch_size,\n                )\n\n            for m in pre_compilation_list:\n                x = torch.empty(\n                    (self.W_K.shape[0], m, self.W_K.shape[2]),\n                    dtype=torch.bfloat16,\n                    device=self.W_K.device,\n                )\n                rocm_aiter_ops.triton_fp8_bmm(\n                    x, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True\n                )\n\n                x = torch.empty(\n                    (self.W_V.shape[0], m, self.W_V.shape[2]),\n                    dtype=torch.bfloat16,\n                    device=self.W_V.device,\n                )\n                rocm_aiter_ops.triton_fp8_bmm(\n                    x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True\n                )\n        else:\n            # Convert from (L, N, V) to (N, L, V)\n            replace_parameter(self, \"W_UV\", W_UV.transpose(0, 1), prefer_copy=True)\n            # Convert from (L, N, P) to (N, P, L)\n            replace_parameter(self, \"W_UK_T\", W_UK.permute(1, 2, 0), prefer_copy=True)\n            if self.dcp_q_replicate:\n                self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(\n                    self.W_UK_T.contiguous(), dim=0\n                )",
+   "elide": [
+    "L1002-L1015 dcp_q_replicate 校验",
+    "L1037-L1091 ROCm aiter mxfp4/fp8 分支（含 1024 档预编译循环）"
+   ]
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/mla_attention.py",
+   "lines": "L1140-L1174",
+   "what": "get_kv_cache_spec 自报：MLAAttentionSpec(num_kv_heads=1, head_size=kv_lora_rank+qk_rope_head_dim=576)——特形 KV cache 的模型层声明；_v_up_proj 的 bmm 形状账（(N,B,L)×(N,L,V)）",
+   "code": "    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:\n        kv_cache_dtype = kv_cache_dtype_str_to_dtype(\n            self.kv_cache_dtype, vllm_config.model_config\n        )\n        return MLAAttentionSpec(\n            block_size=vllm_config.cache_config.block_size,\n            num_kv_heads=1,\n            head_size=self.head_size,\n            dtype=kv_cache_dtype,\n            cache_dtype_str=self.kv_cache_dtype,\n            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),\n            non_causal_multi_token_decode=self.non_causal_multi_token_decode,\n        )\n\n    def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):\n        # Convert from (B, N, L) to (N, B, L)\n        x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)\n        out = out.view(-1, self.num_heads, self.v_head_dim)\n        if self.is_aiter_triton_fp4_bmm_enabled:\n            out = rocm_aiter_ops.batched_gemm_a16wfp4(\n                x,\n                self.W_V,\n                self.W_V_scale,\n                out,\n                transpose_bm=True,\n                prequant=True,\n                y_scale=None,\n            )\n            x = out.view(-1, self.num_heads * self.v_head_dim)\n        elif self.is_aiter_triton_fp8_bmm_enabled:\n            # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)\n            x = rocm_aiter_ops.triton_fp8_bmm(\n                x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True, YQ=out\n            )\n        else:",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/mla_attention.py",
+   "lines": "L1360-L1397",
+   "what": "MLACommonBackend：MLA 后端家族基类——get_kv_cache_shape 返回 (num_blocks, block_size, head_size) 无 K/V 拆维（潜向量不拆 K/V）、is_mla()=True 是家族身份证",
+   "code": "class MLACommonBackend(AttentionBackend):\n    @staticmethod\n    def get_name() -> str:\n        return \"TRITON_MLA\"\n\n    @staticmethod\n    def get_builder_cls() -> type[\"MLACommonMetadataBuilder\"]:\n        return MLACommonMetadataBuilder\n\n    @staticmethod\n    def get_kv_cache_shape(\n        num_blocks: int,\n        block_size: int,\n        num_kv_heads: int,  # assumed to be 1 for MLA\n        head_size: int,\n        cache_dtype_str: str = \"auto\",\n    ) -> tuple[int, ...]:\n        return (num_blocks, block_size, head_size)\n\n    @staticmethod\n    def get_kv_cache_stride_order(\n        include_num_layers_dimension: bool = False,\n    ) -> tuple[int, ...]:\n        if include_num_layers_dimension:\n            # Default to identity permutation to signal cross-layer allocation\n            # is unsupported. Each MLA backend must opt in to support cross-layer\n            # allocation by overriding this method.\n            return (0, 1, 2, 3)\n        return (0, 1, 2)\n\n    @classmethod\n    def get_supported_head_sizes(cls) -> list[int]:\n        return [320, 576]\n\n    @classmethod\n    def is_mla(cls) -> bool:\n        return True\n",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/mla_attention.py",
+   "lines": "L1499-L1530",
+   "what": "MLADims + get_mla_dims：DSV4（有 compress_ratios 字段）统一 head_dim=512 记法 与 DSV2/V3 分离字段记法的双格式兼容——记法漂移的税由框架侧吃",
+   "code": "class MLADims:\n    q_lora_rank: int | None\n    kv_lora_rank: int\n    qk_nope_head_dim: int\n    qk_rope_head_dim: int\n    v_head_dim: int\n\n\ndef get_mla_dims(model_config: ModelConfig) -> MLADims:\n    hf_text_config = model_config.hf_text_config\n\n    # Check if this is a DeepseekV4 config (uses unified head_dim + rope_head_dim)\n    if hasattr(hf_text_config, \"compress_ratios\"):\n        # DeepseekV4 style config: unified head_dim with rope_head_dim\n        head_dim = hf_text_config.head_dim\n        rope_head_dim = hf_text_config.qk_rope_head_dim\n        return MLADims(\n            q_lora_rank=hf_text_config.q_lora_rank,\n            kv_lora_rank=head_dim,\n            qk_nope_head_dim=head_dim - rope_head_dim,\n            qk_rope_head_dim=rope_head_dim,\n            v_head_dim=head_dim,\n        )\n\n    # DeepseekV2/V3 style config\n    return MLADims(\n        q_lora_rank=getattr(hf_text_config, \"q_lora_rank\", None),\n        kv_lora_rank=hf_text_config.kv_lora_rank,\n        qk_nope_head_dim=hf_text_config.qk_nope_head_dim,\n        qk_rope_head_dim=hf_text_config.qk_rope_head_dim,\n        v_head_dim=hf_text_config.v_head_dim,\n    )",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/mla_attention.py",
+   "lines": "L1803-L1831",
+   "what": "determine_chunked_prefill_workspace_size：min(max(8×max_model_len, 4×max_num_seqs×block_size), 64×1024)——注释自带算例：workspace 2×576×64k≈144MB、若全量上投影 2×(192×128)×64k≈3GB",
+   "code": "    def determine_chunked_prefill_workspace_size(vllm_config: VllmConfig) -> int:\n        scheduler_config = vllm_config.scheduler_config\n        cache_config = vllm_config.cache_config\n        model_config = vllm_config.model_config\n\n        chunked_prefill_workspace_size = min(\n            # Try for 8 full length request or at least 4 pages per-request\n            max(\n                8 * model_config.max_model_len,\n                4 * scheduler_config.max_num_seqs * cache_config.block_size,\n            ),\n            # For long-context models try not to over-allocate limiting\n            # kv-cache space, limiting it to 64k tokens,\n            # which would result in the workspace being:\n            #   2*(576)*(64*1024) = 144mb\n            # (assuming 576 MLA head dim, and fp16)\n            # which would result in up-projected context being\n            #   2*(192*128)*(64*1024) = 3gb\n            # (assuming 192 QK head dim, 128 heads, and fp16)\n            64 * 1024,\n        )\n\n        # Enforce that we enough for at least 1 page per request\n        chunked_prefill_workspace_size = max(\n            chunked_prefill_workspace_size,\n            scheduler_config.max_num_seqs * cache_config.block_size,\n        )\n\n        return chunked_prefill_workspace_size",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/mla_attention.py",
+   "lines": "L2005-L2066",
+   "what": "MLACommonMetadataBuilder.build：split_decodes_and_prefills（decode_threshold=reorder_batch_threshold）产 num_decodes/num_decode_tokens——批已被 runner 预排成 decode→short_extend→long_extend→prefill，这里只找边界",
+   "code": "    def build(\n        self,\n        common_prefix_len: int,\n        common_attn_metadata: CommonAttentionMetadata,\n        fast_build: bool = False,\n    ) -> M:\n        num_reqs = common_attn_metadata.num_reqs\n        num_tokens = common_attn_metadata.num_actual_tokens\n        max_query_len = common_attn_metadata.max_query_len\n        max_seq_len = common_attn_metadata.max_seq_len\n\n        # Note(simon): be careful about the CPU <> GPU memory movement in this\n        # function. We should avoid GPU -> CPU sync as much as possible because\n        # it blocks on all previous kernels.\n        device = self.device\n        block_table_tensor = common_attn_metadata.block_table_tensor\n        slot_mapping = common_attn_metadata.slot_mapping\n\n        query_start_loc = common_attn_metadata.query_start_loc\n        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu\n        seq_lens = common_attn_metadata.seq_lens\n        dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens\n\n        non_causal_decode = common_attn_metadata.causal is False\n        if non_causal_decode:\n            if not (\n                self.supports_non_causal_multi_token_decode\n                and self.non_causal_multi_token_decode\n            ):\n                raise ValueError(\n                    \"Non-causal multi-token MLA requires an explicitly supported \"\n                    \"attention group.\"\n                )\n            query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]\n            num_active_reqs = int(torch.count_nonzero(query_lens > 0))\n            uniform_active_queries = num_active_reqs > 0 and bool(\n                torch.all(query_lens[:num_active_reqs] == query_lens[0])\n            )\n            trailing_graph_padding = bool(torch.all(query_lens[num_active_reqs:] == 0))\n            if not (uniform_active_queries and trailing_graph_padding):\n                raise ValueError(\n                    \"Non-causal MLA requires a uniform query block; got query \"\n                    f\"lengths {query_lens.tolist()}.\"\n                )\n            # Use exact GPU sequence lengths instead of the prefill path's CPU\n            # context-length upper bounds.\n            num_decodes = num_reqs\n            num_prefills = 0\n            num_decode_tokens = num_tokens\n            num_prefill_tokens = 0\n        else:\n            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (\n                split_decodes_and_prefills(\n                    common_attn_metadata,\n                    decode_threshold=self.reorder_batch_threshold,\n                    require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),\n                    treat_short_extends_as_decodes=not self.use_pcp,\n                )\n            )\n\n        assert num_decodes + num_prefills == num_reqs\n        assert num_decode_tokens + num_prefill_tokens == num_tokens",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/mla_attention.py",
+   "lines": "L2301-L2333",
+   "what": "_compute_prefill_context 循环头：按 workspace 容量把历史上下文切片 gather 进 workspace → kv_b_proj 上投影 → 交给 prefill 后端算一块——chunked prefill 的实测循环",
+   "code": "    def _compute_prefill_context(\n        self,\n        q: torch.Tensor,\n        kv_c_and_k_pe_cache: torch.Tensor,\n        attn_metadata: MLACommonMetadata,\n        k_scale: torch.Tensor,\n    ):\n        assert attn_metadata.prefill is not None\n        prefill_metadata = attn_metadata.prefill\n        assert prefill_metadata.prefill_backend is not None\n        assert prefill_metadata.chunked_context is not None\n\n        use_fp8_prefill = prefill_metadata.q_data_type == current_platform.fp8_dtype()\n\n        output = None\n        merge_output = None\n        iters = len(prefill_metadata.chunked_context.seq_tot)\n        workspace = prefill_metadata.chunked_context.workspace\n\n        if use_fp8_prefill:\n            q = q.to(prefill_metadata.q_data_type)\n\n        for i in range(iters):\n            toks = prefill_metadata.chunked_context.seq_tot[i]\n            if self.kv_cache_dtype == \"fp8_ds_mla\":\n                ops.cp_gather_and_upconvert_fp8_kv_cache(\n                    src_cache=kv_c_and_k_pe_cache,\n                    dst=workspace[:toks],\n                    block_table=prefill_metadata.block_table,\n                    workspace_starts=prefill_metadata.chunked_context.cu_seq_lens[i],\n                    batch_size=attn_metadata.num_prefills,\n                    seq_starts=prefill_metadata.chunked_context.starts[i],\n                )",
+   "elide": [
+    "L2325-L2333 fp8_ds_mla gather 分派（三路 gather 按缓存格式选一）"
+   ]
+  },
+  {
+   "path": "vllm/model_executor/layers/attention/mla_attention.py",
+   "lines": "L2581-L2666",
+   "what": "forward_mha（MLACommonBaseImpl）：新 token 段 kv_b_proj 上投影成 per-head K/V → prefill 后端 run_prefill_new_tokens；有历史上下文时 _compute_prefill_context 分块算 + merge_attn_states 按 LSE 精确合并（softmax 分块合并恒等式）",
+   "code": "    def forward_mha(  # type: ignore[override]\n        self,\n        q: torch.Tensor,\n        kv_c_normed: torch.Tensor,\n        k_pe: torch.Tensor,\n        kv_c_and_k_pe_cache: torch.Tensor,\n        attn_metadata: MLACommonMetadata,\n        k_scale: torch.Tensor,\n        output: torch.Tensor,\n        output_scale: torch.Tensor | None = None,\n    ) -> None:\n        assert attn_metadata.prefill is not None\n        assert self.dcp_world_size != -1\n\n        prefill_metadata = attn_metadata.prefill\n        assert prefill_metadata.prefill_backend is not None\n        use_fp8_prefill = prefill_metadata.q_data_type == current_platform.fp8_dtype()\n\n        # Convert q to FP8 if FP8 prefill attention is enabled\n        if use_fp8_prefill:\n            q = q.to(prefill_metadata.q_data_type)\n\n        has_context = prefill_metadata.chunked_context is not None\n        assert output_scale is None or not has_context, (\n            \"Fused FP8 output is only wired for the non-chunked-context path\"\n        )\n\n        kv_nope = self.kv_b_proj(kv_c_normed)[0].view(\n            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim\n        )\n        k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)\n        k = self._concat_k_nope_k_pe(k_nope, k_pe)\n\n        if use_fp8_prefill:\n            k = k.to(prefill_metadata.q_data_type)\n            v = v.to(prefill_metadata.q_data_type)\n\n        output_prefill = prefill_metadata.prefill_backend.run_prefill_new_tokens(\n            q=q,\n            k=k,\n            v=v,\n            return_softmax_lse=has_context,\n            out=(\n                output.view(-1, self.num_heads, self.v_head_dim)\n                if output_scale is not None\n                else None\n            ),\n            output_scale=output_scale,\n        )\n\n        if has_context:\n            assert prefill_metadata.chunked_context is not None\n            suffix_output, suffix_lse = output_prefill\n            if self.dcp_world_size > 1:\n                context_output, context_lse = (\n                    self._context_parallel_compute_prefill_context(\n                        q,\n                        kv_c_and_k_pe_cache,\n                        attn_metadata,\n                        k_scale=k_scale,\n                        dcp_world_size=self.dcp_world_size,\n                    )\n                )\n            else:\n                context_output, context_lse = self._compute_prefill_context(\n                    q, kv_c_and_k_pe_cache, attn_metadata, k_scale\n                )\n\n            context_output = context_output[..., : self.v_head_dim]\n            suffix_output = suffix_output[..., : self.v_head_dim]\n\n            output = output.view(-1, self.num_heads, self.v_head_dim)\n            merge_attn_states(\n                output=output,\n                prefix_output=context_output,\n                prefix_lse=context_lse,\n                suffix_output=suffix_output,\n                suffix_lse=suffix_lse,\n                prefill_tokens_with_context=prefill_metadata.chunked_context.prefill_tokens_with_context,\n            )\n        elif output_scale is None:\n            # With output_scale set, backend already wrote into `output` in place.\n            assert isinstance(output_prefill, torch.Tensor)\n            output_prefill = output_prefill[..., : self.v_head_dim]\n            output_prefill = output_prefill.flatten(start_dim=-2)\n            output.copy_(output_prefill)",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/attention/backends/utils.py",
+   "lines": "L564-L635",
+   "what": "split_decodes_and_prefills：按 query_len 与 decode_threshold 找批内 decode/prefill 边界——docstring 写明批序约定 decode→short_extend→long_extend→prefill 与 require_uniform 语义",
+   "code": "def split_decodes_and_prefills(\n    common_attn_metadata: CommonAttentionMetadata,\n    decode_threshold: int = 1,\n    require_uniform: bool = False,\n    treat_short_extends_as_decodes: bool = True,\n) -> tuple[int, int, int, int]:\n    \"\"\"\n    Assuming a reordered batch, finds the boundary between prefill and decode\n    requests.\n\n    The batch is expected to be ordered as:\n        decode → short_extend → long_extend → prefill\n\n    Args:\n        common_attn_metadata: CommonAttentionMetadata object containing the\n            batch metadata.\n        decode_threshold: The maximum query length to be considered a decode.\n        require_uniform: If True, requires that all decode requests have the\n            same query length. When set, some queries may be considered prefills\n            even if they are <= decode_threshold, in order to ensure uniformity.\n        treat_short_extends_as_decodes: If True (default), short extends\n            (query_len <= threshold but still prefilling) are counted as\n            decodes. If False, they are counted as prefills.\n\n    Returns:\n        num_decodes: The number of decode requests.\n        num_prefills: The number of prefill requests.\n        num_decode_tokens: The number of tokens in the decode requests.\n        num_prefill_tokens: The number of tokens in the prefill requests.\n    \"\"\"\n    max_query_len = common_attn_metadata.max_query_len\n    num_reqs = common_attn_metadata.num_reqs\n    num_tokens = common_attn_metadata.num_actual_tokens\n    query_start_loc = common_attn_metadata.query_start_loc_cpu\n\n    if (\n        max_query_len <= decode_threshold\n        and (not require_uniform or decode_threshold <= 1)\n        and treat_short_extends_as_decodes\n    ):\n        return num_reqs, 0, num_tokens, 0\n\n    query_lens = query_start_loc[1:] - query_start_loc[:-1]\n    if query_lens[0].item() > decode_threshold:\n        # first request is not decode, so no decode requests\n        return 0, num_reqs, 0, num_tokens\n\n    if require_uniform:\n        # check if we are in a padded uniform batch; this is used for full-CGs, some\n        # requests may have a query length of 0 but since they are padding its fine\n        # to treat them as decodes (ensures num_decodes matches the captured size)\n        if treat_short_extends_as_decodes and torch.all(\n            (query_lens == query_lens[0]) | (query_lens == 0)\n        ):\n            return num_reqs, 0, num_tokens, 0  # all decodes\n        is_prefill = query_lens != query_lens[0]\n    else:\n        is_prefill = query_lens > decode_threshold\n\n    if not treat_short_extends_as_decodes:\n        assert common_attn_metadata.is_prefilling is not None\n        is_prefill |= common_attn_metadata.is_prefilling\n\n    if not torch.any(is_prefill):\n        return num_reqs, 0, num_tokens, 0\n\n    first_prefill = is_prefill.int().argmax(dim=-1).item()\n    num_decodes = first_prefill\n    num_prefills = num_reqs - num_decodes\n    num_decode_tokens = query_start_loc[first_prefill].item()\n    num_prefill_tokens = num_tokens - num_decode_tokens\n    return (num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens)",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/attention/backends/utils.py",
+   "lines": "L665-L724",
+   "what": "reorder_batch_to_split_decodes_and_prefills：把持久批重排成 decode→short_extend→long_extend→prefill 四区（互斥类别划分 + 换位）——为『同一前向两段数学』铺批形",
+   "code": "def reorder_batch_to_split_decodes_and_prefills(\n    input_batch: \"InputBatch\",\n    scheduler_output: \"SchedulerOutput\",\n    decode_threshold: int = 1,\n) -> bool:\n    \"\"\"\n    Reorders the batch to split into prefill and decode requests; places all\n    requests with <= decode_threshold tokens at the front of the batch.\n\n    The batch is reordered into 4 regions:\n        decode:        (num_scheduled <= threshold AND is not prefilling)\n        short_extend:  (num_scheduled <= threshold AND is chunked prefilling)\n        long_extend:   (num_scheduled > threshold AND is chunked prefilling)\n        prefill:       (num_computed == 0)   # First chunks\n\n    Returns:\n        True if the batch was modified, False otherwise.\n    \"\"\"\n    num_reqs = len(input_batch.req_ids)\n    num_scheduled_tokens = [\n        scheduler_output.num_scheduled_tokens[id] for id in input_batch.req_ids\n    ]\n    num_scheduled_tokens_np = np.array(num_scheduled_tokens)\n    num_computed_tokens_np = input_batch.num_computed_tokens_cpu[:num_reqs]\n    num_prompt_tokens_np = input_batch.num_prompt_tokens[:num_reqs]\n\n    has_context = num_computed_tokens_np > 0\n    is_below_threshold = num_scheduled_tokens_np <= decode_threshold\n    done_prefilling = num_computed_tokens_np >= num_prompt_tokens_np\n\n    # Mutually exclusive categories (exactly one True per request):\n    # 1. No context yet -> prefill\n    # 2. Has context, above threshold -> long_extend\n    # 3. Has context, below threshold, still prefilling -> short_extend\n    # 4. Has context, below threshold, done prefilling -> decode\n    is_pure_prefill = ~has_context\n    is_long_extend = has_context & ~is_below_threshold\n    is_short_extend = has_context & is_below_threshold & ~done_prefilling\n    is_decode = has_context & is_below_threshold & done_prefilling\n\n    # Desired order: decode → short_extend → long_extend → prefill\n    req_regions = np.zeros(num_reqs, dtype=np.int32)  # 0 = decode by default\n    req_regions[is_short_extend] = 1\n    req_regions[is_long_extend] = 2\n    req_regions[is_pure_prefill] = 3\n\n    num_decodes = int(is_decode.sum())\n    num_short_extends = int(is_short_extend.sum())\n    num_long_extends = int(is_long_extend.sum())\n    num_prefills = int(is_pure_prefill.sum())\n\n    target_regions = np.repeat(\n        [0, 1, 2, 3],\n        [num_decodes, num_short_extends, num_long_extends, num_prefills],\n    ).astype(np.int32)\n\n    needs_swap = req_regions != target_regions\n\n    if not needs_swap.any():\n        return False",
+   "elide": [
+    "L725 起实际换位执行段（continue in source）"
+   ]
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L1115-L1137",
+   "what": "_may_reorder_batch：每拍 _prepare_inputs 前按 reorder_batch_threshold 重排持久批——docstring 原话点名 MLA（compute-bound vs memory-bound 分离）；threshold 取全部 KV 组 builder 声明的最小值",
+   "code": "    def _may_reorder_batch(self, scheduler_output: \"SchedulerOutput\") -> None:\n        \"\"\"\n        Update the order of requests in the batch based on the attention\n        backend's needs. For example, some attention backends (namely MLA) may\n        want to separate requests based on if the attention computation will be\n        compute-bound or memory-bound.\n\n        Args:\n            scheduler_output: The scheduler output.\n        \"\"\"\n        # Attention free models have zero kv_cache_groups, however models\n        # like Mamba are also attention free but use the kv_cache for\n        # keeping its internal state. This is why we check the number\n        # of kv_cache groups instead of solely checking\n        # for self.model_config.is_attention_free.\n        if len(self.kv_cache_config.kv_cache_groups) == 0:\n            return\n\n        if self.reorder_batch_threshold is not None:\n            reorder_batch_to_split_decodes_and_prefills(\n                self.input_batch,\n                scheduler_output,\n                decode_threshold=self.reorder_batch_threshold,",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/attention/backends/mla/flashmla.py",
+   "lines": "L118-L122",
+   "what": "FlashMLAMetadataBuilder：reorder_batch_threshold=128 且注释 'process small prefills with decode pathway'——后端自报『≤128 token 的小 prefill 也走 MQA 吸收』；FA-MLA 同款=512",
+   "code": "class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):\n    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH\n    query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM\n    reorder_batch_threshold: int = 128  # process small prefills with decode pathway\n    # ^ TODO(matt): tune this",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/kv_cache_interface.py",
+   "lines": "L389-L426",
+   "what": "MLAAttentionSpec：MLAAttention.get_kv_cache_spec 的产物——cache_dtype_str/compress_ratio/alignment/model_version 四个 MLA 专属字段；real_page_size_bytes 分格式计字节（fp8_ds_mla 的 584B/656B 特账）",
+   "code": "class MLAAttentionSpec(FullAttentionSpec):\n    # TODO(Lucas/Chen): less hacky way to do this\n    cache_dtype_str: str | None = None\n    # DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.\n    alignment: int | None = None  # Default to None for no padding.\n    compress_ratio: int = 1  # Default to 1 for no compression.\n    model_version: str | None = None\n    # Marks draft groups that flatten a non-causal query block into decode rows.\n    non_causal_multi_token_decode: bool = False\n\n    def __post_init__(self):\n        super().__post_init__()\n        _apply_alignment_padding(self)\n\n    @property\n    def storage_block_size(self) -> int:\n        return self.block_size // self.compress_ratio\n\n    @property\n    def real_page_size_bytes(self) -> int:\n        if self.cache_dtype_str == \"fp8_ds_mla\":\n            if self.model_version == \"deepseek_v4\":\n                # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.\n                # head_size stays semantic (512); bytes are determined here.\n                return self.storage_block_size * 584\n            # V3.2 main MLA: 656-byte custom layout (kv_lora_rank=512 +\n            # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.\n            return self.block_size * 656\n        if self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:\n            head_dim = self.head_size // 2\n        else:\n            head_dim = self.head_size\n        return (\n            self.storage_block_size\n            * self.num_kv_heads\n            * head_dim\n            * get_dtype_size(self.dtype)\n        )",
+   "elide": []
+  },
+  {
+   "path": "vllm/models/deepseek_v4/attention.py",
+   "lines": "L203-L213",
+   "what": "DSV4 compress_ratio 解析：逐层读 config.compress_ratios[layer_id]（MTP 层恒 1）——同一模型里不同层每 4 token 才存一格潜向量",
+   "code": "        self.nope_head_dim = self.head_dim - self.rope_head_dim\n        self.n_groups = config.o_groups\n        self.n_local_groups = self.n_groups // tp_size\n        self.window_size = config.sliding_window\n        # NOTE(zyongye) Compress ratio can't be 0\n        # we do this for because MTP layer is not included\n        # in the compress ratio list\n        if layer_id < config.num_hidden_layers:\n            self.compress_ratio = max(1, config.compress_ratios[layer_id])\n        else:\n            self.compress_ratio = 1",
+   "elide": []
+  },
+  {
+   "path": "vllm/models/deepseek_v4/attention.py",
+   "lines": "L655-L674",
+   "what": "DSV4 get_kv_cache_spec：compress_ratio>1 层报 MLAAttentionSpec(compress_ratio=self.compress_ratio, alignment=576/512, model_version='deepseek_v4')；compress_ratio<=1 层返回 None（SWA 段由 DeepseekV4SWACache 另报）",
+   "code": "    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:\n        if (\n            self.compress_ratio <= 1\n        ):  # SWA part. Allocated separately as DeepseekV4SWACache.\n            return None\n        # fp8_ds_mla is a UE8M0 block-scaled uint8 layout and needs 576B\n        # alignment; plain bf16 / per-tensor fp8 rows use natural element-size\n        # pages.\n        uses_fp8_ds_mla_layout = self.kv_cache_dtype == \"fp8_ds_mla\"\n        return MLAAttentionSpec(\n            block_size=vllm_config.cache_config.block_size,\n            num_kv_heads=1,\n            head_size=self.head_dim,\n            dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,\n            compress_ratio=self.compress_ratio,\n            cache_dtype_str=self.kv_cache_dtype,\n            alignment=576 if uses_fp8_ds_mla_layout else 512,\n            model_version=\"deepseek_v4\",\n            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),\n        )",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/attention/backends/mla/sparse_swa.py",
+   "lines": "L87-L102",
+   "what": "DeepseekV4SWACache.get_kv_cache_spec：SWA 滑窗子缓存以自己独立的 prefix 注册进 static_forward_context、自报 SlidingWindowMLASpec——模型层的『一个注意力层拆多个 KV 子缓存』实证",
+   "code": "    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:\n        # fp8_ds_mla's UE8M0 paged layout needs 576B alignment; contiguous\n        # bf16/fp8 cache uses the natural element-size page.\n        uses_fp8_ds_mla_layout = self.cache_config.cache_dtype == \"fp8_ds_mla\"\n        return SlidingWindowMLASpec(\n            block_size=self.block_size,\n            num_kv_heads=1,\n            head_size=self.head_dim,\n            dtype=self.dtype,\n            sliding_window=self.window_size,\n            cache_dtype_str=self.cache_config.cache_dtype,\n            # 576B for FlashMLA packing; 512B for FlashInfer sparse (#44577).\n            alignment=576 if uses_fp8_ds_mla_layout else 512,\n            model_version=\"deepseek_v4\",\n            kv_quant_mode=get_kv_quant_mode(self.cache_config.cache_dtype),\n        )",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/core/kv_cache_utils.py",
+   "lines": "L1781-L1852",
+   "what": "get_kv_cache_groups 四级分组：全同 spec→一组 / 全同 token 槽数（UniformType）→一组 / DSV4 混合→group_and_unify_kv_cache_specs 多组 / 一般混合→页大小归一后多组——MLA 模型是这条链的最大用户",
+   "code": "def get_kv_cache_groups(\n    vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]\n) -> list[KVCacheGroupSpec]:\n    \"\"\"\n    Split the layers in the model into groups with the same KV cache spec.\n\n    Args:\n        vllm_config: The global VllmConfig\n        kv_cache_spec: The kv cache spec of each attention layer in the model\n\n    Returns:\n        The generated KVCacheGroups\n    \"\"\"\n    if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:\n        unify_hybrid_kv_cache_specs(kv_cache_spec)\n\n    if is_kv_cache_type_attention_free(kv_cache_spec):\n        # This returns an empty list to allow for the KVCacheManager to handle\n        # attention free models.\n        return []\n\n    if is_kv_cache_spec_uniform(kv_cache_spec):\n        # KV cache of all layers are the same, which is true for\n        # most models. Allocate the same amount of memory for\n        # each layer.\n        return _get_kv_cache_groups_uniform_spec(kv_cache_spec)\n    elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):\n        # All layers need the same number of token slots (e.g., all layers are\n        # full attention, or all layers are sliding window attention with the\n        # same window size). Put all layers into one group.\n        return _get_kv_cache_groups_uniform_type(uniform_spec)\n    elif grouped_specs := group_and_unify_kv_cache_specs(kv_cache_spec):\n        # DeepseekV4 case: All layers need the same number of token slots,\n        # yet some layers are full attention while others are sliding window\n        # attention in different sizes. Need to group layers into multiple\n        # UniformTypeKVCacheSpecs.\n        kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)\n        _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)\n        return kv_cache_groups\n\n    # Pull HiddenStateCacheSpec layers out before the general multi-group\n    # path so they don't affect page-size unification or grouping.\n    hidden_specs = {\n        k: v for k, v in kv_cache_spec.items() if isinstance(v, HiddenStateCacheSpec)\n    }\n    filtered_spec = {\n        k: v\n        for k, v in kv_cache_spec.items()\n        if not isinstance(v, HiddenStateCacheSpec)\n    }\n\n    # Prefer preserving each layer's cache semantics. If physical pages cannot\n    # be unified, try a supported allocation-only fallback before failing.\n    try:\n        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)\n    except NotImplementedError:\n        fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)\n        if fallback_groups is None:\n            raise\n        return fallback_groups\n    groups = _get_kv_cache_groups_uniform_page_size(filtered_spec)\n\n    # Add hidden-state layers back with page aligned to the common page.\n    if hidden_specs:\n        common_page = get_uniform_page_size([g.kv_cache_spec for g in groups])\n        for name, spec in hidden_specs.items():\n            per_token = spec.num_kv_heads * spec.head_size * get_dtype_size(spec.dtype)\n            new_bs = max(common_page // per_token, 1)\n            aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)\n            groups.append(KVCacheGroupSpec([name], aligned))\n\n    return groups",
+   "elide": [
+    "L1826-L1846 HiddenStateCacheSpec 抽出与页对齐回填"
+   ]
+  },
+  {
+   "path": "vllm/v1/attention/backends/mla/prefill/registry.py",
+   "lines": "L34-L57",
+   "what": "MLAPrefillBackendEnum：MLA 的第二套后端家族（prefill 专用：FLASH_ATTN/FLASHINFER/TRTLLM_RAGGED/TOKENSPEED_MLA/ROCM_AITER_FA）——decode 后端与 prefill 后端各选各的",
+   "code": "class MLAPrefillBackendEnum(Enum, metaclass=_MLAPrefillBackendEnumMeta):\n    \"\"\"Enumeration of all supported MLA prefill backends.\"\"\"\n\n    FLASH_ATTN = (\n        \"vllm.v1.attention.backends.mla.prefill.flash_attn.FlashAttnPrefillBackend\"\n    )\n    FLASHINFER = (\n        \"vllm.v1.attention.backends.mla.prefill.flashinfer.FlashInferPrefillBackend\"\n    )\n    TRTLLM_RAGGED = (\n        \"vllm.v1.attention.backends.mla.prefill.trtllm_ragged.\"\n        \"TrtllmRaggedPrefillBackend\"\n    )\n    TOKENSPEED_MLA = (\n        \"vllm.v1.attention.backends.mla.prefill.tokenspeed_mla.\"\n        \"TokenspeedMLAPrefillBackend\"\n    )\n    ROCM_AITER_FA = (\n        \"vllm.v1.attention.backends.mla.prefill.aiter_flash_attn.\"\n        \"AiterFlashAttnPrefillBackend\"\n    )\n    # Placeholder for third-party/custom backends - must be registered before use\n    # set to None to avoid alias with other backend, whose value is an empty string\n    CUSTOM = None",
+   "elide": []
+  }
+ ],
+ "theory": [
+  "每 token KV 账（数字例，配 ch24 primer）：DSV3 若 128 头 MHA，每 token 每 layer 缓存 128×(192+128)=40960 元素；MLA 只存 kv_lora_rank+qk_rope_head_dim=512+64=576（≈71 倍压缩）；Llama-70B GQA（8 KV 头×128 维×2）=2048（MLA 约 3.6 倍于 GQA 的节省）。注意：q 侧低秩（q_lora_rank=1536）是算力/参数账，不进 cache——cache 只省 KV 侧。另 MLA cache 是『单头』：num_kv_heads=1，比 GQA 的 8 头还少一层维度。",
+  "吸收的数学（结合律，本章核心推导）：attention score 的 nope 段 = q_nope·k_nope = q_nope·(W_UK^T·c) = (q_nope^T·W_UK^T)^T·c——乘法结合律让『先上投影 K 再点积』与『先把 q 乘进潜空间再点积』结果相同；输出侧同理 o = attn_out·W_UV。decode 侧选后者：每步只需把 [B,N,128] 的 q 变 [B,N,512]，而 cache 里的 576 维潜向量一行都不用动、也不用为 128 头物化 K。代价：W_UK/W_UV 以 bmm 副本存两份（mla_attention.py:L1094-L1096），且 q 侧每步多乘一次。",
+  "Sq/Skv 代价模型（两腿选择依据，文件头 L13-L21）：prefill 时 Sq/Skv≈1（新 token 多、历史少）——上投影 K/V 的算力被大量 query 摊薄，走 compute-friendly MHA；decode 时 Sq/Skv≈1/上千（每步 1 个新 token、历史全量）——瓶颈是把 KV 从显存搬进计算单元的字节数，576 维 MQA 只搬一份潜向量，走 data-movement-friendly 吸收。定性量纲：MHA 腿读字节 ∝ N·(P+R)·Skv（128 头全展开），MQA 腿 ∝ (L+R)·Skv（单份潜向量）；FLOPs 反向（L=512 > P=128，每 query-token 多算）。",
+  "chunked prefill workspace 账（源码注释原话，mla_attention.py:L1808-L1823）：workspace = min(max(8×max_model_len, 4×max_num_seqs×block_size), 64×1024) token；按 576 维 fp16 算 workspace 2×576×64×1024 ≈ 144MB；若不 chunk、全量上投影则 2×(192×128)×64×1024 ≈ 3GB——21 倍差距，这就是必须分块的原因。分块正确性靠 merge_attn_states：softmax 分块合并的精确恒等式（max 平移 + exp 加权归一，与 ch20 primer 的 online softmax 同一手法的块间推广），两块的 LSE 合并出与整块算完全一致的输出。",
+  "reorder threshold 的工程含义（flashmla.py:L120-L121 注释 'process small prefills with decode pathway'）：FlashMLA 把 ≤128 token 的 chunked-prefill 尾段也划进 MQA 段（FA-MLA 更激进=512）——这些段按 MHA 展开算力不划算（query 太少摊不动上投影），按吸收走单份潜向量更便宜；阈值是后端经验值（注释 'TODO(matt): tune this'），runner 取全部组的最小值统一执行（gpu_model_runner.py:L7220-L7238）。",
+  "fp8_ds_mla 字节账（flashmla_sparse.py:L64-L84 注释 + kv_cache_interface.py:L409-L416）：DSV4 每token 584B = 448B fp8 NoPE + 128B RoPE（64 个 bf16，**不量化保精度**）+ 8B scale（7 个 ue8m0 + 1B pad）；DSV3.2 = 512B fp8 NoPE + 16B（4 个 fp32 scale）+ 128B RoPE = 656B。对照 bf16 576×2=1152B：DSV4 布局 ≈2 倍压缩。alignment=576（FlashMLA 打包）/512（FlashInfer #44577）是页对齐口径、不是每 token 字节数。",
+  "compress_ratio=4 存储账：storage_block_size = block_size // compress_ratio（kv_cache_interface.py:L403-L405）——每 4 个 token 才占 1 个存储块位，cache 总量÷4；代价是读写都过 DeepseekCompressor（compress→norm→RoPE→store 融合核）且 indexer 只对压缩后的候选选 top-k（机制归 ch26）。注意 head_size 保持语义值 512、字节在 real_page_size_bytes 特算——『语义维数』与『物理字节』分离记账。",
+  "两条数值路径的等价性边界：MHA 腿与 MQA 腿数学等价的前提是 nope 段无 RoPE（RoPE 旋转是逐 token 对角阵，不可与 W_UK 交换——所以 RoPE 只打 rope 段、解耦存放，mla.py:L201-L203 是这个数学约束的代码化身）。这解释了『为什么 head_dim 要拆 nope/rope 两段』（v2 ch28 theory 的解耦 RoPE 维度账在 v0.27.1 仍然成立，锚点换成 mla.py:L189-L203）。"
+ ],
+ "mechanisms": [
+  {
+   "id": "ch25-m01",
+   "name": "MLA 层装配：选型三岔 + 投影积木 + Wrapper/插座双层",
+   "kind": "layout",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/model_executor/models/deepseek_v2.py:L959",
+    "vllm/model_executor/models/deepseek_v2.py:L1010-L1066",
+    "vllm/model_executor/layers/mla.py:L36",
+    "vllm/model_executor/layers/mla.py:L110-L127"
+   ],
+   "note": "DecoderLayer 三岔选型（use_mha/use_mla/普通）→ 六块投影积木（fused_qkv_a_proj 融合下投影、q 低秩链、kv_a_layernorm、kv_b_proj、o_proj）→ MLAModules 注入 Wrapper → 内层 MLAAttention 插座（kv_b_proj 引用交接）。外层 Wrapper 是 PluggableLayer（mla.py:L35 OOT 后门）。"
+  },
+  {
+   "id": "ch25-m02",
+   "name": "外层前向低秩链与解耦 RoPE：q 侧 1536 潜、KV 侧 576 潜、RoPE 只打 rope 段",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "paper_origin": {
+    "paper": "arXiv:2405.04434",
+    "sections": [
+     "§2.1"
+    ]
+   },
+   "source_anchors": [
+    "vllm/model_executor/layers/mla.py:L150-L226",
+    "vllm/model_executor/layers/mla.py:L189-L203"
+   ],
+   "note": "Wrapper.forward 全程走读（DSV3 维度例：hidden 7168→q_c 1536→q 128×192；kv_lora 576=512+64）。kv_a_layernorm 只打 kv_c 不打 k_pe；RoPE 只旋转 rope 段——nope 段可被吸收的数学前提。worked example 建议：一条 token 流过外层的形状表。源码头注 L23-L24 引用该论文与 FlashInfer PR #551。"
+  },
+  {
+   "id": "ch25-m03",
+   "name": "MHA 展开腿（prefill）：kv_b_proj 上投影成完整 K/V 做标准注意力",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "paper_origin": {
+    "paper": "arXiv:2405.04434",
+    "sections": [
+     "§2.1"
+    ]
+   },
+   "source_anchors": [
+    "vllm/model_executor/layers/attention/mla_attention.py:L2581",
+    "vllm/model_executor/layers/attention/mla_attention.py:L2608-L2612",
+    "vllm/model_executor/layers/attention/mla_attention.py:L820-L829"
+   ],
+   "note": "W_UK/W_UV 以原 kv_b_proj 形状用：潜向量 [Sq,512] → [Sq,128,(128+128)] 上投影，拼 rope 段成 per-head K/V，交 prefill 后端做标准 MHA。worked example：矩阵账本 W_DQ/W_UQ/W_UK/W_UV（文件头 L44-L63）配 DSV3 数字。"
+  },
+  {
+   "id": "ch25-m04",
+   "name": "MQA 吸收腿（decode）：q 乘 W_UK^T 降进潜空间、576 维单头 MQA、输出乘 W_UV 上投影",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "paper_origin": {
+    "paper": "arXiv:2405.04434",
+    "sections": [
+     "§2.1",
+     "附录 C（矩阵吸收）"
+    ]
+   },
+   "source_anchors": [
+    "vllm/model_executor/layers/attention/mla_attention.py:L888",
+    "vllm/model_executor/layers/attention/mla_attention.py:L919",
+    "vllm/model_executor/layers/attention/mla_attention.py:L949",
+    "vllm/model_executor/layers/attention/mla_attention.py:L1154-L1174"
+   ],
+   "note": "本章招牌机制：结合律推导（theory[1]）+ bmm 形状账 (N,B,P)×(N,P,L)→(N,B,L) + _v_up_proj (N,B,L)×(N,L,V)。worked example：两头 q 的吸收数值走一遍（q_nope[N=2,P=128]×W_UK_T[N,128,512]）。"
+  },
+  {
+   "id": "ch25-m05",
+   "name": "权重吸收重排：process_weights_after_loading 拆 W_UK/W_UV 造两份 bmm 副本",
+   "kind": "layout",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/model_executor/layers/attention/mla_attention.py:L994",
+    "vllm/model_executor/layers/attention/mla_attention.py:L1033-L1035",
+    "vllm/model_executor/layers/attention/mla_attention.py:L1094-L1096"
+   ],
+   "note": "kv_b_proj 权重 .T 拆两半 → W_UV.transpose(0,1)（N,L,V）与 W_UK.permute(1,2,0)（N,P,L）replace_parameter 常驻——prefill 用原形状、decode 用副本，同一权重两种形状存两份（注释原话：没有量化 bmm、16-bit 副本开销低）。"
+  },
+  {
+   "id": "ch25-m06",
+   "name": "同一前向混批分流：num_mqa_tokens=num_decode_tokens 在 token 维切一刀",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "paper_origin": {
+    "paper": "arXiv:2405.04434",
+    "sections": [
+     "§2.1"
+    ]
+   },
+   "source_anchors": [
+    "vllm/model_executor/layers/attention/mla_attention.py:L771-L772",
+    "vllm/model_executor/layers/attention/mla_attention.py:L812-L829",
+    "vllm/model_executor/layers/attention/mla_attention.py:L831-L838"
+   ],
+   "note": "比 v0.21 的两条独立 forward 更优雅的 v0.27 形态：批被排成 decode→…→prefill 后，token 维前缀走 MQA、后缀走 MHA，两段写回同一 output。worked example：混批 5 请求（3 decode+2 prefill chunk）的 token 切分表。含 num_actual_tokens 裁剪（cudagraph padding 语义）。"
+  },
+  {
+   "id": "ch25-m07",
+   "name": "批重排四区：reorder_batch_to_split_decodes_and_prefills + 后端自报阈值",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/attention/backends/utils.py:L665",
+    "vllm/v1/attention/backends/utils.py:L564",
+    "vllm/v1/worker/gpu_model_runner.py:L1115-L1137",
+    "vllm/v1/attention/backends/mla/flashmla.py:L120-L121",
+    "vllm/v1/worker/gpu_model_runner.py:L7220-L7238"
+   ],
+   "note": "互斥四区划分（decode/short_extend/long_extend/prefill）+ 换位；threshold=各组 builder 声明最小值（FlashMLA=128 'process small prefills with decode pathway'、FA-MLA=512）。worked example：换位前后批序对照。spec decode 时阈值被 _init_reorder_batch_threshold（backend.py:L659-L693）按 num_speculative_tokens 抬高——预告 ch33。"
+  },
+  {
+   "id": "ch25-m08",
+   "name": "chunked prefill workspace 与 LSE merge：上投影大张量永不整段物化",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "paper_origin": {
+    "paper": "arXiv:2205.14135",
+    "sections": [
+     "§3.1（online softmax / 分块 LSE 合并的同源手法）"
+    ]
+   },
+   "source_anchors": [
+    "vllm/model_executor/layers/attention/mla_attention.py:L1803-L1831",
+    "vllm/model_executor/layers/attention/mla_attention.py:L2301-L2333",
+    "vllm/model_executor/layers/attention/mla_attention.py:L2404-L2422",
+    "vllm/model_executor/layers/attention/mla_attention.py:L2652-L2660"
+   ],
+   "note": "64k workspace（144MB）兜 3GB 上投影；分块 gather→kv_b_proj→算块→merge_attn_states（LSE 精确合并恒等式，ch20 online-softmax 的块间推广）。git df71917cf（3.9% E2E TTFT 优化）实证此代价真实。worked example：3 块 LSE 合并数值表。"
+  },
+  {
+   "id": "ch25-m09",
+   "name": "特形 KV spec 自报：MLAAttentionSpec(num_kv_heads=1, head_size=576) 与潜向量 cache 形状",
+   "kind": "protocol",
+   "difficulty": "core",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/model_executor/layers/attention/mla_attention.py:L1140-L1152",
+    "vllm/v1/kv_cache_interface.py:L389-L397",
+    "vllm/model_executor/layers/attention/mla_attention.py:L1370-L1379"
+   ],
+   "note": "MLACommonBackend.get_kv_cache_shape=(num_blocks, block_size, head_size) 无 K/V 拆维（潜向量不拆 K/V，与 ch21 站 7 的 FA (B,H,N,2D) 对照）；get_supported_head_sizes=[320,576]。spec 的 MLA 专属字段（cache_dtype_str/compress_ratio/alignment/model_version）是 KV 账本分组键。"
+  },
+  {
+   "id": "ch25-m10",
+   "name": "MLA 后端家族两套：decode 家族（is_mla 身份证+forward_mha/forward_mqa 双抽象）与 prefill 家族（五选一）",
+   "kind": "protocol",
+   "difficulty": "supporting",
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/model_executor/layers/attention/mla_attention.py:L1360-L1397",
+    "vllm/v1/attention/backend.py:L1009-L1063",
+    "vllm/v1/attention/backends/mla/prefill/registry.py:L34-L57",
+    "vllm/model_executor/layers/mla.py:L35"
+   ],
+   "note": "特形 cache 与通用后端不兼容 → MLA 独立家族；v0.27 再拆第二轴：decode 后端（FlashMLA/FlashInfer-MLA/Triton-MLA…ch21 优先级表选）与 prefill 后端（FLASH_ATTN/FLASHINFER/TRTLLM_RAGGED/TOKENSPEED_MLA/ROCM_AITER_FA）各选各的。选择机制归 ch21，本章只立『为什么 MLA 要两套』。"
+  },
+  {
+   "id": "ch25-m11",
+   "name": "hybrid 组化（MLA 侧）：模型层逐层自报 spec → get_kv_cache_groups 四级分组",
+   "kind": "dataflow",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/worker/gpu_model_runner.py:L7800-L7832",
+    "vllm/v1/core/kv_cache_utils.py:L1781-L1852",
+    "vllm/v1/kv_cache_interface.py:L429-L468"
+   ],
+   "note": "全同 spec→一组 / 全同 token 槽数→一组 / DSV4 grouped→多组 / 页归一→多组；MLAAttentionSpec.merge 断言组内四字段全同。ch14『一组一管理器』的 MLA 兑现：DSV4 压缩层+SWA+indexer 三类 spec 同池。block_size 协商（SWA 64 与 C4A [256/4] 共享物理张量——sparse_swa.py:L77-L82 注释）也在此挂。"
+  },
+  {
+   "id": "ch25-m12",
+   "name": "DSV4 第三代：上下文压缩 compress_ratio=4 + fp8_ds_mla 584B 布局",
+   "kind": "layout",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/models/deepseek_v4/attention.py:L210-L213",
+    "vllm/models/deepseek_v4/attention.py:L655-L674",
+    "vllm/v1/kv_cache_interface.py:L403-L416",
+    "vllm/models/deepseek_v4/compressor.py:L211-L220"
+   ],
+   "note": "compress_ratios 逐层表（MTP 层恒 1）；storage_block_size=block_size//4；584B=448 fp8 NoPE+128 bf16 RoPE（不量化保精度）+8 scale；DeepseekCompressor compress→norm→RoPE→store。worked example：字节账对照表（584/656/1152B）。indexer 机制本身归 ch26。"
+  },
+  {
+   "id": "ch25-m13",
+   "name": "DSV3.2 656B 布局与 DSV4 584B 布局的字节账分叉：real_page_size_bytes 的模型版本特账",
+   "kind": "config",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/kv_cache_interface.py:L407-L416",
+    "vllm/v1/attention/backends/mla/flashmla_sparse.py:L64-L84"
+   ],
+   "note": "同一 fp8_ds_mla 字符串下按 model_version 分账：V3.2=512 fp8+16(4 fp32 scale)+128 RoPE=656B；V4=448+128+8(7 ue8m0+1pad)=584B。『语义 head_size 与物理字节分离』的记账法。"
+  },
+  {
+   "id": "ch25-m14",
+   "name": "DSV4 输出侧低秩：o_lora_rank/o_groups（wo_a bmm + wo_b）与 inverse-RoPE",
+   "kind": "layout",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/models/deepseek_v4/attention.py:L199-L205",
+    "vllm/models/deepseek_v4/attention.py:L244-L262"
+   ],
+   "note": "第三代把低秩从 KV 侧推到输出侧：o 先按组压进 o_lora_rank 再投回 hidden（wo_a.is_bmm 组化）；_o_proj 含 inverse-RoPE（平台子类实现）。点到为止，完整走读归 ch28 capstone。"
+  },
+  {
+   "id": "ch25-m15",
+   "name": "indexer 占位与章界：compress_ratio==4 层才建 DeepseekV4Indexer、IndexerCache 自报 spec",
+   "kind": "config",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/models/deepseek_v4/attention.py:L277-L297",
+    "vllm/models/deepseek_v4/attention.py:L677-L710",
+    "vllm/v1/attention/backends/mla/sparse_swa.py:L87-L102"
+   ],
+   "note": "本章只登记『谁在建 indexer、它的 cache 也是 spec 生产者』；top-k 选 token、IndexCache 复用、NSA/DSA 三支路全归 ch26。DSV3.2 侧的 Indexer（deepseek_v2.py:L645）同理。"
+  },
+  {
+   "id": "ch25-m16",
+   "name": "get_mla_dims 记法漂移税：DSV4 统一 head_dim=512 与 DSV2/V3 分离字段双格式兼容",
+   "kind": "config",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/model_executor/layers/attention/mla_attention.py:L1499-L1530"
+   ],
+   "note": "DSV4 config 用 head_dim(512)+qk_rope_head_dim(64)（nope=512-64=448）；DSV2/V3 用 qk_nope_head_dim/kv_lora_rank/v_head_dim 分离字段。框架侧一处函数吸收两代记法——下游全部只认 MLADims。"
+  }
+ ],
+ "subtraction_plan": {
+  "delete": [
+   {
+    "what": "mla_attention.py 全部 DCP/PCP 分布式路径：dcp_world_size>1 的 all-gather/LSE 归并（forward_impl L902-L946）、_context_parallel_compute_prefill_context（L2424-L2579）、reorg_kvcache（L2162 起）、pcp.py 的 maybe_gather_mla_latent_cache_inputs/finalize_mla_pcp_decode 钩子、dcp_a2a、W_UK_T_dcp_qrep 与 dcp_q_replicate 分支（L103-L104/L196-L213/L1002-L1015/L1097-L1100）",
+    "why_safe": "精简版单进程 TP=1/DCP=1，这些分支的条件恒 False；PCP 仅 prefill_context_parallel>1 时激活"
+   },
+   {
+    "what": "ROCm aiter 三分支：is_aiter_triton_fp8_bmm/fp4_bmm 的 bmm 替换（L854-L873）、process_weights 的 mxfp4/fp8 量化与 1024 档预编译循环（L1037-L1091）、_v_up_proj 的 aiter 分支（L1160-L1169）",
+    "why_safe": "CUDA 路径走 else 分支的 torch.bmm；aiter 开关在 ROCm 平台才为 True"
+   },
+   {
+    "what": "融合输出量化整族：_detect_output_quant_key（L295-L328）、forward_impl 的 quant_key 分支与三种 FP8/FP4 输出打包（L705-L721、L751-L752、L797-L810、L951-L987）、_DecodeConcatQuantFP8/QuantFP8 构造（L580-L589）、supports_quant_query_input 分支（L893-L898）",
+    "why_safe": "量化融合（MoE 输入直喂 FP8 注意力输出）是 ch27 的耦合面；output_scale=None 时全部分支不触发"
+   },
+   {
+    "what": "稀疏 MLA 分支：forward_impl 的 is_sparse use_mha/use_masked_mha 覆写与 _DSV32_MASKED_MHA_THRESHOLDS 阈值表（L774-L795、L1533-L1563）、indexer 调用位（mla.py:L205-L206）、topk 相关字段",
+    "why_safe": "稀疏 MLA（DSV3.2/DSV4 indexer）机制归 ch26；is_sparse=False 时全部短路"
+   },
+   {
+    "what": "spec-decode 专有：reshape_query_for_spec_decode（后端内）、QueryLenSupport 与 _init_reorder_batch_threshold 的 num_speculative_tokens 抬阈值联动（backend.py:L659-L693 的 spec 分支）、build_for_cudagraph_capture",
+    "why_safe": "精简版无投机解码；reorder 阈值语义用静态值即可讲清"
+   },
+   {
+    "what": "batch-invariant 路径：VLLM_BATCH_INVARIANT 的 prefix-caching 禁用告警（L466-L479）与 FlashMLA 手工 tile_scheduler 段（flashmla.py:L287-L315）",
+    "why_safe": "环境变量默认 False；该路径仅复现实验用"
+   },
+   {
+    "what": "flashmla 后端 forward_mqa 里 fp8/非 fp8 双 kernel 分派保留其一、can_return_lse_for_decode 与 DCP LSE 返回只剩单进程形态",
+    "why_safe": "单格式（bf16）即可演示 MQA kernel 接口契约"
+   },
+   {
+    "what": "DeepseekV4Attention 的 aux_stream 三路并行（attn_gemm_parallel_execute/execute_in_parallel/maybe_execute_in_parallel 与 ln_events）、eager_scratch_pool 缓冲池、PREFILL_CHUNK_SIZE 预留路径",
+    "why_safe": "aux_streams=None 时 execute_in_parallel 退化为串行（ROCm 分支即如此），语义不变；scratch 池是显存优化"
+   },
+   {
+    "what": "kv_transfer_utils.maybe_transfer_kv_layer 钩子与非 causal multi-token decode（build 的 L2028-L2054 分支）",
+    "why_safe": "KV connector 归 ch16 面；non_causal 仅特定 draft 组标记"
+   }
+  ],
+  "must_keep": [
+   {
+    "symbol": "MultiHeadLatentAttentionWrapper",
+    "why": "外层主角：低秩链+解耦 RoPE+o_proj 全在这一类"
+   },
+   {
+    "symbol": "MLAModules",
+    "why": "装配契约：模型侧打包投影交 Wrapper 的数据结构"
+   },
+   {
+    "symbol": "DeepseekV2MLAAttention",
+    "why": "模型侧装配者：投影积木的拼装现场"
+   },
+   {
+    "symbol": "fused_qkv_a_proj",
+    "why": "W_DQ 与 W_DKV+W_KR 融合下投影——q 低秩链与 KV 压缩共一层的实证"
+   },
+   {
+    "symbol": "kv_a_proj_with_mqa",
+    "why": "无 q 低秩时的 KV 下投影（对照分支）"
+   },
+   {
+    "symbol": "q_a_layernorm",
+    "why": "q 潜向量归一化——低秩链中点"
+   },
+   {
+    "symbol": "q_b_proj",
+    "why": "q 上投影（1536→128×192）"
+   },
+   {
+    "symbol": "kv_a_layernorm",
+    "why": "潜向量归一化只打 kv_c 不打 k_pe——吸收数学的组成部件"
+   },
+   {
+    "symbol": "kv_b_proj",
+    "why": "上投影权重本体（MHA 腿用原形状、吸收腿的拆分源）"
+   },
+   {
+    "symbol": "MLAAttention",
+    "why": "内层插座：分流决策、写腿、spec 自报都在这"
+   },
+   {
+    "symbol": "forward_impl",
+    "why": "两腿分岔点（num_mqa/num_mha 切刀）"
+   },
+   {
+    "symbol": "forward_mha",
+    "why": "MHA 展开腿入口"
+   },
+   {
+    "symbol": "forward_mqa",
+    "why": "MQA 吸收腿入口（后端抽象）"
+   },
+   {
+    "symbol": "num_mqa_tokens",
+    "why": "分流变量之一——token 维切刀"
+   },
+   {
+    "symbol": "num_mha_tokens",
+    "why": "分流变量之二"
+   },
+   {
+    "symbol": "num_decode_tokens",
+    "why": "metadata 三计数之核心（=num_mqa_tokens 的来源）"
+   },
+   {
+    "symbol": "W_UK_T",
+    "why": "吸收副本一：(N,P,L) bmm 形状"
+   },
+   {
+    "symbol": "W_UV",
+    "why": "吸收副本二：(N,L,V) bmm 形状"
+   },
+   {
+    "symbol": "process_weights_after_loading",
+    "why": "权重吸收重排现场（拆分+replace_parameter）"
+   },
+   {
+    "symbol": "_v_up_proj",
+    "why": "吸收腿输出上投影（bmm 形状账）"
+   },
+   {
+    "symbol": "_compute_prefill_context",
+    "why": "chunked 分块循环现场"
+   },
+   {
+    "symbol": "merge_attn_states",
+    "why": "LSE 精确合并——分块正确性的数学担当"
+   },
+   {
+    "symbol": "determine_chunked_prefill_workspace_size",
+    "why": "workspace 定容公式（144MB vs 3GB 注释）"
+   },
+   {
+    "symbol": "MLAAttentionSpec",
+    "why": "特形 KV spec——分组原料"
+   },
+   {
+    "symbol": "get_kv_cache_spec",
+    "why": "自报入口（MLAAttention 与 DeepseekV4Attention 两处）"
+   },
+   {
+    "symbol": "head_size",
+    "why": "=kv_lora_rank+qk_rope_head_dim=576——潜 cache 形状"
+   },
+   {
+    "symbol": "kv_lora_rank",
+    "why": "潜维 512——一切账的基"
+   },
+   {
+    "symbol": "qk_nope_head_dim",
+    "why": "nope 段 128——可吸收段"
+   },
+   {
+    "symbol": "qk_rope_head_dim",
+    "why": "rope 段 64——不可吸收段"
+   },
+   {
+    "symbol": "MLACommonMetadataBuilder",
+    "why": "分流 builder（split 调用+workspace+阈值声明）"
+   },
+   {
+    "symbol": "MLACommonMetadata",
+    "why": "三计数 metadata 载体"
+   },
+   {
+    "symbol": "split_decodes_and_prefills",
+    "why": "边界计数函数（四计数返回）"
+   },
+   {
+    "symbol": "reorder_batch_to_split_decodes_and_prefills",
+    "why": "四区重排函数（互斥划分+换位）"
+   },
+   {
+    "symbol": "reorder_batch_threshold",
+    "why": "后端自报阈值（FlashMLA=128）"
+   },
+   {
+    "symbol": "MLACommonBackend",
+    "why": "家族基类：特形 cache shape+is_mla"
+   },
+   {
+    "symbol": "is_mla",
+    "why": "家族身份证（断言+选择键）"
+   },
+   {
+    "symbol": "MLAPrefillBackendEnum",
+    "why": "第二套 prefill 家族注册表"
+   },
+   {
+    "symbol": "get_mla_dims",
+    "why": "双记法兼容（DSV4 统一 head_dim）"
+   },
+   {
+    "symbol": "get_kv_cache_groups",
+    "why": "hybrid 组化四级分流入口"
+   },
+   {
+    "symbol": "compress_ratio",
+    "why": "DSV4 上下文压缩比（spec 字段+逐层解析）"
+   },
+   {
+    "symbol": "storage_block_size",
+    "why": "block_size//compress_ratio——压缩存储账"
+   },
+   {
+    "symbol": "real_page_size_bytes",
+    "why": "584B/656B 特账入口"
+   },
+   {
+    "symbol": "DeepseekV4Attention",
+    "why": "第三代 MLA 层（compress_ratio 分层+spec 自报）"
+   },
+   {
+    "symbol": "DeepseekV4SWACache",
+    "why": "SWA 子缓存——一层多子缓存实证"
+   },
+   {
+    "symbol": "alignment",
+    "why": "576/512 页对齐口径（spec 字段）"
+   },
+   {
+    "symbol": "flash_mla_with_kvcache",
+    "why": "MQA kernel 真实调用面（decode 腿落点）"
+   }
+  ]
+ },
+ "foreshadow_due": {
+  "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，不跑）",
+  "should_plant": [],
+  "should_payoff": [],
+  "note": "pedagogy-plan.foreshadows 十条无一 planted=25 或 paid=25——本章不埋不收。途经伏笔（不回收、只回指）：F10（量化与 kernel 的耦合，planted 19 paid 27）在本章 fp8_ds_mla 布局与融合输出量化门（mha_use_quant_output）处是活的——正文可一句『这块耦合 ch27 打开』；F9（L0 逐章点亮）照例由开篇 L2 图承接。下一章种子：站 9 的 indexer 调用位与 m12/m15 的 compress_ratio=4 层即 ch26 的 NSA/DSA 入口，收尾回指段按 WRITING-CONTRACT §7 埋。"
+ },
+ "l2_spec": "book/cartography/l2-specs/ch25.json（同批产出；stations 与本档 stations 同一份账本）"
+}

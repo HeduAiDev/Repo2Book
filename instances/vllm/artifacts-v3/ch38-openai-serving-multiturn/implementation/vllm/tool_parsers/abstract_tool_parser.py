@@ -1,0 +1,385 @@
+# SPDX-License-Identifier: Apache-2.0
+# SOURCE: vllm/tool_parsers/abstract_tool_parser.py —— 忠实承载：ToolParser
+# 基类与 ToolParserManager 注册表逐字（supports_required_and_named /
+# structural_tag_model / engine_based_streaming 三个类属性是统一 Parser 层
+# WC6 的组合契约面）；adjust_request 的 ResponsesRequest 装配臂删（delete[13]）。
+import importlib
+import json
+import os
+from collections.abc import Callable, Sequence
+from functools import cached_property
+from typing import Any
+
+from openai.types.responses import (
+    ResponseFormatTextJSONSchemaConfig,
+    ResponseTextConfig,
+)
+from openai.types.responses.function_tool import FunctionTool
+
+import vllm.envs as envs
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionRequest,
+    ChatCompletionToolsParam,
+)
+from vllm.entrypoints.openai.engine.protocol import (
+    DeltaMessage,
+    ExtractedToolCallInformation,
+)
+from vllm.logger import init_logger
+from vllm.sampling_params import (
+    StructuredOutputsParams,
+)
+from vllm.tokenizers import TokenizerLike
+from vllm.tool_parsers.utils import Tool, get_json_schema_from_tools
+from vllm.utils.collection_utils import is_list_of
+from vllm.utils.import_utils import import_from_path
+
+__all__ = ["Tool"]
+
+logger = init_logger(__name__)
+
+# SUBTRACTED: vllm/tool_parsers/abstract_tool_parser.py:L26-L28
+# ResponsesRequest 导入——delete[13] Responses API 面；本文件所有
+# `ChatCompletionRequest | ResponsesRequest` 注解随删退化为 ChatCompletionRequest。
+
+
+# SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L43-L220 —— ToolParser 逐字
+class ToolParser:
+    """
+    Abstract ToolParser class that should not be used directly. Provided
+    properties and methods should be used in
+    derived classes.
+    """
+
+    # When True (default), the serving layer uses the standard JSON-based
+    # parsing for tool_choice="required" and named function tool_choice,
+    # which works for models where guided decoding produces well-formed
+    # JSON output (e.g. Hermes).
+    # Subclasses set False when the standard parsing does not work for
+    # their model's output format (e.g. GLM models that use XML).  When
+    # False, the serving layer falls back to the tool_parser's
+    # extract_tool_calls / extract_tool_calls_streaming methods for
+    # required/named tool_choice, treating them the same as "auto".
+    supports_required_and_named: bool = True
+    # xgrammar builtin structural tag model key. Subclasses set this when
+    # their parsed tool-call syntax matches a builtin xgrammar format.
+    structural_tag_model: str | None = None
+    engine_based_streaming: bool = False
+
+    # SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L65-L71
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if (
+            cls.structural_tag_model is not None
+            and envs.VLLM_ENFORCE_STRICT_TOOL_CALLING
+        ):
+            cls.supports_required_and_named = False
+
+    # SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L73-L92
+    def __init__(
+        self,
+        tokenizer: TokenizerLike,
+        tools: list[Tool] | None = None,
+    ):
+        self.prev_tool_call_arr: list[dict] = []
+        # the index of the tool call that is currently being parsed
+        self.current_tool_id: int = -1
+        self.current_tool_name_sent: bool = False
+        self.streamed_args_for_tool: list[str] = []
+
+        self.model_tokenizer = tokenizer
+        if tools:
+            self.tools: list[ChatCompletionToolsParam | FunctionTool] = [
+                tool
+                for tool in tools
+                if isinstance(tool, (ChatCompletionToolsParam, FunctionTool))
+            ]
+        else:
+            self.tools = []
+
+    # SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L94-L111
+    def get_remaining_unstreamed_args(self) -> str:
+        """Return tool call arguments parsed but not yet streamed."""
+        if not self.prev_tool_call_arr:
+            return ""
+        index = len(self.prev_tool_call_arr) - 1
+        args = self.prev_tool_call_arr[index].get("arguments", {})
+        if isinstance(args, str):
+            expected = args
+        else:
+            expected = json.dumps(args, ensure_ascii=False)
+        actual = (
+            self.streamed_args_for_tool[index]
+            if index < len(self.streamed_args_for_tool)
+            else ""
+        )
+        if expected.startswith(actual):
+            return expected[len(actual) :]
+        return ""
+
+    # SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L113-L117
+    @cached_property
+    def vocab(self) -> dict[str, int]:
+        # NOTE: Only TokenizersBackend is guaranteed to have .vocab
+        # whereas all tokenizers have .get_vocab()
+        return self.model_tokenizer.get_vocab()
+
+    # SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L119-L166 —— adjust_request
+    # 逐字（ResponsesRequest 装配臂删——delete[13]）
+    def adjust_request(
+        self,
+        request: ChatCompletionRequest,
+    ) -> ChatCompletionRequest:
+        # If there are no tools, return the request as is.
+        if not request.tools:
+            return request
+
+        # Set structured output params when tool constraints are derived from
+        # the tool schema. Unified parsers handle model-specific structural
+        # tags before calling into the tool parser.
+        structured_outputs = getattr(request, "structured_outputs", None)
+        if (
+            structured_outputs is not None
+            and structured_outputs.structural_tag is not None
+        ):
+            return request
+
+        json_schema_from_tool = get_json_schema_from_tools(
+            tool_choice=request.tool_choice, tools=request.tools
+        )
+        # Set structured output params for tool calling
+        if json_schema_from_tool is not None:
+            if isinstance(request, ChatCompletionRequest):
+                # tool_choice: "Forced Function" or "required" will override
+                # structured output json settings to make tool calling work correctly
+                request.structured_outputs = StructuredOutputsParams(
+                    json=json_schema_from_tool  # type: ignore[call-arg]
+                )
+                request.response_format = None
+            # SUBTRACTED: vllm/tool_parsers/abstract_tool_parser.py:L149-L164
+            # ResponsesRequest 的 ResponseTextConfig 装配臂——delete[13]。
+
+        return request
+
+    # SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L168-L185 —— get_structural_tag
+    def get_structural_tag(
+        self,
+        request: ChatCompletionRequest,
+        *,
+        reasoning: bool = False,
+    ):
+        if self.structural_tag_model is None:
+            return None
+        if not envs.VLLM_ENFORCE_STRICT_TOOL_CALLING:
+            return None
+        from vllm.tool_parsers.structural_tag_registry import get_model_structural_tag
+
+        return get_model_structural_tag(
+            model=self.structural_tag_model,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            reasoning=reasoning,
+        )
+
+    # SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L187-L199
+    def extract_tool_calls(
+        self, model_output: str, request: ChatCompletionRequest
+    ) -> ExtractedToolCallInformation:
+        """
+        Static method that should be implemented for extracting tool calls from
+        a complete model-generated string.
+        Used for non-streaming responses where we have the entire model response
+        available before sending to the client.
+        Static because it's stateless.
+        """
+        raise NotImplementedError(
+            "AbstractToolParser.extract_tool_calls has not been implemented!"
+        )
+
+    # SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L201-L220
+    def extract_tool_calls_streaming(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+        previous_token_ids: Sequence[int],
+        current_token_ids: Sequence[int],
+        delta_token_ids: Sequence[int],
+        request: ChatCompletionRequest,
+    ) -> DeltaMessage | None:
+        """
+        Instance method that should be implemented for extracting tool calls
+        from an incomplete response; for use when handling tool calls and
+        streaming. Has to be an instance method because it requires state -
+        the current tokens/diffs, but also the information about what has
+        previously been parsed and extracted (see constructor)
+        """
+        raise NotImplementedError(
+            "AbstractToolParser.extract_tool_calls_streaming has not been implemented!"
+        )
+
+
+# SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L223-L378 —— ToolParserManager 逐字
+class ToolParserManager:
+    """
+    Central registry for ToolParser implementations.
+
+    Supports two modes:
+      - Eager (immediate) registration via `register_module`
+      - Lazy registration via `register_lazy_module`
+    """
+
+    tool_parsers: dict[str, type[ToolParser]] = {}
+    lazy_parsers: dict[str, tuple[str, str]] = {}  # name -> (module_path, class_name)
+
+    # SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L235-L250
+    @classmethod
+    def get_tool_parser(cls, name: str) -> type[ToolParser]:
+        """
+        Retrieve a registered or lazily registered ToolParser class.
+
+        If the parser is lazily registered,
+        it will be imported and cached on first access.
+        Raises KeyError if not found.
+        """
+        if name in cls.tool_parsers:
+            return cls.tool_parsers[name]
+
+        if name in cls.lazy_parsers:
+            return cls._load_lazy_parser(name)
+
+        raise KeyError(f"Tool parser '{name}' not found.")
+
+    # SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L252-L272
+    @classmethod
+    def _load_lazy_parser(cls, name: str) -> type[ToolParser]:
+        """Import and register a lazily loaded parser."""
+        module_path, class_name = cls.lazy_parsers[name]
+        try:
+            mod = importlib.import_module(module_path)
+            parser_cls = getattr(mod, class_name)
+            if not issubclass(parser_cls, ToolParser):
+                raise TypeError(
+                    f"{class_name} in {module_path} is not a ToolParser subclass."
+                )
+            cls.tool_parsers[name] = parser_cls  # cache
+            return parser_cls
+        except Exception as e:
+            logger.exception(
+                "Failed to import lazy tool parser '%s' from %s: %s",
+                name,
+                module_path,
+                e,
+            )
+            raise
+
+    # SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L274-L301
+    @classmethod
+    def _register_module(
+        cls,
+        module: type[ToolParser],
+        module_name: str | list[str] | None = None,
+        force: bool = True,
+    ) -> None:
+        """Register a ToolParser class immediately."""
+        if not issubclass(module, ToolParser):
+            raise TypeError(
+                f"module must be subclass of ToolParser, but got {type(module)}"
+            )
+
+        if module_name is None:
+            module_name = module.__name__
+
+        if isinstance(module_name, str):
+            module_names = [module_name]
+        elif is_list_of(module_name, str):
+            module_names = module_name
+        else:
+            raise TypeError("module_name must be str, list[str], or None.")
+
+        for name in module_names:
+            if not force and name in cls.tool_parsers:
+                existed = cls.tool_parsers[name]
+                raise KeyError(f"{name} is already registered at {existed.__module__}")
+            cls.tool_parsers[name] = module
+
+    # SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L303-L315
+    @classmethod
+    def register_lazy_module(cls, name: str, module_path: str, class_name: str) -> None:
+        """
+        Register a lazy module mapping.
+
+        Example:
+            ToolParserManager.register_lazy_module(
+                name="kimi_k2",
+                module_path="vllm.tool_parsers.kimi_k2_parser",
+                class_name="KimiK2ToolParser",
+            )
+        """
+        cls.lazy_parsers[name] = (module_path, class_name)
+
+    # SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L317-L361
+    @classmethod
+    def register_module(
+        cls,
+        name: str | list[str] | None = None,
+        force: bool = True,
+        module: type[ToolParser] | None = None,
+    ) -> type[ToolParser] | Callable[[type[ToolParser]], type[ToolParser]]:
+        """
+        Register module immediately or lazily (as a decorator).
+
+        Usage:
+            @ToolParserManager.register_module("kimi_k2")
+            class KimiK2ToolParser(ToolParser):
+                ...
+
+        Or:
+            ToolParserManager.register_module(module=SomeToolParser)
+        """
+        if not isinstance(force, bool):
+            raise TypeError(f"force must be a boolean, but got {type(force)}")
+
+        # Immediate registration
+        if module is not None:
+            cls._register_module(module=module, module_name=name, force=force)
+            return module
+
+        # Decorator usage
+        def _decorator(obj: type[ToolParser]) -> type[ToolParser]:
+            module_path = obj.__module__
+            class_name = obj.__name__
+
+            if isinstance(name, str):
+                names = [name]
+            elif name is not None and is_list_of(name, str):
+                names = name
+            else:
+                names = [class_name]
+
+            for n in names:
+                # Lazy mapping only: do not import now
+                cls.lazy_parsers[n] = (module_path, class_name)
+
+            return obj
+
+        return _decorator
+
+    # SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L363-L366
+    @classmethod
+    def list_registered(cls) -> list[str]:
+        """Return names of all eagerly and lazily registered tool parsers."""
+        return sorted(set(cls.tool_parsers.keys()) | set(cls.lazy_parsers.keys()))
+
+    # SOURCE: vllm/tool_parsers/abstract_tool_parser.py:L368-L378
+    @classmethod
+    def import_tool_parser(cls, plugin_path: str) -> None:
+        """Import a user-defined parser file from arbitrary path."""
+
+        module_name = os.path.splitext(os.path.basename(plugin_path))[0]
+        try:
+            import_from_path(module_name, plugin_path)
+        except Exception:
+            logger.exception(
+                "Failed to load module '%s' from %s.", module_name, plugin_path
+            )

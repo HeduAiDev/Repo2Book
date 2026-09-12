@@ -1,0 +1,162 @@
+{
+  "chapter_id": "ch31",
+  "slug": "ch31-bitmask-enforcement",
+  "produced_by": "researcher",
+  "date": "2026-09-12",
+  "scope_note": "v3 ch31『bitmask 落地』的外部背景真相源。复用 v2 同主题章（artifacts/ch32-structured-output）research 四张卡（Triton / apply_token_bitmask_inplace / rollback 外部口径 / pinned+stream——最后一张拆掉，见下），逐条重锚 v0.27.1（xgrammar pin >=0.2.1,<1.0.0，requirements/common.txt L27；最新 release v0.2.6，2026-09-09），并重抓全部 xgrammar/PyTorch 官方文档核实到 2026-09-12 现状。新增三张 v2 未覆盖、本章真用到的卡：(4) ndarray vs tensor 跨进程序列化效率的外部原理（m09/站 9 注释的『为什么』）；(5) record_stream 与 PyTorch 缓存分配器的内存安全（m17，v3 全书无任何章讲过——grep 复核）；(6) CUDA 异步发射模型官方锚（introduces『两段式 execute GPU 窗口』的底座）。另补一张本章并行填充（m06）真正依赖的外部机制卡：(7) GIL 与原生扩展释放 GIL——xgrammar 的 fill_next_token_bitmask 经 TVM FFI 绑定默认释放 GIL，这是 vLLM 线程池并行填表能真并行的外部前提（证据链四环全部一手核实）。v2 的 pinned-memory-and-cuda-streams 卡不再整卡复用：pinned/DMA/PCIe/non_blocking H2D 归 v3 ch18（CpuGpuBuffer 主案例），流/事件/锁页三原语归 v3 ch12（同一 PyTorch 官方 CUDA 语义文档），本章只在 record_stream 卡里保留新增量。 -inf 与 softmax 正交性归 ch29+dossier theory；位打包格式归 ch30；后端生态 competing_set 归 ch30（ch31 不再产）；V1/V2 runner 选择器是 pin 源码解读归 analyst。7 张卡全部真查过官方文档/仓库/论文一手出处，逐条带访问日期。",
+  "concepts": [
+    {
+      "id": "triton-language",
+      "term": "Triton（GPU kernel 编写语言）",
+      "kind": "external_project",
+      "one_line": "OpenAI 发布的 Python 嵌入式 GPU 编程语言：像写 NumPy 一样按『一块数据』（tile）编程，编译器自动搞定线程组织、内存合并、同步这些手写 CUDA 才需要操心的细节。",
+      "what_it_is": "普通人写 GPU 代码要么用现成库（如 xgrammar 自带的 CUDA/CPU 实现），要么手写 CUDA C++——后者要自己管理成千上万个线程怎么分组、怎么从显存搬数据进更快的片上内存、线程间怎么同步，门槛很高。Triton 把编程模型抬高一层：开发者只需要写『每个并行实例（Triton 叫 program）处理一块固定大小的数据（tile/block）』的逻辑——从显存读一块、算一块、写回一块——编译器自己把这套 tile 级代码翻译成高效的底层 GPU 指令（NVIDIA 上是 PTX）。ch31 站 16 的 `_apply_grammar_bitmask_kernel` 正是这种写法：`tl.program_id` 认领『这次归我管哪一块』，`tl.load`/`tl.store` 配合 `mask` 参数一次性读写一整块数据并自动挡住越界，`BLOCK_SIZE: tl.constexpr` 告诉编译器这个块大小在编译期就固定、可以据此做向量化优化。",
+      "background": "Triton 最初是 Philippe Tillet 在哈佛读博期间（导师 H.T. Kung、David Cox）的研究项目，2019 年以论文《Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations》发表于 MAPL/PLDI 2019；OpenAI 在此基础上重新实现，2021-07-28 以 1.0 版本开源发布（MIT 协议）。它要解决的问题是：手写 CUDA 能榨出最高性能但开发周期长、门槛高；纯用现成库（cuBLAS 等）灵活性差，遇到库里没有的算子（比如本章这种『按位掩码原地改 logits』）就没现成实现。Triton 的定位是中间地带——用 Python 写，接近专家级 CUDA 的性能。它后来被深度集成进 PyTorch 的 torch.compile（作为默认 GPU 代码生成后端之一），也被 vLLM、SGLang 等推理框架广泛用来写自定义 kernel。截至本次核实（2026-09-12），官方教程仍在线、项目仍以 OpenAI/Tillet 主导、MIT 协议开源；是否已转移到更中立的基金会治理，未查到权威定论，写作不宜断言。",
+      "example": "官方教程的最小 kernel（向量加法，逐行对应 ch31 站 16 kernel 里同名 API 的通用语义；2026-09-12 重抓确认在线）：\n\n```python\n@triton.jit\ndef add_kernel(x_ptr, y_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):\n    pid = tl.program_id(axis=0)\n    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n    mask = offsets < n_elements\n    x = tl.load(x_ptr + offsets, mask=mask)\n    y = tl.load(y_ptr + offsets, mask=mask)\n    tl.store(output_ptr + offsets, x + y, mask=mask)\n\ngrid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )\nadd_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)\n```\n\n逐词对应读者在 ch31 站 16 见到的写法：`tl.program_id(axis=0)`——『我是哪一个并行实例』，ch31 kernel 里对应 `bitmask_idx = tl.program_id(0)`（认领哪一行掩码）；`BLOCK_SIZE: tl.constexpr`——块大小编译期常量，ch31 同名参数（8192）语义相同；`mask=` 参数——用一个布尔数组同时表达『越界的位置』或『不该写的位置』，ch31 的 `tl.store(..., mask=bitmask & (block_offset < vocab_size))` 是把『语义上非法』和『物理上越界』两个条件按位与成一个 mask，同一 API 习惯用法的复合形态；`grid = (...)` 决定总共起多少个并行实例，ch31 是二维 `(num_masks, cdiv(V, BLOCK_SIZE))`——第一维对应上例的 pid，第二维是『词表也要分块』。",
+      "links": [
+        "https://triton-lang.org/main/getting-started/tutorials/01-vector-add.html",
+        "https://github.com/triton-lang/triton",
+        "https://pldi19.sigplan.org/details/mapl-2019-papers/1/Triton-An-Intermediate-Language-and-Compiler-for-Tiled-Neural-Network-Computations"
+      ],
+      "sources": [
+        {"url": "https://triton-lang.org/main/getting-started/tutorials/01-vector-add.html", "got": "v3 重核（2026-09-12）：官方教程在线且含完整 add_kernel——@triton.jit、tl.program_id(axis=0)、tl.load/tl.store 配 mask、BLOCK_SIZE: tl.constexpr、grid=triton.cdiv 全部在场，并附与 PyTorch 的正确性/带宽对比", "accessed": "2026-09-12"},
+        {"url": "https://pldi19.sigplan.org/details/mapl-2019-papers/1/Triton-An-Intermediate-Language-and-Compiler-for-Tiled-Neural-Network-Computations", "got": "（v2 存量核实，拷贝保留）2019 MAPL/PLDI 论文题目与作者（Tillet, Kung, Cox）及会议信息", "accessed": "2026-07-24"},
+        {"url": "https://openai.com/index/triton/", "got": "（v2 存量核实，经搜索摘要）OpenAI 官方发布博客：Python 嵌入式 DSL、目标是无需专家级 CUDA 知识写出接近专家级性能的 kernel", "accessed": "2026-07-24"},
+        {"url": "https://aiwiki.ai/wiki/openai_triton", "got": "（v2 存量核实）历史脉络：Tillet 哈佛博士项目起源、OpenAI 2021-07-28 以 1.0 版本 MIT 协议开源发布", "accessed": "2026-07-24"}
+      ],
+      "confidence": "high",
+      "confidence_note": "论文与官方教程一手核实（教程 2026-09-12 再次重抓确认在线）；OpenAI 发布博客经搜索摘要交叉印证（营销数字如『25 行匹配 cuBLAS』建议模糊化或不引）。治理归属现状未查到 2026 权威定论，背景段用『据本次核实』限定。",
+      "writer_note": "ch31 是 v3 全书第一次逐行走读一个真实 Triton kernel（站 16 / m19），站内已把 program_id/constexpr/load-store-mask 全部结合真实代码讲透——**不需要再展开教程**。这条研究的价值在站 16 开头第一次点『Triton』时的一句括注：『OpenAI 的 GPU kernel 编写语言，和手写 CUDA 比不用管线程分组/内存合并，编译器包了』，一句话立住 vLLM 为什么用它写自定义 kernel；深入交给 links。v3 ch29 提过『Triton pivot 核』但没教语言，不存在重复。"
+    },
+    {
+      "id": "xgrammar-bitmask-ops",
+      "term": "xgrammar 掩码函数族：allocate_token_bitmask / apply_token_bitmask_inplace / fill_next_token_bitmask",
+      "kind": "external_concept",
+      "one_line": "xgrammar 官方把『算出哪些 token 合法』和『把掩码真正打到 logits 上』两件事都做成了现成函数——vLLM V1 路径直接调 apply_token_bitmask_inplace 落地 -inf，V2 自写 Triton kernel 就是对着它的语义改写。",
+      "what_it_is": "xgrammar（ch30 主角、本章反复出现的语法后端库）的掩码工具分三层。**分配**：`allocate_token_bitmask(batch_size, vocab_size) -> torch.Tensor` 返回形状 `(batch, ceil(vocab_size/32))` 的 **int32** CPU 张量——用 int32 而不是直觉上的 uint32 是因为老版本 PyTorch 没有 uint32；vLLM 的 backend 适配层（vllm/v1/structured_output/backend_xgrammar.py）把它包成单参数 `allocate_token_bitmask(batch_size)`（词表尺寸构造时已记住），所以 pin 源码里看到的是一参形态。**填充**：`GrammarMatcher.fill_next_token_bitmask(bitmask, index=0)` 把第 index 行填成『下一个位置合法的 token 集』——两个关键性质（2026-09-12 抓官方 API 文档核实）：一是**不改变 matcher 状态**（推进状态是另一个方法 accept_token 的事——这正是 ch31 串行分支 apply_bitmask/advance_grammar 二分、以及『填表推进全是试探、rollback 只退推进』在库 API 层的根据）；二是返回值 need_apply（全放行时返回 False 的优化提示，vLLM pin 未消费此返回值）。**落地**：`apply_token_bitmask_inplace(logits, bitmask, *, vocab_size=None, indices=None, backend='auto')` 原地修改 logits——位打包格式官方钉死：32 个 token 挤进一个 int32，**某位是 0 = 该 token 被掩掉（logit 置 -inf），是 1 = 放行**；`indices` 指定只改哪些 batch 行，官方文档明说这正是『结构化/非结构化请求混批』的用法（vLLM 传的 out_indices/indices 张量就是这个参数）；backend 可选 cpu/cuda/triton/torch_compile/torch_native，文档称 triton 为『默认 CUDA 实现』、cuda 为『面向 C++ 推理引擎的原生实现』。另有配套 `reset_token_bitmask`（整表重置为全允许掩码——vLLM 没调它，而是自己在预分配缓冲上 `fill_(-1)` 整行放行，语义等价）。",
+      "background": "几乎每个接入 xgrammar 的推理引擎都要重新实现一遍同样的位运算落地，所以库方统一提供按需选后端的实现（其 Triton 路径有『异步拷贝到设备』等针对性优化提交史）。vLLM 两条 worker 路径对它的态度正好相反：V1 直接调 `xgr.apply_token_bitmask_inplace`（站 13 payoff）；V2 自写 kernel 的头注就写着『Adapted from xgrammar 的 apply_token_bitmask_inplace_triton』——不是平行发明，是同一语义的改写，动机是 V2 需要把『掩码行→logits 行』映射做成 GPU 常驻缓冲+间接寻址的形态，直接调库函数拿不到这种控制权。文档还给出一个设备注意：bitmask 默认分配在 CPU 上，用 CUDA 后端前用户应自己先搬到 GPU——vLLM 的 pinned+non_blocking H2D 链（站 13）正是这句官方建议的工程化版本，且 vLLM 注释点明自己搬（而非让 xgrammar 收 Python list 后内部搬）能 non_blocking 且库内无 cpu sync。另外 xgrammar 自己还提供 `BatchGrammarMatcher`（max_threads 可调）——官方文档原话『利用多线程加速，批大时特别有用』的**原生多线程批量填充**类，vLLM v0.27.1 没用它、而是自己拿 Python ThreadPoolExecutor 逐 matcher 调 fill_next_token_bitmask（见 gil-native-extension-parallel-fill 卡——能真并行的机制前提同查证）。",
+      "example": "官方 API 文档钉死的调用形态（2026-09-12 核实，与 vLLM 站 13 的真实调用逐参对应）：\n\n```python\nimport torch, xgrammar as xgr\n\nbitmask = xgr.allocate_token_bitmask(batch_size=2, vocab_size=32)  # -> int32 CPU, 形状 (2, 1)\nmatcher.fill_next_token_bitmask(bitmask, index=0)   # 填第 0 行；不推进 matcher 状态\n# 假设语法只允许 token 3：第 0 行唯一的 int32 = 0b1000 = 8（bit3=1 其余 0）\nbitmask_gpu = bitmask.to('cuda', non_blocking=True)  # 官方：上 GPU 前用户自搬\nlogits = torch.randn(2, 32, device='cuda')\nxgr.apply_token_bitmask_inplace(logits, bitmask_gpu, indices=torch.tensor([0], device='cuda'))\n# 效果：logits[0][j] 中 j!=3 的位全部变 -inf；logits[1] 因 indices 未含而原样\n```\n\n逐行点一下与本章的对应：`形状 (2,1)` 就是『一行掩码 = ceil(V/32) 个 int32』在玩具词表下的样子；`bit=0 → -inf、bit=1 放行` 与 V2 kernel 谓词 `((packed >> bit) & 1) == 0 → store(-inf)` 逐位一致；`indices=` 参数就是 V1 站 13 传 index_tensor 的地方、也是 V2 用 logits_indices 间接寻址替换掉的东西。",
+      "links": [
+        "https://xgrammar.mlc.ai/docs/api/python/bitmask_ops.html",
+        "https://xgrammar.mlc.ai/docs/api/python/grammar_matcher.html",
+        "https://github.com/mlc-ai/xgrammar"
+      ],
+      "sources": [
+        {"url": "https://xgrammar.mlc.ai/docs/api/python/bitmask_ops.html", "got": "v3 重核（2026-09-12）：allocate_token_bitmask(batch_size, vocab_size) 完整签名与 int32 原因（老 PyTorch 无 uint32）；apply_token_bitmask_inplace 签名/indices 混批用途/backend 五选项（triton=默认 CUDA 实现）；0=masked→-inf、1=unmasked 打包格式；reset_token_bitmask/get_bitmask_shape/bitmask_dtype；『bitmask 通常分配在 CPU，用户应自行拷上 GPU』注意。注：该文档站按版本出多套构建（今日各页渲染 0.1.33/0.2.0/0.2.6 标题混见），API 内容跨 0.2.x 一致", "accessed": "2026-09-12"},
+        {"url": "https://xgrammar.mlc.ai/docs/api/python/grammar_matcher.html", "got": "v3 重核（2026-09-12）：fill_next_token_bitmask(bitmask, index) 返回 need_apply、『此方法不改变 matcher 状态』、bitmask 支持实现 DLPack 协议的任意类数组（含 torch.Tensor）；BatchGrammarMatcher 类文档（多线程批量填充）；rollback/max_rollback_tokens 现状（见 rollback 卡）", "accessed": "2026-09-12"},
+        {"url": "E:/Laboratory/Repo2Book/instances/vllm/source/requirements/common.txt L27（本仓 pin，一手）", "got": "vLLM v0.27.1 对 xgrammar 的约束 `>= 0.2.1, < 1.0.0`（x86_64/arm 条件安装）——与 GitHub releases 核实的 v0.2.1(2026-05-17)…v0.2.6(2026-09-09) 全落在区间内", "accessed": "2026-09-12"},
+        {"url": "https://github.com/mlc-ai/xgrammar (releases API)", "got": "版本时间线：v0.2.6 为最新（2026-09-09）；tvm-ffi 绑定迁移 v0.1.33 合入又回退、v0.1.34(2026-04-29) 重新落地——pin 区间内全部版本均走 tvm-ffi 绑定（供 GIL 卡引用）", "accessed": "2026-09-12"}
+      ],
+      "confidence": "high",
+      "confidence_note": "三个函数的签名/参数/位格式/状态中立性全部来自官方 API 文档一手核实（2026-09-12 抓取，v2 时期 2026-07-24 对 0.2.5 文档的核实结论一致，跨 0.2.x 稳定）。『V2 kernel 改编自 xgrammar Triton 实现』引自 pin 源码头注（analyst 已核），本卡只佐证库方确有此函数与 triton 后端、不重新裁定改编程度。文档站多版本构建并存导致页面标题版本号不一（0.1.33/0.2.0/0.2.6 混见），不影响所引 API 内容。",
+      "writer_note": "站 13 正文点 apply_token_bitmask_inplace 时给两三句：位格式是官方钉死的（0=掩/1=放行，32 token 一个 int32）、indices 参数官方定位就是混批、库文档建议用户自行搬 GPU（vLLM 的 H2D 链是这句的工程化）。站 16 头注『改编自 xgrammar』处补一句『同一语义的改写而非平行发明，动机是行映射控制权』。fill_next_token_bitmask『不改状态』这一点建议放站 5/站 7（试探推进+rollback 处）：库 API 本身就把『填表』与『推进』拆开，rollback 只需要退推进。位打包细节 ch30 已立，本章别重讲。BatchGrammarMatcher 在站 4 可一句带过（库方原生多线程方案，vLLM 选了自己管线程池），不展开。"
+    },
+    {
+      "id": "grammar-rollback-speculative-decoding-api",
+      "term": "语法回滚（rollback）在投机解码下的外部 API 口径",
+      "kind": "external_concept",
+      "one_line": "『先假装接受草稿、取完掩码再倒带』这件事，xgrammar 给的口子是 rollback(num_tokens)——且据其官方文档，构造期的回滚步数上界参数 max_rollback_tokens 已废弃、内部总是无限回滚。",
+      "what_it_is": "投机解码（草稿先猜 k 个 token、目标模型一次验证）与语法约束凑在一起有个通用矛盾：算第 j 个草稿位置的合法集，必须假装前 j-1 个草稿已被接受、把语法状态机推过去；但草稿可能被拒，推错的状态必须能退。xgrammar 的 `GrammarMatcher.rollback(num_tokens=1)` 就是倒带口子——退回 num_tokens 步之前的状态（文档：不能超过当前已走步数）。与之配套，构造参数 `max_rollback_tokens` 据 xgrammar 官方 API 文档（2026-07-24 对 0.2.5、2026-09-12 重核，结论一致）**已标 deprecated**，文档原话：『不需要设置它，它总是无限的（-1）；新的 Earley 解析器大幅减少了状态数量，所以可以允许无限回滚』。也就是说『回滚上界 = 投机步数』在较新 xgrammar 里实际已不是硬约束，是向后兼容的旧接口。另外 2026-09-12 重核拿到一个新的强相关事实：`fill_next_token_bitmask` 官方明说**不改变 matcher 状态**——所以『回滚』只需要撤销 accept_token 的推进，不涉及掩码本身；vLLM 站 7 的 `rollback(state_advancements)` 只回退试探推进次数，正是这个 API 语义的直接映射。",
+      "background": "回滚不是自动机层面免费的能力——状态多为不可变结构或历史记录，撤销要额外簿记（最朴素是记下走过的每步、回滚即弹栈）。各家哲学不同：xgrammar 把状态管理当一等公民（rollback 官方定位同时服务 jump-forward 与投机解码，另有 fork() 分支解码；v0.2.0 起（2026-05-01）还加入 traverse_draft_tree 草稿树遍历 API，把『多草稿位置掩码』做成一次原生调用）；llguidance（guidance 的 Rust 引擎）走 rollback_lag 机制但公开文档少于 xgrammar（未找到官方专门文档页，v2 结论今日未变）；lm-format-enforcer 不支持回滚（ch30 生态对比已立）。结论维持：**回滚能力的上界形态不能跨后端概括**。",
+      "example": "外部 API 语义的最小演示（据官方文档，2026-09-12 核实；vLLM 站 5-7 的行为即此模式的循环嵌套版）：\n\n```python\nmatcher = xgr.GrammarMatcher(compiled)          # max_rollback_tokens 已废弃，总为无限\nmatcher.accept_token(12)                        # 真推进 1 步\nmatcher.fill_next_token_bitmask(bitmask, 0)     # 填表——不推进状态，无需回滚\nmatcher.accept_token(34)                        # 试探推进（假设草稿 token 34）\nmatcher.fill_next_token_bitmask(bitmask, 1)     # 填『已接受 34 后』的合法表\nmatcher.rollback(1)                             # 倒带 1 步：34 的试探作废\n# 此时状态回到只接受过 12——真推进只留给被验证接受的 token\n```\n\n对应关系：vLLM 串行分支里 `accept_tokens(req_id,[token])` 成功一次 `state_advancements += 1`，窗口填完 `grammar.rollback(state_advancements)` 一次退清——即上例『试探→填表→倒带』在草稿窗口上的展开；`AssertionError` 容忍分支对应『草稿先于掩码存在、不保证合法』的 accept 拒绝。",
+      "links": [
+        "https://xgrammar.mlc.ai/docs/api/python/grammar_matcher.html",
+        "https://github.com/mlc-ai/xgrammar",
+        "https://github.com/guidance-ai/llguidance"
+      ],
+      "sources": [
+        {"url": "https://xgrammar.mlc.ai/docs/api/python/grammar_matcher.html", "got": "v3 重核（2026-09-12）：max_rollback_tokens 构造参数与同名 property 均标 Deprecated，『总是无限的 (-1)』、归因 Earley 解析器状态数大减；rollback(num_tokens=1) 不能超当前步数也不能超上界（上界如今恒无限）；fill_next_token_bitmask 不改变 matcher 状态；v0.2.0 起有 traverse_draft_tree（releases 核实其发布时间 2026-05-01）", "accessed": "2026-09-12"},
+        {"url": "E:/Laboratory/Repo2Book/instances/vllm/source/requirements/common.txt L27（本仓 pin，一手）", "got": "v0.27.1 约束 xgrammar >=0.2.1,<1.0.0——今日重核的文档结论落在区间内，适用于本 pin 的实际安装", "accessed": "2026-09-12"},
+        {"url": "https://github.com/sgl-project/sglang/issues/9187", "got": "（v2 存量核实，拷贝保留；社区 issue）投机+结构化的回滚必须处理『多 token』而非只退最后一个——佐证 state_advancements 计数式回滚的必要性", "accessed": "2026-07-24"},
+        {"url": "https://github.com/guidance-ai/llguidance", "got": "（v2 存量核实）llguidance 仓库在，但其 rollback_lag 参数语义仍无官方专门文档页——跨后端差异部分维持 medium", "accessed": "2026-07-24"}
+      ],
+      "confidence": "medium",
+      "confidence_note": "xgrammar 半边（deprecated/无限回滚/fill 不改状态）是官方文档一手原文、且 2026-07-24 与 2026-09-12 两次核实一致——这部分 high；整卡标 medium 仅因 llguidance rollback_lag 无官方文档、跨后端断言只到『不能概括』为止。vLLM pin 里 backend 构造时是否仍传 max_rollback_tokens 值，属 pin 源码（analyst 的 dossier 已记），本卡不裁定。",
+      "writer_note": "站 7 讲 `grammar.rollback(state_advancements)` 时给一个旁注即可：据 xgrammar 官方文档，构造期的回滚上界参数已名存实亡（总为无限）、且填表本身不动状态、回滚只退 accept 的推进——所以 vLLM 只需数住 state_advancements 就能一次退清，不必担心『退过头/退不动』。不要展开 llguidance（无官方口径），跨后端差异一句『归 ch30』。traverse_draft_tree 可不提或在站 5 脚注一句（库方后来把多草稿掩码做成了原生 API），别喧宾。"
+    },
+    {
+      "id": "numpy-vs-tensor-serialization",
+      "term": "为什么 ndarray 跨进程序列化比 torch.Tensor 便宜",
+      "kind": "external_concept",
+      "one_line": "numpy 数组的序列化路径几乎就是『把原始字节缓冲原样吐出去』，而 torch.Tensor 的 pickle 路径要背上 storage 对象与重建机器——PyTorch 官方 issue 里同尺寸数据差出几十倍，vLLM 注释那句话有外部根据。",
+      "what_it_is": "vLLM 站 9 的注释原话：转成 np.ndarray 是因为『发给 GPU worker 时序列化/反序列化高效得多』。外部原因是两条序列化路径的重量完全不同。**numpy 侧**：ndarray 的 pickle 协议（`__reduce__` 族）把数组降成『(形状, dtype, 原始字节缓冲)』三元组——本质是一次 memcpy 加几个小对象；现代 pickle 协议 5 还支持带外缓冲（out-of-band buffers）避免额外拷贝，Ray/Dask 等分布式框架正是靠这条路对 numpy 做零拷贝投递。**torch 侧**：Tensor 的 pickle 要序列化配套的 storage（一整套带对象身份的存储对象）、经 rebuild_tensor 机器重建——PyTorch 官方 issue #9168（2018 年由 Dask 作者 mrocklin 提出）给出同尺寸对照：10000×10000 矩阵（约 800MB）numpy 序列化约 711ms（~1GB/s），tensor 约 15.7s（~50MB/s），瓶颈定位在 storage 走 Python 标量列表的旧路径（`t.storage().tolist()` 一项就 13.2s）。该 issue 后来历经修复（tensor pickle 已不走标量列表），但『numpy 缓冲直通 vs tensor 带 storage/rebuild 机器』的结构差仍在：对一张**每步都要过一次进程边界**的掩码表（128k 词表下单行约 16KB、批 256 约 4.6MB），这条路径差乘以每秒几十步，就是注释说的『much more efficient』。补充一层与本书已有知识的连接：vLLM v1 跨进程走 ZMQ+msgpack（ch5 已讲 msgpack）——msgpack 对『字节块』有一等公民的 bin 类型，ndarray 的『形状+dtype+原始字节』表示能直接落进去；而 Tensor 没有 msgpack 原生表示，要么走 pickle 兜底、要么自己拆 storage（此句为机制性说明，vLLM 侧具体编码归 pin 源码与 ch5，本卡不代查）。",
+      "background": "这个差异的历史：Python pickle 本身只是协议框架，快慢取决于对象自己实现的 `__reduce__`（Dask 官方博客有专门一篇《Pickle isn't slow, it's a protocol》讲透这点）；numpy 一直把 pickle 协议实现得很薄（PEP 574/pickle 5 的带外缓冲设计也主要面向 numpy 这类缓冲对象），PyTorch 的 Tensor 序列化则长期背着 storage 间接层（#9168 时代的问题表述是『疑似把 storage 转成 Python 列表』，后来修复但对象机器仍在），社区通用解法至今仍是『跨边界前转 numpy』（Ray/Dask 文档、vLLM/众多推理引擎同款做法）。对 vLLM 结构化输出：掩码表是调度器进程算、worker 进程用，每步必过界一次——选 ndarray 不是风格偏好，是字节量级上的工程必然。",
+      "example": "两条路径的最小对照（可在本机复现的量级感；数字引 pytorch#9168 一手报告，现代版本差距已缩小但结构差不变）：\n\n```python\nimport numpy as np, torch, pickle\nt = torch.randint(0, 2**31, (256, 4040), dtype=torch.int32)   # 批 256、DeepSeek 词表的掩码形状\na = t.numpy()                                                  # 零拷贝视图（同一段内存）\nlen(pickle.dumps(a))   # ≈ 形状+dtype+4.1MB 原始字节：序列化主体就是一次缓冲拷贝\nlen(pickle.dumps(t))   # 同尺寸字节 + storage 对象/重建信息：路径更重\n```\n\n逐行点一下：`t.numpy()` 不搬运数据（共享底层缓冲），所以站 9 的 `.numpy()` 转换本身免费；贵的是过界时的编码——ndarray 降成『形状+dtype+字节』，tensor 要带 storage 机器。这就是注释里 serialization **and deserialization** 两头都省的对端。",
+      "links": [
+        "https://github.com/pytorch/pytorch/issues/9168",
+        "https://blog.dask.org/2018/07/23/protocols-pickle",
+        "https://docs.ray.io/en/latest/ray-core/objects/serialization.html"
+      ],
+      "sources": [
+        {"url": "https://github.com/pytorch/pytorch/issues/9168", "got": "v3 一手抓取（2026-09-12）：mrocklin 2018-07-04 报告 tensor pickle 远慢于 numpy（711ms vs 15.7s，约 800MB 输出），瓶颈 `t.storage().tolist()` 13.2s，建议『传 numpy/buffer/memoryview 而非 list』；issue 已关闭（triage review），评论需登录不可见——现代版本已修复标量列表路径，本卡只用它作『路径重量差』的历史一手证据", "accessed": "2026-09-12"},
+        {"url": "https://blog.dask.org/2018/07/23/protocols-pickle", "got": "（经搜索摘要核实存在与主旨，2026-09-12）『Pickle 不慢、慢的是对象的 __reduce__ 实现』；numpy 走高效 pickle 路径（含协议 5 带外缓冲）、tensor 历史上没有——Dask 官方博客", "accessed": "2026-09-12"},
+        {"url": "https://docs.ray.io/en/latest/ray-core/objects/serialization.html", "got": "（经搜索摘要核实，2026-09-12）Ray 官方文档：对 numpy 数组经 pickle 协议 5 带外数据做零拷贝优化——佐证『numpy 缓冲直通』是分布式框架的通用依赖", "accessed": "2026-09-12"}
+      ],
+      "confidence": "high",
+      "confidence_note": "pytorch#9168 一手抓取（数字为 2018 年 torch 0.4 的报告，正文已注明『历经修复、结构差仍在』，不把旧数字当现状）。Dask/Ray 两篇经搜索摘要核实（未逐字抓全文），用作方向性佐证、不当具体数字出处。『msgpack 对字节块有一等 bin 类型』是 msgpack 规范常识，vLLM 侧具体怎么编码 ndarray 归 pin 源码（analyst/ch5），本卡不越界代查。",
+      "writer_note": "站 9 的注释 vLLM 只给了结论没给原因——这条就是给 writer 的『为什么』：一句『numpy 的序列化主体就是原始字节缓冲的一次拷贝，tensor 要背 storage 对象与重建机器』即可，可引 pytorch#9168 的量级感（注明老版本数字）。别展开 pickle 协议细节，msgpack 细节回指 ch5。`.numpy()` 本身零拷贝这一点值得半句（转换免费、收益全在过界）。"
+    },
+    {
+      "id": "record-stream-allocator-safety",
+      "term": "record_stream：异步拷贝流借用来的内存，为什么不会被缓存分配器提前回收",
+      "kind": "external_concept",
+      "one_line": "PyTorch 的缓存分配器只看『本流同步』就敢复用内存——张量在 A 流上注销后，若 B 流上还有没跑完的异步操作在用它，必须 record_stream 打个招呼，否则数据可能被下家覆写。",
+      "what_it_is": "ch31 站 15 / m17 的 DraftTokensHandler 在 copy_stream 上发起异步 D2H 后调了一句 `draft_tokens.record_stream(self.copy_stream)`，源码注释给了原因（『不 record 的话，缓存分配器可能在异步拷贝执行前就复用这块内存』）。外部的机制根据在 PyTorch 官方 CUDA 语义文档（2026-09-12 抓 2.14 版原文）：PyTorch 用**缓存分配器**管显存——张量释放（Python 引用没了）不是真还给驱动，而是进缓存池等复用；而分配器判断『这块内存安全可复用』的依据是**流内同步**（同一流上后发的操作天然排在后面）。于是有个盲区：张量在默认流上创建、Python 侧已释放，但你又在另一条流上对它发过异步操作——默认流自己觉得『没人用了』，分配器就敢把这块内存发给新张量；而另一条流上那个异步操作可能还没执行，执行时读到的已是新张量的数据。PyTorch 官方文档给出的解法原文（同页示例）：`A.record_stream(s)`——『torch.Tensor.record_stream() 确保在 sum(A) 完成前不会释放 A』；官方对『为什么计算明明不读 A 的内容也必须同步』的解释原话：『A 可能对应被 CUDA 缓存分配器重新分配的内存，带着旧（已释放）内存上未完成的操作』。DraftTokensHandler 场景逐点对上：draft_tokens 是主流上的**临时分配**（函数返回即释放进缓存池），D2H 挂在 copy_stream 上（另一条流）、此刻多半还在飞——record_stream(copy_stream) 就是告诉分配器『copy_stream 上还有人用，等它完事再复用』。",
+      "background": "这是『CUDA 异步执行模型』（见 cuda-async-launch 卡）与『缓存分配器换性能』两个设计叠加出的经典坑：异步 = 发射与完成分离，分配器 = 释放与归还分离；两个分离各自都对，叠起来就出现『逻辑上已死、物理上还在被读』的窗口。PyTorch 缓存分配器因此设计了 record_stream 这条补充通道（张量记下『我还被流 s 使用』，复用前多等一道）；文档同时提醒它有簿记开销、且更优的写法是一开始就在目标流上分配。v3 前章的分工：ch12 讲了流/事件/锁页三原语与 future 等一个 D2H 事件，ch18 讲了 pinned 缓冲与 DMA——但 record_stream 与分配器复用这个**内存安全**侧面 v3 全书尚未讲过（grep 全部已成稿 narrative 复核），它是本章 m17『两个异步内存安全细节』（另一个 blocking event 防忙轮询，归 ch12 语境内一句话能带过）里真正新增的一个。",
+      "example": "官方 CUDA 语义文档里的原型场景（2026-09-12 抓原文，DraftTokensHandler 是它的直接变体）：\n\n```python\ns = torch.cuda.Stream()\nA = torch.randn(1000, device='cuda')      # A 在默认流上分配\nwith torch.cuda.stream(s):               # 换到另一条流\n    B = A.clone()                          # 异步操作排队：读 A\n# 离开 with：s 上 B=A.clone() 可能还没执行\nA = None                                  # 默认流视角：A 可回收——危险！\n\n# 官方解法：在 with 块里加一句\n#     A.record_stream(s)\n# 分配器便知道 s 上还有未完成操作在用 A，复用前先等 s\n```\n\n对应到站 15：`A` = draft_tokens（主流临时张量）、`s` = copy_stream、『异步操作』= async_copy_to_np 的 D2H；vLLM 把官方解法逐字搬了进来。",
+      "links": [
+        "https://docs.pytorch.org/docs/stable/notes/cuda.html",
+        "https://docs.pytorch.org/docs/stable/notes/cuda.html#cuda-streams"
+      ],
+      "sources": [
+        {"url": "https://docs.pytorch.org/docs/2.14/notes/cuda.html（stable 重定向目标）", "got": "v3 一手抓取（2026-09-12，页首标 PyTorch 2.14、2026-07-17 更新）：CUDA streams 节 record_stream 示例与原话『The torch.Tensor.record_stream() ensures that we do not deallocate A before sum(A) has completed』『it is still necessary to synchronize, because A may correspond to memory reallocated by the CUDA caching allocator, with pending operations from the old (deallocated) memory』；同页另含异步执行模型与 pinned 三段（供另两卡）", "accessed": "2026-09-12"}
+      ],
+      "confidence": "high",
+      "confidence_note": "机制与原话全部来自 PyTorch 官方 CUDA semantics 文档一手抓取（2.14，stable 重定向，2026-09-12）；DraftTokensHandler 侧的对应用 pin 源码注释印证（dossier m17 已录），本卡不重新解读 pin。",
+      "writer_note": "站 15 讲 DraftTokensHandler 时，record_stream 这半句建议给 3-4 行的小卡式解释（分配器只认流内同步/复用盲区/record_stream 就是打招呼），官方原话可意译；blocking event 那半句回指 ch12 的 event 语义即可。这是本章唯一全新外部的异步内存安全点，别只留括注——读者在这里恰恰会问『不 record 会怎样』。与 ch18 的 pinned 教学勿混：pinned 管搬运快慢，record_stream 管内存不被提前复用。"
+    },
+    {
+      "id": "cuda-async-launch-and-cpu-gpu-overlap",
+      "term": "CUDA 异步执行模型：发射即返回，CPU 与 GPU 天然可以各干各的",
+      "kind": "external_concept",
+      "one_line": "调 GPU 干活（kernel 或数据搬运）时，CPU 只是把指令塞进设备的队列就立刻返回——活什么时候真干完是另一回事；『两段式 execute 窗口』能成立的全部物理前提就是这一句。",
+      "what_it_is": "PyTorch 官方 CUDA 语义文档『Asynchronous execution』节原话（2026-09-12 抓 2.14 版）：『**By default, GPU operations are asynchronous.** When you call a function that uses the GPU, the operations are enqueued to the particular device, but not necessarily executed until later. This allows us to execute more computations in parallel, including operations on CPU or other GPUs.（默认情况下 GPU 操作是异步的：调用 GPU 函数时操作只是入队到特定设备，不一定立刻执行——这让我们能把更多计算并行起来，包括 CPU 上或其他 GPU 上的操作）』。两个直接推论构成本章命门的底座：(1) **发射与完成分离**——`execute_model(non_block=True)` 发车即返 Future、CPU 转身去填掩码表，不是 vLLM 发明了什么新魔法，而是 CUDA 调用的天然形态：CPU 那侧的『返回』从来只代表『指令进队了』；(2) **流内有序、流间可并**——官方同页：『每个流内部的操作按创建顺序串行执行，不同流之间的操作可以并发执行』——掩码在 CPU 上算、前向在 GPU 上跑、搬运在 copy_stream 上飞，三件事同时成立而不打架，靠的就是这条。文档同页还给出非阻塞搬运参数（`to()/copy_() 的 non_blocking`，配 pinned 源内存才真异步）——那是 ch18 的主场，本章只借用其结果。",
+      "background": "为什么 CUDA 设计成这样：GPU 一次 kernel 的发射开销（微秒级）远小于执行开销（毫秒级），若 CPU 每次都等执行完才返回，GPU 大部分时间在空转等指令——异步发射让 CPU 能跑在 GPU 前面，把队列填满。但『CPU 跑在前面』对推理引擎是个机会也是个坑：机会是任何 CPU 侧的活（比如本章的 FSM 填表）都能藏进 GPU 执行窗口；坑是『指令进队了』不等于『数据好了』，何时取结果必须显式约定（Future 等事件——ch12 已立）。v3 分工：ch12 讲了 async ≠ asyncio、流/事件/锁页三原语与 future 等一个 D2H 事件；本章 introduces『两段式 execute GPU 窗口』需要的增量只有一条——**发射即返回是 CUDA 调用的默认形态**（官方原话背书），其余全部回指。",
+      "example": "官方语义在本书语境下的最小对应（机制示意，非 vLLM 代码）：\n\n```python\nlogits_gpu = model(x)                     # CPU 只是把前向入队，立即返回——GPU 此刻才开始/正在算\ntable = fill_bitmask_cpu(...)            # CPU 与 GPU 前向同时在干活（重叠窗口就是这里）\nout = logits_gpu + 0                      # 入队一个后续 GPU 操作：会在前向之后执行（流内有序）\ntorch.cuda.current_stream().synchronize() # 到这一步才保证上面的活全部真完成\n```\n\n逐行点一下：第一行返回时 logits_gpu 只是『占位 + 未完成的队列承诺』；第二行就是站 1 的 L597（趁 GPU 在算，CPU 算 get_grammar_bitmask）；第四行对应 future.result() / sample_tokens 的时序约定——**取结果才需要等，发射从不需要等**。",
+      "links": [
+        "https://docs.pytorch.org/docs/stable/notes/cuda.html",
+        "https://docs.nvidia.com/cuda/cuda-c-programming-guide/"
+      ],
+      "sources": [
+        {"url": "https://docs.pytorch.org/docs/2.14/notes/cuda.html（stable 重定向目标）", "got": "v3 一手抓取（2026-09-12）：Asynchronous execution 节原话『By default, GPU operations are asynchronous…enqueued to the particular device, but not necessarily executed until later. This allows us to execute more computations in parallel, including operations on CPU or other GPUs.』；CUDA streams 节『operations inside each stream are serialized in the order they are created, but operations from different streams can execute concurrently』；non_blocking 参数与 pinned 配套段落", "accessed": "2026-09-12"}
+      ],
+      "confidence": "high",
+      "confidence_note": "PyTorch 官方 CUDA semantics 一手抓取（2.14，2026-09-12），与 ch12 已引用的同一权威文档（ch12 用 2.13 链接）内容一致——版本间该节表述稳定。NVIDIA 编程指南链接为深入门，未在本轮重抓（不作为具体断言出处）。",
+      "writer_note": "这是 introduces『两段式 execute GPU 窗口』的底座卡——站 1 讲『发车即返、CPU 活藏进前向窗口』时，值得引一次官方原话（意译即可：『GPU 操作默认异步：调用只是把操作入队，不一定立刻执行——这正让 CPU 能同时干别的』），一句话把『凭什么能重叠』钉在官方文档上。**别重复 ch12 的流/事件/锁页教学**（那章已有完整三原语+官方链接），本卡只补『发射即返回是默认形态』这一条；non_blocking/pinned 细节回指 ch18。NVIDIA 指南放 links 给深潜读者。"
+    },
+    {
+      "id": "gil-native-extension-parallel-fill",
+      "term": "GIL 与原生扩展：为什么 Python 线程池填掩码能『真并行』",
+      "kind": "external_concept",
+      "one_line": "Python 线程平时被 GIL 锁成单车道，但一旦钻进 C/C++ 扩展且扩展主动放锁，车道就真宽了——xgrammar 的 fill_next_token_bitmask 经 TVM FFI 绑定、默认释放 GIL，vLLM 的并行填表踩的正是这个口子。",
+      "what_it_is": "ch1 讲过 GIL：同一时刻只有一个线程执行 Python 字节码，所以纯 Python 的多线程只能换位不能并跑。但 GIL 管不到 C 界外面——原生扩展（C/C++/Rust 编译出的模块）在执行重活前可以**主动释放 GIL**（如 pybind11 的 gil_scoped_release、Cython 的 nogil、TVM FFI 的 release_gil 标志），干活期间其他 Python 线程随便跑，干完回 Python 界面前再拿回来。于是『线程池并行填掩码』（站 4 / m06）成立有个隐藏前提：每个线程干的主要活 `matcher.fill_next_token_bitmask(...)` 必须是一个**会放锁的原生调用**，否则线程们只是轮流进 C 函数、一点没并行。这条前提本章正文若不点，读者拿着 ch1 的 GIL 认知会当场卡住（『GIL 下线程池不是白开吗？』）。核实结论（证据链见 sources，四环全部一手）：(1) vLLM v0.27.1 的 pin 区间是 xgrammar >=0.2.1,<1.0.0；(2) xgrammar 从 v0.1.34（2026-04-29）起 Python 绑定迁移到 **TVM FFI**（v0.1.33 合入又回退、v0.1.34 重新落地）——pin 区间内所有版本都是 TVM FFI；(3) xgrammar 的 fill_next_token_bitmask 就登记为 TVM FFI 方法（cpp/tvm_ffi/tvm_ffi.cc 一手抓到注册代码）；(4) TVM FFI 的 Python 调用路径默认释放 GIL——`Function.__call__` 把 `self.release_gil` 传进 TVMFFIPyFuncCall，其默认值来自环境变量 `TVM_FFI_RELEASE_GIL_BY_DEFAULT`、**缺省为 1（放锁）**，亦可按函数改 release_gil 属性（官方 Python API 文档成文：『Whether calls release the Python GIL while executing』）。旁证：xgrammar 自己的 `BatchGrammarMatcher` 官方文档明说『利用多线程加速、批大时特别有用』——库方原生方案就预设了多线程真并行；vLLM 没用它，而是 Python 层自管 ThreadPoolExecutor（16 行一任务、workers=max(1,min(cpu//2,8))），两层方案都吃同一条放锁前提。",
+      "background": "历史脉络：pybind11 时代绑定的 C++ 函数默认**持锁**执行，要并行的库得显式写 call_guard/gil_scoped_release，生态里『扩展放锁』长期是约定而非保证——所以 Python 官方文档至今把线程池定性为『适合 I/O 等待，CPU 密集想并行用多进程』，同时又留了后门说明：释放 GIL 的扩展例外。TVM 社区 2025 年推出 apache/tvm-ffi（开放 ABI/FFI，取代旧 PackedFunc）时把默认反过来：**调用即放锁**（env 可关），理由是 ML 系统的典型调用都是重 C++ 计算、持锁纯亏——xgrammar 随之迁移（v0.1.34）。对读者的认知升级点：『GIL 锁死多线程』是纯 Python 界的规则；穿过语言边界后，是否真并行取决于那个扩展的态度——本章遇到的是一个默认放锁的扩展。",
+      "example": "机制最小对照（示意代码，说明放锁前后差别）：\n\n```python\nfrom concurrent.futures import ThreadPoolExecutor\n\n# 假设 fill 是重 CPU 原生函数：\n# 情形 A（持锁扩展）：线程 B 在 A 进 C 函数期间连入口都拿不到——串行，白开池\n# 情形 B（放锁扩展，xgrammar/TVM FFI 实况）：\n#   线程 A 进 C 时释放 GIL -> 线程 B 立刻进自己的 C 调 -> 各填各的行，真并行\nwith ThreadPoolExecutor(max_workers=8) as pool:\n    promises = [pool.submit(_fill_bitmasks, batch_of_16_rows) for batch_of_16_rows]\n    [p.result() for p in promises]              # vLLM 站 4 的形态\n```\n\nvLLM 能并行的另一半理由在数据面（行间各写各行、无共享可变状态——dossier m06 已立），本卡只补『线程层为什么没被 GIL 锁死』这半面；两半合起来才是完整答案。",
+      "links": [
+        "https://tvm.apache.org/ffi/reference/python/generated/tvm_ffi.Function.html",
+        "https://github.com/apache/tvm-ffi",
+        "https://github.com/mlc-ai/xgrammar"
+      ],
+      "sources": [
+        {"url": "https://raw.githubusercontent.com/mlc-ai/xgrammar/main/cpp/tvm_ffi/tvm_ffi.cc", "got": "v3 一手抓取（2026-09-12，main 分支）：fill_next_token_bitmask 以 TVM FFI 反射宏注册（refl::ObjectDef<GrammarMatcherObj>().def(...)，lambda 转 DLTensor* 后调 FillNextTokenBitmask）；绑定文件内无任何 GIL 代码——语义上交 TVM FFI 运行时；另证 apply_token_bitmask_inplace CPU 变体注册于 kernels 命名空间", "accessed": "2026-09-12"},
+        {"url": "https://raw.githubusercontent.com/apache/tvm-ffi/main/python/tvm_ffi/cython/function.pxi", "got": "v3 一手抓取（2026-09-12，main 分支）：Function.__call__ 调 TVMFFIPyFuncCall 传入 self.release_gil；release_gil 默认取 `int(os.environ.get(\"TVM_FFI_RELEASE_GIL_BY_DEFAULT\", \"1\"))` ——**默认放锁**；有 per-function release_gil 属性可改", "accessed": "2026-09-12"},
+        {"url": "https://tvm.apache.org/ffi/reference/python/generated/tvm_ffi.Function.html", "got": "官方 Python API 参考：Function.release_gil 属性『Whether calls release the Python GIL while executing』（默认值文档未成文，实现在上条源码）", "accessed": "2026-09-12"},
+        {"url": "https://api.github.com/repos/mlc-ai/xgrammar/releases", "got": "v3 一手抓取（2026-09-12）：tvm-ffi 绑定迁移 v0.1.33 合入又回退、v0.1.34（2026-04-29）『Reapply migrate the binding logic into tvm_ffi』落地；v0.2.1(2026-05-17)…v0.2.6(2026-09-09) 均在其后——pin 区间 >=0.2.1,<1.0.0 全覆盖", "accessed": "2026-09-12"},
+        {"url": "https://xgrammar.mlc.ai/docs/api/python/grammar_matcher.html", "got": "BatchGrammarMatcher 文档：『batch version … can fill the next token bitmask for multiple matchers in parallel. It utilizes multiple threads … especially useful when the batch size is large』——库方原生多线程方案的存在性旁证", "accessed": "2026-09-12"}
+      ],
+      "confidence": "high",
+      "confidence_note": "证据链四环（pin 区间本地核实 / xgrammar 迁移时间线 releases API / fill 的 TVM FFI 注册源码 / tvm-ffi 默认放锁源码）全部一手抓取。残余不确定：(a) release_gil 默认值核实于 apache/tvm-ffi main（2026-09-12），xgrammar 0.2.x 各 wheel 内嵌的 tvm-ffi 具体小版本未逐一钉死——该默认自迁移起未查到变更记录，风险低；(b) 若部署环境显式设 TVM_FFI_RELEASE_GIL_BY_DEFAULT=0 则并行退化为串行（不损正确性）。写作按『默认放锁』表述并保留一句版本限定即可。",
+      "writer_note": "站 4 讲并行填表时，读者带着 ch1 的 GIL 认知必问『线程池在 GIL 下不白开吗』——本卡就是给那句回答的：两三行讲清『扩展放锁则真并行』+ 一句『xgrammar 的绑定（TVM FFI）默认释放 GIL，据 2026-09 源码核实』。别展开 tvm-ffi/pybind11 史（背景段是给 writer 的底气，不是正文材料）；BatchGrammarMatcher 一句带过即可。注意诚实边界：默认值是核实于 tvm-ffi main 的实现默认，正文别写成『xgrammar 文档承诺』。"
+    }
+  ]
+}

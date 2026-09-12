@@ -1,0 +1,421 @@
+{
+  "schema": "l2-spec/1",
+  "chapter": 25,
+  "part": "VI",
+  "title": "MLA 的两种展开",
+  "hook": "ch24 说 MLA 把每 token 的 KV 压进 576 维潜向量——可注意力要 128 个头各自的 K 和 V，怎么变出来？同一层有两条相反的路：prefill 上投影成完整 K/V 按 MHA 算，decode 把 q 吸收进潜空间按单头 MQA 算——谁在同一次前向里划的线？上投影爆不爆显存？576 维 cache 怎么跟别的层共池？",
+  "l0_zoom": "模型层 MLA 框",
+  "l0_region": {
+    "anchors": [
+      "gpu_column"
+    ]
+  },
+  "depends_on": [
+    24,
+    14
+  ],
+  "reading": "读图：上排 = 进出件（hidden 进/attn_out 出/潜 KV 池/spec）；中排 ①-⑧ = 三幕——①-③ 装配期（选型拼积木→插座+吸收重排→spec 自报与组化）、④-⑤ 每拍前置（批重排+数边界）、⑥-⑧ 前向（外层低秩链+切一刀→两条展开腿）；下排 = 三条 why+后端家族/组化/DSV4 注；站号 = 装配 1-6+每拍 7-13 流经顺序，正文按讲解需要编排；方法与 file:line 均为 v0.27.1 已核锚点。",
+  "frame": {
+    "title": "worker 进程 · 模型层 MLA 层（外层 Wrapper + 内层 MLAAttention 插座 ⇆ MLA 后端家族两套）",
+    "file": "vllm/model_executor/layers/mla.py · mla_attention.py · vllm/models/deepseek_v4/"
+  },
+  "center": {
+    "name": "mla_two_paths",
+    "title": "装配幕①-③ → 每拍④-⑤ → 前向幕⑥-⑧：同一层、同一数学、两条展开",
+    "where": "mla.py:L150-L226 · mla_attention.py:L771-L772"
+  },
+  "components": [
+    {
+      "name": "入 hidden+positions",
+      "role": "gpu",
+      "zone": "north",
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "methods": [
+        "· 每拍 GPU 张量归 runner 常驻缓冲（ch18/23 已立）",
+        "· 模型只读不拥有；metadata 已由 set_forward_context 挂好"
+      ]
+    },
+    {
+      "name": "出 attn_out→o_proj",
+      "role": "gpu",
+      "zone": "north",
+      "file": "vllm/model_executor/layers/mla.py",
+      "methods": [
+        "· 两腿输出写回同一 output 缓冲（token 维前/后段）",
+        "· → o_proj → 下一层 hidden 流（层间穿针归 ch23）"
+      ]
+    },
+    {
+      "name": "入 潜 KV cache 池",
+      "role": "kv",
+      "zone": "north",
+      "file": "vllm/v1/kv_cache_interface.py",
+      "methods": [
+        "· 只存 576 维潜向量+rope（512+64），num_kv_heads=1",
+        "· 自始至终没有任何完整 K/V 落 cache",
+        "· 分页寻址（block_table/slot_mapping）归 ch22"
+      ]
+    },
+    {
+      "name": "出 MLAAttentionSpec",
+      "role": "kv",
+      "zone": "north",
+      "file": "vllm/model_executor/layers/attention/mla_attention.py",
+      "methods": [
+        "· 启动期一次：spec(num_kv_heads=1, head_size=576)",
+        "· 特形 KV 的模型层声明 → 分组原料（→ 下排组化注）"
+      ]
+    },
+    {
+      "name": "① 选型与投影装配",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        1,
+        2
+      ],
+      "methods": [
+        "use_mla 三岔选型 deepseek_v2.py:L1233",
+        "fused_qkv_a_proj：W_DQ|W_DKV+W_KR 融合",
+        "（L1010-L1016）· q 低秩链+kv_b_proj",
+        "（L1034-L1066）· 六块积木=ch23 拼装术实例"
+      ]
+    },
+    {
+      "name": "② 插座+吸收重排",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        3,
+        4
+      ],
+      "methods": [
+        "MLAModules→MLAAttention 插座 mla.py:L110",
+        "（kv_b_proj 引用交接——吸收要用它的权重）",
+        "process_weights_after_loading L994：",
+        "拆 W_UK/W_UV→bmm 副本 L1033+L1094",
+        "prefill 用原形状、decode 用副本=存两份"
+      ]
+    },
+    {
+      "name": "③ spec 自报→组化",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        5,
+        6
+      ],
+      "methods": [
+        "get_kv_cache_spec（L1140）",
+        "→ MLAAttentionSpec(576)",
+        "runner 逐层收集 gpu_model_runner.py:L7800",
+        "get_kv_cache_groups 四级分组",
+        "kv_cache_utils.py:L1781（hybrid 组化）"
+      ]
+    },
+    {
+      "name": "④ 每拍批重排",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        7
+      ],
+      "methods": [
+        "reorder_batch_to_split_",
+        "decodes_and_prefills L665",
+        "decode→short_extend→",
+        "long_extend→prefill 四区互斥划分+换位",
+        "阈值=各组 builder 最小（FlashMLA=128）"
+      ]
+    },
+    {
+      "name": "⑤ builder 数边界",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        8
+      ],
+      "methods": [
+        "split_decodes_and_prefills utils.py:L564",
+        "数出 num_decodes/num_decode_tokens",
+        "→ MLACommonMetadata（L2056-L2063）",
+        "批已排好，只找边界线落在哪行 token"
+      ]
+    },
+    {
+      "name": "⑥ 外层 forward+切刀",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        9,
+        10,
+        11
+      ],
+      "methods": [
+        "Wrapper.forward mla.py:L150：q 低秩链",
+        "（1536→128×192）+KV 压缩+RoPE 只打 rope 段",
+        "写腿 do_kv_cache_update（L647）：576 落池",
+        "切刀（L771-L772）：num_mqa=num_decode_tokens"
+      ]
+    },
+    {
+      "name": "⑦ MHA 展开腿",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        12
+      ],
+      "methods": [
+        "输入=⑥ 切刀后段（num_mha_tokens）",
+        "kv_b_proj 上投影成 per-head K/V（L2608）",
+        "→ prefill 后端（第二家族）标准 MHA",
+        "历史上下文：64k workspace 分块 gather→上投影",
+        "→merge_attn_states LSE 精确合并（L2301+L1803）"
+      ]
+    },
+    {
+      "name": "⑧ MQA 吸收腿",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        13
+      ],
+      "methods": [
+        "输入=⑥ 切刀前段（num_mqa_tokens",
+        "  =decode+≤阈值短 extend）",
+        "bmm(q_nope, W_UK_T) 吸收（L888）",
+        "（W_UK_T/W_UV 副本出自 ② 重排）",
+        "→ impl.forward_mqa 单头 MQA（L919）",
+        "→ _v_up_proj×W_UV 回 V 维（L949）",
+        "cache 一行不动，权重跟着 q 走"
+      ]
+    },
+    {
+      "name": "why · KV 账 40960→576",
+      "role": "plain",
+      "zone": "south",
+      "kind": "note",
+      "methods": [
+        "· DSV3 若 128 头 MHA：128×(192+128)=40960 元素/token/层；MLA=512+64=576（≈71×）",
+        "· 对照 GQA（Llama-70B 8 头×128×2）=2048——MLA 比 GQA 再省 3.6×",
+        "· q 侧低秩（1536）不进 cache——cache 只省 KV 侧（ch24 数学本章兑现）"
+      ]
+    },
+    {
+      "name": "why · Sq/Skv 定两腿",
+      "role": "plain",
+      "zone": "south",
+      "kind": "note",
+      "methods": [
+        "· prefill Sq/Skv≈1：query 多、上投影算力被摊薄 → compute-friendly MHA 展开",
+        "· decode Sq/Skv≈1/上千：带宽瓶颈 → data-movement-friendly 吸收（只搬单份潜向量）",
+        "· MHA 腿读 N×(P+R)×Skv 字节、MQA 腿读 (L+R)×Skv（mla_attention.py:L13-L21 头注）",
+        "· 阈值是后端经验值：FlashMLA 128 / FA-MLA 512（'process small prefills with decode pathway'）"
+      ]
+    },
+    {
+      "name": "why · workspace 兜 3GB",
+      "role": "plain",
+      "zone": "south",
+      "kind": "note",
+      "methods": [
+        "· 全量上投影 2×(192×128)×64k≈3GB vs workspace 2×576×64k≈144MB（L1808-L1823 注释原账）",
+        "· 分块 gather→kv_b_proj→算块→merge_attn_states：softmax 分块合并精确恒等式",
+        "· 与 ch20 online softmax 同一手法的块间推广；git df71917cf 专门优化此路径（+3.9% TTFT）"
+      ]
+    },
+    {
+      "name": "MLA 后端家族 · 两套",
+      "role": "gpu",
+      "zone": "south",
+      "file": "vllm/v1/attention/backends/mla/",
+      "methods": [
+        "· decode 家族：is_mla()=True 身份证（FlashMLA/FlashInfer-MLA/Triton-MLA…选择归 ch21 优先级表）",
+        "· prefill 家族五选一（registry.py:L34-L57）：",
+        "FLASH_ATTN/FLASHINFER/TRTLLM_RAGGED/",
+        "TOKENSPEED_MLA/ROCM_AITER_FA",
+        "· get_kv_cache_shape=(blocks, block, head) 不拆 K/V 维（mla_attention.py:L1370-L1379）",
+        "· MLAAttentionImpl 双抽象：forward_mha + forward_mqa（backend.py:L1009-L1063）"
+      ]
+    },
+    {
+      "name": "hybrid 组化 · DSV4 三类子缓存",
+      "role": "kv",
+      "zone": "south",
+      "file": "vllm/v1/core/kv_cache_utils.py",
+      "methods": [
+        "· DSV4 一层拆多缓存：压缩层 MLAAttentionSpec(compress_ratio=4) + SWA SlidingWindowMLASpec + indexer cache 同池分组",
+        "· MLAAttentionSpec.merge 断言组内 cache_dtype_str/compress_ratio/model_version/block_stride 全同（kv_cache_interface.py:L429-L468）",
+        "· ch14『一组一管理器共享一池』在 MLA 侧的兑现——模型层自报什么 spec，层就落进哪个组",
+        "· SWA 块 64 与压缩块 [256/4] 共享物理张量（sparse_swa.py:L77-L82 注释）"
+      ]
+    },
+    {
+      "name": "DSV4 第三代 · 压缩+fp8_ds_mla",
+      "role": "gpu",
+      "zone": "south",
+      "file": "vllm/models/deepseek_v4/attention.py",
+      "methods": [
+        "· compress_ratios 逐层表（L210-L213，MTP 层恒 1）：每 4 token 才存 1 格（storage_block_size=block//4）",
+        "· fp8_ds_mla 584B/token = 448B fp8 NoPE + 128B bf16 RoPE（不量化保精度）+ 8B scale（7 ue8m0+1pad）",
+        "· 对照 V3.2 656B / bf16 1152B；alignment 576=页对齐口径非字节数",
+        "· 输出侧 o_lora/o_groups 低秩+inverse-RoPE（细节归 ch28）；indexer 机制归 ch26"
+      ]
+    },
+    {
+      "name": "记法漂移税 · get_mla_dims",
+      "role": "plain",
+      "zone": "south",
+      "kind": "note",
+      "methods": [
+        "· DSV4 统一 head_dim=512+qk_rope_head_dim（nope=448）vs DSV2/V3 分离字段（kv_lora_rank/qk_nope/v_head_dim）",
+        "· get_mla_dims（mla_attention.py:L1499-L1530）一处函数吸收两代记法——下游全部只认 MLADims",
+        "· 记法漂移的税由框架侧吃，模型作者不感知"
+      ]
+    }
+  ],
+  "flows": [
+    {
+      "from": "入 hidden+positions",
+      "to": "⑥ 外层 forward+切刀",
+      "label": "一拍 GPU 张量（模型只读）"
+    },
+    {
+      "from": "⑥ 外层 forward+切刀",
+      "to": "入 潜 KV cache 池",
+      "label": "写腿：do_kv_cache_update 写新 token 的 576 维（L647-L654）",
+      "up": true,
+      "color_role": "kv"
+    },
+    {
+      "from": "⑥ 外层 forward+切刀",
+      "to": "⑦ MHA 展开腿",
+      "label": "num_mha_tokens 段（prefill+长 extend）"
+    },
+    {
+      "from": "入 潜 KV cache 池",
+      "to": "⑦ MHA 展开腿",
+      "label": "chunked gather 潜向量（块表寻址）"
+    },
+    {
+      "from": "入 潜 KV cache 池",
+      "to": "⑧ MQA 吸收腿",
+      "label": "block_table 直读 576 维单头"
+    },
+    {
+      "from": "⑦ MHA 展开腿",
+      "to": "出 attn_out→o_proj",
+      "label": "上投影+合并后的 per-head 输出",
+      "up": true
+    },
+    {
+      "from": "⑧ MQA 吸收腿",
+      "to": "出 attn_out→o_proj",
+      "label": "吸收+上投影后的 per-head 输出",
+      "up": true
+    },
+    {
+      "from": "④ 每拍批重排",
+      "to": "⑤ builder 数边界",
+      "label": "批序已排成 decode→…→prefill"
+    },
+    {
+      "from": "⑤ builder 数边界",
+      "to": "⑥ 外层 forward+切刀",
+      "label": "num_decode_tokens 随 metadata 进层"
+    },
+    {
+      "from": "③ spec 自报→组化",
+      "to": "出 MLAAttentionSpec",
+      "label": "MLAAttentionSpec(num_kv_heads=1, head_size=576)",
+      "up": true,
+      "color_role": "kv"
+    },
+    {
+      "from": "③ spec 自报→组化",
+      "to": "hybrid 组化 · DSV4 三类子缓存",
+      "label": "spec=分组原料（四级分流）",
+      "dash": true
+    },
+    {
+      "from": "① 选型与投影装配",
+      "to": "② 插座+吸收重排",
+      "label": "投影积木打包 MLAModules"
+    },
+    {
+      "from": "② 插座+吸收重排",
+      "to": "③ spec 自报→组化"
+    }
+  ],
+  "loop": {
+    "label": "下一层：同款 MLA 层 ×num_hidden_layers（层间 hidden 穿针归 ch23）；下一拍回到 ④ 重新排批"
+  },
+  "rail_header": "站号 = 装配期 1-6（一生一次/启动期）+ 每拍 7-13（一拍之内）",
+  "stations": [
+    {
+      "n": 1,
+      "where": "vllm/model_executor/models/deepseek_v2.py:L1233-L1237",
+      "what": "选型三岔：DecoderLayer 装配时按 config 选注意力类——老 Deepseek（MHA）/ model_config.use_mla（DeepseekV2MLAAttention）/ 普通注意力。use_mla=is_deepseek_mla 且未禁用（config/model.py:L1791-L1792）——MLA 不是运行时开关，是装配期就定死的层类型"
+    },
+    {
+      "n": 2,
+      "where": "vllm/model_executor/models/deepseek_v2.py:L1010-L1066",
+      "what": "投影装配：fused_qkv_a_proj 一个 MergedColumnParallelLinear 同时做 q 侧下投影（hidden→q_lora_rank 1536）与 KV 侧压缩（hidden→kv_lora_rank+rope 576）；再配 q_a_layernorm/q_b_proj（q 低秩链）、kv_a_layernorm、kv_b_proj（512→128×(128+128) 上投影）、o_proj——低秩链在模型层就是六块标准积木"
+    },
+    {
+      "n": 3,
+      "where": "vllm/model_executor/layers/mla.py:L110-L127",
+      "what": "Wrapper 装配：投影打包成 MLAModules 注入 MultiHeadLatentAttentionWrapper，内层构造 MLAAttention 插座（prefix=…attn、kv_b_proj 引用一并交接——吸收重排要靠它拿权重）。插座 __init__ 断言后端 is_mla、注册 static_forward_context（mla_attention.py:L516-L518）"
+    },
+    {
+      "n": 4,
+      "where": "vllm/model_executor/layers/attention/mla_attention.py:L994-L1100",
+      "what": "权重吸收重排（装配收尾，一生一次）：process_weights_after_loading 把 kv_b_proj 权重转置拆成 W_UK(512,N,128)/W_UV(512,N,128)，重排成 W_UV(N,512,128) 与 W_UK_T(N,128,512) 两份 bmm 副本常驻——prefill 走原 kv_b_proj、decode 走副本，同一份权重两种形状存两份（显存代价明码标价）"
+    },
+    {
+      "n": 5,
+      "where": "vllm/model_executor/layers/attention/mla_attention.py:L1140-L1152",
+      "what": "KV spec 自报：get_kv_cache_spec 报 MLAAttentionSpec(num_kv_heads=1, head_size=kv_lora_rank+qk_rope_head_dim=576)——潜向量不拆 K/V、单『头』；cache_dtype_str 原样透传（fp8_ds_mla 等特布局的字节账在 spec 侧算）"
+    },
+    {
+      "n": 6,
+      "where": "vllm/v1/core/kv_cache_utils.py:L1781-L1852",
+      "what": "spec 收集与 hybrid 组化（启动期）：runner.get_kv_cache_spec（gpu_model_runner.py:L7800-L7832）遍历 static_forward_context 逐层收 spec → get_kv_cache_groups 四级分流（全同 spec 一组 / 全同 token 槽数一组 / DSV4 grouped 多组 / 页大小归一多组）。DSV4 实测：压缩层 MLAAttentionSpec(compress_ratio=4) + SWA 子缓存 SlidingWindowMLASpec + indexer cache 同池分组——ch14 的『一组一管理器』在 MLA 侧的兑现"
+    },
+    {
+      "n": 7,
+      "where": "vllm/v1/worker/gpu_model_runner.py:L1115-L1137",
+      "what": "每拍批重排：_may_reorder_batch 在 _prepare_inputs 前把持久批排成 decode→short_extend→long_extend→prefill 四区（backends/utils.py:L665 的互斥划分+换位）；threshold 取全部 KV 组 builder 自报的最小值（L7220-L7238）——FlashMLA 报 128『小 prefill 也走 decode 路径』、FA-MLA 报 512"
+    },
+    {
+      "n": 8,
+      "where": "vllm/model_executor/layers/attention/mla_attention.py:L2056-L2063",
+      "what": "builder 分流：MLACommonMetadataBuilder.build 调 split_decodes_and_prefills（decode_threshold=reorder_batch_threshold）数出 num_decodes/num_decode_tokens——批已被第 7 站排好，这里只找边界线在哪一行 token"
+    },
+    {
+      "n": 9,
+      "where": "vllm/model_executor/layers/mla.py:L150-L226",
+      "what": "外层前向：q 低秩链（fused_qkv_a_proj→split→q_a_layernorm→q_b_proj→view[Sq,N,P+R]）、KV 侧 split [512,64]+kv_a_layernorm 只打 kv_c、RoPE 只作用 rope 段（q[...,128:] 与 k_pe；nope 段不旋转——低秩可吸收的前提）、indexer 位（稀疏归 ch26）→ 交 mla_attn(q, kv_c_normed, k_pe)"
+    },
+    {
+      "n": 10,
+      "where": "vllm/model_executor/layers/attention/mla_attention.py:L647-L654",
+      "what": "写腿：impl.do_kv_cache_update 把本步新 token 的 576 维潜向量（kv_c_normed+k_pe 拼接）照 slot_mapping 散写进分页 cache——MLA 的 cache 里自始至终只有潜向量，没有任何完整 K/V"
+    },
+    {
+      "n": 11,
+      "where": "vllm/model_executor/layers/attention/mla_attention.py:L771-L772",
+      "what": "分流决策：num_mqa_tokens = attn_metadata.num_decode_tokens；num_mha_tokens = q.size(0) − num_mqa_tokens——token 维切一刀（批已重排：前段 decode/短 extend、后段 prefill），两条数学等价的路线就此分岔"
+    },
+    {
+      "n": 12,
+      "where": "vllm/model_executor/layers/attention/mla_attention.py:L2581-L2666",
+      "what": "MHA 展开腿（prefill 段）：kv_b_proj 把新 token 潜向量上投影成 per-head K/V（W_UK/W_UV 在此用原形状）→ prefill 后端算新 token 段；有历史上下文时 _compute_prefill_context（L2301）按 64k workspace 分块 gather 潜向量→上投影→算一块，merge_attn_states 按 LSE 精确合并——上投影大张量永不整段物化"
+    },
+    {
+      "n": 13,
+      "where": "vllm/model_executor/layers/attention/mla_attention.py:L874-L919",
+      "what": "MQA 吸收腿（decode 段）：torch.bmm(q_nope, W_UK_T) 把每头 q 的 nope 段乘进潜空间（L888）→ 与 rope 段拼成 [B,N,512+64] → impl.forward_mqa 以单 KV『头』的 MQA kernel 直接读分页 cache（L919）→ _v_up_proj 乘 W_UV 上投影回 V 维（L949）——576 维 cache 不动，权重跟着 q 走"
+    }
+  ]
+}

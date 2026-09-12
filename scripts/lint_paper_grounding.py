@@ -199,6 +199,23 @@ def lint_paper_grounding(chapter_dir: str, expect_primer: bool = False) -> dict:
     #    双论文 primer 章可能有 paper.md + paper-dsa.md 等多份,拼接全部 *.md 再 grep
     inst_book = d.resolve().parent.parent / "book"
     pack_dir = inst_book / "papers" / d.resolve().name
+    if not pack_dir.exists():
+        # 目录名猜测落空时,退回 dossier 自报的论文文件路径(真相源)解析包目录——
+        # exp-2026-09-12:ch24 论文包名 ch24b-primer-attn-variants(_fetch 时避开 v2 遗留
+        # ch24-primer-flash-attention 占名),与章目录名不一致,目录名猜测会找不到包、
+        # 把正文合法的「重绘自…Fig.N」图注误报成孤儿重绘(BLOCKING 假阳)。
+        inst_root = d.resolve().parent.parent
+        papers = doc.get("papers") or {}
+        for spec in papers.values():
+            if not isinstance(spec, dict):
+                continue
+            rel = spec.get("file")
+            if not isinstance(rel, str):
+                continue
+            cand = (inst_root / rel).resolve().parent
+            if cand.is_dir() and any(cand.glob("*.md")):
+                pack_dir = cand
+                break
     pack_dir_missing = not pack_dir.exists()
     pack_files = sorted(pack_dir.glob("*.md")) if pack_dir.exists() else []
     ptext = (

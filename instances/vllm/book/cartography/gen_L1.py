@@ -21,6 +21,18 @@
   - minimap 上本 Part 区域画高亮描边框（Part 主题色，双层描边=粗线+外发光），
     框外元素整体 opacity 0.45 退后（仍可辨）；框右上/右下角 → detail 左上/
     左下角两条 #94a3b8 虚线，锥形展开锚定放大关系；
+  - 锥线锚可见角（2026-09-12 立，ch24 盲审「箭头悬空」后）：上/下根分别锚到
+    最上/最下区域各自高亮框的右上/右下角（可见锚点），不再锚多区域外包框
+    角（几何锚但无可见元素，虚线像从空处出发）；单区域 Part 两锚同框、几何不变；
+  - 裁切护栏（2026-09-12 立，ch24 盲审「切口落在文字行中间/字残」后）：
+    detail 裁切边不得落入任何文字墨迹区间。墨迹区间用紧致墨迹模型（CJK=1em、
+    字母数字 0.555em、空格 0.30em、其余 ASCII 0.40em、粗体×1.04、锚侧端点精确，
+    系数经本机 sharp 渲染像素标定）
+    从元素流 <text> 解析重算；发现边切入文字时向两侧走查最近墨迹净空位（±SAFE），
+    走查越出 cap 即该向不可行；另把区域自身四界（卡片边框）作结构候选——浅穿透
+    （≤TOL2，模型误差带内）即接受：卡片文字内缩 14、间隙标签居中于间隙，结构界
+    天然让墨。两向皆不可行且无结构候选 → 保持原位并告警；不许剃进区域环带超过
+    SHAVE（= comp() 文字内缩深度，只剃卡片衬边、不碰字）；
   - 标题带在画布顶部专用区（不再与 L0 内容抢位——旧版的确定性落位搜索
     及其 bbox 复刻全部退役）；三行基线 8 张图完全一致；
   - Part→L0 区域映射沿用 regions_for（坐标全部取自 GEO，L0 改版自动联动）；
@@ -35,6 +47,7 @@ L0 自身逐字一致（端点在白底内=已连接的宽容分支同语义）�
 输出：L1-part{N}.svg + L1-part{N}.png（node sharp density=144 → 2x，同 L0 约定）。
 """
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -72,6 +85,111 @@ def ov(a, b):
     return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
 
 
+# ---- 裁切护栏（见模块 docstring）：裁切边不得落入文字墨迹区间 ----
+SAFE = 1.5      # 落点离墨迹区间的最小净空
+SHAVE = 14.0    # 允许剃进区域环带的最大深度（= comp() 文字内缩 tx-x，只剃卡片衬边）
+TOL2 = 3.5      # 结构候选（区域自身四界）的浅穿透容忍——墨迹模型对混排串的误差带
+
+_TEXT_RE = re.compile(
+    r'<text x="([-\d.]+)" y="([-\d.]+)" font-family="[^"]+" font-size="([\d.]+)" '
+    r'fill="[^"]+" text-anchor="(\w+)"( font-weight="bold")?>(.*)</text>')
+
+
+def _ink_w(s, fs, bold):
+    """紧致墨迹宽度：CJK=1em · 字母数字 0.555em · 空格 0.30em · 其余 ASCII 0.40em · 粗体×1.04。
+
+    系数经本机 sharp 渲染像素标定（2026-09-12：'hidden_states' 实测 64.4px@fs9 ≈0.55em/char，
+    0.52 低估会让护栏把切口留在末字符身上）。"""
+    w = 0.0
+    for ch in s:
+        o = ord(ch)
+        if o > 0x2E80:
+            w += fs
+        elif ch == ' ':
+            w += 0.30 * fs
+        elif ch.isalnum():
+            w += 0.555 * fs
+        else:
+            w += 0.40 * fs
+    return w * (1.04 if bold else 1.0)
+
+
+def ink_boxes(elems):
+    """从元素流解析文字的墨迹 bbox（x0,y0,x1,y1）；非 <text> 元素跳过。
+
+    与 l0_common.text() 记录的保守 bbox（±2 padding + ASCII 0.58em）不同——
+    那是碰撞检测的保守侧；本墨迹模型是「边切没切到字」的判定侧，过宽会把
+    间隙标签↔列头这类 ~3 单位的真间隙判成无隙，导致护栏大幅让位。"""
+    out = []
+    for _, s_ in elems:
+        m = _TEXT_RE.match(s_)
+        if not m:
+            continue
+        x, y, fs = float(m.group(1)), float(m.group(2)), float(m.group(3))
+        anchor, bold, body = m.group(4), bool(m.group(5)), m.group(6)
+        for a, b in (('&lt;', '<'), ('&gt;', '>'), ('&quot;', '"'),
+                     ('&apos;', "'"), ('&amp;', '&')):
+            body = body.replace(a, b)
+        w = _ink_w(body, fs, bold)
+        x0 = x - w / 2 if anchor == 'middle' else (x - w if anchor == 'end' else x)
+        out.append((x0 - 0.5, y - 0.86 * fs - 0.5, x0 + w + 0.5, y + 0.23 * fs + 0.5))
+    return out
+
+
+def _walk(edge, ivs, d, lo_cap, hi_cap):
+    """从 edge 沿方向 d 走查到第一个墨迹净空位；越出 cap 即该向不可行（返回 None）。"""
+    t = edge
+    for _ in range(80):
+        hit = next(((a, b) for a, b in ivs if a < t < b), None)
+        if hit is None:
+            return t if lo_cap <= t <= hi_cap else None
+        t = (hit[1] + SAFE) if d > 0 else (hit[0] - SAFE)
+        if (d > 0 and t > hi_cap) or (d < 0 and t < lo_cap):
+            return None
+    return None
+
+
+def _guard_edge(edge, ivs, lo_cap, hi_cap, struct, pid, tag, glog):
+    """单条裁切边的护栏：不动(未切字) / 走查净空位 / 结构候选(区域界,浅穿透容忍) / 保持+告警。"""
+    if not any(a < edge < b for a, b in ivs):
+        return edge
+    cands = []
+    for d in (-1, 1):
+        t = _walk(edge, ivs, d, lo_cap, hi_cap)
+        if t is not None:
+            cands.append(t)
+    for e_ in struct:
+        if not (lo_cap <= e_ <= hi_cap):
+            continue
+        pen = min((min(e_ - a, b - e_) for a, b in ivs if a < e_ < b), default=None)
+        if pen is None or pen <= TOL2:
+            cands.append(e_)
+    if not cands:
+        glog.append(f'L1-{pid} {tag} {edge:.1f}: 护栏无净空位，保持原位（需人工核图）')
+        return edge
+    new = min(cands, key=lambda c: (abs(c - edge), c))
+    if abs(new - edge) > 0.05:
+        glog.append(f'L1-{pid} {tag} {edge:.1f} -> {new:.1f}（避开文字墨迹）')
+    return new
+
+
+def guard_crop(crop, inks, reg, pid, g, glog):
+    """四条裁切边逐条过护栏；三趟迭代收敛（边动过会改变对侧的相关文字过滤范围）。"""
+    cx0, cy0, cx1, cy1 = crop
+    rx0, ry0, rx1, ry1 = reg
+    for _ in range(3):
+        before = (cx0, cy0, cx1, cy1)
+        ivx = [(b[0], b[2]) for b in inks if b[1] < cy1 and cy0 < b[3]]
+        ivy = [(b[1], b[3]) for b in inks if b[0] < cx1 and cx0 < b[2]]
+        cy0 = _guard_edge(cy0, ivy, 0.0, ry0 + SHAVE, (ry0,), pid, '上缘', glog)
+        cy1 = _guard_edge(cy1, ivy, ry1 - SHAVE, float(g['H']), (ry1,), pid, '下缘', glog)
+        cx0 = _guard_edge(cx0, ivx, 0.0, rx0 + SHAVE, (rx0,), pid, '左缘', glog)
+        cx1 = _guard_edge(cx1, ivx, rx1 - SHAVE, float(lc.W), (rx1,), pid, '右缘', glog)
+        if (cx0, cy0, cx1, cy1) == before:
+            break
+    return cx0, cy0, cx1, cy1
+
+
 def expand(r, m):
     return (r[0] - m, r[1] - m, r[2] + m, r[3] + m)
 
@@ -96,7 +214,7 @@ def regions_for(g, pid):
     return [(g['CX'], g['CY0'], g['CX'] + CW, g['C4Y'] + g['c4h'])]   # VII 采样与出口列
 
 
-def build_part(pid, part, elems, g, chapters):
+def build_part(pid, part, elems, g, chapters, inks, glog):
     regions = regions_for(g, pid)
     full = pid in ('I', 'VIII')
     rx0 = min(r[0] for r in regions)
@@ -107,6 +225,9 @@ def build_part(pid, part, elems, g, chapters):
     cx0, cy0 = max(0.0, rx0 - CROP_M), max(0.0, ry0 - CROP_M)
     cx1 = min(float(lc.W), rx1 + CROP_M)
     cy1 = min(float(g['H']), ry1 + CROP_M)
+    if not full:                       # 裁切护栏：切口不得落在文字行中间（半行残字）
+        cx0, cy0, cx1, cy1 = guard_crop((cx0, cy0, cx1, cy1), inks,
+                                        (rx0, ry0, rx1, ry1), pid, g, glog)
     cw, chh = cx1 - cx0, cy1 - cy0
 
     band = BAND_H_VIII if pid == 'VIII' else BAND_H
@@ -181,10 +302,13 @@ def build_part(pid, part, elems, g, chapters):
     out.append('</g></g>')
     out.append(lc.rect_svg(dx0, ct, dw, dh, 'none', lc.C_FAINT, rx=4, sw=1.2, dash=False))
 
-    # ---- 指示线：高亮框右缘两角 → detail 左缘两角（锥形展开） ----
+    # ---- 指示线：高亮框右缘两角 → detail 左缘两角（锥形展开；锚可见角） ----
     if not full:
-        for y_from, y_to in ((uby0, ct), (uby1, dy1)):
-            out.append(f'<line x1="{ubx1:.1f}" y1="{y_from:.1f}" x2="{dx0:.1f}" '
+        top_r = min(regions, key=lambda r: r[1])       # 最上区域 → 上根锚其高亮框右上角
+        bot_r = max(regions, key=lambda r: r[3])       # 最下区域 → 下根锚其高亮框右下角
+        for (rx_, ry_), y_to in ((mm(top_r[2] + HL_EXP, top_r[1] - HL_EXP), ct),
+                                 (mm(bot_r[2] + HL_EXP, bot_r[3] + HL_EXP), dy1)):
+            out.append(f'<line x1="{rx_:.1f}" y1="{ry_:.1f}" x2="{dx0:.1f}" '
                        f'y2="{y_to:.1f}" stroke="{lc.C_FAINT}" stroke-width="1.6" '
                        f'stroke-dasharray="6,4"/>')
 
@@ -225,6 +349,8 @@ def render_png(svg_path, png_path):
 
 def main():
     elems, g, warn = lc.build_l0()
+    inks = ink_boxes(elems)
+    glog = []
     chapters = {p['id']: [] for p in PLAN['parts']}
     for c in PLAN['chapters']:
         chapters[c['part']].append(c)
@@ -233,12 +359,16 @@ def main():
     parts = {p['id']: p for p in PLAN['parts']}
     metas = []
     for pid in ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII']:
-        m = build_part(pid, parts[pid], elems, g, chapters)
+        m = build_part(pid, parts[pid], elems, g, chapters, inks, glog)
         cp = m['crop']
         mm_s = '省（全景页）' if pid in ('I', 'VIII') else f'×{S:.3f} 暗{m["n_dim"]}/亮{m["n_bright"]}'
         print(f"Part {pid}: canvas={CANVAS_W}x{m['H']} crop=({cp[0]:.0f},{cp[1]:.0f})-"
               f"({cp[2]:.0f},{cp[3]:.0f}) k=×{m['k']:.2f} minimap={mm_s}")
         metas.append(m)
+    if glog:
+        print(f'--- {len(glog)} CROP-GUARD ADJUSTMENTS ---')
+        for w in glog:
+            print('  ' + w)
     if warn:
         print(f'--- {len(warn)} OVERFLOW WARNINGS ---')
         for w in warn:
