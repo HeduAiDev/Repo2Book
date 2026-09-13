@@ -16,7 +16,7 @@ Part IV 的总问题一句没变：**显存就那么多，KV cache 必须活到�
 
 读法建议：只想知道「一个类怎么住两个进程」，读[「契约的脸」](#契约的脸一个类两份实例站-1-2)就够；关心外部缓存怎么和本地缓存合并命中，看[「第二个前缀缓存」](#第二个前缀缓存查外部none-是稍后再问站-3)与[「两本账打架」](#两本账打架子块尾仲裁站-4)；关心「等货的请求怎么不挤死别人」，直奔[「占块等货」](#占块等货护轨与已分配未缓存的窗口站-5-6)；想看 worker 侧怎么干活，[「worker 的一拍」](#worker-的一拍收单发车交回执站-8)与[「只等本层」](#只等本层传输与计算的重叠站-8-的前向内部)连读；失败处理与 producer 视角是进阶两节。想跟全程，按序读。
 
-照例交代取证环境，全章数值表都适用：本章实测来自配套精简版：按 v0.27.1 只做减法抽出的「契约+调度器侧+worker 侧+池侧开口」全链，host 上实跑纯控制流（本章机制全部是纯 CPU 元数据与控制流路径，不涉 GPU 行为差异）；驱动用的是一个可编程的测试替身连接器，经真实工厂入口装配。四处取证口径与真实引擎有刻意差别，后文碰到会就近挑明：逐层重叠一节的时间账是教学模型；子块尾场景的 mamba 组只讲调度器可观测的行为；失败回滚一节有一例清零开关关着、由开关打开的变体补证；终局交接一例的「接管」答复是替身编程所得。
+照例交代取证环境，全章数值表都适用：本章实测来自配套精简版：按 v0.27.1 只做减法抽出的「契约+调度器侧+worker 侧+池侧开口」全链，host 上实跑纯控制流（本章机制全部是纯 CPU 元数据与控制流路径，不涉 GPU 行为差异）；驱动用的是一个可编程的测试替身连接器，经真实工厂入口装配。五处取证口径与真实引擎有刻意差别，后文碰到会就近挑明：逐层重叠一节的时间账是教学模型；子块尾场景的 mamba 组只讲调度器可观测的行为；失败回滚一节有一例清零开关关着、由开关打开的变体补证；终局交接一例的「接管」答复是替身编程所得；边界三例外一节是纯步序/时序控制流，本章以代码走读呈现、未驱动实测。
 
 ## 契约的脸：一个类，两份实例（站 1-2）
 
@@ -77,7 +77,7 @@ The class provides the following primitives:
 """
 ```
 
-上半是**调度器侧**五原语：查（`get_num_new_matched_tokens`）、分配后记账（`update_state_after_alloc`）、消化回传（`update_connector_output`）、终局交接（`request_finished`）、事件上报（`take_events`）。下半是 **worker 侧**七原语：覆写前抢救（`handle_preemptions`）、逐层收发四件套（`start_load_kv` / `wait_for_layer_load` / `save_kv_layer` / `wait_for_save`）、完成上报（`get_finished`）与回信（`build_connector_worker_meta`）。注意 docstring 里反复出现的括注 maybe async、blocks until、assumes responsibility for freeing asynchronously：**异步**贯穿这份契约的每一条，本章后面所有护栏、栅栏、回滚，都是为异步世界的正确性交的税。
+上半是**调度器侧**五原语：查（`get_num_new_matched_tokens`）、分配后记账（`update_state_after_alloc`）、消化回传（`update_connector_output`）、终局交接（`request_finished`）、事件上报（`take_events`）。下半是 **worker 侧**七原语：覆写前抢救（`handle_preemptions`）、逐层收发四件套（`start_load_kv` / `wait_for_layer_load` / `save_kv_layer` / `wait_for_save`）、完成上报（`get_finished`）与回信（`build_connector_worker_meta`）。这两个名字全章没有正戏：`take_events` 是 KV 事件上报的观测面原语，调度器侧收集事件批次时才调它；`build_connector_worker_meta` 只在 worker 一拍的收尾回填里被顺带调用（后文那处省略行就是调用点），把 worker 侧状态装配成随回执带给调度器侧连接器的信。本章的决策主线不经过这两个。注意 docstring 里反复出现的括注 maybe async、blocks until、assumes responsibility for freeing asynchronously：**异步**贯穿这份契约的每一条，本章后面所有护栏、栅栏、回滚，都是为异步世界的正确性交的税。
 
 ### role：同一个类，两个进程各建一份
 
@@ -364,7 +364,7 @@ waiting 循环里，connector 在场时本地命中要走一个混合感知的�
 | 步 2 | (32, False) 同步命中 | 本地 0 + 外部 32 = 已算 32 | 32 | r1 本拍算 64−32=32、转 RUNNING；update_state_after_alloc 收到 32 |
 | 另景（ExampleConnector 磁盘版） | (32, False) 磁盘命中 | 40-token prompt 块对齐取 32（留最后 1 token 要 logits） | — | worker 先存 2 块到磁盘；调度器侧查同一 prompt 命中 32，文件系统就是外部缓存 |
 
-步 1 退避的请求零占块、零调度，它甚至还没资格占块；步 2 答案一到，32 个外部 token 直接抵掉一半 prefill。None 语义不损失活性（liveness：只要外部世界还在动，被退避的请求不会被永久晾着）有个结构性保证：每轮 `schedule()` 先选 skipped 队头（FCFS：先来先服务，skipped 优先），退避请求每步必被重新查询一次；查询本身按契约要求 side-effect free（docstring 明说 Might be called multiple times），重复问没有代价。外部世界（远端索引、连接建立）只会把答案从 None 推进到具体数，每个退避请求的等待被系统外的进展单调消解；系统内它不占队头、不占块。
+步 1 退避的请求零占块、零调度，它甚至还没资格占块；步 2 答案一到，32 个外部 token 直接抵掉一半 prefill。步 2 走的是同步路径（load_kv_async=False），没有窗口期：外部段的块这一拍就分配、照常登记进缓存账（不跳 cache_blocks），KV 数据随本次前向逐层灌入，请求当拍转 RUNNING；「已分配未缓存」的窗口只对 load_kv_async=True 开，后面的护轨与等待态整套都是异步路径的代价。None 语义不损失活性（liveness：只要外部世界还在动，被退避的请求不会被永久晾着）有个结构性保证：每轮 `schedule()` 先选 skipped 队头（FCFS：先来先服务，skipped 优先），退避请求每步必被重新查询一次；查询本身按契约要求 side-effect free（docstring 明说 Might be called multiple times），重复问没有代价。外部世界（远端索引、连接建立）只会把答案从 None 推进到具体数，每个退避请求的等待被系统外的进展单调消解；系统内它不占队头、不占块。
 
 ![None 不等于 0：三态出边](../diagrams/ch16-fig-none-means-later.png)
 
@@ -683,6 +683,18 @@ ext 段的块照常挂上块表（L535，物理占用、free 计数掉下去）�
 
 窗口期的可观测面（64 块池、64-token 请求、外部 32）：块表挂上 2 块（block_ids [1,2]），`num_cached_block=0`、首块哈希为 None，即「已分配未缓存」；free 从 63 掉到 61；`num_computed_tokens` 先行写成 32，本拍零前向。这是块生涯的第一个挂起态：**账本说它归这个请求，物理上还没有效数据**。账实分离是异步契约的常态，后面还有两个同族的挂起态（交接未送达、已释放未归还）。
 
+这 2 块怎么发出来的（64 个 token 明明要 4 块，另外 2 块在哪），正是[第 13 章](../../ch13-paged-kv/narrative/chapter.md)E3 挂账待结的那笔：ext_comp 的 token 已算过、块要另发，token 账与块账在它身上分道扬镳。L535 那个包装 `allocate_new_computed_blocks` 内部分两段：先逐组 touch 本地命中块挂表（滑窗部署的窗外跳段先垫 null 占位，只占表长不占实体），再逐组调 `allocate_external_computed_blocks`，按 `cdiv(total, block_size) − len(req_blocks)` 另发实体块（total 是本地加外部的已算总量，req_blocks 是此刻已挂的块表）；两段不能倒过来，先发的外部块可能把别的组还没 touch 的命中块逐出。m4 的 2 块、护轨表 r1 的「占 4 块 ext」都是后一段发出的。至于本拍为什么只发外部段：异步准入拍的新算量在更上游就被清零：
+
+```python
+# vllm/v1/core/sched/scheduler.py:L866-L869 · Scheduler.schedule
+                if load_kv_async:
+                    # KVTransfer: loading remote KV, do not allocate for new work.
+                    assert num_external_computed_tokens > 0
+                    num_new_tokens = 0
+```
+
+注释原话「不为新活分配」（do not allocate for new work）：本拍只发外部段的块，新算段的块推迟到提升拍续算时补发——到货结算一节部分命中案例的「1 块新算」正是它，护轨表 r1 全程 8 块、本拍只占 4 的差也在这。E3 的账在此结清：滑窗 W=16 的请求跳段先垫 [null, null, null] 占 3 格表长，跳段前缀里的 2 块命中不被 touch、也不挂表，外部段另发 1 块，续算 36 token 再发 3 块，实体块 1+3 = 4，恰是那章预测器返回的 4。
+
 ## 一封不透明的搬运单（站 7）
 
 现在走到账本列的出口格：调度器侧的全部产出，要从这里过线到 GPU 列。
@@ -727,6 +739,8 @@ ext 段的块照常挂上块表（L535，物理占用、free 计数掉下去）�
 ```
 
 这封下行信随 `SchedulerOutput` 走完调度器到 worker 的全部过线路径（那是[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)的 ZMQ 边界和[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)的异步调度的事，本章不重讲）。回程是另一封信 `KVConnectorOutput`（vllm/v1/outputs.py:L223-L248）：装着 `finished_sending` / `finished_recving`（异步收发完成）、`invalid_block_ids`（失败块），worker 一拍干完活，把回执塞进去带回来。**决策侧只产计划、搬运侧只认 block_ids 加张量**：两封信是这两个世界之间仅有的往来，也是「换后端不改调度器」的物理基础：调度器从头到尾没见过后端的任何数据结构。
+
+多 worker 部署配了连接器时，上行信还有一个例外形状，[第 13 章](../../ch13-paged-kv/narrative/chapter.md) RPC 往返清单里留的那笔账在此兑现。正常只有 output_rank（唯一有权回话的那个 rank）交回执；这里 output_rank 被置成 None、全 rank 各回一份——每个 worker 的连接器只知道自己那份 KV 分片传输完没完，一个请求要全员报齐才算收发完毕。执行器用 `KVOutputAggregator`（kv_connector/utils.py:L53，启动时从调度器侧连接器构造）把 N 份回执聚成一份：某请求要进 finished_sending / finished_recving，得每个 rank 都报过它。广播怎么发、应答怎么收的通道内景，是[第 17 章](../../ch17-executor-worker-model-runner/narrative/chapter.md) collective_rpc 的正片。
 
 ## worker 的一拍：收单、发车、交回执（站 8）
 
