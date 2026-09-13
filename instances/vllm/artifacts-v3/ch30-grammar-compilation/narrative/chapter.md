@@ -1,6 +1,6 @@
 # 第 30 章　约束解码 I：语法编译
 
-用户只给了一句话：「必须输出合法 JSON」。或者一条正则、一个候选列表、一份 schema。可采样器认识的只有 logits：从 128000 个分数里挑一个 token 出门。这句人话怎么变成每个采样位置上「哪些 token 合法」的判定？
+用户只给了一句话：「必须输出合法 JSON」。或者一条正则、一个候选列表、一份 schema。可采样器认识的只有 logits：从约 13 万个分数里挑一个 token 出门。这句人话怎么变成每个采样位置上「哪些 token 合法」的判定？
 
 时间上还有一笔账。复杂 schema 的编译是毫秒到百毫秒级的 CPU 密集活，而 EngineCore 是单线程忙循环，[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)立过的纪律是慢活不许进循环。没编译完的请求凭什么既不进批、又拖不住别人一个 token？编译要是干脆失败了呢，一个坏 schema 凭什么只死它自己、不连累引擎？
 
@@ -12,11 +12,11 @@
 
 ![L2 章图：约束解码 I 语法编译](../diagrams/L2-ch30.png)
 
-> *图注：本章放大的是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 图采样出口列里的「结构化输出组」，就是那张图里画在采样器下方、写入却在采样之前先行的那块位掩码，[第 29 章](../../ch29-sampler-pipeline/narrative/chapter.md)门口第 1 站交接点 `apply_grammar_bitmask` 的上游。三块已读地基直接踩上来：采样列 9 步管线与 `allowed_token_ids` 白名单（[第 29 章](../../ch29-sampler-pipeline/narrative/chapter.md)，白名单是「不带状态机的粗粒结构化输出」，本章是它的完全体）；五拍循环第三拍的掩码窗口（[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)，掩码藏进前向窗口的位置账）；阻塞态与侧队机制（[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)，本章只是它的一次实例化）。读图：上排是请求进出条，中排 ①-⑥ 是语法对象的一生，下排是两层契约与四后端对照。站号 = 请求流经代码的顺序：第 1 站在前端进程（请求还没进引擎），第 2-8 站在引擎进程（IO 线程→编译线程→调度器）；正文按讲解需要编排、不必照站号读。*
+> *图注：本章放大的是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 图采样出口列里那块「结构化输出位掩码」（图面块名；本书行文与 L2 图顶带称结构化输出组，同一块），就是那张图里画在采样器下方、写入却在采样之前先行的那块位掩码，[第 29 章](../../ch29-sampler-pipeline/narrative/chapter.md)门口第 1 站交接点 `apply_grammar_bitmask` 的上游。三块已读地基直接踩上来：采样列 9 步管线与 `allowed_token_ids` 白名单（[第 29 章](../../ch29-sampler-pipeline/narrative/chapter.md)，白名单是「不带状态机的粗粒结构化输出」，本章是它的完全体）；五拍循环第三拍的掩码窗口（[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)，掩码藏进前向窗口的位置账）；阻塞态与侧队机制（[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)，本章只是它的一次实例化）。读图：上排是请求进出条，中排 ①-⑥ 是语法对象的一生，下排是两层契约与四后端对照。站号 = 请求流经代码的顺序：第 1 站在前端进程（请求还没进引擎），第 2-8 站在引擎进程（IO 线程→编译线程→调度器）；正文按讲解需要编排、不必照站号读。*
 
 读法建议：想知道「为什么是掩码不是重试」的原理账，直奔[「掩码不是重试」](#掩码不是重试采样前把非法-token-掐掉)；被「四家后端怎么选」困扰的，跳[「auto 降级阶梯」](#auto-降级阶梯校验期一次定终身)和[「四家后端，同一份契约」](#四家后端同一份契约分歧点对照)；本章的命门是异步编译门，在[「侧队与百微秒门控」](#第-56-站侧队与百微秒门控没编完的不进批也拖不住别人)；思考模型怎么跟语法联动，看[「先想后说的门」](#先想后说的门思考模型联动)；想跟全程，按序读。
 
-照例交代取证环境，全章数值表通用。所有数值来自 host 实跑：六个驱动脚本对着配套精简版与真实依赖库跑（xgrammar 0.2.6、llguidance 1.7.6，均为 vLLM requirements 钉版区间的 wheel；torch 2.11 CPU 张量），分词器用 gpt2、词表 50257（本地缓存，无网络）。四处差异先挑明：其一，取证词表 50257 不是 13 万级生产词表，正文里 128k 词表每行 16KB 的账引的是源码分配公式，不是本机观测；其二，xgrammar 0.2.6 已把 `GrammarMatcher(max_rollback_tokens=…)` 的限制语义弃用，构造时发 DeprecationWarning、内部恒无限回滚，vLLM 侧传参行为与 pin 源码一致，讲到回滚时再展开；其三，思考模型一节用的 reasoner 是最小替身（装配链按减法删除，四个方法本体逐字）；其四，四后端对照表里 outlines 与 lm-format-enforcer 两列的行为以源码行号为据（精简版按减法删了这两家，未在取证机运行）。计时数字一律是 host 单线程 perf_counter，毫秒级有抖动，只作数量级证据。
+照例交代取证环境，全章数值表通用。所有数值来自 host 实跑：六个驱动脚本与一枚双线程 GIL 探针（第 3 站放锁对照用）对着配套精简版与真实依赖库跑（xgrammar 0.2.6、llguidance 1.7.6，均为 vLLM requirements 钉版区间的 wheel；torch 2.11 CPU 张量），分词器用 gpt2、词表 50257（本地缓存，无网络）。四处差异先挑明：其一，取证词表 50257 不是 13 万级生产词表，正文里 128k 词表每行 16KB 的账引的是源码分配公式，不是本机观测；其二，xgrammar 0.2.6 已把 `GrammarMatcher(max_rollback_tokens=…)` 的限制语义弃用，构造时发 DeprecationWarning、内部恒无限回滚，vLLM 侧传参行为与 pin 源码一致，讲到回滚时再展开；其三，思考模型一节用的 reasoner 是最小替身（装配链按减法删除，四个方法本体逐字）；其四，四后端对照表里 outlines 与 lm-format-enforcer 两列的行为以源码行号为据（精简版按减法删了这两家，未在取证机运行）。计时数字一律是 host 单线程 perf_counter，毫秒级有抖动，只作数量级证据。
 
 ## 掩码不是重试：采样前把非法 token 掐掉
 
@@ -24,7 +24,7 @@
 
 ### 语法编译成什么：一台只往前走的状态机
 
-先把主角立住。**FSM（finite-state machine，有限状态机）** 是一台只能处于有限个状态之一的抽象机器，由三件东西定义：一组状态、一张转移表（「在状态 S 读到符号 x 就去状态 T」）、若干接受态（走到这里算整串合法）。它读输入永远一次一个符号，每步查一次表，不回头、不另带记忆。「语法编译」就是把一段「什么样的字符串算合法」的规则，翻译成这样一张走图，并且**替每个状态预先算好「从这个状态出发能走通的 token 集合」**，编译期干的重活就是这一件。生成期的循环因此变得极轻：查当前状态的允许集，拿它当掩码，被采出的 token 把机器推到下一个状态，周而复始。
+先把主角立住。**FSM（finite-state machine，有限状态机）** 是一台只能处于有限个状态之一的抽象机器，由三件东西定义：一组状态、一张转移表（「在状态 S 读到符号 x 就去状态 T」）、若干接受态（走到这里算整串合法）。它读输入永远一次一个符号，每步查一次表，不回头、不另带记忆。「语法编译」就是把一段「什么样的字符串算合法」的规则，翻译成这样一张走图，并且**替每个状态预先算好「从这个状态出发能走通的 token 集合」**，编译期干的重活主要就是这一件（这是原理基座的理想化：xgrammar 实际还把词表切成「不看语法栈位置、合法性固定不变」与「要看栈位置」两类——栈＝下文下推自动机的那块记忆——后者的允许集留给运行期快速判定，见[四后端对照](#四家后端同一份契约分歧点对照)一节）。生成期的循环因此变得极轻：查当前状态的允许集，拿它当掩码，被采出的 token 把机器推到下一个状态，周而复始。
 
 拿本章反复用的最小例子走一遍（说明性推演，非源码运行结果；真实 token id 见下节）。候选列表 `["yes", "no"]` 编译出的状态机是：
 
@@ -37,7 +37,7 @@ S0 是起点，只允许下一个字符是 y 或 n；沿 yes 三步、no 两步�
 
 ### 为什么不是生成后修复
 
-那为什么必须在采样**前**掩码，而不是生成后校验、错了重采样？形式化地说：设词表为 $`V`$，语法在当前状态 $`s`$ 下的合法集为 $`A(s) \subseteq V`$。模型分布 $`p`$ 落在 $`V`$ 全集上，采到非法 token 的概率一般非零；而生成是自回归的，一步走错（比如 JSON 里吐了裸换行），后续所有 token 都在错误前缀上条件化，回不到合法轨道。重试法解的是「最近合法串」问题，既无唯一解也不保证有限步终止。掩码法把分布换成合法集上的条件分布：
+那为什么必须在采样**前**掩码，而不是生成后校验、错了重采样？先掂大白话：重试是让观众随便进、坐错了再轰出去重排——不保证散场前坐对；掩码是门口直接挂名单，不在名单上的人根本拿不到票。形式化地说：设词表为 $`V`$，语法在当前状态 $`s`$ 下的合法集为 $`A(s) \subseteq V`$。模型分布 $`p`$ 落在 $`V`$ 全集上，采到非法 token 的概率一般非零；而生成是自回归的，一步走错（比如 JSON 里吐了裸换行），后续所有 token 都在错误前缀上条件化，回不到合法轨道。重试法解的是「最近合法串」问题，既无唯一解也不保证有限步终止。掩码法把分布换成合法集上的条件分布：
 
 ```math
 p_{\mathrm{mask}}(x)=\frac{p(x)\cdot\mathbf{1}[x\in A(s)]}{\sum_{x'\in A(s)}p(x')}
@@ -45,7 +45,7 @@ p_{\mathrm{mask}}(x)=\frac{p(x)\cdot\mathbf{1}[x\in A(s)]}{\sum_{x'\in A(s)}p(x'
 
 其中 $`\mathbf{1}[\cdot]`$ 是指示函数，方括号里的条件成立取 1、否则取 0。工程上不用真做这套归一化：把非法位的 logit 写成 −inf，softmax 之后它的概率恰好为零，归一化自动完成，采样器一行不用改。每步采样必落在 $`A(s)`$ 内，采完 FSM 前进到新状态、下一拍对新状态再掩码——链式保证整串合法。
 
-这条 why 链的完整四要素。**旧设计**：v0 早期 outlines 集成的形态是「生成→校验→重采样」循环，或者每步在 CPU 枚举合法 token id 列表传给采样器。**痛点**：词表 13 万，枚举/序列化合法集本身就有 O(V) 开销，一个 Python list 没法与批处理 GPU 管线拼合；重试路径根本不保证有限步终止，每轮重试还多一次 GPU 前向。**v1 方案**：语法编译成 FSM，每步 `fill_next_token_bitmask` 在预分配的位掩码上标记非法 token，掩码传到 worker 侧把非法 logits 原位写 −inf（`vllm/v1/structured_output/backend_xgrammar.py:L78-L126` 编译、采样侧执法是[第 29 章](../../ch29-sampler-pipeline/narrative/chapter.md)站 1 交接点）。**代价**（诚实账）：FSM 活在调度器进程，每步一次 CPU FSM 走查加一次跨进程传输；位掩码常驻显存外还要过一遍 H2D（host-to-device，主机内存到显存的拷贝；下一章的账）；xgrammar 啃不动的 JSON 特性直接拒单（下文降级阶梯）；掩码写入发生在采样管线之前，与惩罚/bad_words 的先后顺序是一条隐式契约。
+这条 why 链的完整四要素。**旧设计**：两条朴素路——a) 「生成→校验→重采样」循环，每步多轮 GPU 前向、延迟成倍；b) v0 早期 outlines 集成的形态：每步在 CPU 枚举合法 token id 列表传给采样器，合法集是 list[int]。**痛点**：词表 13 万，枚举/序列化合法集本身就有 O(V) 开销，一个 Python list 没法与批处理 GPU 管线拼合；重试路径根本不保证有限步终止，每轮重试还多一次 GPU 前向。**v1 方案**：语法编译成 FSM，每步 `fill_next_token_bitmask` 在预分配的位掩码上标记非法 token，掩码传到 worker 侧把非法 logits 原位写 −inf（`vllm/v1/structured_output/backend_xgrammar.py:L78-L126` 编译、采样侧执法是[第 29 章](../../ch29-sampler-pipeline/narrative/chapter.md)站 1 交接点）。**代价**（诚实账）：FSM 活在调度器进程，每步一次 CPU FSM 走查加一次跨进程传输；位掩码在 worker 侧常驻一份显存，且每步还要过一遍 H2D（host-to-device，主机内存到显存的拷贝；下一章的账）；xgrammar 啃不动的 JSON 特性直接拒单（下文降级阶梯）；掩码写入发生在采样管线之前，与惩罚/bad_words 的先后顺序是一条隐式契约。
 
 配上实测。手工构造一行 logits，让非法 token 得分最高（gpt2 词表 50257，`####` 是词表里真实存在但语法外的 token）：
 
@@ -57,7 +57,7 @@ p_{\mathrm{mask}}(x)=\frac{p(x)\cdot\mathbf{1}[x\in A(s)]}{\sum_{x'\in A(s)}p(x'
 | 掩码后 | apply_token_bitmask_inplace | bit=0 的位置写 -inf：4242 从 5.0 变 -inf | 非法位概率归零 | argmax 翻到 8505（'yes'） |
 | 对照·重试法 | 采样→校验→重采样循环 | 落在非法集的概率非零就永远可能再落错 | 不保证有限步终止 | 掩码法=对分布做合法集上的条件化，一步到位 |
 
-位置 0 为什么恰好允许 5 个 token？`choice ["yes","no"]` 的合法开头是 y 和 n 两个字符，但 gpt2 词表里 `no`、`ye`、`yes` 本身各是一个 token——**FSM 按 token 接受，一个 token 可以一口吃掉多个字符**，所以位置 0 的合法集是 choice 的前缀闭包：77('n')、88('y')、3919('no')、5948('ye')、8505('yes')，恰好五个。5/50257 ≈ 0.01%：自由采样踩非法 token 的概率约 99.99%，本例又构造了非法位得分最高，argmax 必错；掩码一盖，一步翻正。
+位置 0 为什么恰好允许 5 个 token？`choice ["yes","no"]` 的合法开头是 y 和 n 两个字符，但 gpt2 词表里 `no`、`ye`、`yes` 本身各是一个 token——**FSM 按 token 接受，一个 token 可以一口吃掉多个字符**，所以位置 0 的合法集是 choice 的前缀闭包：77('n')、88('y')、3919('no')、5948('ye')、8505('yes')，恰好五个。5/50257 ≈ 0.01%：若模型对约束一无所知（分布近似均匀），自由采样踩非法 token 的概率约 99.99%；本例又构造了非法位得分最高，argmax 必错。掩码一盖，一步翻正。
 
 ![概念链：choice 到位掩码到 argmax 翻转](../diagrams/ch30-fig-concept-chain.png)
 
@@ -89,7 +89,7 @@ class StructuredOutputsParams:
     structural_tag: str | None = None
 
     _backend: str | None = field(default=None, init=False)
-    """CAUTION: Should only be set by Processor._validate_structured_output"""   # L85
+    """CAUTION: Should only be set by Processor._validate_structured_output"""   # L86
     _backend_was_auto: bool = field(default=False, init=False)
     # … 省略：_backend_was_auto 的同款 CAUTION docstring …
 
@@ -109,12 +109,12 @@ class StructuredOutputsParams:
             raise VLLMValidationError(
                 "You can only use one kind of structured outputs constraint "
                 f"but multiple are specified: {self.__dict__}"
-            )                                   # 同时给两种约束：拒                         # L113
+            )                                   # 同时给两种约束：拒                         # L106
         if count < 1:
             raise VLLMValidationError(
                 "You must use one kind of structured outputs constraint "
                 f"but none are specified: {self.__dict__}"
-            )                                   # 一个不给也拒（占位对象）                  # L119
+            )                                   # 一个不给也拒（占位对象）                  # L111
     # … 省略：all_constraints_none——六个字段全 None 的便捷判定，from_sampling_params 用它区分「无约束请求」…
 ```
 
@@ -143,7 +143,7 @@ class StructuredOutputsParams:
 def get_structured_output_key(params: StructuredOutputsParams) -> StructuredOutputKey:
     if params.json is not None:
         if not isinstance(params.json, str):
-            json_str = json.dumps(params.json)      # dict 熨平成字符串               # L86
+            json_str = json.dumps(params.json)      # dict 熨平成字符串               # L85
         else:
             json_str = params.json
         return StructuredOutputOptions.JSON, json_str
@@ -178,6 +178,8 @@ def get_structured_output_key(params: StructuredOutputsParams) -> StructuredOutp
 | grammar | root ::= "yes" | GRAMMAR | root ::= "yes"（原样） |
 | structural_tag | {"x": 1} | STRUCTURAL_TAG | {"x": 1}（原样） |
 
+这张表能穷尽六形态的前提是上一小节的互斥校验：六选一被 `__post_init__` 双向强制，`get_structured_output_key` 的分支链（优先级 json→json_object→regex→choice→grammar→structural_tag）必恰有一条命中，函数尾那行 `raise ValueError` 实际不可达——取件码必为（枚举，字符串）二元组，天生可哈希、可比对。
+
 还有一个纠偏要趁早：`structured_output_key` 是**每请求**的 `cached_property`（同一请求读两次是同一对象），不是跨请求的编译缓存键。实跑证据：两个请求给同一 schema，键相等但对象独立。同 schema 的复用完全发生在后端内部，[编译缓存](#编译缓存各后端各自为政)一节对账。
 
 ### json 那格是什么：三十秒 JSON Schema
@@ -211,7 +213,7 @@ def get_structured_output_key(params: StructuredOutputsParams) -> StructuredOutp
         )
 ```
 
-`_validate_structured_outputs` 先做两类拒单。diffusion 模型直接拒（`sampling_params.py:L932-L942`，注释点名 #45436：FSM 要求从左到右采样，扩散模型整块画布并行去噪，中途 FSM 必然拒收，用户会拿到 HTTP 500，不如进门就拒）；`skip_tokenizer_init` 也拒（语法编译离不开分词器，`L944-L947`）。然后是引擎级单后端的冲突检查（下一小节），最后才是 auto 阶梯：
+`_validate_structured_outputs` 先做两类环境拒单。diffusion 模型直接拒（`sampling_params.py:L932-L942`，注释点名 #45436：FSM 要求从左到右采样，扩散模型整块画布并行去噪，中途 FSM 必然拒收，用户会拿到 HTTP 500，不如进门就拒）；`skip_tokenizer_init` 也拒（语法编译离不开分词器，`L944-L947`）。然后是引擎级单后端的冲突检查（下一小节）；夹在冲突检查与 auto 阶梯之间的还有一组内容预检（`L968-L998`）：choice 给空列表拒、grammar/json 给空串拒、json_object=False 拒——注释原话「Reject empty string grammar early to avoid engine-side crashes」，逻辑与 diffusion 拒单同族：能在前端拦下的崩溃，绝不留给引擎侧变 HTTP 500。最后才是 auto 阶梯：
 
 ```python
 # vllm/sampling_params.py:L1043-L1086 · SamplingParams._validate_structured_outputs（auto 分支）
@@ -261,13 +263,13 @@ def get_structured_output_key(params: StructuredOutputsParams) -> StructuredOutp
         self.structured_outputs.__post_init__()
 ```
 
-骨架一句话：**auto 不是运行期试错，是校验期一次定终身**。先试 xgrammar（试编 + JSON 特性预检），`ValueError` 则查两个 skip 判据再决定降 guidance 还是跳级降 outlines；显式指定后端时不做任何降级，编不动就拒单。两个判据：`_is_non_tekken_mistral`（tekken 是 Mistral 较新的 tiktoken 系分词器；**非** tekken 的老 SentencePiece 系 Mistral 分词器与 guidance 的分词器包装不兼容，这类请求跳过 guidance）和 `has_guidance_unsupported_json_features`（schema 特性扫描）。LMFE 永远不在 auto 的选项里——它撑不住回滚、能力面最窄，只能显式点名使用。
+骨架一句话：**auto 不是运行期试错，是校验期一次定终身**。先试 xgrammar（试编 + JSON 特性预检），`ValueError` 则查两个 skip 判据再决定降 guidance 还是跳级降 outlines；显式指定后端时不做任何降级，编不动就拒单。两个判据：`_is_non_tekken_mistral`（tekken 是 Mistral 较新的 tiktoken 系分词器，tiktoken 即 OpenAI 开源的那套 BPE 分词器实现；**非** tekken 的老 SentencePiece 系 Mistral 分词器与 guidance 的分词器包装不兼容，这类请求跳过 guidance）和 `has_guidance_unsupported_json_features`（schema 特性扫描）。LMFE（lm-format-enforcer，开篇四家里的第四家，下文用缩写）不在 auto 的选项里——源码 auto 分支只有 xgrammar→guidance/outlines 三条路，LMFE 只能显式点名使用；它也是四家里唯一不开投机解码的一家（引擎侧编译期即拒，为什么，第 4 站展开）。
 
 ![auto 降级阶梯](../diagrams/ch30-fig-auto-ladder.png)
 
 > *图注：auto 的决策树，全部发生在前端校验期（请求还没进引擎）。六形态入口先过「试编 xgrammar」菱形：试编成功且 JSON 特性预检通过，落 `_backend=xgrammar`；ValueError 则查两个 skip 判据（非 tekken Mistral 分词器、guidance 不支持的 schema 特性），命中任一降 outlines，都不命中降 guidance。旁栏是四个显式后端分支与引擎级单后端的冲突拒单。三例实测：choice [yes,no] 编得过 → xgrammar；json 带 multipleOf=5（xgrammar 预检不过）→ guidance；json {"a":{"type":"integer"}} → xgrammar 直接过。能力差异暴露在校验期（拒单或降级）而非运行中段。*
 
-那个 JSON 特性预检的黑名单，理论出身值得一句。`has_xgrammar_unsupported_json_features`（`vllm/v1/structured_output/backend_xgrammar.py:L225-L269`）扫四类：数值带 `multipleOf`、数组带 `uniqueItems`/`contains`、字符串带非白名单 `format`、对象带 `patternProperties`。这不是工程偷懒：`multipleOf` 是算术整除，文法只管字符形状、不会做除法；`uniqueItems` 要记住并比较已经出过的所有值，需要无界记忆；而有限状态的机器原理上够不着无界记忆。JSONSchemaBench（[arXiv:2501.10868](https://arxiv.org/abs/2501.10868)）在一万个真实 schema 上横评过六家引擎对这些特性的覆盖，黑名单词汇各家大同小异。读者撞上拒单时，答案在这里：不是 bug，是这台机器的表达力边界。
+那个 JSON 特性预检的黑名单，理论出身值得一句。`has_xgrammar_unsupported_json_features`（`vllm/v1/structured_output/backend_xgrammar.py:L225-L269`）扫四类：数值带 `multipleOf`，数组带 `uniqueItems`/`contains`/`minContains`/`maxContains`，字符串带非白名单 `format`，对象带 `patternProperties`/`propertyNames`。这不是工程偷懒：`multipleOf` 是算术整除，文法只管字符形状、不会做除法；`uniqueItems` 要记住并比较已经出过的所有值，需要无界记忆；而有限状态的机器原理上够不着无界记忆。JSONSchemaBench（[arXiv:2501.10868](https://arxiv.org/abs/2501.10868)）在一万个真实 schema 上横评过六家引擎对这些特性的覆盖，黑名单词汇各家大同小异。读者撞上拒单时，答案在这里：不是 bug，是这台机器的表达力边界。
 
 ### 校验期不只选后端，还会改写请求：choice→EBNF
 
@@ -354,7 +356,7 @@ item  ::= "a" | root
             # using the `_backend_was_auto` field set in the params.
             if backend != _backend and not (
                 backend == "auto" and self.structured_outputs._backend_was_auto
-            ):                                              # auto 记账放行复用         # L960
+            ):                                              # auto 记账放行复用         # L958
                 raise VLLMValidationError(
                     "Request-level structured output backend selection is not "
                     f"supported. The request specified '{_backend}', but vLLM "
@@ -362,10 +364,12 @@ item  ::= "a" | root
                     "resolved by removing '_backend' from the request."
                 )
         else:
-            self.structured_outputs._backend = backend      # 首个请求：引擎配置即后端  # L965
+            self.structured_outputs._backend = backend      # 首个请求：引擎配置即后端  # L966
 ```
 
 正常用户不碰 `_backend`，这个检查防的是**复用 params 对象**的离线场景：同一份 params 发第二次请求，上次 auto 已经把 `_backend` 写成了具体名字，这次的引擎配置若与它不同就误报冲突。`_backend_was_auto` 就是记账位：上次是 auto 定的，这次放行。实跑两例：auto 复用通过（`_backend=xgrammar`、引擎 auto）；显式 guidance 对引擎 auto+xgrammar 记账则拒单，报错原文「Request-level structured output backend selection is not supported」。
+
+还有一条配置级限制把「同一份契约」的边界再画一次。第 1 站那段源码里露过脸的两个开关：`disable_any_whitespace`（禁掉 JSON 里任意位置的空白）与 `disable_additional_properties`（把 schema 里所有没写 `additionalProperties` 的对象补成 false，模型一个声明之外的字段都吐不出来），能配谁是跟后端走的：前者只支持 xgrammar 与 guidance，后者只支持 guidance（`config/structured_outputs.py:L63-L74` 的 model_validator，即 pydantic 挂在配置类上的校验钩子，引擎启动即跑，配错当场 raise、服务根本起不来）。「全引擎只装一家」不只是运行期纪律，配置层就先画好了界。
 
 ## 第 2、3 站：进门即阻塞，IO 线程起编
 
@@ -379,7 +383,7 @@ item  ::= "a" | root
 # vllm/v1/request.py:L87-L114 · Request.__init__（末段）
         self.structured_output_request = StructuredOutputRequest.from_sampling_params(
             sampling_params
-        )                                   # 无约束则 None                       # L88
+        )                                   # 无约束则 None                       # L89
         # … 省略：arrival_time、初始 status=WAITING、events、stop_reason、kv_transfer_params 等常规字段 …
 
         if pooling_params is not None:
@@ -405,20 +409,22 @@ class StructuredOutputRequest:
     params: StructuredOutputsParams
     _grammar: (
         Future[StructuredOutputGrammar] | StructuredOutputGrammar | Exception | None
-    ) = None                                # Future/成品/Exception 多态演化的核心   # L24
+    ) = None                                # Future/成品/Exception 多态演化的核心   # L26
     reasoning_ended: bool | None = None     # 思考模型：独白是否已结束               # L27
     # Absolute index into the request's all_token_ids of the last reasoning
     # token (the reasoning-end marker). Tokens at or before this index are
     # reasoning content and must never be fed to the grammar. Only set when
     # reasoning ends in a step whose tokens the scheduler advances immediately
     # (structural tags + speculative decoding, see #42452).
-    reasoning_end_token_index: int | None = None                              # L35
+    reasoning_end_token_index: int | None = None                              # L33
     reasoning_parser_kwargs: dict[str, Any] | None = None
-    reasoner: "ReasoningParser | None" = None   # 不配推理解析器的模型恒为 None      # L39
+    # Cached per request; do not share reasoning parsers across requests because
+    # their behavior can depend on reasoning_parser_kwargs.
+    reasoner: "ReasoningParser | None" = None   # 不配推理解析器的模型恒为 None      # L37
     # … 省略：from_sampling_params 静态方法——params 无约束（all_constraints_none）返回 None …
 ```
 
-重点是 `_grammar` 的类型注解：它一生要经历四种形态——`None`（还没提交编译）、`Future`（编译中）、成品 `StructuredOutputGrammar`（编好了）、`Exception`（编砸了）。`Future`、成品、`Exception` 三态的演进是第 5、6 站门控的全部依据，reasoning 三字段则服务第 7 站的思考门。
+重点是 `_grammar` 的类型注解：它一生要经历四种形态——`None`（还没提交编译）、`Future`（期货——`executor.submit()` 当场返回的取货凭证：活儿在后台线程里跑，凭证到期兑成品、出错重抛原异常，下文与第 5、6 站反复用它）、成品 `StructuredOutputGrammar`（编好了）、`Exception`（编砸了）。`Future`、成品、`Exception` 三态的演进是第 5、6 站门控的全部依据，reasoning 三字段则服务第 7 站的思考门。
 
 ### grammar_init：惰性建唯一后端，把编译提交线程池
 
@@ -440,11 +446,11 @@ class StructuredOutputRequest:
             # `structured_output_manager`, each request is independent and
             # grammar compilation is async. Scheduler always checks grammar
             # compilation status before scheduling request.
-            self.structured_output_manager.grammar_init(req)   # IO 线程独占调用   # L989
+            self.structured_output_manager.grammar_init(req)   # IO 线程独占调用   # L990
         return req, request.current_wave
 ```
 
-docstring 原话「allow request initialization running in parallel with Model forward」：请求初始化（含语法编译的**发起**）与 GPU 前向并行。那段线程安全注释不是拍胸脯，是在论证为什么无竞态——「grammar_init 只在输入处理线程被调用」+「编译是异步的」+「调度器总在调度前检查编译状态」，三方各写各的、互不踩脚，第 5、6 站会逐条兑现。
+docstring 原话「allow request initialization running in parallel with Model forward」：请求初始化（含语法编译的**发起**）与 GPU 前向并行。那段线程安全注释不是拍胸脯，是在论证为什么无竞态——「grammar_init 只在输入处理线程被调用」+「编译是异步的」+「调度器总在调度前检查编译状态」，三方各写各的、互不踩脚，第 5、6 站会逐条兑现。截取里带出的两个标识符顺手认脸：`request_block_hasher` 是[第 15 章](../../ch15-prefix-caching/narrative/chapter.md)前缀缓存立的块哈希器（给请求的 KV 块算指纹），`current_wave` 是 DP（data parallel，数据并行）多引擎部署里协调器盖在请求上的波次号——都与语法无关，返回值的第二元本章用不到。
 
 `grammar_init` 本体两件事：惰性构造全引擎唯一后端，然后把编译提交线程池：
 
@@ -465,7 +471,7 @@ docstring 原话「allow request initialization running in parallel with Model f
             backend = request.sampling_params.structured_outputs._backend
             vocab_size = self.vllm_config.model_config.get_vocab_size()
             if backend == "xgrammar":
-                self.backend = XgrammarBackend(       # 首个请求定型后端            # L128
+                self.backend = XgrammarBackend(       # 首个请求定型后端            # L134
                     self.vllm_config,
                     tokenizer=self.tokenizer,
                     vocab_size=vocab_size,
@@ -498,13 +504,13 @@ docstring 原话「allow request initialization running in parallel with Model f
             # with just grammar compilation, so we set it to half the number
             # of CPUs.
             max_workers = max(1, (multiprocessing.cpu_count() + 1) // 2)
-            self.executor = ThreadPoolExecutor(max_workers=max_workers)  # 半 CPU     # L76
+            self.executor = ThreadPoolExecutor(max_workers=max_workers)  # 半 CPU     # L77
             self.tokenizer = cached_tokenizer_from_config(
                 model_config=self.vllm_config.model_config
             )
 ```
 
-三个为什么。**为什么用线程不用进程**：线程是同一进程里并肩跑的执行流，共享同一片内存（一个进程里的多个线程读写同一个地址空间），编译线程把编好的 FSM 对象原地递给调度线程只需传引用，不用序列化；进程之间内存隔离，传对象要跨进程序列化往返。**为什么线程数压到半个 CPU**：源码注释点的是「默认 CPU×5 太高，因为这些活是 CPU 密集不是 IO 密集」。对照 Python 文档正好严丝合缝：线程池（预先建好一组工人线程排队领活、submit 即返回的执行器）的旧默认（3.5-3.7 时代）就是 CPU 数×5，给 IO 密集任务堆一大把线程的思路；3.8 起改成 `min(32, CPU数+4)`，文档同时写明线程池「常用于重叠 IO 而非 CPU 工作」。两个版本的默认对 CPU 密集活都偏大，vLLM 显式压半——注释里的「为什么」在语言层面也站得住。**为什么不用 async/await**：忙循环是同步代码，起一个 executor、submit 一个函数是侵入最小的并行化，主线一行不改。
+四个为什么。**为什么用线程不用进程**：线程是同一进程里并肩跑的执行流，共享同一片内存（一个进程里的多个线程读写同一个地址空间），编译线程把编好的 FSM 对象原地递给调度线程只需传引用，不用序列化；进程之间内存隔离，传对象要跨进程序列化往返。**为什么 CPU 密集的活线程救得了**：[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)立过 GIL（global interpreter lock，全局解释器锁——CPython 同一时刻只放一个线程执行 Python 字节码）的账——纯 Python 的 CPU 活（tokenize/detokenize 那类）线程救不了，socket 收发这类活线程救得了，因为收发跑在原生代码里、执行期间不持这把锁。语法编译恰好是后者的亲戚：重活全在原生库里跑（xgrammar 的 C++、llguidance 的 Rust），绑定层一进原生活就放锁，编译线程与忙循环真并行——host 双线程探针实测（同一取证环境）：约 200ms 的编译活在编译线程里跑时，同进程纯 Python 忙循环的吞吐保持在九成以上（xgrammar 单次重 schema 与 llguidance 八连编两臂皆然）；对照臂把同样时长的纯 Python CPU 活放进同一个线程池，忙循环吞吐立刻掉到约一半——放没放锁，一测便知。Python 侧只剩读键、分派这层微秒级薄壳。若编译是纯 Python 写的，线程确实救不了——那就只剩进程池一条路，序列化往返的账又回来了。**为什么线程数压到半个 CPU**：源码注释点的是「默认 CPU×5 太高，因为这些活是 CPU 密集不是 IO 密集」。对照 Python 文档正好严丝合缝：线程池（预先建好一组工人线程排队领活、submit 即返回的执行器）的旧默认（3.5-3.7 时代）就是 CPU 数×5，给 IO 密集任务堆一大把线程的思路；3.8 起改成 `min(32, CPU数+4)`，文档同时写明线程池「常用于重叠 IO 而非 CPU 工作」。两个版本的默认对 CPU 密集活都偏大，vLLM 显式压半——注释里的「为什么」在语言层面也站得住。**为什么不用 async/await**：忙循环是同步代码，起一个 executor、submit 一个函数是侵入最小的并行化，主线一行不改。
 
 ### 两层契约：共享的编译器，独立的状态机
 
@@ -529,7 +535,7 @@ class StructuredOutputGrammar(ABC):
 
     @abstractmethod
     def fill_bitmask(self, bitmask: "torch.Tensor", batch_index: int) -> None:
-        """…把「下一步允许谁」写进位掩码的第 batch_index 行…"""                     # L73
+        """…把「下一步允许谁」写进位掩码的第 batch_index 行…"""                     # L74
 
     @abstractmethod
     def is_terminated(self) -> bool:
@@ -547,7 +553,7 @@ class StructuredOutputBackend(ABC):
 
     vllm_config: VllmConfig
     tokenizer: TokenizerLike
-    vocab_size: int                       # 三字段固定四个后端的构造签名           # L103
+    vocab_size: int                       # 三字段固定四个后端的构造签名           # L104
 
     @abstractmethod
     def compile_grammar(
@@ -568,7 +574,7 @@ class StructuredOutputBackend(ABC):
 
 ![两层契约](../diagrams/ch30-fig-two-layer-contract.png)
 
-> *图注：引擎级 Backend 全引擎一份：三字段（vllm_config/tokenizer/vocab_size，四个后端的构造签名由此固定）加三方法（compile_grammar/allocate_token_bitmask/destroy），怀里抱着 GrammarCompiler（LRU+512MB 字节预算缓存）与词表这类重资源，首个结构化请求到达时定型。请求级 Grammar 每请求一个：六方法加各自独立推进的 FSM，经 1→N 的 compile_grammar 扇出产生。四家后端在引擎级各占一列、同一套签名；它们的请求级产物都实现同一套六方法——「换后端不动引擎」的接缝就在这两层 ABC 上。*
+> *图注：引擎级 Backend 全引擎一份：三字段（vllm_config/tokenizer/vocab_size，四个后端的构造签名由此固定）加三方法（compile_grammar/allocate_token_bitmask/destroy），怀里抱着 GrammarCompiler（LRU+512MB 字节预算缓存）与词表这类重资源，首个结构化请求到达时定型。请求级 Grammar 每请求一个：六方法加各自独立推进的 FSM，经 1→N 的 compile_grammar 扇出产生。四家后端在引擎级并列、同一套签名；它们的请求级产物都实现同一套六方法——「换后端不动引擎」的接缝就在这两层 ABC 上。*
 
 ## 第 4 站（工作线程）：编译，语法怎么变成 FSM
 
@@ -616,14 +622,16 @@ class StructuredOutputBackend(ABC):
         elif request_type == StructuredOutputOptions.GRAMMAR:
             ctx = self.compiler.compile_grammar(grammar_spec)
         elif request_type == StructuredOutputOptions.REGEX:
-            ctx = compile_regex_with_timeout(             # ReDoS 护栏包着编           # L93
+            ctx = compile_regex_with_timeout(             # ReDoS 护栏包着编           # L92
                 self.compiler.compile_regex,
                 grammar_spec,
             )
         elif request_type == StructuredOutputOptions.STRUCTURAL_TAG:
             s_tag = json.loads(grammar_spec)
-            # … 省略：deprecated 老格式分支（structures/triggers 逐项拆 StructuralTagItem）…
-            ctx = self.compiler.compile_structural_tag(grammar_spec)
+            if "structures" in s_tag:      # deprecated 老格式
+                # … 省略：structures/triggers 逐项拆成 StructuralTagItem 再编 …
+            else:
+                ctx = self.compiler.compile_structural_tag(grammar_spec)
         else:
             logger.error(
                 "Validation should have already occurred. Please file an issue."
@@ -633,7 +641,7 @@ class StructuredOutputBackend(ABC):
             )                                               # 兜底：校验漏网才到这     # L117
 
         return XgrammarGrammar(
-            matcher=xgr.GrammarMatcher(                    # 逐 token 状态机          # L119
+            matcher=xgr.GrammarMatcher(                    # 逐 token 状态机          # L120
                 ctx,
                 max_rollback_tokens=self.num_speculative_tokens,   # 投机口子        # L122
             ),
@@ -642,7 +650,7 @@ class StructuredOutputBackend(ABC):
         )
 ```
 
-三个读点。第一，**五个分支、没有 CHOICE**。这不是漏写，是前端校验期把 choice 原地改写成了 EBNF（上一站），引擎侧自然无此分支；兜底的 `raise ValueError` 防的是绕过前端的异常路径，错误暴露在编译入口而非静默错编。第二，`JSON_OBJECT` 是 `compile_json_schema('{"type": "object"}')` 的语法糖，五分派实为「四种编译入口」。第三，产物是 `GrammarMatcher`，即 xgrammar 的逐 token 状态机，构造参数 `max_rollback_tokens=num_speculative_tokens` 是给投机解码留的回滚口子，下下节展开。边界声明：xgrammar 内部怎么做（schema→CFG→自适应 FSM→逐状态 token 集）是库内实现，vLLM 侧只见 API 契约，本章不杜撰库内部。
+三个读点。第一，**五个分支、没有 CHOICE**。这不是漏写，是前端校验期把 choice 原地改写成了 EBNF（上一站），引擎侧自然无此分支；兜底的 `raise ValueError` 防的是绕过前端的异常路径，错误暴露在编译入口而非静默错编。第二，`JSON_OBJECT` 是 `compile_json_schema('{"type": "object"}')` 的语法糖，五分派实为「四种编译入口」。第三，产物是 `GrammarMatcher`，即 xgrammar 的逐 token 状态机，构造参数 `max_rollback_tokens=num_speculative_tokens` 是给投机解码留的回滚口子，下下节展开。边界声明：xgrammar 内部怎么做（schema→CFG→自适应 FSM→逐状态 token 集；CFG 就是前文讲过的上下文无关文法，自适应 FSM 是 xgrammar 论文的自造结构，它借力的「上下文无关/相关 token 二分」在下文生态史一段点名）是库内实现，vLLM 侧只见 API 契约，本章不杜撰库内部。
 
 ### 走一遍最小状态机：choice 的两个可观测位置
 
@@ -650,7 +658,7 @@ class StructuredOutputBackend(ABC):
 
 ![choice FSM](../diagrams/ch30-fig-choice-fsm.png)
 
-> *图注：一条 EBNF（root ::= "yes" \| "no"）走成状态机：两个可观测状态加终态。位置 0 的入边束是五个前缀 token：半路键 n/y 停中间位、整词键 no/yes 一口吃完，位置 0 的合法集因此是 choice 的前缀闭包；位置 1 只允许 EOS 边到终态。打叉虚线是 4242('####')：词表内、语法外，accept_token 返回 False、计数不动——掩码层正是把这些转移在采样前掐掉。侧栏读法：状态数由语法决定（本例三个），与词表大小无关；词表大小决定的是每个状态上「挑选合法 token」的工作量，那是一次性编译算好的。*
+> *图注：一条 EBNF（root ::= "yes" \| "no"）走成状态机，图面画 token 级可观测位置：实测轨迹停驻的两个（位置 0 与吃完整词后的位置 1）加终态共三个；字符级编译产物有 5 个状态（本章开头的 S0/S1/S2/S4/S3），半路键停下的中间位不单列成框。位置 0 的出边束是五个前缀 token：半路键 n/y/ye 停中间位、整词键 no/yes 一口吃完，位置 0 的合法集因此是 choice 的前缀闭包；位置 1 只允许 EOS 边到终态。打叉虚线是 4242('####')：词表内、语法外，accept_token 返回 False、计数不动——掩码层正是把这些转移在采样前掐掉。侧栏读法：状态数由语法决定（本例 3 个可观测状态），与词表大小无关；词表大小决定的是每个状态上「挑选合法 token」的工作量，那是一次性编译算好的。*
 
 实测全程（gpt2 词表，grammar 形态走 GRAMMAR 分支编译）：
 
@@ -661,7 +669,7 @@ class StructuredOutputBackend(ABC):
 | 位置 0·反例 | accept_token(4242) | 4242('####') 不在 A(s) | False | 计数 0（拒收不前进） |
 | 位置 1 | fill_bitmask | 1 个：50256('<\|endoftext\|>') | accept_tokens([50256])=True | 计数 2，is_terminated=True |
 
-两个细节值得停留。其一，**同一 token 的合法性随状态变化**：3919('no') 在位置 0 合法、在位置 1 非法——这就是「每步都要重填掩码」的根本原因，掩码行是状态机的脚印，不是一张静态表。其二，终态语义：吃下整词 yes 之后语法串已完整，位置 1 只允许 EOS，accept 后 `is_terminated` 翻 True、引擎从此不再给这个请求填掩码。
+两个细节值得停留。其一，**同一 token 的合法性随状态变化**：3919('no') 在位置 0 合法、在位置 1 非法——这就是「每步都要重填掩码」的根本原因，掩码行是状态机的脚印，不是一张静态表。其二，终态语义：吃下整词 yes 之后语法串已完整，位置 1 只允许 EOS，accept 后 `is_terminated` 翻 True、引擎从此不再给这个请求填掩码（装配侧怎么跳过已终态的请求，下一章）。
 
 ### accept 与 validate：记账与验钞
 
@@ -677,7 +685,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
     ctx: xgr.CompiledGrammar = field(hash=False)
     num_processed_tokens: int = field(
         default_factory=lambda: 0, repr=False, hash=False, init=False
-    )                                       # 推进计数，与状态成对维护            # L145
+    )                                       # 推进计数，与状态成对维护            # L149
     _is_terminated: bool = field(default=False, repr=False, hash=False)
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
@@ -696,7 +704,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
                     request_id,
                     token,
                 )
-                return False                # 拒收即返回，不增计数                 # L167
+                return False                # 拒收即返回，不增计数                 # L168
             self.num_processed_tokens += 1  # 接受一个，计数加一                   # L169
         self._is_terminated = self.matcher.is_terminated()
         return True
@@ -709,7 +717,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
         """
         accepted_tokens = []
         for token in tokens:
-            if self.matcher.accept_token(token):    # 先真 accept                  # L182
+            if self.matcher.accept_token(token):    # 先真 accept                  # L181
                 accepted_tokens.append(token)
             else:
                 break
@@ -734,7 +742,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
         self.matcher.reset()
 ```
 
-直觉先行：accept 与 validate 是会计的两支笔。`accept_tokens` 是记账，钱真花了、账本（状态与计数）前进；`validate_tokens` 是验钞，钞票在验钞机过一遍看能过几张，一张都不真扣款。注意 `validate_tokens` 的实现手法：**先真 accept、计数 k、再 rollback(k)**，用「做了再撤销」等效「问了但没动」。这个等价性有边界：它依赖 rollback 是 accept 的精确逆操作，而回滚深度上限是构造时的 `max_rollback_tokens`，等价性在投机 token 数以内成立。语义分工的调用面：第 7 站的 `update_from_output` 用 accept_tokens 喂真采出的 token；投机解码路径用 validate_tokens 试走草稿（调用点 `scheduler.py:L2163/L2192`，展开归投机解码两章，这里只点名）。同一台 matcher 上的对照实测：
+直觉先行：accept 与 validate 是会计的两支笔。`accept_tokens` 是记账，钱真花了、账本（状态与计数）前进；`validate_tokens` 是验钞，钞票在验钞机过一遍看能过几张，一张都不真扣款。注意 `validate_tokens` 的实现手法：**先真 accept、计数 k、再 rollback(k)**，用「做了再撤销」等效「问了但没动」。这个等价性有边界：它依赖 rollback 是 accept 的精确逆操作，而回滚深度上限是构造时的 `max_rollback_tokens`，等价性在投机 token 数以内成立。语义分工的调用面：第 7 站的 `update_from_output` 用 accept_tokens 喂真采出的 token；投机解码路径用 validate_tokens 试走草稿（调用点 `scheduler.py:L2165/L2194`，展开归投机解码两章，这里只点名）。同一台 matcher 上的对照实测：
 
 <!-- trace: m8 -->
 | 操作 | 输入 | 返回 | num_processed_tokens | 语义 |
@@ -758,7 +766,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
 | 悔后探测 | fill_bitmask | 允许 1 个：'c' | 2 | 与位置 2 的合法集一致——悔棋精确还原状态 |
 | 重走 | accept_tokens([66]) | True | 3 | 与首次等价（计数/状态复原） |
 
-悔后探测那行是关键证据：悔一步之后 fill 出的允许集恰好是位置 2 的合法集（只剩 'c'），悔棋不是「大概回到附近」，是精确还原。深度上限由构造参数钉死：`max_rollback_tokens=num_speculative_tokens`（`backend_xgrammar.py:L119-L123`），不开投机就是 0。这里必须挑明取证差异（开头交代过的第二处）：xgrammar 0.2.6 已把这个参数的**限制**语义弃用，实跑构造时库发 DeprecationWarning，原话「You don't need to set it and it's always unlimited (-1)」——vLLM 传参行为与 pin 源码逐字一致，但库侧内部恒无限回滚；生产上投机 token 数本来就小，行为不受影响。后端对照：outlines 的 `Guide(max_rollback=…)` 同源；LMFE 压根没有状态机可悔，干脆在编译期对 `max_rollback_tokens>0` 显式抛错拒绝投机（`backend_lm_format_enforcer.py:L131-L134`，宁可不上牌桌）。
+悔后探测那行是关键证据：悔一步之后 fill 出的允许集恰好是位置 2 的合法集（只剩 'c'），悔棋不是「大概回到附近」，是精确还原。深度上限由构造参数钉死：`max_rollback_tokens=num_speculative_tokens`（`backend_xgrammar.py:L119-L123`），不开投机就是 0。这里必须挑明取证差异（开头交代过的第二处）：xgrammar 0.2.6 已把这个参数的**限制**语义弃用，实跑构造时库发 DeprecationWarning，原话「You don't need to set it and it's always unlimited (-1)」——vLLM 传参行为与 pin 源码逐字一致，但库侧内部恒无限回滚；生产上投机 token 数本来就小，行为不受影响。后端对照：outlines 的 `Guide(max_rollback=…)` 同源；LMFE 不预建状态机、逐前缀现算允许集，自身的 rollback 只是截短前缀列表、没有状态可悔，vLLM 干脆在编译期对 `max_rollback_tokens>0` 显式抛错拒绝投机（`backend_lm_format_enforcer.py:L130-L133`，宁可不上牌桌）。
 
 ### 编译缓存：各后端各自为政
 
@@ -777,18 +785,18 @@ class XgrammarGrammar(StructuredOutputGrammar):
 直觉：后厨的菜谱夹。同一位客人再点同一道菜，xgrammar 后厨翻菜谱夹（512MB 字节预算的 LRU，least-recently-used：越久没人点的菜谱越先扔）直接复用成品；guidance 后厨没有菜谱夹，每单从头炒。冷热差约三个数量级（10.178ms 对 0.034ms），且证据不止计时：`get_cache_size_bytes` 在数次编译后读到 186932 B、`clear_cache` 后归零、清空后重编耗时回到冷路径量级（8.932ms）——增长、清空、复原三段互证，缓存命中是因果不是巧合。缓存住在哪：
 
 ```python
-# vllm/v1/structured_output/backend_xgrammar.py:L60-L75 · XgrammarBackend.__init__（编译器装配）
+# vllm/v1/structured_output/backend_xgrammar.py:L60-L76 · XgrammarBackend.__init__（编译器装配）
         else:
             tokenizer_info = xgr.TokenizerInfo.from_huggingface(
                 self.tokenizer,
                 vocab_size=self.vocab_size,
             )
-            self.compiler = xgr.GrammarCompiler(
-                tokenizer_info,
-                max_threads=8,
-                cache_enabled=True,          # 库内缓存开                     # L67
-                cache_limit_bytes=vllm.envs.VLLM_XGRAMMAR_CACHE_MB * 1024 * 1024,
-            )                                # 字节预算，默认 512MB           # L69
+        self.compiler = xgr.GrammarCompiler(
+            tokenizer_info,
+            max_threads=8,
+            cache_enabled=True,          # 库内缓存开                     # L68
+            cache_limit_bytes=vllm.envs.VLLM_XGRAMMAR_CACHE_MB * 1024 * 1024,
+        )                                # 字节预算，默认 512MB           # L70
 
         self.num_speculative_tokens = 0
         if self.vllm_config.speculative_config is not None:
@@ -797,7 +805,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
             )
 ```
 
-`VLLM_XGRAMMAR_CACHE_MB` 默认 512MB，envs 的 docstring 顺手给了容量直觉：「512MB 大约够一千个 JSON schema」（`vllm/envs.py:L1558-L1561`）。生态全景各家各自为政：xgrammar 库内 LRU+字节预算；outlines 内存 LRUCache(128)，可选 SQLite（嵌入式磁盘数据库）缓存（`VLLM_V1_USE_OUTLINES_CACHE`，落盘用 outlines_core 原生二进制序列化，docstring 原话「代替 pickle，消除任意代码执行风险」（pickle 反序列化能执行任意代码）；磁盘缓存对不可信客户端还另有一条警告「无界、慎开」，`vllm/v1/structured_output/utils.py:L282-L301`）；guidance 无编译缓存（设计反题：它赌的就是惰性构造便宜，不需要摊薄）；LMFE 只对分词器数据做 `lru_cache`。**vLLM 侧零跨请求去重**：没有一层「同 schema 请求共享编译成果」的引擎级缓存，`structured_output_key` 只是每请求的取件码。所以「缓存命中」这件事完全取决于流量形状：同一 schema 反复来，xgrammar 白捡三个数量级；schema 千变万化，谁也救不了每次真编译。这正是 auto 先试 xgrammar 的偏好来源（同 schema 高复用选 xgrammar，schema 多变、首 token 延迟敏感选 guidance，后文对照表展开）。
+`VLLM_XGRAMMAR_CACHE_MB` 默认 512MB，envs 的 docstring 顺手给了容量直觉：「512MB 大约够一千个 JSON schema」（`vllm/envs.py:L1558-L1561`）。生态全景各家各自为政：xgrammar 库内 LRU+字节预算；outlines 内存 LRUCache(128)，可选 SQLite（嵌入式磁盘数据库）缓存（`VLLM_V1_USE_OUTLINES_CACHE`，落盘用 outlines_core 原生二进制序列化，类 docstring 原话「instead of pickle, eliminating arbitrary code execution risk」，意即用 Rust serde 二进制序列化代替 pickle、消除反序列化时的任意代码执行风险，`vllm/v1/structured_output/utils.py:L218-L224`；pickle 反序列化能执行任意代码，磁盘缓存对不可信客户端还另有一条「无界、慎开」警告，`utils.py:L282-L301`）；guidance 无编译缓存（设计反题：它赌的就是惰性构造便宜，不需要摊薄）；LMFE 只对分词器数据做 `lru_cache`。**vLLM 侧零跨请求去重**：没有一层「同 schema 请求共享编译成果」的引擎级缓存，`structured_output_key` 只是每请求的取件码。所以「缓存命中」这件事完全取决于流量形状：同一 schema 反复来，xgrammar 白捡三个数量级；schema 千变万化，谁也救不了每次真编译。这正是 auto 先试 xgrammar 的偏好来源（同 schema 高复用选 xgrammar，schema 多变、首 token 延迟敏感选 guidance，后文对照表展开）。
 
 ### ReDoS 护栏：给编译上闹钟
 
@@ -814,7 +822,7 @@ def compile_regex_with_timeout(fn: Callable[[str], _T], pattern: str) -> _T:
     """
     timeout = envs.VLLM_REGEX_COMPILATION_TIMEOUT_S
     if timeout <= 0:
-        return fn(pattern)                 # 关护栏：直跑                        # L65
+        return fn(pattern)                 # 关护栏：直跑                        # L66
 
     executor = ThreadPoolExecutor(max_workers=1)   # 单线程小灶
     future = executor.submit(fn, pattern)
@@ -828,13 +836,13 @@ def compile_regex_with_timeout(fn: Callable[[str], _T], pattern: str) -> _T:
             "The pattern may be too complex or contain constructs that "
             "cause exponential state-space explosion (e.g. nested "
             f"quantifiers). Pattern: {pattern[:200]}"
-        ) from None                        # 铃响即拉闸：ValueError 拒单          # L78
+        ) from None                        # 铃响即拉闸：ValueError 拒单          # L80
     else:
         executor.shutdown(wait=False)
         return result
 ```
 
-闹钟默认 5 秒（`VLLM_REGEX_COMPILATION_TIMEOUT_S`，envs docstring 原话「Set to 0 to disable (not recommended in production)」）。三家共用同一个护栏：xgrammar 的 `compile_regex`、outlines 的 `oc.Index`、LMFE 的 `RegexParser` 全从这过——护栏守在编译入口而非匹配入口，超时即拒单，坏正则杀不掉引擎。实测（护栏机制用受控慢函数验证，恶意候选在本机的表现诚实记录）：
+闹钟默认 5 秒（`VLLM_REGEX_COMPILATION_TIMEOUT_S`，envs docstring 原话「Set to 0 to disable the timeout (not recommended in production)」）。三家共用同一个护栏：xgrammar 的 `compile_regex`、outlines 的 `oc.Index`、LMFE 的 `RegexParser` 全从这过——护栏守在编译入口而非匹配入口，超时即拒单，坏正则杀不掉引擎。实测（护栏机制用受控慢函数验证，恶意候选在本机的表现诚实记录）：
 
 <!-- trace: m19 -->
 | 场景 | 调用 | 耗时 | 判定 | 结果 |
@@ -844,16 +852,16 @@ def compile_regex_with_timeout(fn: Callable[[str], _T], pattern: str) -> _T:
 | 恶意候选·host 探测 | (a+)+$ 等嵌套量词候选 | 最慢 40.6 ms | host 不复现爆炸 | 护栏必要性以源码 docstring 为据，不编造爆炸毫秒数 |
 | 关闭护栏 | VLLM_REGEX_COMPILATION_TIMEOUT_S=0 | — | fn 直跑不包 executor | 生产不建议（envs docstring） |
 
-诚实账两笔。其一，本机不复现爆炸：六个恶意候选在 host 上全部毫秒级编完（xgrammar 0.2.6 的正则编译没被这些候选打爆），护栏的必要性以源码 docstring 与 OWASP 的机理为据，超时**机制**由受控慢函数验证（1.01s 被拦）。其二，护栏的代价：Python 线程不可强杀，被放弃的编译线程可能还在后台烧（泄漏一个线程），但引擎不挂死——宁可漏一个线程，不塌一个店。防线思想与下一站的编译失败隔离同族：都不猜哪种爆炸，只保证爆炸的波及范围是单个请求。
+诚实账两笔。其一，本机不复现爆炸：六个恶意候选在 host 上全部毫秒级编完（xgrammar 0.2.6 的正则编译没被这些候选打爆），护栏的必要性以源码 docstring 与 OWASP 的机理为据，超时**机制**由受控慢函数验证（1.01s 被拦）。其二，护栏的代价：Python 线程不可强杀——`future.cancel()` 只拦得下还没开跑的任务、拦不下正在跑的——被放弃的编译线程可能还在后台烧（泄漏一个线程），但引擎不挂死——宁可漏一个线程，不塌一个店。防线思想与下一站的编译失败隔离同族：都不猜哪种爆炸，只保证爆炸的波及范围是单个请求。
 
 ### 四家后端，同一份契约：分歧点对照
 
 两层 ABC 立了之后，「四家吃同一份契约」可以落到实处。分歧都藏在各自的 `compile_grammar` 分派与六方法实现里，挑三处最有味道的对照。
 
-**终态语义分歧**。outlines 故意把终态**延迟一步**报，注释原话（`backend_outlines.py:L118-L121`）：
+**终态语义分歧**。outlines 故意把终态**延迟一步**报，注释原话（`backend_outlines.py:L119-L121`）：
 
 ```python
-# vllm/v1/structured_output/backend_outlines.py:L110-L124 · OutlinesGrammar（终态延迟注记）
+# vllm/v1/structured_output/backend_outlines.py:L111-L121 · OutlinesGrammar（终态延迟注记）
 @dataclass
 class OutlinesGrammar(StructuredOutputGrammar):
     vocab_size: int
@@ -868,7 +876,7 @@ class OutlinesGrammar(StructuredOutputGrammar):
 ```
 
 ```python
-# vllm/v1/structured_output/backend_outlines.py:L155-L164 · OutlinesGrammar（掩码写入与终态）
+# vllm/v1/structured_output/backend_outlines.py:L155-L163 · OutlinesGrammar（掩码写入与终态）
     # … 省略：accept_tokens / validate_tokens / rollback——走 outlines_core 的 Guide …
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
         mask = bitmask[idx]
@@ -876,12 +884,12 @@ class OutlinesGrammar(StructuredOutputGrammar):
 
     def is_terminated(self) -> bool:
         curr = self.guide.is_finished()
-        prev = self._prev_finished          # 报的是上一步的终态                 # L162
+        prev = self._prev_finished          # 报的是上一步的终态                 # L161
         self._prev_finished = curr
         return prev
 ```
 
-outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定是「EOS 发出才算完」——直接透传 done 会让最后一个还该发的 token 被掐掉，于是延迟一步，让 EOS 还能发出去。xgrammar 没这个问题（它的终态缓存标志跟着 accept 走）；guidance 用 `terminated` 标志加 `rollback_lag`。LMFE 最直接：看前缀末位是不是 EOS。
+outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定是「EOS 发出才算完」——直接透传 done 会让最后一个还该发的 token 被掐掉，于是延迟一步，让 EOS 还能发出去。xgrammar 没这个问题（它的终态缓存标志跟着 accept 走）；guidance 用 `terminated` 标志加 `rollback_lag`。LMFE 最直接：看前缀末位是不是 EOS（`backend_lm_format_enforcer.py:L82-L88`，注释原话「terminated if the prefix ends with eos_token_id」）。
 
 **rollback_lag：guidance 的「少退一格」**。guidance 的 accept 里藏着一个计数器：
 
@@ -915,7 +923,9 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
         return self.terminated
 ```
 
-为什么少退一格：EOS 被引擎接受后 matcher 已经处于停机态，回滚 `num_tokens` 会把停机这件事本身也回滚掉、下一拍状态就错了；lag=1 把停机记号留住。这是「同一契约、异实现」最典型的一格：xgrammar 的 rollback 是纯算术（回退 N 格），guidance 的 rollback 带 EOS 修正。同契约还体现在编译入口：guidance 的 `compile_grammar` 先 `serialize_guidance_grammar` 把六种形态统一序列化成 guidance 自己的语法（**原生支持 choice**，不需要 xgrammar 那套校验期改写），再构造 `LLMatcher`（`backend_guidance.py:L108-L131`）；outlines 一切先转正则（JSON Schema 用 `build_regex_from_schema` 转正则、choice 转交替式正则，再编 outlines_core 的 DFA Index，`backend_outlines.py:L73-L97`）；LMFE 不编任何自动机，拿 `current_tokens_prefix` 前缀列表按需查 `get_allowed_tokens`、fill 时才物化掩码行——没有状态机就没有 O(1) 查表，也就撑不住回滚，于是有了它「对投机解码直接抛错」的立场（`backend_lm_format_enforcer.py:L124-L139`：`max_rollback_tokens>0` 即 `ValueError`）。
+为什么少退一格：EOS 被引擎接受后 matcher 已经处于停机态，回滚 `num_tokens` 会把停机这件事本身也回滚掉、下一拍状态就错了；lag=1 把停机记号留住。这是「同一契约、异实现」最典型的一格：xgrammar 的 rollback 是纯算术（回退 N 格），guidance 的 rollback 带 EOS 修正。validate_tokens 的返回口径也分流：xgrammar 先真 accept 再整体回退、返回被接受的前缀列表（前文 accept/validate 对照实测立的「返回前缀不是布尔」），guidance 的 ll_matcher.validate_tokens 直接返回接受数、vLLM 侧再拿它切出前缀（`backend_guidance.py:L197-L201`）——同一条契约、两种数法。同契约还体现在编译入口：guidance 的 `compile_grammar` 先 `serialize_guidance_grammar` 把六种形态统一序列化成 guidance 自己的语法（**原生支持 choice**，不需要 xgrammar 那套校验期改写），再构造 `LLMatcher`（`backend_guidance.py:L108-L131`）。`LLMatcher` 内部是词法-句法两层：词法层拿**正则导数**惰性构词（把正则式当成可求导的式子，每读进一个字符就「微分」一次、化简成只描述剩余合法后缀的新式子，下一步允许的字符集当场可读，不必预先建好整张 DFA）；真正的嵌套结构才轮到 Earley 句法分析器出手（下面表格里那格「正则导数惰性词法器+Earley」说的就是这套）。
+
+outlines 一切先转正则（JSON Schema 用 `build_regex_from_schema` 转正则、choice 转交替式正则，再编 outlines_core 的 DFA Index，`backend_outlines.py:L73-L97`）。LMFE 不编任何自动机，拿 `current_tokens_prefix` 前缀列表按需查 `get_allowed_tokens`、fill 时才物化掩码行（`backend_lm_format_enforcer.py:L76-L80`）；没有状态机就没有 O(1) 查表，回滚也只是截短前缀列表、没有状态可悔，vLLM 干脆在编译期对 `max_rollback_tokens>0` 抛错拒绝投机（`L130-L133`）。这套逐前缀现算换来的灵活性是 LMFE 官方 README 的卖点口径：不逼模型走唯一格式，空白、换行与 JSON 字段的先后留给模型自己定（称可减少幻觉），另带逐 token 诊断（对比被约束选的 token 与模型本想选的）——下文「怎么选的一句话版」里「要模型自控空白与字段顺序」说的就是这。
 
 四家速览（能力矩阵藏在各自分派里；措辞以 v0.27.1 源码为准）：
 
@@ -924,13 +934,13 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
 | xgrammar | 字节级下推自动机 | 全六形（CHOICE 经校验期改写） | 支持（构造参数钉深度） | 库内 LRU+512MB 预算 |
 | guidance（llguidance） | 词法-句法两层：正则导数惰性词法器+Earley | 全六形（serialize 统一，choice 原生） | 支持（带 EOS lag 修正） | 无（设计反题） |
 | outlines（outlines-core） | 一切转正则→DFA+词表索引 | JSON/REGEX/CHOICE 三形 | 支持（Guide 构造参数） | 内存 LRU(128)+可选 SQLite |
-| lm-format-enforcer | 无自动机：字符级解析器×分词器前缀树逐 token 试探 | JSON/JSON_OBJECT/REGEX/CHOICE 四形 | 不支持，开投机即抛错 | 仅分词器数据 lru_cache |
+| lm-format-enforcer | 无自动机：字符级解析器×分词器前缀树逐 token 试探 | JSON/JSON_OBJECT/REGEX/CHOICE 四形 | 不开投机（编译期抛错）；自身 rollback 仅截前缀列表 | 仅分词器数据 lru_cache |
 
-四家的技术路线背后是一段生态史，三波。第一波（2023）：guidance（微软，模板式控制生成）、llama.cpp 的 GBNF、outlines（Willard 与 Louf 的论文首次把「生成即 FSM 状态转移+预建词表索引」形式化，[arXiv:2307.09702](https://arxiv.org/abs/2307.09702)）与 LMFE，确立了「掩码非法 token」范式，但要么预计算太重、要么表达力有限。第二波（2024）：xgrammar（MLC 团队，[arXiv:2411.15100](https://arxiv.org/abs/2411.15100)，MLSys'25）用字节级下推自动机加「上下文无关/相关 token 二分」预查表，把每 token 开销压到近零，论文声称对已有方案最高 100x 加速；outlines 把核心改写为 Rust。第三波（2024-2025）：微软把 guidance 引擎重写为 Rust 的 llguidance（惰性词法+Earley，官方口径启动约 2ms、每掩码约 50µs@128k 词表），2025 年合入 vLLM、其后又被 OpenAI 采用为 Structured Outputs 的底层引擎（据 llguidance 官方博客）。两处竞品口径按出处读：llguidance 博客批评 xgrammar 式预计算「有时数秒甚至数分钟」，是竞争方的话；Red Hat 2025 年[实测](https://developers.redhat.com/articles/2025/06/03/structured-outputs-vllm-guiding-ai-responses)的结论倒是可以当工程共识：xgrammar 缓存友好、长生成占优，guidance 单请求延迟低、schema 多变场景更好。怎么选的一句话版：同 schema 高复用选 xgrammar，schema 千变万化、首 token 延迟敏感选 guidance，纯正则且复用选 outlines，要模型自控空白与字段顺序或要逐 token 诊断就显式点 LMFE。vLLM 的 auto 阶梯正是这个偏好的编码。顺带一提展望：两家的源码注释都点名了 jump-forward decoding（语法允许时一次跳过整段确定的字符串，[xgrammar 文档](https://xgrammar.mlc.ai/docs/)），vLLM 尚未启用，是这条流水线可见的下一个提速位。
+四家的技术路线背后是一段生态史，三波。第一波（2023）：guidance（微软，模板式控制生成）、llama.cpp 的 GBNF、outlines（Willard 与 Louf 的论文首次把「生成即 FSM 状态转移+预建词表索引」形式化，[arXiv:2307.09702](https://arxiv.org/abs/2307.09702)）与 LMFE，确立了「掩码非法 token」范式，但要么预计算太重、要么表达力有限。第二波（2024）：xgrammar（MLC 团队，[arXiv:2411.15100](https://arxiv.org/abs/2411.15100)，MLSys'25）用字节级下推自动机加「上下文无关/相关 token 二分」预查表（论文自造词：编译期把词表切成两类——不看语法栈位置、合法性固定不变的「上下文无关」token 预先算好存表；要看栈位置的「上下文相关」token 留给运行期快速判定），把每 token 开销压到近零，论文声称对已有方案最高 100x 加速；outlines 把核心改写为 Rust。第三波（2024-2025）：微软把 guidance 引擎重写为 Rust 的 llguidance（惰性词法+Earley，官方口径启动约 2ms、每掩码约 50µs@128k 词表），2025 年合入 vLLM、其后又被 OpenAI 采用为 Structured Outputs 的底层引擎（据 llguidance 官方博客）。两处竞品口径按出处读：llguidance 博客批评 xgrammar 式预计算「有时数秒甚至数分钟」，是竞争方的话；Red Hat 2025 年[实测](https://developers.redhat.com/articles/2025/06/03/structured-outputs-vllm-guiding-ai-responses)的结论倒是可以当工程共识：xgrammar 缓存友好、长生成占优，guidance 单请求延迟低、schema 多变场景更好。怎么选的一句话版：同 schema 高复用选 xgrammar，schema 千变万化、首 token 延迟敏感选 guidance，纯正则且复用选 outlines，要模型自控空白与字段顺序或要逐 token 诊断就显式点 LMFE。vLLM 的 auto 阶梯正是这个偏好的编码。顺带一提展望：两家的源码注释都点名了 jump-forward decoding（语法允许时一次跳过整段确定的字符串，[xgrammar 文档](https://xgrammar.mlc.ai/docs/)），vLLM 尚未启用，是这条流水线可见的下一个提速位。
 
 ## 第 5、6 站：侧队与百微秒门控——没编完的不进批，也拖不住别人
 
-编译在线程池里跑，调度器在忙循环里转，两者怎么互不打扰、又怎么交接？这是本章的命门，先立 why 链再走源码。**旧设计**：同步编译——请求带 schema 到达，阻塞编译完才能调度。**痛点**：复杂 schema 编译是 CPU 密集（毫秒到百毫秒级，随嵌套深度），同步做等于把这段 CPU 时间直接插进关键路径，打爆首 token 延迟（TTFT），一个慢 schema 请求拖住整个引擎循环；[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)算过这笔账：一步前向只有几十毫秒，10ms 串行 CPU 杂务约等于 20% 以上的吞吐损失。**v1 方案**：编译提交线程池（第 3 站已见），请求进门即进阻塞态侧队，调度器每拍花百微秒探测一次，编好了当拍晋级入批。**代价**：轮询是忙等变体（每拍每请求一次探测）；门控机制本身有复杂度（三态字段、单调性、失败隔离，全在本节）；external_launcher 部署形态下还得把异步关掉（本节末）。
+现在回到 L0 图引擎进程的逐拍循环框：调度器每拍要做的这件事。编译在线程池里跑，调度器在忙循环里转，两者怎么互不打扰、又怎么交接？这是本章的命门，先立 why 链再走源码。**旧设计**：同步编译——请求带 schema 到达，阻塞编译完才能调度。**痛点**：复杂 schema 编译是 CPU 密集（毫秒到百毫秒级，随嵌套深度），同步做等于把这段 CPU 时间直接插进关键路径，打爆首 token 延迟（TTFT），一个慢 schema 请求拖住整个引擎循环；[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)算过这笔账：一步前向只有几十毫秒，10ms 串行 CPU 杂务按 50ms 前向算就把每拍拖成 60ms、吞吐掉约 17%，前向越快这笔账越狠。**v1 方案**：编译提交线程池（第 3 站已见），请求进门即进阻塞态侧队，调度器每拍花百微秒探测一次，编好了当拍晋级入批。**代价**：轮询是忙等变体（忙等＝不睡觉、原地反复查条件的等待方式；这里每拍每请求一次探测）；门控机制本身有复杂度（三态字段、单调性、失败隔离，全在本节）；external_launcher 部署形态下还得把异步关掉（本节末）。
 
 ### 侧队：三个阻塞态共用一套机制
 
@@ -962,9 +972,9 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
                     request.status
                 ) and not self._try_promote_blocked_waiting_request(request):
                     # … 省略：REMOTE_KVS 仍在等待的 debug 日志 …
-                    request_queue.pop_request()           # 未就绪：请出队           # L708
+                    request_queue.pop_request()           # 未就绪：请出队           # L709
                     step_skipped_waiting.prepend_request(request)
-                    continue                              # 本拍跳过，看下一位      # L710
+                    continue                              # 本拍跳过，看下一位      # L711
 ```
 
 窥队头、试晋级、失败就 pop 出来放进本拍的临时收集队、步末整批插回侧队队头——没编译完的请求每拍只花一次探测的成本，别人的 token 一个不耽误。
@@ -1036,7 +1046,7 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
             if isinstance(structured_output_req.grammar, Exception):
                 self.grammar_compile_error_reqs.add(request.request_id)
                 return False                 # 出口二：编砸了，记账不晋升         # L2701
-            request.status = RequestStatus.WAITING   # 出口三：就绪，提回 WAITING  # L2704
+            request.status = RequestStatus.WAITING   # 出口三：就绪，提回 WAITING  # L2702
             return True
 
         # … 省略：WAITING_FOR_STREAMING_REQ 分支与防御性 AssertionError …
@@ -1066,17 +1076,17 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
         error_req_ids = set(self.grammar_compile_error_reqs)
         self.grammar_compile_error_reqs.clear()       # 取走即清                    # L1955
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
-            error_req_ids.update(failed_kv_load_req_ids)   # KV 加载失败同路合并   # L1958
+            error_req_ids.update(failed_kv_load_req_ids)   # KV 加载失败同路合并   # L1957
 
         if error_req_ids:
             error_reqs = self.finish_requests(
                 error_req_ids, RequestStatus.FINISHED_ERROR
-            )                                        # 只杀这批                    # L1961
+            )                                        # 只杀这批                    # L1962
             for request in error_reqs:
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=request.request_id,
-                        new_token_ids=[],            # 空 token 回执                # L1965
+                        new_token_ids=[],            # 空 token 回执                # L1967
                         finish_reason=request.get_finished_reason(),
                         events=request.take_events(),
                         trace_headers=request.trace_headers,
@@ -1093,7 +1103,7 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
 | 晋升检查 | _try_promote_blocked_waiting_request(bad-1) | isinstance(grammar, Exception)=True | return False；记账 grammar_compile_error_reqs 含 bad-1；不晋升 |
 | 同拍收账 | update_from_output 尾部 finish_requests(FINISHED_ERROR) | bad-1 出列、good-1 存活 | bad-1=FINISHED_ERROR；回执 new_token_ids=[]；good-1 无感 |
 
-对照一下同步编译的平行世界：坏 schema 的异常会以异常打断**整拍**调度。隔离语义是异步化的副产品红利——Future 本来就把异常封存成了数据，「只杀单请求」只是顺着这个形状把清算放在了拍尾。external_launcher 的同步回退分支也把异常包进 Future（第 3 站 embed 的 L171-L174），两条路径对下游同形。
+对照一个「同步直调、不包 Future」的平行世界（v0 式的假想形态；本章 external_launcher 的同步分支其实是包 Future 的，见段末）：坏 schema 的异常会以异常打断**整拍**调度。隔离语义是异步化的副产品红利——Future 本来就把异常封存成了数据，「只杀单请求」只是顺着这个形状把清算放在了拍尾。external_launcher 的同步回退分支也把异常包进 Future（第 3 站内嵌源码的 L171-L174），两条路径对下游同形。
 
 ### external_launcher：异步门为什么关掉
 
@@ -1110,10 +1120,10 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
         self._use_async_grammar_compilation = (
             vllm_config.parallel_config.distributed_executor_backend
             != "external_launcher"
-        )                                          # external_launcher：关异步    # L53
+        )                                          # external_launcher：关异步    # L55
 
         self._grammar_bitmask: torch.Tensor | None = None
-        self._full_mask = torch.tensor(-1, dtype=torch.int32)   # 全允许兜底值      # L57
+        self._full_mask = torch.tensor(-1, dtype=torch.int32)   # 全允许兜底值      # L58
 ```
 
 为什么异步门在 torchrun 形态下必须关。**torchrun**（PyTorch 官方分布式启动器）给每个 rank（参与分布式训练的一个成员进程）孵一个独立进程、各自跑同一份程序；张量并行（TP，每个 rank 持有权重的一片）下各 rank 靠 **集合通信**（collective：all_reduce、broadcast 这类所有 rank 一起进入的调用）拼齐结果。集合通信的铁律是各 rank 必须以 **相同顺序** 进入每一次调用——底层按到达顺序配对撮合，甲的第 1 次 all_reduce 去和乙的第 1 次汇合；顺序一错位，两边都在等一个永远配不上对的调用，死锁。而异步编译的门迁移时刻（WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR→WAITING 何时发生）取决于各 rank 自己的线程调度，天然漂移；两个 rank 的调度决策从这一拍开始分叉，集合通信顺序跟着错位。所以在「每 rank 一个调度器」的 external_launcher 形态下，vLLM 显式回退同步编译，用确定性换并发。代价同步看：编译回到请求预处理的关键路径上，单请求慢一点，换全队锁步。
@@ -1134,7 +1144,7 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
 # vllm/v1/core/sched/scheduler.py:L1817-L1843 · Scheduler.update_from_output（语法推进块）
             if new_token_ids and self.structured_output_manager.should_advance(
                 request, new_token_ids=new_token_ids
-            ):                                     # 思考门：先问该不该推进        # L1818
+            ):                                     # 思考门：先问该不该推进        # L1819
                 struct_output_request = request.structured_output_request
                 assert struct_output_request is not None
                 grammar = struct_output_request.grammar
@@ -1146,10 +1156,10 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
                     self.structured_output_manager.trim_reasoning_for_advance(
                         request, new_token_ids
                     )
-                )                                  # 混步剔除：思考 token 撕掉      # L1830
+                )                                  # 混步剔除：思考 token 撕掉      # L1831
                 if advance_token_ids and not grammar.accept_tokens(
                     req_id, advance_token_ids
-                ):                                 # 用真采出的 token 推进          # L1832
+                ):                                 # 用真采出的 token 推进          # L1834
                     logger.error(
                         "Unexpected: grammar rejected tokens %s for request %s. "
                         "Terminating request.",
@@ -1157,11 +1167,11 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
                         req_id,
                     )
                     request.status = RequestStatus.FINISHED_ERROR
-                    request.resumable = False      # 拒收=引擎 bug，不可恢复        # L1839
+                    request.resumable = False      # 拒收=引擎 bug，不可恢复        # L1842
                     stopped = True
 ```
 
-两件事。**其一，FSM 状态的唯一写者是调度器线程。** 推进用的 token 是本步真正采出、真正落定的 `new_token_ids`，不是草稿、不是预测。spec 路径的 validate/rollback 试走发生在别处（`scheduler.py:L2163/L2192`，投机解码两章的领地），最终都以「实际接受的 token」回到这里兑现。**其二，拒收即引擎 bug。** 掩码保证了采样只能落在合法集内，所以 `accept_tokens` 必然成功；它返回 False 意味着 fill→sample→accept 这条环在某一处断了——源码自己承认这一点，错误措辞「Unexpected: grammar rejected tokens … Please file an issue」级别的自认（xgrammar 侧 `backend_xgrammar.py:L162-L167` 同款），处置是 FINISHED_ERROR 加 `resumable=False`：不是请求的错，但这个请求的状态已不可信，杀掉止损。这条闭合不变式回头看特别踏实：第 1 节的条件分布论证（采样必落合法集）在这里被源码当成运行时断言用。
+两件事。**其一，FSM 状态的唯一写者是调度器线程。** 推进用的 token 是本步真正采出、真正落定的 `new_token_ids`，不是草稿、不是预测。spec 路径的 validate/rollback 试走发生在别处（`scheduler.py:L2165/L2194`，投机解码两章的领地），最终都以「实际接受的 token」回到这里兑现。**其二，拒收即引擎 bug。** 掩码保证了采样只能落在合法集内，所以 `accept_tokens` 必然成功；它返回 False 意味着 fill→sample→accept 这条环在某一处断了——源码自己承认这一点：调度器侧措辞「Unexpected: grammar rejected tokens … Terminating request」，xgrammar 侧同款自认「Failed to advance FSM … Please file an issue.」（`backend_xgrammar.py:L162-L167`），处置是 FINISHED_ERROR 加 `resumable=False`：不是请求的错，但这个请求的状态已不可信，杀掉止损。这条闭合不变式回头看特别踏实：第 1 节的条件分布论证（采样必落合法集）在这里被源码当成运行时断言用。
 
 ### 先想后说的门：思考模型联动
 
@@ -1175,7 +1185,7 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
         new_token_ids: list[int] | None = None,
     ) -> bool:
         if not request.use_structured_output:
-            return False                     # 无结构化输出：不推进                # L386
+            return False                     # 无结构化输出：不推进                # L387
 
         # To determine whether we can advance the FSM.
         # Supports thinking usage where we skip the reasoning components.
@@ -1192,7 +1202,7 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
 
         structured_req = request.structured_output_request
         if structured_req.reasoning_ended:
-            return True                      # 已结束：缓存短路                   # L410
+            return True                      # 已结束：缓存短路                   # L406
 
         # Check if reasoning ends in *this* step.
         # When the caller passes new_token_ids (the tokens that were just
@@ -1206,17 +1216,17 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
             # The tokens were already appended this step, so the step window
             # starts exactly len(new_token_ids) from the end.
             start = len(all_token_ids) - len(new_token_ids)
-            delta_ids: Iterable[int] = new_token_ids   # delta 窗口=本步 token     # L426
+            delta_ids: Iterable[int] = new_token_ids   # delta 窗口=本步 token     # L421
         else:
             # … 省略：无 new_token_ids 时按占位数推算窗口起点的旧路径 …
         if reasoner.is_reasoning_end_streaming(all_token_ids, delta_ids):
-            structured_req.reasoning_ended = True     # 独白在本步结束             # L434
+            structured_req.reasoning_ended = True     # 独白在本步结束             # L431
             # Record the boundary so the scheduler can exclude reasoning tokens.
             end_index = self._find_reasoning_end_index(reasoner, all_token_ids, start)
             structured_req.reasoning_end_token_index = end_index   # 边界绝对索引  # L436
             return True
 
-        return False                         # 独白未完：FSM 不动                 # L438
+        return False                         # 独白未完：FSM 不动                 # L439
 ```
 
 门有三层短路：reasoner 为 None（非思考模型）、enable_in_reasoning（约束要管独白内部的场景）、reasoning_ended 缓存。之外才做本步探测：拿本步 token 当 delta 窗口问「独白结束标记是不是出现在这一步」——历史上早出现过的标记不算（prompt 里的、几步前的都不触发），#43388 的修复就是把它从「按占位数推算窗口」改成「new_token_ids 直传」（异步调度加投机下占位数有残余，旧算法会把窗口起点推过边界）。本步结束时写下 `reasoning_end_token_index`：独白结束标记在全部 token 里的绝对位置，给下一刀用：
@@ -1242,12 +1252,12 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
             return new_token_ids
         end_idx = structured_req.reasoning_end_token_index
         if end_idx is None:
-            return new_token_ids             # 无边界：整步都是语法内容          # L473
+            return new_token_ids             # 无边界：整步都是语法内容          # L481
         first_idx = len(request.all_token_ids) - len(new_token_ids)
-        num_reasoning = end_idx + 1 - first_idx  # 绝对索引换算回本步内偏移      # L476
+        num_reasoning = end_idx + 1 - first_idx  # 绝对索引换算回本步内偏移      # L483
         if num_reasoning <= 0:
-            return new_token_ids             # 边界之后的整步：原样              # L478
-        return new_token_ids[num_reasoning:] # 剔掉混进步内的思考 token          # L479
+            return new_token_ids             # 边界之后的整步：原样              # L485
+        return new_token_ids[num_reasoning:] # 剔掉混进步内的思考 token          # L486
 ```
 
 混步问题（#44006 的原案）：独白结束标记落在某一步输出 **中间**：同一步里前半是独白 token、后半是答案开头。把独白部分喂给 `accept_tokens`，语法必然拒收（独白不在语言里）、请求被杀。trim 的算术就三行：把绝对边界换算回本步内偏移，切掉前缀。全场景实测（替身声明：reasoner 用最小替身，delta 窗口出现 99 即判思考结束；装配链按减法删除，四个方法本体逐字）：
@@ -1279,18 +1289,18 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
             # bonus token / non-speculative token.
             self._grammar_bitmask = self.backend.allocate_token_bitmask(
                 max_batch_size * (1 + max_num_spec_tokens)
-            )                                # 行数=批上限×(1+spec 位)           # L233
+            )                                # 行数=批上限×(1+spec 位)           # L234
 ```
 
-一行 = 词表按 32 打包的 int32 数组，$`\lceil V/32 \rceil`$ 个，xgrammar 的 `allocate_token_bitmask(max_num_seqs, vocab_size)` 按此分配。取证词表 50257 → 每行 1571 个 int32、6284 B，批 16 行共 100544 B。生产 128k 词表（129280）→ 4040 个 int32 = 16160 B ≈ 16KB 每行；对比逐 token 的 fp32 logits（129280×4B ≈ 512KB），**恰好 1/32**。位打包正是它扛得住每步「跨进程加拷上 GPU」的定量理由。位约定一条记牢：xgrammar 约定 bit=1 允许、bit=0 才写 −inf，于是 int32 的 −1（补码全 1）等于全允许。源码三处用同一条约定兜底：outlines/LMFE 的 `allocate_token_bitmask` 用 `torch.full(..., -1)` 构造（`backend_outlines.py:L99-L105`、`backend_lm_format_enforcer.py:L141-L147`）；调度器侧 `_full_mask = torch.tensor(-1)`（`__init__.py:L57`）给本步不填掩码的行兜底；worker 侧重排基底张量也以 −1 预填（`utils.py:L126-L131`）。效果：非语法请求行、思考段请求行都是全允许，它们的 logits 每拍照常被采样，只是不受约束——畅通，不是禁足。
+一行 = 词表按 32 打包的 int32 数组，$`\lceil V/32 \rceil`$ 个。行数那头的 (1+spec 位) 里，注释把那个 1 叫 bonus token——投机验证草稿全对后引擎白送的额外 token；非投机请求每步的正常单 token 也走这一位。xgrammar 库的分配函数 `allocate_token_bitmask(max_num_seqs, vocab_size)` 按此分配（行数、词表各一参）；引擎级 ABC 方法只收行数一个参数，词表用构造时存下的 `vocab_size` 字段、内部转调这个双参库函数（`backend_xgrammar.py:L128-L129`）。取证词表 50257 → 每行 1571 个 int32、6284 B，批 16 行共 100544 B。生产 128k 词表（129280）→ 4040 个 int32 = 16160 B ≈ 16KB 每行；对比逐 token 的 fp32 logits（129280×4B ≈ 512KB），**恰好 1/32**。位打包正是它扛得住每步「跨进程加拷上 GPU」的定量理由。位约定一条记牢：xgrammar 约定 bit=1 允许、bit=0 才写 −inf，于是 int32 的 −1 等于全允许——负整数按补码（two's complement，带符号整数的标准二进制表示）存储，−1 的补码恰是 32 位全 1（验算：0−1 逐位借位，32 位全翻成 1）。源码三处用同一条约定兜底：outlines/LMFE 的 `allocate_token_bitmask` 用 `torch.full(..., -1)` 构造（`backend_outlines.py:L99-L105`、`backend_lm_format_enforcer.py:L141-L147`）；调度器侧 `_full_mask = torch.tensor(-1)`（`__init__.py:L58`）给本步不填掩码的行兜底；worker 侧重排基底张量也以 −1 预填（重排＝worker 侧把调度器行序换成 GPU 执行序，下一章展开；`utils.py:L126-L131`）。效果：非语法请求行、思考段请求行都是全允许，它们的 logits 每拍照常被采样，只是不受约束——畅通，不是禁足。
 
 ![位掩码布局](../diagrams/ch30-fig-bitmask-layout.png)
 
-> *图注：一行位掩码的物理形态。左：allocate_token_bitmask(16, 50257) 产出的 [16, 1571] int32 张量，抽三行放大：位置 0 行五个允许位、位置 1 行只有 EOS 一个位、−1 行全 1 即全允许（非语法行的畅通兜底）。中：一个 int32 的 32 格位展开，bit=1 允许、bit=0 在采样前写 −inf，例 int32 第 265 个覆盖 token 8480-8511、bit25 即 8505('yes')。右：对比条，128k 词表每行约 16KB 对逐 token fp32 logits 约 512KB，恰为 1/32，位打包是掩码能上每步热路径的定量理由。分配按批上限乘 (1+投机位) 一次做足预算。行的流转（跨进程、拷上 GPU、盖 logits）归下一章。*
+> *图注：一行位掩码的物理形态。左：allocate_token_bitmask(16, 50257)（xgrammar 库层双参签名）产出的 [16, 1571] int32 张量，抽三行放大：位置 0 行五个允许位、位置 1 行只有 EOS 一个位、−1 行全 1 即全允许（非语法行的畅通兜底）。中：一个 int32 的 32 格位展开，bit=1 允许、bit=0 在采样前写 −inf，例 int32 第 265 个覆盖 token 8480-8511、bit25 即 8505('yes')。右：对比条，128k 词表每行约 16KB 对逐 token fp32 logits 约 512KB，恰为 1/32，位打包是掩码能上每步热路径的定量理由。分配按批上限乘 (1+投机位) 一次做足预算。行的流转（跨进程、拷上 GPU、盖 logits）归下一章。*
 
 ### 交棒：get_grammar_bitmask
 
-一生的最后一站是交棒点，调度器把自己维护的行序契约打包给 worker：
+一生的最后一站是交棒点：L0 图忙循环横带上的第③拍 get_grammar_bitmask（那条 ①-⑤ 横带按 EngineCore.step() 的拍次编号），交出的正是采样出口列里「结构化输出位掩码」那块画的张量。调度器把自己维护的行序契约打包给 worker：
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L1646-L1668 · Scheduler.get_grammar_bitmask
@@ -1300,14 +1310,14 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
         # Collect list of scheduled request ids that use structured output.
         # The corresponding rows of the bitmask will be in this order.
         if not scheduler_output.has_structured_output_requests:
-            return None                      # 快速出口一：批里没有结构化请求   # L1651
+            return None                      # 快速出口一：批里没有结构化请求   # L1652
 
         structured_output_request_ids = [
             req_id
             for req_id in scheduler_output.num_scheduled_tokens
             if (req := self.requests.get(req_id))
             and (req.use_structured_output and not req.is_prefill_chunk)
-        ]                                     # 行序=本拍调度序，跳过 prefill 中段 # L1657
+        ]                                     # 行序=本拍调度序，跳过 prefill 中段 # L1659
         if not structured_output_request_ids:
             return None
 
@@ -1315,7 +1325,7 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
             self.requests,
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
-        )                                     # 批装配本体                       # L1663
+        )                                     # 批装配本体                       # L1667
         return GrammarOutput(structured_output_request_ids, bitmask)
 ```
 
@@ -1323,6 +1333,6 @@ outlines_core 在 DFA 走到接受态时就报 done，但 vLLM 的收尾约定�
 
 ## 收尾：结构化输出组的前半点亮
 
-回头看 L0 图：采样出口列里「结构化输出组」这块，本章点亮了它的前半：编译子系统。三根线收拢。**原理线**：约束解码是采样前掩码，不是生成后重试；掩码把模型分布条件化到合法集上，重试法解「最近合法串」既无唯一解也不保证终止（`vllm/v1/structured_output/backend_types.py` 的 fill_bitmask 契约、`sampling_params.py:L72-L126` 的六选一是这条线的两端）。**生态线**：六种说法一张取件码，前端校验期一次定终身地选好后端（auto 阶梯 `sampling_params.py:L1043-L1086`）甚至改写请求（choice→EBNF）；两层 ABC 把「共享的编译器」与「独立的状态机」类型化，四家后端在六个方法的缝隙里各显神通（`__init__.py:L114-L175` 单后端正身）。**时序线**：进门即阻塞、线程池异步编译、侧队加百微秒探测、当拍晋级；编译失败经 Future 封存成数据、拍尾只杀单请求；采样后调度器是 FSM 唯一写者，fill→sample→accept 环闭合（`scheduler.py:L1817-L1843`）。[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)埋的那个窗口（「同一行 logits：先被掩码改写、再采样」），前半张账单还清了：这张每 token 一位的允许表，从一句话变成取件码、从取件码变成 FSM、从 FSM 变成每位置一张极小的合法集。
+回头看 L0 图：采样出口列里「结构化输出位掩码」（结构化输出组）这块，本章点亮了它的前半：编译子系统。三根线收拢。**原理线**：约束解码是采样前掩码，不是生成后重试；掩码把模型分布条件化到合法集上，重试法解「最近合法串」既无唯一解也不保证终止（`vllm/v1/structured_output/backend_types.py` 的 fill_bitmask 契约、`sampling_params.py:L72-L126` 的六选一是这条线的两端）。**生态线**：六种说法一张取件码，前端校验期一次定终身地选好后端（auto 阶梯 `sampling_params.py:L1043-L1086`）甚至改写请求（choice→EBNF）；两层 ABC 把「共享的编译器」与「独立的状态机」类型化，四家后端在六个方法的缝隙里各显神通（`__init__.py:L114-L175` 单后端正身）。**时序线**：进门即阻塞、线程池异步编译、侧队加百微秒探测、当拍晋级；编译失败经 Future 封存成数据、拍尾只杀单请求；采样后调度器是 FSM 唯一写者，fill→sample→accept 环闭合（`scheduler.py:L1817-L1843`）。[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)埋的那个窗口（「同一行 logits：先被掩码改写、再采样」），前半张账单还清了：这张每 token 一位的允许表，从一句话变成取件码、从取件码变成 FSM、从 FSM 变成每位置一张极小的合法集。
 
-后半张账单还挂着。`GrammarOutput` 里那张 [行数 × ceil(V/32)] 的 int32 大表此刻还只是「预算已分配、行序已约定」的半成品：每拍的行怎么从各自请求的 FSM 填出来、批大时怎么并行填、投机窗口怎么预推进再回退、它怎么以 ndarray 跨进程传给 worker、`apply_token_bitmask_inplace` 怎么在采样前把 −inf 盖上去，以及这一切怎么塞进[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)量过的那个 GPU 前向窗口——下一章「约束解码 II：bitmask 落地」接着算。语法已经编译好了，现在要让每个采样位置都用得上它。
+后半张账单还挂着。`GrammarOutput` 里那张 [行数 × $`\lceil V/32 \rceil`$] 的 int32 大表此刻还只是「预算已分配、行序已约定」的半成品：每拍的行怎么从各自请求的 FSM 填出来、批大时怎么并行填、投机窗口怎么预推进再回退、它怎么以 ndarray 跨进程传给 worker、`apply_token_bitmask_inplace` 怎么在采样前把 −inf 盖上去，以及这一切怎么塞进[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)量过的那个 GPU 前向窗口——下一章「约束解码 II：bitmask 落地」接着算。语法已经编译好了，现在要让每个采样位置都用得上它。

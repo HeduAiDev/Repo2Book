@@ -65,7 +65,7 @@ lc.text(GX + GW / 2, GY + 16 * (RH + RG) + 14, '每行 1571 个 int32（示意�
         'middle', maxw=200, tag='g:sub')
 lc.text(F1X + 16, F1Y + F1H - 30, '分配预算：max_num_seqs × (1 + num_speculative_tokens) 行', 8.6,
         '#334155', 'start', maxw=640, tag='f1:b1')
-lc.text(F1X + 16, F1Y + F1H - 14, '+1 = bonus / 非 spec 位 · spec 位给投机窗口预留（下一章展开·预告）', 8.2,
+lc.text(F1X + 16, F1Y + F1H - 14, '括号里的 1 = bonus / 非 spec 位 · spec 位给投机窗口预留（下一章展开·预告）', 8.2,
         lc.C_MUTE, 'start', maxw=640, tag='f1:b2')
 
 # 三个放大行（右侧）
