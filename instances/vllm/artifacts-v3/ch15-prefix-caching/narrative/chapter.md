@@ -36,7 +36,7 @@ Part IV 的总问题一句不变：**显存就那么多，KV cache 必须活到�
 
 ![一拍调度全景：谁调用谁](../diagrams/ch15-fig-call-panorama.png)
 
-> *图注：B 这一拍的 17 个调用事件全景（正文上表的全量版）。泳道自上而下：Request、Scheduler、KVCacheManager、Coordinator、管家、BlockPool。事件 0 在拍外：B 构造即算 5 枚哈希（哈希账本长在请求身上，不占调度拍的账）；事件 1-7 是准入查，5 层下潜、平面 dict 查 3 次（2 命中 1 miss）即断，hit=32、预算 79；事件 8-17 是同一趟 allocate_slots 的三段：挂（touch 块 1、2 出队）→ 写新块（48 token 拆 3 块：5、6、7）→ 写回（登记 [2,5)、map 4→7，块表 5 项随返回值交还调度器）；拍尾采样后 append 顺手续算哈希（虚线回 Request 泳道）。后文每节讲一个切面，迷路时回这张图对位置。*
+> *图注：B 这一拍的 17 个调用事件全景（正文上表的全量版）。泳道自左向右：Request、Scheduler、KVCacheManager、Coordinator、管家、BlockPool，时间轴自上而下。事件 0 在拍外：B 构造即算 5 枚哈希（哈希账本长在请求身上，不占调度拍的账）；事件 1-7 是准入查，5 层下潜、平面 dict 查 3 次（2 命中 1 miss）即断，hit=32、预算 79；事件 8-17 是同一趟 allocate_slots 的三段：挂（touch 块 1、2 出队）→ 写新块（48 token 拆 3 块：5、6、7）→ 写回（登记 [2,5)、map 4→7，块表 5 项随返回值交还调度器）；拍尾采样后 append 顺手续算哈希（虚线回 Request 泳道）。后文每节讲一个切面，迷路时回这张图对位置。*
 
 三个结构事实先立住，后文各节都会用。其一，**查只发生在准入步**：调度循环只在请求一次没算过（`num_computed_tokens == 0`，scheduler.py:L745；waiting 首次进门或被抢占者归零后重进）时查表，running 中的请求不再查，「查」节展开为什么。其二，**挂、写新块、写回满块恒在同一趟 allocate_slots 里依序发生**：先 touch 挂命中块，再分配新块，最后写回满块；这段直线调用的真码「写回」一节开头会嵌。其三，**哈希不在这条流水线上算**：它长在请求身上，进门算一遍、每出一个 token 顺手补一段，两头的源码「指纹」节整节走读。往后每节也会像这里一样先交代调用位置，再下潜实现。
 
@@ -338,7 +338,7 @@ SWA 组那一行值得停一下：decode 拍开始时，窗外那 16 个 token �
 
 ![为什么需要组：判据与案例](../diagrams/ch15-fig-why-groups.png)
 
-> *图注：分组判据与案例一图清。左：Hybrid 协调器两个管家（full 与 SWA）共享同一个块池、各持块表，同一请求 decode 拍后两组块表分叉（full 组 [1,2,3,4,9] 纹丝不动、SWA 组窗外块 null 换位回收成 [NULL,6,7,8,10]）；键构成条：同一枚哈希拼不同组号得到两把钥匙（键尾字节 00 00 00 00 与 00 00 00 01）。右：判据「看 spec 不看算法」加六张案例卡：纯 full（全同型 → 单组）、gpt-oss（12 滑窗 + 13 dense → 分组）、Jamba（1:7 → 分组）、Gemma 3（5:1、窗 1024 → 分组）、DeepSeek V3.2 DSA 反例（计算稀疏但存储同型 MLA → 单组）、DeepSeek V4（两类异型 spec → 分组；判据无特设，分组算法却为它单开第三路，正文同段拆解）。计算侧机制归拆读 V4 的专章。*
+> *图注：分组判据与案例一图清。左：Hybrid 协调器两个管家（full 与 SWA）共享同一个块池、各持块表。右上：同一请求 decode 拍后两组块表分叉（full 组 [1,2,3,4,9] 纹丝不动、SWA 组窗外块 null 换位回收成 [NULL,6,7,8,10]）；键构成条：同一枚哈希拼不同组号得到两把钥匙（键尾字节 00 00 00 00 与 00 00 00 01）。下：判据「看 spec 不看算法」加六张案例卡：纯 full（全同型 → 单组）、gpt-oss（12 滑窗 + 13 dense → 分组）、Jamba（1:7 → 分组）、Gemma 3（5:1、窗 1024 → 分组）、DeepSeek V3.2 DSA 反例（计算稀疏但存储同型 MLA → 单组）、DeepSeek V4（两类异型 spec → 分组；判据无特设，分组算法却为它单开第三路，正文同段拆解）。计算侧机制归拆读 V4 的专章。*
 
 ### 一串珠子两种戴法：粒度视图零成本重串
 
@@ -539,7 +539,7 @@ B 例的账：64 token 的 prompt 查 3 次表（2 命中 1 miss）命中 32，�
             # … 省略：metrics 两行（纯观测，L716-L717）……
 ```
 
-两件事：引用计数 +1（[第 13 章](../../ch13-paged-kv/narrative/chapter.md)立的记账术：+1 登记、−1 退租、归零才回池）；若块此刻 ref_cnt 为 0（躺在自由队列里当驱逐候选），就把它从队列**中间**摘出来救回。摘除是侵入式双向链表的指针手术（O(1)，不是 O(n) 遍历），这正是[第 13 章](../../ch13-paged-kv/narrative/chapter.md)「为什么不用 deque」的答案在这里兑现。调用它的管账函数：
+两件事：引用计数 +1（[第 13 章](../../ch13-paged-kv/narrative/chapter.md)立的记账术：+1 登记、−1 退租、归零才回池）；若块此刻 ref_cnt 为 0（躺在自由队列里当驱逐候选），就把它从队列**中间**摘出来救回。条件里的 `not block.is_null` 把 null 块豁在外：它从不在自由队列、ref_cnt 也不记账（[第 13 章](../../ch13-paged-kv/narrative/chapter.md)池出生时立过的「处处特判」）。摘除是侵入式双向链表的指针手术（O(1)，不是 O(n) 遍历），这正是[第 13 章](../../ch13-paged-kv/narrative/chapter.md)「为什么不用 deque」的答案在这里兑现。调用它的管账函数：
 
 ```python
 # vllm/v1/core/single_type_kv_cache_manager.py:L232-L289
@@ -562,7 +562,8 @@ B 例的账：64 token 的 prompt 查 3 次表（2 命中 1 miss）命中 32，�
         # requests are short-circuited there), so the request has no blocks yet.
         req_blocks = self.req_to_blocks[request_id]
         assert len(req_blocks) == 0
-        # … 省略：skip 段计算七行（SWA 窗外段以 null 块占位；显存账本
+        # … 省略：skip 段计算九行（SWA 窗外段以 null 块占位，跳段前缀内的
+        #       命中块先从 new_computed_blocks 切出、不 touch；显存账本
         #       一章已立的 [NULL,…] 形态，此处只消费）……
         # Touch the computed blocks to make sure they won't be evicted.
         if self.enable_caching:
@@ -652,7 +653,7 @@ LRU 在[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md
         self.coordinator.cache_blocks(request, num_tokens_to_cache)    # L563
 ```
 
-三段依序：先挂（`allocate_new_computed_blocks`，「挂」节的主角 touch 在这一段里被调到；开头那个 if 判的是「本次有没有命中块要挂」，`empty_kv_cache_blocks` 是空命中的哨兵对象），再分配新块，最后才是写回。写回前那道 `min` 值得看一眼：本拍要缓存的 token 数上限压到 `request.num_tokens`，注释交代了原因，投机解码的草稿 token 可能被拒收，没定稿的不许入缓存。（注释里的 P/D 是 prefill 与 decode 分离部署的形态：KV 要从 prefill 侧的机器收回来，缓存推迟到收齐，本章不展开。）掐好之后交给协调器，协调器的活是转发：
+三段依序：先挂（`allocate_new_computed_blocks`，「挂」节的主角 touch 在这一段里被调到；开头那个 if 判的是「本次有没有命中块要挂」，`empty_kv_cache_blocks` 是空命中的哨兵对象），再分配新块，最后才是写回。写回前那道 `min` 值得看一眼：本拍要缓存的 token 数上限压到 `request.num_tokens`，注释交代了原因，投机解码的草稿 token 可能被拒收，没定稿的不许入缓存。左边那笔 `total_computed_tokens` 是准入查表定下的已算数（本例即命中的 32），加本拍新算 `num_new_tokens` 48 恰好等于 `num_tokens` 80，`min` 两边相等、不截——开篇全景图 ⑮ 帧的 cache_blocks 因此收到 80，不是查表那一刻的 32。（注释里的 P/D 是 prefill 与 decode 分离部署的形态：KV 要从 prefill 侧的机器收回来，缓存推迟到收齐，本章不展开。）掐好之后交给协调器，协调器的活是转发：
 
 ```python
 # vllm/v1/core/kv_cache_coordinator.py:L652-L683 · KVCacheCoordinator.cache_blocks（转发循环）
@@ -927,9 +928,9 @@ class FreeKVCacheBlockQueue:
         first when caching is enabled.
         # … 省略：docstring 两行……
         """
-        pins = self._partial_tail_pins.pop(request.request_id, None)
-        if pins:
-            self.block_pool.free_blocks(pins)
+        # … 省略：connector 分支三行（_partial_tail_pins：外部 KV 传输
+        #       partial-tail offload 钉住的块在此先释放，无 connector 恒空，
+        #       归 Part IV 末章）……
         self.coordinator.free(request.request_id)
 ```
 
