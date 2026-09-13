@@ -473,6 +473,12 @@ class FreeKVCacheBlockQueue:
 
 ### 先数块：快慢两条路，同一本账
 
+![allocate_slots 调用全景：谁调用谁](../diagrams/ch13-fig-alloc-calls.png)
+
+> *图注：主线是从 Scheduler.schedule 到 BlockPool 的一条链：调度器把请求交进 allocate_slots，容量检查、挂命中块、分新块、写回满块四步各自下潜（中间那层协调器 KVCacheCoordinator 在本章单组全注意力下近乎直通），容量检查下潜到单类型管理器（SingleTypeKVCacheManager）里分出快慢两路，殊途同归——只「数」不「动」，返回的只是一个数，真正摘块发生在第三段。节点上的方法名按调用链从外到内读；内层 BlockPool 的 touch（「引用计数」一节）、get_new_blocks（「再拿块挂账」一节）、cache_full_blocks（写回满块的池侧动作，本章关缓存早退、戏在[前缀缓存章](../../ch15-prefix-caching/narrative/chapter.md)）等是后文各节的主角，此处见到名字即可。蓝实线是调用、红虚线是返回；底部 GPU 带是同一拍并行的另一摊活，「过线」一节讲。*
+
+往下逐层看这条链——先看开关在哪分岔。
+
 三段式的第一段是 **容量检查**，开吃前先看冰箱。这一眼要回答的问题只有一个：**这一拍要从自由队列摘走几块**——数出来的数超过空闲，整个 allocate_slots 当场拒绝。核心算术都在 `get_num_blocks_to_allocate`（需块预测）里，中间有一道快慢分岔，先读整段再拆：
 
 ```python
