@@ -933,5 +933,797 @@
   "should_payoff": [],
   "note": "pedagogy-plan.foreshadows F7：planted=13、paid=22。本章不回收任何伏笔；邻章钩子路过点：ch11 已讲「free 全部块（哈希保留在表）」的外部行为——本章第 12 站给出其内景（ref_cnt 归零回池、哈希为何保留 → ch15 展开）；ch10 第 10 站的 allocate_slots 黑盒在第 2 站打开。"
  },
- "l2_spec": "book/cartography/l2-specs/ch13.json（stations 与本档案 stations 同一份账本）"
+ "l2_spec": "book/cartography/l2-specs/ch13.json（stations 与本档案 stations 同一份账本）",
+ "supplement": {
+ "why": "ch13 读者反馈两项补挖掘：A『算 block』的分岔没讲清（fast-path 判定条件 / get_num_blocks_to_allocate 非 fast-path 完整公式与三参 / 五段模型↔块账对接 / CoW 准确时机）；B EngineCore↔Worker 跨进程通信全貌（供配图与定点改写）。",
+ "added": "2026-09-13",
+ "requester": "ch13 读者反馈（Lead 转发，analyst 补挖掘）",
+ "pin_verified": "全部锚点与代码对 vllm v0.27.1 (6e448d0ea) HEAD 逐条现核（git show HEAD:<path>；embed_excerpts 的 code 由脚本机械截取，逐字性由构造保证）",
+ "scope_guard": "本节为增量素材，不动原 mechanisms/embed_excerpts/subtraction_plan。原 deletion 清单不因本节撤销：CoW/滑窗/多组在精简版仍删（ch14/ch15 域），正文新增讲解走『内嵌真源码』路径。素材内部已标注与 ch09（两段契约时序语义）、ch14（滑窗回收不变量）、ch15（CoW 哈希侧全套）、ch17（MQ 传输层）、ch18（持久批次张量重建）、ch16（KV connector 聚合）的分工边界，writer 据此避免重复。",
+ "A_block_accounting": {
+  "A1_fast_path_gate": {
+   "question": "进不进 fast-path 的准确开关是什么？是 request 状态？is_prefill？调度相位？",
+   "answer_one_line": "都不是——开关是 `request_id in self.num_cached_block`：一个「该请求已有满块写回过缓存」的记账位（dict 键），由挂账/写回两处写入、请求退场时删除。",
+   "facts": [
+    {
+     "claim": "判定本身是 dict 成员测试，不是状态位",
+     "evidence": "vllm/v1/core/single_type_kv_cache_manager.py:L194-L200（`if request_id in self.num_cached_block:` → 断言空命中 → `return max(num_required_blocks - num_req_blocks, 0)`）",
+     "intuition": "num_cached_block 是「该请求已缓存到第几块」的增量游标（值=len 已写回满块），兼职 fast-path 开关：只要它存在，就说明这个请求已经过了首排、块表已在增长，账简化成『目标表长 − 已持表长』。"
+    },
+    {
+     "claim": "武装写入点只有三处",
+     "evidence": "① 挂账时：vllm/v1/core/single_type_kv_cache_manager.py:L282（`self.num_cached_block[request_id] = len(req_blocks)`，首排带命中/外部 token 时挂账即武装）；② 同函数 partial 命中下修：L289（`self.num_cached_block[request_id] = block_idx`，只算整块）；③ 写回满块：L477（`self.num_cached_block[request.request_id] = num_full_blocks`，num_full_blocks = num_tokens_to_cache // block_size，L446）",
+     "intuition": "三处都是『≥1 个整块落袋』的时刻——partial 命中那处反着读更清楚：账位被钉在整块边界 block_idx 上，块内那半截不算『已缓存』。"
+    },
+    {
+     "claim": "反直觉边界一：短请求（prompt+已生成 < block_size）一直不武装、恒走慢路径",
+     "evidence": "cache_blocks 幂等闸早退：vllm/v1/core/single_type_kv_cache_manager.py:L445-L448（`num_cached_blocks >= num_full_blocks: return`，prompt=5、block_size=16 时 num_full_blocks=0、0>=0 成立）",
+     "intuition": "数字例（block_size=16，开缓存，prompt=5）：第 1~11 个 decode 拍请求总长 5..15 <16，num_full_blocks 恒 0，账位始终不存在；第 12 拍（总长 16）写回第 1 个满块才武装。武装前后公式结果相同（见 A2 退化证明），只是路径不同——所以这条边界无正确性影响，只有『谁在走哪条路』的解说价值。"
+    },
+    {
+     "claim": "反直觉边界二：关缓存（--no-enable-prefix-caching）时永不武装",
+     "evidence": "vllm/v1/core/kv_cache_manager.py:L551-L552（`if not self.enable_caching or delay_cache_blocks: return`，写回整段被跳过）→ cache_blocks 的 L477 永不执行；挂账路径 L529-L531 只在有命中/外部 token 时进，而关缓存时命中恒空",
+     "intuition": "这正是 ch13 精简版「关缓存恒走慢路径」的机制根源（正文 L534 那个括注可以据此扩写成一小段）。"
+    },
+    {
+     "claim": "断言『running 请求无新命中』的真正保证人在调度器，且是『每次入场』而非『一生一次』",
+     "evidence": "vllm/v1/core/sched/scheduler.py:L745（`if request.num_computed_tokens == 0:` 才做 get_computed_blocks）+ L854-L859（else 拿 empty_kv_cache_blocks 过账）；第二道闸在协调器：vllm/v1/core/kv_cache_coordinator.py:L210-L217（running 请求 allocate_new_computed_blocks 直接 no-op + assert all empty）。被抢占请求重新入场时 num_computed_tokens 被清 0（vllm/v1/core/sched/scheduler.py:L1294，_preempt_request 内）、块也全 free（L1290 → kv_cache_manager.free → pop_blocks_for_free 把 num_cached_block.pop，vllm/v1/core/single_type_kv_cache_manager.py:L515）——所以恢复首排会重新开闸查前缀（自己的旧缓存可被自己再命中，这是抢占便宜的根源之一）",
+     "intuition": "「首排」的准确说法是『本次入场的第一次调度』：新请求首排、抢占恢复首排都算；running 中的每一拍都不算。"
+    },
+    {
+     "claim": "fast-path 公式里 max 钳零是给投机解码兜底，慢路径同样有 max",
+     "evidence": "vllm/v1/core/single_type_kv_cache_manager.py:L197-L199（NOTE 注释：草稿被拒后 num_required_blocks 可能小于 num_req_blocks）与 L210-L213 的 `max(..., 0)`",
+     "intuition": "两条路径共用同一句差值算术，只是慢路径的减数从『已持块数』推广成『已就位表长』（见 A2）。"
+    }
+   ],
+   "worked_example": {
+    "setup": "block_size=16，开缓存，prompt=100，无命中，预算足够一次 prefill 完",
+    "steps": [
+     "首拍 prefill：慢路径 required=cdiv(100,16)=7、num_req=0、命中 0、跳段 0 → num_new=7、evictable=0 → 预测 7。收尾写回：num_tokens_to_cache=100 → num_full_blocks=6 → num_cached_block[req]=6，武装。",
+     "第 2 拍 decode（num_tokens=101，new=1）：fast-path required=cdiv(101,16)=7、num_req=7 → max(7-7,0)=0。",
+     "总长 112（7×16）拍：required=7 → 0；总长 113 拍：required=8 → +1——『每 block_size 个 token 多要一块』的 fast-path 视角。"
+    ]
+   }
+  },
+  "A2_slow_path_formula": {
+   "question": "get_num_blocks_to_allocate 的完整非 fast-path 公式：三个参数各是什么、怎么算、为什么减它们？token 级已算量→块换算的桥梁是什么？",
+   "answer_one_line": "返回值的准确语义是『本拍将从自由队列摘走多少块』：新分配的 + CoW 换来的 + 被 touch 摘走的可驱逐命中块；减 max(num_skipped_blocks, num_local_computed_blocks) 是因为这些位置不需要从池里拿实体块。",
+   "formula_breakdown": [
+    {
+     "line": "L178",
+     "expr": "num_required_blocks = cdiv(num_tokens, self.block_size)",
+     "meaning": "目标表长：本拍结束时请求块表 req_to_blocks 应有的长度。num_tokens=num_tokens_need_slot=min(comp+new_comp+ext_comp+new+lookahead, max_model_len)（vllm/v1/core/kv_cache_manager.py:L490-L493）"
+    },
+    {
+     "line": "L192",
+     "expr": "num_req_blocks = len(self.req_to_blocks.get(request_id, ()))",
+     "meaning": "已持表长：这个请求名下已经挂着的块（含滑窗跳段被换成 null 的占位——replace 不缩表，vllm/v1/core/single_type_kv_cache_manager.py:L622-L659）"
+    },
+    {
+     "line": "L202",
+     "expr": "num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)",
+     "meaning": "注意力窗外、不再被读的 token 数。全注意力基类恒 0（L661-L672）；SWA=max(0, T-W+1)（L1083，源码自带 W=4,T=7→4 的 ASCII 例）；chunked-local=(T//chunk)*chunk（L1239-L1242）。注意基数是 total_computed_tokens（含外部 token）"
+    },
+    {
+     "line": "L203",
+     "expr": "num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks",
+     "meaning": "已就位的实体块数：已持 + 本拍新命中的（命中天然以块为单位，1 块=block_size token——这是五段表驱动换算的出处，vllm/v1/core/kv_cache_manager.py:L418）"
+    },
+    {
+     "line": "L206",
+     "expr": "num_skipped_blocks = num_skipped_tokens // self.block_size",
+     "meaning": "跳段换块用 floor 不用 cdiv：跨窗边界的块还有一角在窗内、必须保留实体，只有整块全在窗外才能换 null 占位"
+    },
+    {
+     "line": "L210-L213",
+     "expr": "num_new_blocks = max(num_required_blocks - max(num_skipped_blocks, num_local_computed_blocks), 0)",
+     "meaning": "max(...) = 挂账（touch 命中 + null 占位）之后、无需新实体块的表长。取 max 的两种触发：无跳段时=已持+命中；跳段超过已就位时（只在 ext_comp 抬高 total_computed_tokens 的混合场景出现）以跳段为准——null 占位本身就占表长"
+    },
+    {
+     "line": "L218",
+     "expr": "num_skipped_new_computed_blocks = max(0, num_skipped_blocks - num_req_blocks)",
+     "meaning": "命中块里落在跳段前缀内的那部分：不会被 touch（不会离开自由队列），所以要从可驱逐计数里剔掉"
+    },
+    {
+     "line": "L223-L225",
+     "expr": "num_evictable_blocks = _get_num_evictable_blocks(new_computed_blocks[num_skipped_new_computed_blocks:])",
+     "meaning": "将被 touch 的命中块中 ref_cnt==0 且非 null 的（正在自由队列里当驱逐候选）——touch 会把它们从自由队列摘走，所以虽不『新分配』也占容量。漏数它容量检查就失真（注释原话 L220-L222）"
+    },
+    {
+     "line": "L226-L229",
+     "expr": "if self._has_partial_local_hit(...): num_new_blocks += 1",
+     "meaning": "partial 命中预留 CoW 私有块（见 A4）"
+    },
+    {
+     "line": "L230",
+     "expr": "return num_new_blocks + num_evictable_blocks",
+     "meaning": "= 本拍自由队列净减量。分配侧对账：allocate_external_computed_blocks 的 get_new_blocks + allocate_new_blocks 的 get_new_blocks + touch 摘走的可驱逐命中块，三处加起来严格等于它（预测器与分配器同构的总量口径）"
+    }
+   ],
+   "three_params": [
+    {
+     "param": "num_skipped_blocks",
+     "what": "滑窗/块内局部注意力已滑出窗外、换成 null 占位的整块数",
+     "how": "get_num_skipped_tokens(total_computed_tokens) // block_size（floor）",
+     "why_subtract": "null_block 不是实体块、永不出租（构造期从队头抽出贴 is_null 封条、ref_cnt 不维护须特判防误释放，vllm/v1/core/block_pool.py:L186-L191；get_usage 分母也永远少记这一块，L807-L818）；这些表位不需要从池里拿块"
+    },
+    {
+     "param": "num_local_computed_blocks",
+     "what": "已持块 + 本拍新命中块（都是『已有着落』的实体块）",
+     "how": "len(new_computed_blocks) + num_req_blocks",
+     "why_subtract": "已持的早就分配过；命中的由 touch 复用别人的，不走 get_new_blocks——但 ref_cnt==0 的命中块要单独加回 evictable"
+    },
+    {
+     "param": "num_evictable_blocks",
+     "what": "命中块里正躺在自由队列（ref_cnt==0 非 null）的个数",
+     "how": "sum(blk.ref_cnt == 0 and not blk.is_null for blk in 剔除跳段后的命中块)（L128-L130）",
+     "why_add": "touch 会把它们从自由队列中间摘走——既是复用又占容量，必须计入容量检查；这是公式里两个加法项之一（另一个是 partial 命中的 CoW 预留 +1）"
+    }
+   ],
+   "bridge": "token→块有三种取整、各管一摊：cdiv 管容量（目标表长）、floor 管跳段（跨界块留实体）、命中以块计数（len，天然块单位）。守恒式：目标表长 = null 占位 + 命中实体 + external 新块 + 新块；预测返回值 = 后三项里要从池里拿的（external+new+CoW）+ 被 touch 摘走的可驱逐命中块。『已算过的 token』不等于『不用分配的块』——ext_comp 就是反例：token 已算过（connector 缓存了），块却要新分配（allocate_external_computed_blocks，L309-L328：cdiv(total,bs)−len(req_blocks)）。",
+   "degeneration_proof": "全注意力、无命中、无外部 token 时慢路径严格退化为 fast-path：skipped=0 → max(0, num_req)=num_req → num_new = max(required−num_req, 0)；命中空 → evictable=0；无 partial → +0。所以『关缓存恒走慢路径』与『开缓存走 fast-path』算出的数永远一致——这也是短请求不武装（A1）无正确性影响的原因。",
+   "worked_examples": [
+    {
+     "name": "E2 慢路径+命中（全注意力，无跳段）",
+     "setup": "block_size=16，prompt=100，前缀命中 48 token（3 块），无外部、无投机",
+     "steps": [
+      "入账：num_new_tokens=100−48=52；num_tokens_need_slot=48+52=100 → required=cdiv(100,16)=7",
+      "慢路径：local_computed=3+0=3；skipped=0 → num_new=max(7−3,0)=4；命中 3 块若都 ref_cnt==0（躺在自由队列）→ evictable=3；48%16==0 无 partial → 总预测 4+3=7",
+      "分配侧对账：touch 3 块（3 块离开自由队列、ref_cnt 0→1）+ allocate_new_blocks 取 7−3=4 块 → 自由队列净减 7 = 预测 7 ✓",
+      "若那 3 块正被别的请求引用（ref_cnt≥1、不在自由队列）：evictable=0 → 预测 4 ✓——共享得越热，容量越省"
+     ]
+    },
+    {
+     "name": "E3 跳段+外部 token（SWA，max 的另一支）",
+     "setup": "block_size=16，滑窗 W=16；本地命中 2 块（32 token）+ connector 外部 32 token → total_computed=64；本拍再算 36",
+     "steps": [
+      "required=cdiv(64+36,16)=cdiv(100,16)=7",
+      "skipped_tokens=max(0,64−16+1)=49 → skipped_blocks=49//16=3（floor：第 4 块跨 48/49 边界，token 49..63 在窗内必须留实体）",
+      "local_computed=2+0=2 → num_new=7−max(3,2)=4（max 落在跳段支——ext_comp 抬高了跳段基数却不进 local_computed）",
+      "skipped_new_computed=max(0,3−0)=3 → 命中块剔掉前 3 块后剩 0 → evictable=0 → 总预测 4",
+      "分配侧对账：挂账 [null,null,null]（表长 3）→ 外部段 get_new_blocks(cdiv(64,16)−3=1)（表长 4）→ 新块 7−4=3 → 实体块共 1+3=4 = 预测 4 ✓"
+     ]
+    }
+   ],
+   "boundary_note": "『滑窗为什么敢跳、跳了为什么正确』的回收不变量归 ch14（其正文 L997-L1053 已走读 remove_skipped_blocks 与 SWA 公式）；ch13 只讲这些量怎么进块账公式。"
+  },
+  "A3_five_segment_mapping": {
+   "question": "五段模型 |comp|new_comp|ext_comp|new|lookahead|（token 域）怎么映射到块域公式？哪个段贡献哪个参数？",
+   "answer_one_line": "comp+new_comp 进『已就位』减数（num_req_blocks 与 len(new_computed_blocks)），new+lookahead 进 cdiv 的被除数（目标表长），ext_comp 两头都沾：抬高 total_computed_tokens（→跳段基数）与 num_tokens_need_slot（→目标表长），但它的块不在减数里——要当新块真分配。",
+   "mapping_table": [
+    {
+     "segment": "comp = request.num_computed_tokens",
+     "token_to_block": "已持表长 num_req_blocks = len(req_to_blocks)（首排为 0；含 null 占位）",
+     "in_formula": "num_local_computed_blocks 的加数（L203）",
+     "anchor": "vllm/v1/core/kv_cache_manager.py:L455-L457"
+    },
+    {
+     "segment": "new_comp = num_new_computed_tokens = len(new_computed_blocks) × block_size",
+     "token_to_block": "命中以块计数：len(new_computed_blocks)，1 块=block_size token（docstring 原话 L418）",
+     "in_formula": "num_local_computed_blocks 的另一加数；其中 ref_cnt==0 者再进 num_evictable_blocks；跳段内的部分被 num_skipped_new_computed_blocks 剔除",
+     "anchor": "vllm/v1/core/single_type_kv_cache_manager.py:L203+L218+L223-L225"
+    },
+    {
+     "segment": "ext_comp = num_external_computed_tokens（connector 缓存）",
+     "token_to_block": "不进减数！只抬高 total_computed_tokens（→get_num_skipped_tokens 的基数）与 num_tokens_need_slot（→num_required_blocks）；块由 allocate_external_computed_blocks 单独发（cdiv(total,bs)−len(req_blocks)，L323-L325）",
+     "in_formula": "差值里隐含的『要新分配的块』",
+     "anchor": "vllm/v1/core/kv_cache_manager.py:L458-L461+L490-L493；vllm/v1/core/single_type_kv_cache_manager.py:L291-L328"
+    },
+    {
+     "segment": "new = num_new_tokens（本拍真要算的，含未验证草稿）",
+     "token_to_block": "cdiv 上取整进目标表长",
+     "in_formula": "num_required_blocks 的主要增量（L178）",
+     "anchor": "vllm/v1/core/kv_cache_manager.py:L490"
+    },
+    {
+     "segment": "lookahead = num_lookahead_tokens（投机前瞻槽）",
+     "token_to_block": "num_tokens_need_slot = min(num_tokens_main_model + lookahead, max_model_len) 的尾部",
+     "in_formula": "同上进目标表长；num_tokens_main_model = total_computed + new（不带 lookahead）另传给分配器",
+     "anchor": "vllm/v1/core/kv_cache_manager.py:L490-L493"
+    }
+   ],
+   "key_insight": "读者卡住的根源：docstring 五段图把 comp/new_comp/ext_comp 都画成『前缀已算过』（绿区），但块账里三者的待遇完全不同——comp 的块已在表上（不用拿）、new_comp 的块是 touch 别人的（不新分配但可能占容量）、ext_comp 的块根本还没落地（必须当新块分配）。『已算过 ≠ 不用分配』是五段图对不上块账的准确解法。另外注意 L515-L516 传给预测器的 total_computed_tokens 是未钳 max_model_len 的和（与 L458-L461 钳过的同名局部变量不同值：kv_cache_manager.py:L515-L516 传的是未钳的 num_local_computed_tokens + num_external_computed_tokens），滑窗跳段基数用的是前者。",
+   "suggested_figure": "五段条带（token 域）下方并排一条块表条带（块域）：comp 段下画『已持块』、new_comp 段下画『touch 复用（ref_cnt==0 的标为可驱逐=占容量）』、ext_comp 段下画『要新分配』、new+lookahead 段下画『要新分配』；每段标注它进公式的哪一项。"
+  },
+  "A4_cow_timing": {
+   "question": "CoW（copy-on-write）的准确时机：allocate_slots 里什么条件返回 cow_blocks / cow_blocks+new_blocks？与 v0 经典 CoW（beam search 时代）有何同异？",
+   "answer_one_line": "条件链=本拍 partial 命中（命中结束在块中间）：预测段多记 1 块 → 挂账段登记 _partial_hit_reqs → allocate_new_blocks 消费它换出私有 cow 块（此时若长度差值≤0 就只返回 cow_blocks）→ schedule() 收尾把 (src,dst) 拷贝对随 SchedulerOutput 过线 → worker 清零后、前向前做块拷贝 → 调度器按围栏延迟释放两端保留引用。",
+   "precondition": {
+    "claim": "partial 命中只在细粒度哈希查找下出现；单组全注意力（ch13 主路径）永远不触发",
+    "evidence": "判定：vllm/v1/core/single_type_kv_cache_manager.py:L132-L142（len(new_computed_blocks)>0 且 num_local_computed_tokens % block_size != 0）。细粒度开关：L716-L718（alignment_tokens < block_size 且整除）+ L741-L762（块内边界自高向低探测）。单组下 hash_block_size==block_size（vllm/v1/core/kv_cache_utils.py:L649-L651）且协调器把 alignment_tokens 传成本组 block_size（vllm/v1/core/kv_cache_coordinator.py:L498）→ 命中长度恒为块整数倍 → 永无 partial。多组混合（GCD 粒度）或 prefix_match_unit 覆盖时才会出现",
+    "intuition": "这也是原 subtraction_plan 把 CoW 全套划给 ch15 的原因：ch13 主路径上它是死代码；但『账上的时机』值得在 ch13 点透（读者问到）。"
+   },
+   "timing_pipeline": [
+    {
+     "beat": "1 预测 +1",
+     "what": "get_num_blocks_to_allocate 对 partial 命中请求 num_new_blocks += 1",
+     "anchor": "vllm/v1/core/single_type_kv_cache_manager.py:L226-L229",
+     "note": "注释原话：Reserve the extra block that allocate_new_blocks pulls for the partial-hit CoW redirect"
+    },
+    {
+     "beat": "2 挂账登记",
+     "what": "add_local_computed_blocks 检测到 partial：记 _partial_hit_reqs[req]=(block_idx, 共享尾块)，并把 num_cached_block 下修到整块边界",
+     "anchor": "vllm/v1/core/single_type_kv_cache_manager.py:L283-L289"
+    },
+    {
+     "beat": "3 分配换尾",
+     "what": "allocate_new_blocks pop 登记：get_new_blocks(1) 拿 cow 块 → _apply_cow 原地替换 req_blocks[block_idx]（表长不变，注释原话 Replacing in place keeps the length-based allocation below correct）→ 记拷贝对 → cow 块额外 +1 引用",
+     "anchor": "vllm/v1/core/single_type_kv_cache_manager.py:L347-L357+L405-L425"
+    },
+    {
+     "beat": "4 返回值分岔",
+     "what": "num_new_blocks = cdiv(num_tokens,bs) − len(req_blocks)：≤0 → return cow_blocks（本拍只换不增）；>0 → return cow_blocks + new_blocks（又换又增）",
+     "anchor": "vllm/v1/core/single_type_kv_cache_manager.py:L360-L369",
+     "note": "读者问的『什么条件返回哪个』就是这两行；触发只返回 cow_blocks 的典型形态=整条 prompt 都落在共享前缀上、本拍没有越出命中块的净新增"
+    },
+    {
+     "beat": "5 收割过线",
+     "what": "schedule() 收尾 take_kv_cache_block_copies 排干拷贝对 → KVCacheBlockCopy(src_block_id, dst_block_id)（纯 int 对，NamedTuple 定义 vllm/v1/core/kv_cache_utils.py:L179-L182）+ 保留端点清单 → 塞进 SchedulerOutput.kv_cache_block_copies；保留端点按 sched_step_seq+1 围栏延迟释放（拷贝可能还在飞）",
+     "anchor": "vllm/v1/core/kv_cache_manager.py:L831-L845；vllm/v1/core/sched/scheduler.py:L1181-L1190+L2356-L2365；vllm/v1/core/sched/output.py:L258-L259"
+    },
+    {
+     "beat": "6 worker 执行",
+     "what": "_update_states 里先 zero（new_block_ids_to_zero）后 copy（注释原话 after zeroing new blocks and before forward）→ copy_kv_cache_blocks_inplace 把整存储视为 [num_blocks, page_bytes] 做 blocks[dst]=blocks[src]",
+     "anchor": "vllm/v1/worker/gpu_model_runner.py:L1219-L1227；vllm/v1/worker/utils.py:L528-L567"
+    }
+   ],
+   "refcount_ledger": "partial 命中时三个端点的引用账：共享尾块 source 被 touch 过（挂账 +1）且换出请求块表后并不减——这就是『保留引用』，保证 worker 拷贝时源块没被回收；cow 块 = 请求持有 1 + _apply_cow 额外 +1 = 2；围栏到期 free_blocks([source,cow]) 把 1→0（source 回池）、2→1（cow 留给请求）。docstring 原话：Both copy endpoints stay retained until the copy has run on the worker（L414-L417）。",
+   "v0_comparison": {
+    "same": "同族机制：多个序列共享同一物理块、谁要接着写谁才拷一份私有——省的是『共享只读前缀』的显存。",
+    "diff": "v0 的 CoW 服务 SequenceGroup 分叉（beam search/parallel sampling 的 n 条 Sequence 共享 prompt 块，分叉时拷尾块）；v1 的这条 CoW 服务前缀缓存的部分命中（命中的共享尾块只有前半截有效、本请求要接着写后半截），分叉方从『同组兄弟序列』换成了『缓存里不明身份的任何前任』。SequenceGroup 已在 V1 移除、beam search 移出核心。",
+    "evidence": "pin 内权威出处：docs/design/metrics.md:L516-L530（原话：SequenceGroup encapsulated the idea of N Sequences which all shared the same prompt kv blocks. This enabled KV cache block sharing between requests, and copy-on-write to do branching + SequenceGroup was removed in V1）。v0 代码本体不在 pin 工作树（v0 core 已于 #25321 删除），只能引这段官方文档，不能引旧代码行号。",
+    "boundary": "ch15 进阶一（chapter.md L1152 起）已开课讲哈希侧全套（含 +1 预留 L226-L230、保留引用、实测表）；ch13 只讲『allocate_slots 账上的时机』并以一小节/边框收口，避免与 ch15 重复。"
+   },
+   "worked_example": {
+    "name": "E4 partial 命中的全程对账（块=32、哈希粒度=16、prompt=36、命中到 token 16）",
+    "steps": [
+     "查得 1 块命中但只盖 16 token：new_computed_blocks=[blkX]、num_local_computed_tokens=16 → 16%32≠0 且 len>0 → partial ✓；登记 _partial_hit_reqs=(block_idx=0, blkX)",
+     "预测：num_new_tokens=36−16=20、need_slot=36 → required=cdiv(36,32)=2；local_computed=1 → num_new=2−1=1；blkX 若 ref_cnt==0 → evictable=1；partial +1 → 总预测 3",
+     "分配：touch blkX（离开自由队列）→ cow 块 get_new_blocks(1) 换入表位 0 → 长度差值 cdiv(36,32)−1=1 → 再取 1 新块 → 返回 [cow, new]；自由队列净减 1(touch)+1(cow)+1(new)=3 = 预测 3 ✓",
+     "过线与执行：kv_cache_block_copies=[(blkX→cow)]；worker 先清零新块（cow 与 new）再 blocks[cow]=blocks[blkX]（整块 32 槽字节），随后 prefill 的 token 16..35 写进 cow 槽 16..31 与新块槽 0..3——共享方 blkX 的后半截（陈旧/无效字节）永远不被读到",
+     "适用面提醒：此例只在多组混合或 prefix_match_unit 覆盖（哈希粒度<块）的部署成立；单组 16/16 下命中恒为整块、走不到这条路"
+    ]
+   }
+  }
+ },
+ "B_ipc_timeline": {
+  "question": "mp 部署下 EngineCore 进程 ↔ Worker 进程跨进程通信全貌：SchedulerOutput 怎么下去、ModelRunnerOutput 怎么回来、两次 RPC 的完整时序、数据 ownership。",
+  "deployment_gate": "distributed_executor_backend 决定形态：单卡默认 uni（UniProcExecutor，同进程直呼、零 MQ）；mp（MultiprocExecutor）才有一拍两次跨进程往返（vllm/v1/executor/abstract.py:L69-L76）。",
+  "topology": [
+   {
+    "item": "下行广播 MQ（rpc_broadcast_mq）",
+    "fact": "仅 DP 组 leader 节点创建 MessageQueue(world_size, local_world_size)，一次 enqueue 全 worker 可读；句柄 export_handle() 随 spawn 传进每个子进程",
+    "anchor": "vllm/v1/executor/multiproc_executor.py:L131-L157+L580-L582"
+   },
+   {
+    "item": "上行应答 MQ（worker_response_mq）",
+    "fact": "每 worker 一条 MessageQueue(1,1)（自己是写者、executor 是唯一读者）；句柄放进 READY 报到信，父进程 create_from_handle(handle, 0) 重建读者侧",
+    "anchor": "vllm/v1/executor/multiproc_executor.py:L585+L725-L745"
+   },
+   {
+    "item": "output_rank",
+    "fact": "= world_size − tp×pcp：最后一个 PP 级的第一个 TP worker；TP=8/PP=4 → 24。无 KV connector 时 execute_model/sample_tokens 只有这个 rank 回写应答（其余算完就扔）",
+    "anchor": "vllm/v1/executor/multiproc_executor.py:L509-L523+L1012-L1013"
+   },
+   {
+    "item": "配 KV connector 时的例外",
+    "fact": "vllm/v1/engine/core.py:L173-L174 装配 kv_output_aggregator → collective_rpc 把下行四元组里的 output_rank 置 None → 全 rank 各回一份、executor 收齐后 aggregate 取 output_rank 那份为主、合并各 rank 的 kv_connector_output",
+    "anchor": "vllm/v1/executor/multiproc_executor.py:L375-L382；vllm/distributed/kv_transfer/kv_connector/utils.py:L53-L72；vllm/v1/engine/core.py:L173-L174"
+   },
+   {
+    "item": "载体",
+    "fact": "pickle protocol 5；CPU 张量 ≥1MiB 走 out-of-band buffer（_reduce_tensor）；总量超块上限（executor 侧 VLLM_MQ_MAX_CHUNK_BYTES_MB=16MiB）标 overflow 改走 zmq XPUB/SUB（本地 ipc://、远端 tcp://）；MessageQueue 自身 24MiB 默认值的注释点名 grammar bitmask（1024 请求）是尺寸依据",
+    "anchor": "vllm/distributed/device_communicators/shm_broadcast.py:L465-L476+L824-L881；vllm/envs.py:L226-L227"
+   },
+   {
+    "item": "FIFO 配对",
+    "fact": "每次 RPC 造一个 FutureWrapper 压进 futures_queue；result() 从队尾排干先于自己的 future——应答 MQ 的 dequeue 顺序与调用顺序对齐，这就是『哪次调用收哪条应答』的机制",
+    "anchor": "vllm/v1/executor/multiproc_executor.py:L70-L100+L412-L416"
+   }
+  ],
+  "step_timeline": [
+   {
+    "seq": "T0",
+    "actor": "EngineCore 进程",
+    "action": "① schedule()：Scheduler 打包 SchedulerOutput（差量：新请求全量 NewRequestData、老请求 new_block_ids 增量、new_block_ids_to_zero、kv_cache_block_copies）",
+    "direction": "进程内",
+    "carrier": "Python 对象（CPU）",
+    "anchor": "vllm/v1/engine/core.py:L595；vllm/v1/core/sched/scheduler.py:L1208-L1229"
+   },
+   {
+    "seq": "T1",
+    "actor": "EngineCore → 全体 worker",
+    "action": "② execute_model(scheduler_output, non_block=True)：collective_rpc 把四元组 ('execute_model',(scheduler_output,),{},output_rank) enqueue 进广播 MQ，拿 Future 立即返回",
+    "direction": "下行（一次写、N 读）",
+    "carrier": "SHM 环形缓冲内的 pickle 字节（超限转 zmq）",
+    "anchor": "vllm/v1/engine/core.py:L596；vllm/v1/executor/multiproc_executor.py:L321-L331+L388"
+   },
+   {
+    "seq": "T2",
+    "actor": "EngineCore 进程",
+    "action": "③ get_grammar_bitmask：CPU 上算结构化输出掩码——与消息在途/worker 预处理/GPU 前向重叠（两次 RPC 之间不空等的全部意义）",
+    "direction": "进程内",
+    "carrier": "numpy int32 数组（GrammarOutput）",
+    "anchor": "vllm/v1/engine/core.py:L597；vllm/v1/core/sched/output.py:L286-L291"
+   },
+   {
+    "seq": "T3",
+    "actor": "每个 worker 进程",
+    "action": "worker_busy_loop dequeue → GPUWorker.execute_model → GPUModelRunner.execute_model：_update_states（块表镜像 append_row、清零、CoW 块拷贝——ch13 站 5-8 的落点）→ _prepare_inputs（块表先行拷贝）→ 前向 launch → 暂存 ExecuteModelState → return None",
+    "direction": "进程内",
+    "carrier": "—",
+    "anchor": "vllm/v1/executor/multiproc_executor.py:L1001；vllm/v1/worker/gpu_worker.py:L1019；vllm/v1/worker/gpu_model_runner.py:L4166+L4516-L4535"
+   },
+   {
+    "seq": "T4",
+    "actor": "output_rank worker → EngineCore",
+    "action": "第一次应答：(SUCCESS, None) 入自己的 worker_response_mq（AsyncModelRunnerOutput 在 enqueue_output 里先解包成普通对象）；executor dequeue + FIFO 配对 → future.result() 拿到 None",
+    "direction": "上行（N 选 1）",
+    "carrier": "pickle 元组",
+    "anchor": "vllm/v1/executor/multiproc_executor.py:L950-L967+L1012-L1013+L394-L410；vllm/v1/engine/core.py:L602"
+   },
+   {
+    "seq": "T5",
+    "actor": "EngineCore → 全体 worker",
+    "action": "④b sample_tokens(grammar_output)：第二次 RPC，同一广播 MQ；载荷=GrammarOutput（含 int32 掩码数组，≥1MiB 走 OOB）",
+    "direction": "下行（一次写、N 读）",
+    "carrier": "同 T1",
+    "anchor": "vllm/v1/engine/core.py:L604；vllm/v1/executor/multiproc_executor.py:L333-L343"
+   },
+   {
+    "seq": "T6",
+    "actor": "output_rank worker",
+    "action": "GPUWorker.sample_tokens → GPUModelRunner.sample_tokens：解包 ExecuteModelState（状态机保证两次调用严格交替，execute_model 入口的 assert）→ apply_grammar_bitmask 盖掩码 → _sample → D2H → 组装 ModelRunnerOutput",
+    "direction": "进程内",
+    "carrier": "GPU 张量 → CPU list",
+    "anchor": "vllm/v1/worker/gpu_worker.py:L1012-L1015；vllm/v1/worker/gpu_model_runner.py:L4553-L4590+L4166-L4175"
+   },
+   {
+    "seq": "T7",
+    "actor": "output_rank worker → EngineCore",
+    "action": "第二次应答：(SUCCESS, ModelRunnerOutput) 入应答 MQ → executor dequeue → future.result() 返回；update_from_output 记账，EngineCoreOutputs 进 output_queue（那是 EngineCore→前端的另一堵墙，ch04/ch05/ch07 域，不入本图）",
+    "direction": "上行（N 选 1）",
+    "carrier": "pickle（刻意 list 不用 tensor，注释原话）",
+    "anchor": "vllm/v1/executor/multiproc_executor.py:L394-L416；vllm/v1/engine/core.py:L604+L609-L611+L1435-L1444；vllm/v1/outputs.py:L258-L259"
+   }
+  ],
+  "ownership": [
+   {
+    "claim": "SchedulerOutput：调度器进程独占写、worker 只读",
+    "evidence": "vllm/v1/core/sched/output.py:L194-L201（注释原话：We cache the request's data in each worker process / we only send the diff to minimize the communication cost）"
+   },
+   {
+    "claim": "token id 流向不对称：prompt 只过线一次、生成 token 只回程一次",
+    "evidence": "prompt 随首帧 NewRequestData.prompt_token_ids 全量过线（vllm/v1/core/sched/output.py:L37）；decode 的采样 token 由 worker 自己采、经 ModelRunnerOutput.sampled_token_ids 回程（vllm/v1/outputs.py:L271）——调度器每拍不把生成 token 发回去（例外：投机草稿 scheduled_spec_decode_tokens，vllm/v1/core/sched/output.py:L209-L212）"
+   },
+   {
+    "claim": "输入张量不跨进程：worker 用 block_id+num_scheduled_tokens 在本地 CpuGpuBuffer 重建",
+    "evidence": "ch13 已立（m15 块表先行拷贝 vllm/v1/worker/gpu_model_runner.py:L1977-L1979）；细节归 ch18 持久批次"
+   },
+   {
+    "claim": "消息体里永远没有 GPU 张量",
+    "evidence": "ModelRunnerOutput 字段注释（vllm/v1/outputs.py:L258-L259：serialized and sent to the scheduler process / expensive for torch.Tensor so prefer to use list）；grammar bitmask 是唯一常驻大数组（int32 numpy，shm_broadcast 24MiB 注释点名它）"
+   },
+   {
+    "claim": "None 的语义=『前向已 launch、采样待第二次 RPC』",
+    "evidence": "vllm/v1/worker/gpu_model_runner.py:L4516-L4535（暂存状态后 return None）+ L4166-L4175（状态机 assert：sample_tokens must be called after execute_model returns None）；空批/池化模型返回非 None 常量（EMPTY_MODEL_RUNNER_OUTPUT，vllm/v1/worker/gpu_model_runner.py:L4231-L4233），此时 ④b 整段跳过（ch09 拍 4 实测）"
+   }
+  ],
+  "figure_brief": {
+   "reader_ask": "读者要一张图辅助理解 EngineCore↔Worker 跨进程通信。",
+   "angle": "ch13 视角的一拍消息往返清单图：左右两根生命线（EngineCore 进程 / Worker 进程[output_rank]），中间画广播 MQ（下行粗箭头×2：execute_model、sample_tokens）与应答 MQ（上行细箭头×2：None、ModelRunnerOutput），③掩码画在两次下行之间的 EngineCore 生命线上、与前向窗口重叠的阴影标出；消息气泡里标注载荷要点（SchedulerOutput=差量块账+token 账；GrammarOutput=int32 掩码；ModelRunnerOutput=list token ids）。block_id/token_id 用 ch13 已立的键色强调。",
+   "must_differ": "与 ch09 的时间轴图（五拍耗时实测）和 ch17 的星形拓扑图区分：那两张讲『多久』和『怎么架』，这张讲『装什么、谁写谁读』。图注建议显式指路 ch09（两段契约语义）/ch17（MQ 装配与传输）/ch05（前端那堵墙）。",
+   "optional_panels": "左下小框：uni 后端同进程直呼对照（vllm/v1/executor/uniproc_executor.py:L91-L106，无 MQ）；右下小框：配 KV connector 时全 rank 应答+聚合（sB-21）。"
+  }
+ },
+ "mechanisms_added": [
+  {
+   "id": "s1",
+   "name": "需块预测慢路径完整公式：token 域→块域的桥（目标表长守恒：返回值=本拍将从自由队列摘走的块数）",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/core/single_type_kv_cache_manager.py:L192-L230",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L128-L142",
+    "vllm/v1/core/kv_cache_manager.py:L490-L519"
+   ],
+   "note": "对 m5 的增量展开（m5 只登记了 cdiv+fast-path+evictable）。三种取整是桥：cdiv（容量）、floor（跳段：跨窗边界的块仍有一角在窗内必须留实体）、命中以块计数（len）。守恒式：num_required_blocks（目标表长）= null 占位 + 命中实体 + external 新块 + 新块；预测返回值 = 后三项中要从池里拿的 + 被 touch 摘走的可驱逐命中块 + partial 命中的 CoW 块。"
+  },
+  {
+   "id": "s2",
+   "name": "fast-path 的准确开关：num_cached_block 记账位的武装时刻表（不是请求状态/is_prefill/调度相位）",
+   "kind": "algorithm",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/core/single_type_kv_cache_manager.py:L194-L200",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L282-L289",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L445-L448",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L477",
+    "vllm/v1/core/kv_cache_manager.py:L551-L563",
+    "vllm/v1/core/sched/scheduler.py:L745"
+   ],
+   "note": "开关=dict 记账位「该请求已有满块写回缓存」。三个武装写入点+一个删除点（pop_blocks_for_free→抢占/结束）；两个不武装边界（prompt<block_size 的短请求、关缓存）。断言的保证人是调度器 L745 首排闸 + 协调器 L210-L217 第二道闸。"
+  },
+  {
+   "id": "s3",
+   "name": "partial 命中的 CoW 时机（allocate_slots 账上视角）：预测 +1 → 挂账登记 → allocate_new_blocks 换尾 → 过线 → worker 块拷贝 → 围栏释放",
+   "kind": "protocol",
+   "difficulty": "supporting",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/v1/core/single_type_kv_cache_manager.py:L132-L142",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L226-L229",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L283-L289",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L347-L369",
+    "vllm/v1/core/single_type_kv_cache_manager.py:L405-L425",
+    "vllm/v1/core/kv_cache_manager.py:L831-L845",
+    "vllm/v1/core/sched/scheduler.py:L1181-L1190",
+    "vllm/v1/core/sched/scheduler.py:L2356-L2365",
+    "vllm/v1/worker/gpu_model_runner.py:L1219-L1227",
+    "vllm/v1/worker/utils.py:L528-L567"
+   ],
+   "note": "ch15 进阶一已开课讲哈希侧全套（含 L226-L230 的 +1 预留），ch13 只补「allocate_slots 账上的时机」：什么条件多记 1 块、什么时候 return cow_blocks vs cow_blocks+new_blocks、两端保留引用到 worker 拷完。单组全注意力（hash==block）下 partial 命中不出现，适用面=多组混合/prefix_match_unit 覆盖。"
+  },
+  {
+   "id": "s4",
+   "name": "EngineCore↔Worker 一拍两 RPC 的跨进程时序（execute_model/sample_tokens）：下行一条广播、上行 N 条应答、两次往返夹一次 CPU 掩码",
+   "kind": "dataflow",
+   "difficulty": "supporting",
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/engine/core.py:L584-L614",
+    "vllm/v1/executor/multiproc_executor.py:L321-L343",
+    "vllm/v1/executor/multiproc_executor.py:L372-L416",
+    "vllm/v1/executor/multiproc_executor.py:L997-L1022",
+    "vllm/v1/worker/gpu_model_runner.py:L4166-L4175",
+    "vllm/v1/worker/gpu_model_runner.py:L4516-L4535",
+    "vllm/v1/worker/gpu_model_runner.py:L4552-L4590"
+   ],
+   "note": "ch09 已讲两段契约的时序语义（InprocClient 同进程实测）、ch17 已讲 MQ 传输层拓扑。本章角度=消息内容级：谁写谁读、装什么、何时、走哪条道；block_id/token_id 差量是 ch13 已立的键。图须与 ch09 图（时间轴）、ch17 图（星形拓扑）区分：这是「一拍消息往返清单」。"
+  },
+  {
+   "id": "s5",
+   "name": "消息载体：SHM 环形缓冲 + pickle protocol 5 OOB + 超限转 zmq XPUB/SUB（grammar bitmask 是 24MiB 默认值的注释依据）",
+   "kind": "dataflow",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/distributed/device_communicators/shm_broadcast.py:L465-L476",
+    "vllm/distributed/device_communicators/shm_broadcast.py:L824-L881",
+    "vllm/envs.py:L226-L227"
+   ],
+   "note": "ch17 域的传输细节，此处仅作图注/一句话引用素材，不展开。"
+  }
+ ],
+ "embed_excerpts": [
+  {
+   "id": "sA-01",
+   "path": "vllm/v1/core/sched/scheduler.py",
+   "lines": "L744-L747",
+   "why": "A1 前缀查换的调度侧闸门：只有 num_computed_tokens==0 的首排才做 get_computed_blocks——running 请求无新命中的真正保证人。",
+   "elide": [],
+   "code": "                # Get already-cached tokens.\n                if request.num_computed_tokens == 0:\n                    did_prefix_cache_lookup = True\n                    hit_diverged = False"
+  },
+  {
+   "id": "sA-02",
+   "path": "vllm/v1/core/sched/scheduler.py",
+   "lines": "L854-L859",
+   "why": "A1 else 支：非首排（含 KVTransfer 的 WAITING 复入请求）一律拿空命中过账，get_num_blocks_to_allocate 的 assert 因此永不破。",
+   "elide": [],
+   "code": "                else:\n                    # KVTransfer: WAITING reqs have num_computed_tokens > 0\n                    # after async KV recvs are completed.\n                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks\n                    num_new_local_computed_tokens = 0\n                    num_computed_tokens = request.num_computed_tokens"
+  },
+  {
+   "id": "sA-03",
+   "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+   "lines": "L192-L230",
+   "why": "A1+A2 主excerpt：fast-path 判定（num_cached_block 记账位）与慢路径完整公式（skipped/local_computed/evictable/partial+1）。六行账全部在内。",
+   "elide": [],
+   "code": "        num_req_blocks = len(self.req_to_blocks.get(request_id, ()))\n\n        if request_id in self.num_cached_block:\n            # Fast-path: a running request won't have any new prefix-cache hits.\n            assert len(new_computed_blocks) == 0\n            # NOTE: With speculative decoding, request's blocks may be allocated\n            # for draft tokens which are later rejected. In this case,\n            # num_required_blocks may be smaller than num_req_blocks.\n            return max(num_required_blocks - num_req_blocks, 0)\n\n        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)\n        num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks\n        # Number of whole blocks that are skipped by the attention window.\n        # If nothing is skipped, this is 0.\n        num_skipped_blocks = num_skipped_tokens // self.block_size\n        # We need blocks for the non-skipped suffix. If there are still\n        # local-computed blocks inside the window, they contribute to the\n        # required capacity; otherwise, skipped blocks dominate.\n        num_new_blocks = max(\n            num_required_blocks - max(num_skipped_blocks, num_local_computed_blocks),\n            0,\n        )\n\n        # Among the `new_computed_blocks`, the first `num_skipped_blocks` worth\n        # of blocks are skipped; `num_req_blocks` of those may already be in\n        # `req_to_blocks`, so only skip the remainder from `new_computed_blocks`.\n        num_skipped_new_computed_blocks = max(0, num_skipped_blocks - num_req_blocks)\n\n        # If a computed block is an eviction candidate (in the free queue and\n        # ref_cnt == 0), it will be removed from the free queue when touched by\n        # the allocated request, so we must count it in the free-capacity check.\n        num_evictable_blocks = self._get_num_evictable_blocks(\n            new_computed_blocks[num_skipped_new_computed_blocks:]\n        )\n        if self._has_partial_local_hit(new_computed_blocks, num_local_computed_tokens):\n            # Reserve the extra block that allocate_new_blocks pulls for the\n            # partial-hit CoW redirect.\n            num_new_blocks += 1\n        return num_new_blocks + num_evictable_blocks"
+  },
+  {
+   "id": "sA-04",
+   "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+   "lines": "L128-L142",
+   "why": "A2 两个辅助谓词：可驱逐命中块计数（ref_cnt==0 且非 null）与 partial 命中判定（命中结束在块中间）。",
+   "elide": [],
+   "code": "    @classmethod\n    def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):\n        return sum(blk.ref_cnt == 0 and not blk.is_null for blk in blocks)\n\n    def _has_partial_local_hit(\n        self,\n        new_computed_blocks: Sequence[KVCacheBlock],\n        num_local_computed_tokens: int,\n    ) -> bool:\n        # The local prefix-cache hit ends inside one of this manager's\n        # blocks: the shared tail block needs CoW.\n        return (\n            len(new_computed_blocks) > 0\n            and num_local_computed_tokens % self.block_size != 0\n        )"
+  },
+  {
+   "id": "sA-05",
+   "path": "vllm/v1/core/kv_cache_manager.py",
+   "lines": "L453-L461",
+   "why": "A3 五段中 comp+new_comp+ext_comp 的 token 域求和点：num_local_computed_tokens 与 total_computed_tokens。",
+   "elide": [],
+   "code": "        # The number of computed tokens is the number of computed tokens plus\n        # the new prefix caching hits\n        num_local_computed_tokens = (\n            request.num_computed_tokens + num_new_computed_tokens\n        )\n        total_computed_tokens = min(\n            num_local_computed_tokens + num_external_computed_tokens,\n            self.max_model_len,\n        )"
+  },
+  {
+   "id": "sA-06",
+   "path": "vllm/v1/core/kv_cache_manager.py",
+   "lines": "L490-L493",
+   "why": "A3 五段中 new+lookahead 的入账点：num_tokens_main_model 与 num_tokens_need_slot（cdiv 的被除数）。",
+   "elide": [],
+   "code": "        num_tokens_main_model = total_computed_tokens + num_new_tokens\n        num_tokens_need_slot = min(\n            num_tokens_main_model + num_lookahead_tokens, self.max_model_len\n        )"
+  },
+  {
+   "id": "sA-07",
+   "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+   "lines": "L253-L289",
+   "why": "A1+A4 挂命中块函数体：touch 救回、跳段 null 占位、num_cached_block 的武装写入（L282）与 partial 命中下修（L289）。",
+   "elide": [],
+   "code": "        # The coordinator only calls this for first-time allocations (running\n        # requests are short-circuited there), so the request has no blocks yet.\n        req_blocks = self.req_to_blocks[request_id]\n        assert len(req_blocks) == 0\n        num_total_computed_tokens = (\n            num_local_computed_tokens + num_external_computed_tokens\n        )\n        num_skipped_tokens = self.get_num_skipped_tokens(num_total_computed_tokens)\n        num_skipped_blocks = num_skipped_tokens // self.block_size\n        if num_skipped_blocks > 0:\n            # It is possible that all new computed blocks are skipped when\n            # num_skipped_blocks > len(new_computed_blocks).\n            new_computed_blocks = new_computed_blocks[num_skipped_blocks:]\n\n        # Touch the computed blocks to make sure they won't be evicted.\n        if self.enable_caching:\n            self.block_pool.touch(new_computed_blocks)\n        else:\n            assert not any(new_computed_blocks), (\n                \"Computed blocks should be empty when prefix caching is disabled\"\n            )\n\n        # Skip blocks are padded with null blocks.\n        req_blocks.extend([self._null_block] * num_skipped_blocks)\n        # Add the remaining computed blocks.\n        req_blocks.extend(new_computed_blocks)\n        # All cached hits (including skipped nulls) are already cached; mark\n        # them so cache_blocks() will not try to re-cache blocks that already\n        # have a block_hash set.\n        self.num_cached_block[request_id] = len(req_blocks)\n        if self._has_partial_local_hit(new_computed_blocks, num_local_computed_tokens):\n            # Record the partial tail for the CoW redirect in\n            # allocate_new_blocks; cap the cached count at the full blocks so\n            # cache_blocks() re-caches the private copy once full.\n            block_idx = num_local_computed_tokens // self.block_size\n            self._partial_hit_reqs[request_id] = (block_idx, new_computed_blocks[-1])\n            self.num_cached_block[request_id] = block_idx"
+  },
+  {
+   "id": "sA-08",
+   "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+   "lines": "L347-L369",
+   "why": "A4 CoW 时机主excerpt：partial 命中换私有块 + 长度差值分配；return cow_blocks（差值<=0）vs cow_blocks+new_blocks 的分岔就在 L362-L369。",
+   "elide": [],
+   "code": "        cow_blocks: list[KVCacheBlock] = []\n        if request_id in self._partial_hit_reqs:\n            # Partial hit: redirect the shared tail to a private CoW block.\n            # Replacing in place keeps the length-based allocation below\n            # correct; the extra block was reserved by\n            # get_num_blocks_to_allocate.\n            block_idx, source_block = self._partial_hit_reqs.pop(request_id)\n            cow_block = self.block_pool.get_new_blocks(1)[0]\n            self._apply_cow(request_id, block_idx, source_block, cow_block)\n            self.new_block_ids.append(cow_block.block_id)\n            cow_blocks.append(cow_block)\n\n        req_blocks = self.req_to_blocks[request_id]\n        num_required_blocks = cdiv(num_tokens, self.block_size)\n        num_new_blocks = num_required_blocks - len(req_blocks)\n        if num_new_blocks <= 0:\n            return cow_blocks\n        else:\n            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)\n            req_blocks.extend(new_blocks)\n            if self._record_new_block_ids:\n                self.new_block_ids.extend(b.block_id for b in new_blocks)\n            return cow_blocks + new_blocks"
+  },
+  {
+   "id": "sA-09",
+   "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+   "lines": "L405-L425",
+   "why": "A4 _apply_cow：原地换块、登记拷贝对、cow 块额外 +1 保留引用（两端都活到 worker 拷完）。",
+   "elide": [],
+   "code": "    def _apply_cow(\n        self,\n        request_id: str,\n        block_idx: int,\n        source_block: KVCacheBlock,\n        cow_block: KVCacheBlock,\n    ) -> None:\n        \"\"\"Redirect a partial prefix-cache hit to a private CoW block.\n\n        Both copy endpoints stay retained until the copy has run on the worker,\n        so a same-step free cannot recycle them: ``source_block`` keeps its\n        hit-ref, ``cow_block`` takes an extra ref beyond the one handed to the\n        request.\n        \"\"\"\n        req_blocks = self.req_to_blocks[request_id]\n        assert block_idx < len(req_blocks)\n        assert req_blocks[block_idx] is source_block\n        assert not source_block.is_null and source_block.ref_cnt > 0\n        req_blocks[block_idx] = cow_block\n        self._pending_cow_copies.append((source_block, cow_block))\n        cow_block.ref_cnt += 1"
+  },
+  {
+   "id": "sA-10",
+   "path": "vllm/v1/core/kv_cache_manager.py",
+   "lines": "L831-L845",
+   "why": "A4 拷贝对的收割：pending (source,cow) 对 → KVCacheBlockCopy(src,dst) id 对 + 保留端点清单。",
+   "elide": [],
+   "code": "    def take_kv_cache_block_copies(\n        self,\n    ) -> tuple[list[KVCacheBlockCopy], list[KVCacheBlock]]:\n        \"\"\"Drain pending copies and return their retained endpoints.\"\"\"\n        pending_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []\n        for mgr in self.coordinator.single_type_managers:\n            pending_copies.extend(mgr.take_pending_cow_copies())\n        copies = [\n            KVCacheBlockCopy(\n                src_block_id=source_block.block_id,\n                dst_block_id=cow_block.block_id,\n            )\n            for source_block, cow_block in pending_copies\n        ]\n        retained_blocks = [block for pair in pending_copies for block in pair]"
+  },
+  {
+   "id": "sA-11",
+   "path": "vllm/v1/core/sched/scheduler.py",
+   "lines": "L1181-L1190",
+   "why": "A4 schedule() 收尾排干拷贝对、随 SchedulerOutput 过线，并以 sched_step_seq+1 围栏延迟释放保留引用。",
+   "elide": [],
+   "code": "        kv_cache_block_copies, cow_retained_blocks = (\n            self.kv_cache_manager.take_kv_cache_block_copies()\n        )\n        if kv_cache_block_copies:\n            # The copies run with this step's execution; the first non-empty\n            # step at or after it gets seq `sched_step_seq + 1` (0-token steps\n            # do not advance the seq), and its completion implies the copies\n            # have run.\n            self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)\n        pending_kv_cache_block_copies = kv_cache_block_copies or None"
+  },
+  {
+   "id": "sA-12",
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L1219-L1227",
+   "why": "A4 worker 侧执行顺序：先清零新块、后做 CoW 块拷贝、再进前向（注释原话 after zeroing new blocks and before forward）。",
+   "elide": [],
+   "code": "        # Zero GPU memory for freshly allocated cache blocks to prevent\n        # stale NaN/data from corrupting attention or SSM computation.\n        if scheduler_output.new_block_ids_to_zero:\n            self._zero_block_ids(scheduler_output.new_block_ids_to_zero)\n        if scheduler_output.kv_cache_block_copies:\n            copy_kv_cache_blocks_inplace(\n                self.kv_caches,\n                self.kv_cache_config.num_blocks,\n                scheduler_output.kv_cache_block_copies,"
+  },
+  {
+   "id": "sA-13",
+   "path": "vllm/v1/worker/utils.py",
+   "lines": "L528-L567",
+   "why": "A4 copy_kv_cache_blocks_inplace：按存储去重、H2D 索引对、整存储视为 [num_blocks, page_bytes] 后 blocks[dst]=blocks[src]。",
+   "elide": [],
+   "code": "def copy_kv_cache_blocks_inplace(\n    kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],\n    num_blocks: int,\n    kv_cache_block_copies: Sequence[KVCacheBlockCopy],\n) -> None:\n    if not kv_cache_block_copies:\n        return\n\n    storage_tensors: list[torch.Tensor] = []\n    seen_storage: set[int] = set()\n    for entry in kv_caches:\n        # Mamba layers hold a list of state tensors; attention layers a single\n        # tensor. Both alias the shared block-major backing storage.\n        tensors = entry if isinstance(entry, (list, tuple)) else (entry,)\n        for tensor in tensors:\n            ptr = tensor.untyped_storage().data_ptr()\n            if ptr in seen_storage:\n                continue\n            seen_storage.add(ptr)\n            storage_tensors.append(tensor)\n\n    if not storage_tensors:\n        return\n    device = storage_tensors[0].device\n    indices_np = np.array(kv_cache_block_copies, dtype=np.int64)\n    indices = async_tensor_h2d(indices_np, device=device)\n    src_indices, dst_indices = indices.unbind(dim=1)\n\n    for tensor in storage_tensors:\n        assert tensor.device == device\n        blocks = torch.empty(0, dtype=torch.uint8, device=device)\n        blocks.set_(tensor.untyped_storage())\n        # Block-major backing storage: block i owns the contiguous byte range\n        # [i * page_size, (i + 1) * page_size).\n        assert blocks.numel() % num_blocks == 0\n        blocks = blocks.view(num_blocks, -1)\n        blocks[dst_indices] = blocks[src_indices]\n\n\ndef is_residual_scattered_for_sp("
+  },
+  {
+   "id": "sA-14",
+   "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+   "lines": "L1057-L1083",
+   "why": "A2 SWA 的 get_num_skipped_tokens（含源码自带 ASCII 例：W=4,T=7→4）——num_skipped_tokens 的出处；全注意力基类恒 0（L661-L672）。",
+   "elide": [],
+   "code": "    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:\n        \"\"\"\n        Get the number of tokens that will be skipped for attention computation.\n\n        For sliding window, this corresponds to the tokens that are prior to\n        the current sliding window.\n\n        Example:\n        sliding_window=4, num_computed_tokens=7\n\n        Tokens:   [ 0  1  2  3  4  5  6  7 ]\n                  | ---- computed -----|\n                                         ^ next token to be computed\n                               |-----------| sliding window for next token\n                  |--skipped---|\n\n        The current window contains tokens 4~7. Tokens 0~3 will be skipped for\n        attention computation since they are outside the sliding window.\n        Thus, get_num_skipped_tokens(7) == 4.\n\n        Args:\n            num_computed_tokens: The number of tokens that have been computed.\n\n        Returns:\n            The number of tokens that will be skipped for attention computation.\n        \"\"\"\n        return max(0, num_computed_tokens - self.sliding_window + 1)"
+  },
+  {
+   "id": "sA-15",
+   "path": "docs/design/metrics.md",
+   "lines": "L516-L530",
+   "why": "A4 v0 经典 CoW 的 pin 内权威出处：SequenceGroup 共享 prompt 块 + copy-on-write 做 branching；SequenceGroup 已在 V1 移除、beam search 移出核心。",
+   "elide": [],
+   "code": "Historically, [vLLM has long supported beam search](https://github.com/vllm-project/vllm/issues/6226). The\nSequenceGroup encapsulated the idea of N Sequences which\nall shared the same prompt kv blocks. This enabled KV cache block\nsharing between requests, and copy-on-write to do branching. CPU\nswapping was intended for these beam search like cases.\n\nLater, the concept of prefix caching was introduced, which allowed KV\ncache blocks to be shared implicitly. This proved to be a better\noption than CPU swapping since blocks can be evicted slowly on demand\nand the part of the prompt that was evicted can be recomputed.\n\nSequenceGroup was removed in V1, although a replacement will be\nrequired for \"parallel sampling\" (`n>1`).\n[Beam search was moved out of the core](https://github.com/vllm-project/vllm/issues/8306). There was a\nlot of complex code for a very uncommon feature."
+  },
+  {
+   "id": "sA-16",
+   "path": "vllm/v1/core/kv_cache_utils.py",
+   "lines": "L649-L651",
+   "why": "A4 partial 命中的适用面前提：单组模型 hash_block_size==block_size（无细粒度哈希）。",
+   "elide": [],
+   "code": "    if len(groups) <= 1:\n        bs = cache_config.block_size * dcp\n        return bs, bs"
+  },
+  {
+   "id": "sA-17",
+   "path": "vllm/v1/core/kv_cache_coordinator.py",
+   "lines": "L486-L503",
+   "why": "A4 单组协调器把 alignment_tokens 传成自身 block_size——单组下细粒度分支恒不成立、partial 命中/CoW 不出现。",
+   "elide": [],
+   "code": "    def find_longest_cache_hit(\n        self,\n        block_hashes: list[BlockHash],\n        max_cache_hit_length: int,\n    ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:\n        hit_blocks, hit_length = self.single_type_managers[0].find_longest_cache_hit(\n            block_hashes=block_hashes,\n            max_length=max_cache_hit_length,\n            kv_cache_group_ids=[0],\n            block_pool=self.block_pool,\n            kv_cache_spec=self.kv_cache_spec,\n            drop_eagle_block=0 in self.eagle_group_ids,\n            alignment_tokens=self.block_size,\n            dcp_world_size=self.dcp_world_size,\n            pcp_world_size=self.pcp_world_size,\n        )\n        # Single group: nothing \"uncached common\" -- no other group to lag it.\n        return hit_blocks, hit_length, 0"
+  },
+  {
+   "id": "sB-01",
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L584-L614",
+   "why": "B 全图骨架：step 五拍——L595 schedule、L596 execute_model(non_block)、L597 掩码、L602 future.result、L604 sample_tokens、L609 update_from_output。",
+   "elide": [],
+   "code": "    def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:\n        \"\"\"Schedule, execute, and make output.\n\n        Returns tuple of outputs and a flag indicating whether the model\n        was executed.\n        \"\"\"\n\n        # Check for any requests remaining in the scheduler - unfinished,\n        # or finished and not yet removed from the batch.\n        if not self.scheduler.has_requests():\n            return {}, False\n        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())\n        future = self.model_executor.execute_model(scheduler_output, non_block=True)\n        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)\n        with (\n            self.capture_iteration_details(scheduler_output) as iteration_details,\n            self.log_error_detail(scheduler_output),\n        ):\n            model_output = future.result()\n            if model_output is None:\n                model_output = self.model_executor.sample_tokens(grammar_output)\n\n        # Before processing the model output, process any aborts that happened\n        # during the model execution.\n        self._process_aborts_queue()\n        engine_core_outputs = self.scheduler.update_from_output(\n            scheduler_output, model_output\n        )\n        self._attach_iteration_details(engine_core_outputs, iteration_details)\n\n        return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0"
+  },
+  {
+   "id": "sB-02",
+   "path": "vllm/v1/executor/multiproc_executor.py",
+   "lines": "L321-L343",
+   "why": "B 两次 RPC 的执行器侧入口：execute_model 与 sample_tokens 都只是 collective_rpc 的具名包装（unique_reply_rank=output_rank）。",
+   "elide": [],
+   "code": "    def execute_model(  # type: ignore[override]\n        self, scheduler_output: SchedulerOutput, non_block: bool = False\n    ) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:\n        return self.collective_rpc(\n            \"execute_model\",\n            args=(scheduler_output,),\n            unique_reply_rank=self.output_rank,\n            non_block=non_block,\n            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,\n            kv_output_aggregator=self.kv_output_aggregator,\n        )\n\n    def sample_tokens(  # type: ignore[override]\n        self, grammar_output: GrammarOutput | None, non_block: bool = False\n    ) -> ModelRunnerOutput | Future[ModelRunnerOutput]:\n        return self.collective_rpc(\n            \"sample_tokens\",\n            args=(grammar_output,),\n            unique_reply_rank=self.output_rank,\n            non_block=non_block,\n            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,\n            kv_output_aggregator=self.kv_output_aggregator,\n        )"
+  },
+  {
+   "id": "sB-03",
+   "path": "vllm/v1/executor/multiproc_executor.py",
+   "lines": "L372-L416",
+   "why": "B 下行一行 + 上行收割：L388 四元组 enqueue 进广播 MQ；L390-L410 按应答 MQ dequeue；FutureWrapper 非阻塞返回。",
+   "elide": [],
+   "code": "        deadline = None if timeout is None else time.monotonic() + timeout\n        kwargs = kwargs or {}\n\n        if kv_output_aggregator is not None:\n            output_rank = None\n            aggregate: Callable[[Any], Any] = partial(\n                kv_output_aggregator.aggregate, output_rank=unique_reply_rank or 0\n            )\n        else:\n            output_rank = unique_reply_rank\n            aggregate = lambda x: x\n\n        if isinstance(method, str):\n            send_method = method\n        else:\n            send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)\n        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))\n\n        response_mqs: Sequence[MessageQueue] = self.response_mqs\n        if output_rank is not None:\n            response_mqs = (response_mqs[output_rank],)\n\n        def get_response():\n            responses = []\n            for mq in response_mqs:\n                dequeue_timeout = (\n                    None if deadline is None else max(0.0, deadline - time.monotonic())\n                )\n                try:\n                    status, result = mq.dequeue(timeout=dequeue_timeout)\n                except TimeoutError as e:\n                    raise TimeoutError(f\"RPC call to {method} timed out.\") from e\n                if status != WorkerProc.ResponseStatus.SUCCESS:\n                    raise RuntimeError(\n                        f\"Worker failed with error '{result}', please check the\"\n                        \" stack trace above for the root cause\"\n                    )\n                responses.append(result)\n            return responses[0] if output_rank is not None else responses\n\n        future = FutureWrapper(\n            self.futures_queue, get_response=get_response, aggregate=aggregate\n        )\n\n        return future if non_block else future.result()"
+  },
+  {
+   "id": "sB-04",
+   "path": "vllm/v1/executor/multiproc_executor.py",
+   "lines": "L997-L1022",
+   "why": "B worker 侧主循环：dequeue 广播 → getattr 派发 → output_rank 过滤后 handle_output；异常也走同一应答通道。",
+   "elide": [],
+   "code": "    def worker_busy_loop(self):\n        \"\"\"Main busy loop for Multiprocessing Workers\"\"\"\n        assert self.rpc_broadcast_mq is not None\n        while True:\n            method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(\n                indefinite=True\n            )\n            try:\n                if isinstance(method, str):\n                    func = getattr(self.worker, method)\n                elif isinstance(method, bytes):\n                    func = partial(cloudpickle.loads(method), self.worker)\n\n                output = func(*args, **kwargs)\n\n                if output_rank is None or self.rank == output_rank:\n                    self.handle_output(output)\n            except Exception as e:\n                # Notes have been introduced in python 3.11\n                if hasattr(e, \"add_note\"):\n                    e.add_note(traceback.format_exc())\n                logger.exception(\"WorkerProc hit an exception.\")\n                # exception might not be serializable, so we convert it to\n                # string, only for logging purpose.\n                if output_rank is None or self.rank == output_rank:\n                    self.handle_output(e)"
+  },
+  {
+   "id": "sB-05",
+   "path": "vllm/v1/executor/multiproc_executor.py",
+   "lines": "L950-L967",
+   "why": "B 应答封装：(SUCCESS/FAILURE, payload) 元组入 worker_response_mq；AsyncModelRunnerOutput 在此解包成普通 ModelRunnerOutput。",
+   "elide": [],
+   "code": "    def enqueue_output(self, output: Any):\n        \"\"\"Prepares output from the worker and enqueues it to the\n        worker_response_mq. If the output is an Exception, it is\n        converted to a FAILURE response.\n        \"\"\"\n        if isinstance(output, AsyncModelRunnerOutput):\n            try:\n                output = output.get_output()\n            except Exception as e:\n                logger.exception(\"Error getting async model runner output\")\n                output = e\n\n        if isinstance(output, Exception):\n            result = (WorkerProc.ResponseStatus.FAILURE, str(output))\n        else:\n            result = (WorkerProc.ResponseStatus.SUCCESS, output)\n        if (response_mq := self.worker_response_mq) is not None:\n            response_mq.enqueue(result)"
+  },
+  {
+   "id": "sB-06",
+   "path": "vllm/distributed/device_communicators/shm_broadcast.py",
+   "lines": "L824-L881",
+   "why": "B 载体内景：pickle protocol 5、CPU 张量 >=1MiB 走 out-of-band buffer、总量超块上限标 overflow 改走 zmq XPUB/SUB。",
+   "elide": [],
+   "code": "    def enqueue(self, obj, timeout: float | None = None):\n        \"\"\"Write to message queue with optional timeout (in seconds)\"\"\"\n        assert self._is_writer, \"Only writers can enqueue\"\n        all_buffers: list[SizedBuffer] = [b\"\"]\n        total_bytes = 6  # 2 bytes for oob buffer count, 4 for main buffer size\n\n        def oob_callback(buf: PickleBuffer) -> bool:\n            raw_buf = buf.raw()\n            if len(raw_buf) < 1024 * 1024:\n                # In-line buffers smaller than 1MiB.\n                return True\n            all_buffers.append(raw_buf)\n            nonlocal total_bytes\n            total_bytes += len(raw_buf) + 4\n            return False\n\n        # CPU tensors are routed through `_reduce_tensor` so that their\n        # bytes are emitted as out-of-band buffers instead of being\n        # copied into the pickle stream by torch's default reducer.\n        # Start from `copyreg.dispatch_table` to preserve globally\n        # registered reducers (e.g. `re.Pattern`); the per-pickler\n        # dispatch table would otherwise shadow them.\n        dispatch_table = dict(copyreg.dispatch_table)\n        dispatch_table[torch.Tensor] = _reduce_tensor\n        with io.BytesIO() as bio:\n            pickler = pickle.Pickler(\n                bio,\n                protocol=pickle.HIGHEST_PROTOCOL,\n                buffer_callback=oob_callback,\n            )\n            pickler.dispatch_table = dispatch_table\n            pickler.dump(obj)\n            all_buffers[0] = bio.getvalue()\n        if self.n_local_reader > 0:\n            if total_bytes + len(all_buffers[0]) >= self.buffer.max_chunk_bytes:\n                with self.acquire_write(timeout) as buf:\n                    buf[0] = 1  # overflow\n                self.local_socket.send_multipart(all_buffers, copy=False)\n            else:\n                # Byte 0: 0\n                # Bytes 1-2: Count of buffers\n                # Then each buffer follows, preceded by 4 bytes containing its length:\n                # [4 byte int L][L bytes of buffer content] ...\n                with self.acquire_write(timeout) as buf:\n                    buf[0] = 0  # not overflow\n                    offset = 3\n                    buf[1:offset] = to_bytes_big(len(all_buffers), 2)  # oob buf count\n                    for buffer in all_buffers:\n                        buf_len = len(buffer)\n                        # prepend each buffer with 4 bytes containing its size.\n                        buf_offset = offset + 4\n                        buf[offset:buf_offset] = to_bytes_big(buf_len, 4)\n                        buf[buf_offset : (offset := buf_offset + buf_len)] = buffer\n\n            self._spin_condition.notify()\n\n        if self.n_remote_reader > 0:\n            self.remote_socket.send_multipart(all_buffers, copy=False)"
+  },
+  {
+   "id": "sB-07",
+   "path": "vllm/v1/core/sched/output.py",
+   "lines": "L192-L216",
+   "why": "B 消息体主干：SchedulerOutput 前半——差量协议的注释原话（新请求全量/老请求只发 diff）。",
+   "elide": [],
+   "code": "@dataclass\nclass SchedulerOutput:\n    # list of the requests that are scheduled for the first time.\n    # We cache the request's data in each worker process, so that we don't\n    # need to re-send it every scheduling step.\n    scheduled_new_reqs: list[NewRequestData]\n    # list of the requests that have been scheduled before.\n    # Since the request's data is already cached in the worker processes,\n    # we only send the diff to minimize the communication cost.\n    scheduled_cached_reqs: CachedRequestData\n\n    # req_id -> num_scheduled_tokens\n    # Number of tokens scheduled for each request.\n    num_scheduled_tokens: dict[str, int]\n    # Total number of tokens scheduled for all requests.\n    # Equal to sum(num_scheduled_tokens.values())\n    total_num_scheduled_tokens: int\n    # req_id -> spec_token_ids\n    # If a request does not have any spec decode tokens, it will not be\n    # included in the dictionary.\n    scheduled_spec_decode_tokens: dict[str, list[int]]\n    # req_id -> encoder input indices that need processing.\n    # E.g., if a request has [0, 1], it could mean the vision encoder needs\n    # to process that the request's 0-th and 1-th images in the current step.\n    scheduled_encoder_inputs: dict[str, list[int]]"
+  },
+  {
+   "id": "sB-08",
+   "path": "vllm/v1/core/sched/output.py",
+   "lines": "L253-L259",
+   "why": "B ch13 直接相关的两个 KV 字段：new_block_ids_to_zero 与 kv_cache_block_copies（CoW 拷贝对）。",
+   "elide": [],
+   "code": "    # Block IDs freshly allocated from the pool during this scheduling step.\n    # The worker zeros the corresponding GPU memory before the blocks are used,\n    # preventing stale NaN/data from corrupting attention or SSM computation.\n    new_block_ids_to_zero: list[int] | None = None\n\n    # CoW copies to apply after zeroing new blocks and before forward.\n    kv_cache_block_copies: list[KVCacheBlockCopy] | None = None"
+  },
+  {
+   "id": "sB-09",
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L4166-L4175",
+   "why": "B 两段契约的防御：execute_model 入口的状态检查（sample_tokens 必须在 execute_model 返回 None 之后）。",
+   "elide": [],
+   "code": "    def execute_model(\n        self,\n        scheduler_output: \"SchedulerOutput\",\n        intermediate_tensors: IntermediateTensors | None = None,\n    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:\n        if self.execute_model_state is not None:\n            raise RuntimeError(\n                \"State error: sample_tokens() must be called \"\n                \"after execute_model() returns None.\"\n            )"
+  },
+  {
+   "id": "sB-10",
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L4516-L4535",
+   "why": "B 两段契约的 worker 半边：前向已 launch、ExecuteModelState 暂存、return None——None 的准确语义。",
+   "elide": [],
+   "code": "        self.execute_model_state = ExecuteModelState(\n            scheduler_output,\n            logits,\n            spec_decode_metadata,\n            spec_decode_common_attn_metadata,\n            hidden_states,\n            sample_hidden_states,\n            aux_hidden_states,\n            ec_connector_output,\n            cudagraph_stats,\n            slot_mappings,\n        )\n        self.kv_connector_output = kv_connector_output\n\n        # Now the batch has been launched we can wait for corrections from the\n        # previous model forward without breaking async scheduling.\n        if deferred_state_corrections_fn:\n            deferred_state_corrections_fn()\n\n        return None"
+  },
+  {
+   "id": "sB-11",
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L4552-L4590",
+   "why": "B 第二次 RPC 的 worker 半边：解包状态、盖语法掩码、采样；mask 应用点证明两次 RPC 的切分动机。",
+   "elide": [],
+   "code": "    @torch.inference_mode\n    def sample_tokens(\n        self, grammar_output: \"GrammarOutput | None\"\n    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:\n        if self.execute_model_state is None:\n            kv_connector_output = self.kv_connector_output\n            self.kv_connector_output = None\n            # receive sampled token ids from the last PP rank.\n            if self.use_async_scheduling and not get_pp_group().is_last_rank:\n                self._pp_receive_prev_sampled_token_ids_to_input_batch()\n            # In case of PP with kv transfer, we need to pass through the\n            # kv_connector_output\n            return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)\n\n        # Unpack ephemeral state.\n        (\n            scheduler_output,\n            logits,\n            spec_decode_metadata,\n            spec_decode_common_attn_metadata,\n            hidden_states,\n            sample_hidden_states,\n            aux_hidden_states,\n            ec_connector_output,\n            cudagraph_stats,\n            slot_mappings,\n        ) = self.execute_model_state\n        # Clear ephemeral state.\n        self.execute_model_state = None\n\n        # Apply structured output bitmasks if present.\n        if grammar_output is not None:\n            apply_grammar_bitmask(\n                scheduler_output, grammar_output, self.input_batch, logits\n            )\n\n        with record_function_or_nullcontext(\"gpu_model_runner: sample\"):\n            sampler_output = self._sample(logits, spec_decode_metadata)\n"
+  },
+  {
+   "id": "sB-12",
+   "path": "vllm/v1/outputs.py",
+   "lines": "L258-L271",
+   "why": "B 回程消息体的设计决定：ModelRunnerOutput 刻意用 list 而非 torch.Tensor（注释原话 serialized and sent to the scheduler process）。",
+   "elide": [],
+   "code": "# ModelRunnerOutput is serialized and sent to the scheduler process.\n# This is expensive for torch.Tensor so prefer to use list instead.\n@dataclass\nclass ModelRunnerOutput:\n    # [num_reqs]\n    req_ids: list[str]\n    # req_id -> index\n    req_id_to_index: dict[str, int]\n\n    # num_reqs x num_generated_tokens\n    # num_generated_tokens is the number of tokens\n    # generated in the current step. It can be different for\n    # each request due to speculative/jump decoding.\n    sampled_token_ids: list[list[int]] = field(default_factory=list)"
+  },
+  {
+   "id": "sB-13",
+   "path": "vllm/v1/executor/multiproc_executor.py",
+   "lines": "L509-L523",
+   "why": "B output_rank 的定义：world_size - tp*pcp = 最后一个 PP 级的第一个 TP worker（TP=8,PP=4 例 → 24）。",
+   "elide": [],
+   "code": "    def _get_output_rank(self) -> int:\n        # Only returns ModelRunnerOutput from TP rank=0 and PP rank=-1\n        # (the first TP worker of the last PP stage).\n        # Example:\n        # Assuming TP=8, PP=4, then the world_size=32\n        # 0-7, PP rank 0\n        # 8-15, PP rank 1\n        # 16-23, PP rank 2\n        # 24-31, PP rank 3\n        # so world_size - tp_size = 32 - 8 = 24 should be PP rank = -1 (i.e. 3)\n        return (\n            self.world_size\n            - self.parallel_config.tensor_parallel_size\n            * self.parallel_config.prefill_context_parallel_size\n        )"
+  },
+  {
+   "id": "sB-14",
+   "path": "vllm/v1/executor/multiproc_executor.py",
+   "lines": "L131-L157",
+   "why": "B 广播 MQ 的出生：仅 DP 组 leader 节点建 MessageQueue(world_size, local_world_size)，句柄 export 随 spawn 传给每个 worker。",
+   "elide": [],
+   "code": "        self.rpc_broadcast_mq: MessageQueue | None = None\n        scheduler_output_handle: Handle | None = None\n        # Initialize worker and set up message queues for SchedulerOutputs\n        # and ModelRunnerOutputs\n        if self.parallel_config.node_rank_within_dp == 0:\n            # For leader node within each dp rank,\n            # each dp will have its own leader multiproc executor.\n            max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024\n            mq_connect_ip = get_ip()\n            logger.info(\n                \"DP group leader: node_rank=%d, node_rank_within_dp=%d, \"\n                \"master_addr=%s, mq_connect_ip=%s (local), \"\n                \"world_size=%d, local_world_size=%d\",\n                self.parallel_config.node_rank,\n                self.parallel_config.node_rank_within_dp,\n                self.parallel_config.master_addr,\n                mq_connect_ip,\n                self.world_size,\n                self.local_world_size,\n            )\n            self.rpc_broadcast_mq = MessageQueue(\n                self.world_size,\n                self.local_world_size,\n                max_chunk_bytes=max_chunk_bytes,\n                connect_ip=mq_connect_ip,\n            )\n            scheduler_output_handle = self.rpc_broadcast_mq.export_handle()"
+  },
+  {
+   "id": "sB-15",
+   "path": "vllm/v1/executor/multiproc_executor.py",
+   "lines": "L70-L100",
+   "why": "B FIFO 配对：FutureWrapper 进 futures_queue，result() 按调用顺序排干前面的 future——应答与调用如何对上号。",
+   "elide": [],
+   "code": "class FutureWrapper(Future):\n    def __init__(\n        self,\n        futures_queue: deque[\"FutureWrapper\"],\n        get_response: Callable[[], Any],\n        aggregate: Callable = lambda x: x,\n    ):\n        self.futures_queue = futures_queue\n        self.get_response = get_response\n        self.aggregate = aggregate\n        super().__init__()\n        self.futures_queue.appendleft(self)\n\n    def result(self, timeout=None):\n        if timeout is not None:\n            raise RuntimeError(\"timeout not implemented\")\n\n        # Drain any futures ahead of us in the queue.\n        while not self.done():\n            future = self.futures_queue.pop()\n            future._wait_for_response()\n        return super().result()\n\n    def _wait_for_response(self):\n        try:\n            response = self.aggregate(self.get_response())\n            with suppress(InvalidStateError):\n                self.set_result(response)\n        except Exception as e:\n            with suppress(InvalidStateError):\n                self.set_exception(e)"
+  },
+  {
+   "id": "sB-16",
+   "path": "vllm/v1/executor/multiproc_executor.py",
+   "lines": "L575-L586",
+   "why": "B worker 侧双 MQ 装配：广播 MQ 从句柄重建（只读）、应答 MQ MessageQueue(1,1)（自己是写者、executor 唯一读者）。",
+   "elide": [],
+   "code": "    def _init_message_queues(\n        self, input_shm_handle: Handle, vllm_config: VllmConfig\n    ) -> None:\n        if vllm_config.parallel_config.nnodes_within_dp == 1:\n            # Initialize MessageQueue for receiving SchedulerOutput\n            self.rpc_broadcast_mq = MessageQueue.create_from_handle(\n                input_shm_handle, self.worker.rank\n            )\n\n            # Initializes a message queue for sending the model output\n            self.worker_response_mq = MessageQueue(1, 1)\n            self.peer_response_handles = []"
+  },
+  {
+   "id": "sB-17",
+   "path": "vllm/v1/executor/multiproc_executor.py",
+   "lines": "L725-L745",
+   "why": "B READY 报到信的拆包：父进程从子进程发来的应答 MQ 句柄重建读者侧——上行通道的另一半装配。",
+   "elide": [],
+   "code": "    @staticmethod\n    def wait_for_response_handle_ready(\n        handles: dict[str, Any], proc_handle: UnreadyWorkerProcHandle\n    ) -> WorkerProcHandle:\n        response_handle = handles[\"handle\"]\n        worker_response_mq: MessageQueue | None = None\n        if len(response_handle.local_reader_ranks) > 0:\n            worker_response_mq = MessageQueue.create_from_handle(response_handle, 0)\n        peer_response_handles = handles[\"peer_response_handles\"]\n        peer_worker_response_mqs = [\n            MessageQueue.create_from_handle(handle, -1)\n            if handle.remote_subscribe_addr is not None\n            else None\n            for handle in peer_response_handles\n        ]\n        return WorkerProcHandle.from_unready_handle(\n            proc_handle,\n            worker_response_mq,\n            peer_worker_response_mqs=peer_worker_response_mqs,\n        )\n"
+  },
+  {
+   "id": "sB-18",
+   "path": "vllm/distributed/device_communicators/shm_broadcast.py",
+   "lines": "L465-L476",
+   "why": "B MessageQueue 构造签名：24MiB 默认块上限的注释原话点名 grammar bitmask（1024 请求）是尺寸依据；executor 侧用 VLLM_MQ_MAX_CHUNK_BYTES_MB=16 覆盖。",
+   "elide": [],
+   "code": "class MessageQueue:\n    def __init__(\n        self,\n        n_reader,  # number of all readers\n        n_local_reader,  # number of local readers through shared memory\n        local_reader_ranks: list[int] | None = None,\n        # Default of 24MiB chosen to be large enough to accommodate grammar\n        # bitmask tensors for large batches (1024 requests).\n        max_chunk_bytes: int = 1024 * 1024 * 24,\n        max_chunks: int = 10,\n        connect_ip: str | None = None,\n    ):"
+  },
+  {
+   "id": "sB-19",
+   "path": "vllm/v1/core/sched/output.py",
+   "lines": "L286-L291",
+   "why": "B 第二次 RPC 的载荷：GrammarOutput = 结构化输出请求名单 + int32 numpy 掩码（走 pickle OOB 的大对象）。",
+   "elide": [],
+   "code": "@dataclass\nclass GrammarOutput:\n    # ids of structured output requests.\n    structured_output_request_ids: list[str]\n    # Bitmask ordered as structured_output_request_ids.\n    grammar_bitmask: \"npt.NDArray[np.int32]\""
+  },
+  {
+   "id": "sB-20",
+   "path": "vllm/v1/executor/uniproc_executor.py",
+   "lines": "L91-L106",
+   "why": "B 对照：uni 后端同两个方法名在本进程直呼（无 MQ）——mp 的两次 RPC 是同一逻辑调用的跨进程形态。",
+   "elide": [],
+   "code": "        if not non_block:\n            result = run_method(self.driver_worker, method, args, kwargs)\n            if isinstance(result, AsyncModelRunnerOutput):\n                result = result.get_output()\n            return result if single_value else [result]\n\n        try:\n            result = run_method(self.driver_worker, method, args, kwargs)\n            if isinstance(result, AsyncModelRunnerOutput):\n                return AsyncOutputFuture(result, single_value)\n            future = Future[Any]()\n            future.set_result(result if single_value else [result])\n        except Exception as e:\n            future = Future[Any]()\n            future.set_exception(e)\n        return future"
+  },
+  {
+   "id": "sB-21",
+   "path": "vllm/distributed/kv_transfer/kv_connector/utils.py",
+   "lines": "L53-L72",
+   "why": "B 精确边界：配了 KV connector 时 kv_output_aggregator 生效 → output_rank 置 None、全 rank 应答、聚合取 output_rank 那份。",
+   "elide": [],
+   "code": "class KVOutputAggregator:\n    \"\"\"Utility class to aggregate the output of all workers into a single\n    output corresponding to Rank 0 for scheduler.\"\"\"\n\n    def __init__(self, expected_finished_count: int):\n        # Complete transfer tracker. Used to track finished requests\n        # [req_id -> n_remaining_workers]\n        self._recv_remaining_count = dict[str, int]()\n        self._send_remaining_count = dict[str, int]()\n        self._expected_finished_count = expected_finished_count\n\n    @classmethod\n    def from_connector(cls, connector: \"KVConnectorBase\", world_size: int):\n        return cls(connector.get_finished_count() or world_size)\n\n    def aggregate(\n        self, outputs: list[ModelRunnerOutput | None], output_rank: int = 0\n    ) -> ModelRunnerOutput | None:\n        if not outputs[output_rank]:\n            return None"
+  },
+  {
+   "id": "sB-22",
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L1435-L1444",
+   "why": "B step() 的调用点与出口：_process_engine_step → step_fn() → EngineCoreOutputs 进 output_queue（EngineCore→前端那堵墙，不属本图）。",
+   "elide": [],
+   "code": "    def _process_engine_step(self) -> bool:\n        \"\"\"Called only when there are unfinished local requests.\"\"\"\n\n        # Step the engine core.\n        outputs, model_executed = self.step_fn()\n        # Put EngineCoreOutputs into the output queue.\n        for output in outputs.items() if outputs else ():\n            self.output_queue.put_nowait(output)\n        # Post-step hook.\n        self.post_step(model_executed)"
+  }
+ ],
+ "writer_notes": [
+  "落点 1（主要）：narrative/chapter.md L474-L534「先数块」小节。把 L502-L503 的『…省略：慢路径的滑窗外跳块推导…』括注替换为完整慢路径小节：建议结构=目标表长守恒式（A2.answer_one_line）→ 三参逐个（A2.three_params）→ 五段映射表（A3.mapping_table，建议配 suggested_figure 的小图或直接列表格）→ E2/E3 两个数字例 → 退化证明一句（慢路径在主路径上严格退化为 fast-path，两者数字恒一致）。原六问实测表保留，可在其后补一行慢路径对账（E2）。",
+  "落点 2：fast-path 判定条件在 L494-L500 附近补一段（素材 A1）：开关=num_cached_block 记账位+武装时刻表+两个不武装边界（短请求/关缓存——后者正是 L534 括注『精简版关缓存恒走慢路径』的机制根源，可就地展开）；『首排』的准确说法（每次入场而非一生一次，抢占恢复也算）呼应 ch11。",
+  "落点 3：CoW 时机在 L566-L567 的省略注释处展开为小节或边框（素材 A4）：五拍管线时间轴+返回值分岔两行+E4 对账；以『单组主路径永不触发（hash==block）』开场界定适用面，收尾指向 ch15 进阶一（勿重复其哈希侧内容）。v0 对比一段引 metrics.md 原话，不引已删除的 v0 代码。",
+  "落点 4：§「过线」末尾（L820-L824 图后）或新小节放一拍两 RPC 时序图（素材 B.figure_brief+step_timeline）；事实清单可直接化作图上的标注。务必与 ch09/ch17 的图分工并在图注互指。",
+  "铁律提醒：新增内嵌代码一律取 supplement.embed_excerpts 的逐字段（已对 pin HEAD 逐字核验），不得手写改行；数值例先在 explainer/traces 里跑出痕迹再上表（lint_trace_consistency 会查）。若要走六问表的口径，E2/E3 需在精简版/驱动里复算一遍——精简版关缓存跑不了 evictable 支，E2 的 evictable=3 支要么开缓存跑、要么在表注里说明是代码走读推演（与现有表 f 行的口径保持一致即可，先查 explainer.json 里 m5 表怎么取的证）。",
+  "精简版（implementation/）不必改：CoW/滑窗/多组仍在原 subtraction_plan 的 delete 清单（ch14/ch15 域），must_keep 不变；本章新增讲解全部走『正文内嵌真源码』路径（方法论 C）。",
+  "mechanisms 账本：本节 mechanisms_added（s1-s5）不并入顶层 mechanisms[]（按 Lead 指示不动原账本）；若后续 retro 需要登记，直接搬 s1-s5 即可。"
+ ]
+}
 }
