@@ -1,0 +1,494 @@
+{
+ "figures": [
+  {
+   "figure_id": "L2-ch25",
+   "svg": "L2-ch25.svg",
+   "png": "L2-ch25.png",
+   "claim": "ch24 说 MLA 把每 token 的 KV 压进 576 维潜向量——可注意力要 128 个头各自的 K 和 V，怎么变出来？同一层有两条相反的路：prefill 上投影成完整 K/V 按 MHA 算，decode 把 q 吸收进潜空间按单头 MQA 算——谁在同一次前向里划的线？上投影爆不爆显存？576 维 cache 怎么跟别的层共池？",
+   "numbers": [
+    {
+     "n": 1,
+     "where": "vllm/model_executor/models/deepseek_v2.py:L1233-L1237",
+     "what": "选型三岔：DecoderLayer 装配时按 config 选注意力类——老 Deepseek（MHA）/ model_config.use_mla（DeepseekV2MLAAttention）/ 普通注意力。use_mla=is_deepseek_mla 且未禁用（config/model.py:L1791-L1792）——MLA 不是运行时开关，是装配期就定死的层类型"
+    },
+    {
+     "n": 2,
+     "where": "vllm/model_executor/models/deepseek_v2.py:L1010-L1066",
+     "what": "投影装配：fused_qkv_a_proj 一个 MergedColumnParallelLinear 同时做 q 侧下投影（hidden→q_lora_rank 1536）与 KV 侧压缩（hidden→kv_lora_rank+rope 576）；再配 q_a_layernorm/q_b_proj（q 低秩链）、kv_a_layernorm、kv_b_proj（512→128×(128+128) 上投影）、o_proj——低秩链在模型层就是六块标准积木"
+    },
+    {
+     "n": 3,
+     "where": "vllm/model_executor/layers/mla.py:L110-L127",
+     "what": "Wrapper 装配：投影打包成 MLAModules 注入 MultiHeadLatentAttentionWrapper，内层构造 MLAAttention 插座（prefix=…attn、kv_b_proj 引用一并交接——吸收重排要靠它拿权重）。插座 __init__ 断言后端 is_mla、注册 static_forward_context（mla_attention.py:L516-L518）"
+    },
+    {
+     "n": 4,
+     "where": "vllm/model_executor/layers/attention/mla_attention.py:L994-L1100",
+     "what": "权重吸收重排（装配收尾，一生一次）：process_weights_after_loading 把 kv_b_proj 权重转置拆成 W_UK(512,N,128)/W_UV(512,N,128)，重排成 W_UV(N,512,128) 与 W_UK_T(N,128,512) 两份 bmm 副本常驻——prefill 走原 kv_b_proj、decode 走副本，同一份权重两种形状存两份（显存代价明码标价）"
+    },
+    {
+     "n": 5,
+     "where": "vllm/model_executor/layers/attention/mla_attention.py:L1140-L1152",
+     "what": "KV spec 自报：get_kv_cache_spec 报 MLAAttentionSpec(num_kv_heads=1, head_size=kv_lora_rank+qk_rope_head_dim=576)——潜向量不拆 K/V、单『头』；cache_dtype_str 原样透传（fp8_ds_mla 等特布局的字节账在 spec 侧算）"
+    },
+    {
+     "n": 6,
+     "where": "vllm/v1/core/kv_cache_utils.py:L1781-L1852",
+     "what": "spec 收集与 hybrid 组化（启动期）：runner.get_kv_cache_spec（gpu_model_runner.py:L7800-L7832）遍历 static_forward_context 逐层收 spec → get_kv_cache_groups 四级分流（全同 spec 一组 / 全同 token 槽数一组 / DSV4 grouped 多组 / 页大小归一多组）。DSV4 实测：压缩层 MLAAttentionSpec(compress_ratio=4) + SWA 子缓存 SlidingWindowMLASpec + indexer cache 同池分组——ch14 的『一组一管理器』在 MLA 侧的兑现"
+    },
+    {
+     "n": 7,
+     "where": "vllm/v1/worker/gpu_model_runner.py:L1115-L1137",
+     "what": "每拍批重排：_may_reorder_batch 在 _prepare_inputs 前把持久批排成 decode→short_extend→long_extend→prefill 四区（backends/utils.py:L665 的互斥划分+换位）；threshold 取全部 KV 组 builder 自报的最小值（L7220-L7238）——FlashMLA 报 128『小 prefill 也走 decode 路径』、FA-MLA 报 512"
+    },
+    {
+     "n": 8,
+     "where": "vllm/model_executor/layers/attention/mla_attention.py:L2056-L2063",
+     "what": "builder 分流：MLACommonMetadataBuilder.build 调 split_decodes_and_prefills（decode_threshold=reorder_batch_threshold）数出 num_decodes/num_decode_tokens——批已被第 7 站排好，这里只找边界线在哪一行 token"
+    },
+    {
+     "n": 9,
+     "where": "vllm/model_executor/layers/mla.py:L150-L226",
+     "what": "外层前向：q 低秩链（fused_qkv_a_proj→split→q_a_layernorm→q_b_proj→view[Sq,N,P+R]）、KV 侧 split [512,64]+kv_a_layernorm 只打 kv_c、RoPE 只作用 rope 段（q[...,128:] 与 k_pe；nope 段不旋转——低秩可吸收的前提）、indexer 位（稀疏归 ch26）→ 交 mla_attn(q, kv_c_normed, k_pe)"
+    },
+    {
+     "n": 10,
+     "where": "vllm/model_executor/layers/attention/mla_attention.py:L647-L654",
+     "what": "写腿：impl.do_kv_cache_update 把本步新 token 的 576 维潜向量（kv_c_normed+k_pe 拼接）照 slot_mapping 散写进分页 cache——MLA 的 cache 里自始至终只有潜向量，没有任何完整 K/V"
+    },
+    {
+     "n": 11,
+     "where": "vllm/model_executor/layers/attention/mla_attention.py:L771-L772",
+     "what": "分流决策：num_mqa_tokens = attn_metadata.num_decode_tokens；num_mha_tokens = q.size(0) − num_mqa_tokens——token 维切一刀（批已重排：前段 decode/短 extend、后段 prefill），两条数学等价的路线就此分岔"
+    },
+    {
+     "n": 12,
+     "where": "vllm/model_executor/layers/attention/mla_attention.py:L2581-L2666",
+     "what": "MHA 展开腿（prefill 段）：kv_b_proj 把新 token 潜向量上投影成 per-head K/V（W_UK/W_UV 在此用原形状）→ prefill 后端算新 token 段；有历史上下文时 _compute_prefill_context（L2301）按 64k workspace 分块 gather 潜向量→上投影→算一块，merge_attn_states 按 LSE 精确合并——上投影大张量永不整段物化"
+    },
+    {
+     "n": 13,
+     "where": "vllm/model_executor/layers/attention/mla_attention.py:L874-L919",
+     "what": "MQA 吸收腿（decode 段）：torch.bmm(q_nope, W_UK_T) 把每头 q 的 nope 段乘进潜空间（L888）→ 与 rope 段拼成 [B,N,512+64] → impl.forward_mqa 以单 KV『头』的 MQA kernel 直接读分页 cache（L919）→ _v_up_proj 乘 W_UV 上投影回 V 维（L949）——576 维 cache 不动，权重跟着 q 走"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "2026-09-12 ch25 开篇「你在这里」图 = L2 章图。权威产出点 = cartography gen_L2.py（dossier 站 spec l2-specs/ch25.json 渲染）：本角色重跑渲染干净（no overflow warnings，canvas 2200x1354，PNG 4400x2708，sharp 2x）→ lint_diagram_geometry（cartography 路径自动 strict）✓ 无问题 → 拷入本章仅复制不改造（cmp 校验 svg/png 与源字节一致）。Read PNG 亲眼看：整图 + 10 处原生分辨率裁剪（顶带/minimap+站号轨道上下半/north 行/center 拍片①②③④⑤⑥⑦⑧/south 注三段/底条）——①顶带 ch25·MLA 的两种展开 + hook 全句 + L2·L0 位置：模型层 MLA 框；②minimap 高亮框罩 GPU 执行臂列（anchor=gpu_column）、框外 0.45 退后；③站号轨道 13 站 where·what 与 spec.stations 一致；④拍片徽标 ①(1,2)②(3,4)③(5,6)④(7)⑤(8)⑥(9,10,11)⑦(12)⑧(13) 全部挂点齐；⑤north 四进出件/south 七注（三条 why+后端家族/hybrid 组化/DSV4/记法漂移税）方法行齐全；⑥CJK 无豆腐、无越界/相撞/箭头悬空、读序 上排进出件→中排三幕拍片→下排支撑注 清楚。另做逐字硬核对：SVG 全部 text 节点拼接后对 spec 140 条字符串（hook/reading/rail_header/frame/center/17 组件名+全部方法行/13 站 where+what/全部 flow 标签/loop）whitespace 归一化逐一包含，0 缺失。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "2026-09-12 独立盲审（只看 PNG + l2-specs/ch25.json，未看 gen_L2/dossier/正文）：①只看图复述路线=装配期 1-6（选型三岔→投影装配→Wrapper 装配→吸收重排→spec 自报→组化）+ 每拍 7-13（批重排→数边界→外层前向→写腿→切刀分流→MHA 腿/MQA 腿）；②13 站顺序与 where/what 逐站比对 spec.stations 全一致（含 L1233-L1237/L1010-L1066/L110-L127/L994-L1100/L1140-L1152/L1781-L1852/L1115-L1137/L2056-L2063/L150-L226/L647-L654/L771-L772/L2581-L2666/L874-L919）；③19 个组件名+方法行、拍片徽标站号（①[1|2]②[3|4]③[5|6]④[7]⑤[8]⑥[9|10|11]⑦[12]⑧[13]）、13 条 flow 标签、hook/rail_header/frame/center/loop 文本逐一对上，无杜撰无缺失；④整图+10 处原生分辨率裁剪细读：CJK 无豆腐、无越界/裁切/相撞/箭头悬空，minimap 高亮框罩 GPU 列正确；仅 minimap 内部小字偏小属 cosmetic 宽限。2026-09-13 修后复验（revise 回环再验证，只核 issue 清单+linter 输出，未看 gen/正文）：孤儿残片 .ch25-crop-bottomband.png（本图底带自查裁剪，4400×218）已删除——文件系统 test -f 确认不存在、diagrams/ 目录无任何点号临时残片；python scripts/lint_diagrams.py instances/vllm/artifacts-v3/ch25-mla-two-expansions 全绿（SVG 有效/PNG 在位且被引用，无 BLOCKING 孤儿）；git status 无 crop/bottomband 残留。verdict=PASS。"
+   }
+  },
+  {
+   "figure_id": "ch25-fig-assembly",
+   "gen": "gen_ch25-fig-assembly.py",
+   "svg": "ch25-fig-assembly.svg",
+   "png": "ch25-fig-assembly.png",
+   "claim": "MLA 不是运行时开关而是装配期定死的层类型：DecoderLayer 三岔选型（老 Deepseek MHA / use_mla / 普通）选出 DeepseekV2MLAAttention，它装六块投影积木打包成 MLAModules 注入 Wrapper，内层 MLAAttention 插座接过 kv_b_proj 引用（后面的权重吸收重排要靠它拿权重）。",
+   "numbers": [
+    {
+     "value": "三岔条件 use_mha = model_type==\"deepseek\" 或全部 head dim==0 / elif model_config.use_mla / else",
+     "provenance": "vllm/model_executor/models/deepseek_v2.py:L1226-L1238"
+    },
+    {
+     "value": "use_mla = is_deepseek_mla 且未设 VLLM_MLA_DISABLE（装配期判定）",
+     "provenance": "vllm/config/model.py:L1791-L1792"
+    },
+    {
+     "value": "六积木 DSV3 实尺 fused_qkv_a_proj [2112,7168] / q_a_layernorm [1536] / q_b_proj [24576,1536] / kv_a_layernorm [512] / kv_b_proj [32768,512] / o_proj [7168,16384]",
+     "provenance": "traces/m02.json dsv3_shapes.weight_shapes"
+    },
+    {
+     "value": "W_DQ→1536 与 W_DKV‖W_KR→576 融合一次 GEMM",
+     "provenance": "deepseek_v2.py:L1006-L1024"
+    },
+    {
+     "value": "@PluggableLayer.register('multi_head_latent_attention') 注册点",
+     "provenance": "vllm/model_executor/layers/mla.py:L34-L36"
+    },
+    {
+     "value": "构造插座时 kv_b_proj=self.kv_b_proj 引用交接",
+     "provenance": "vllm/model_executor/layers/mla.py:L110-L127"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "Read PNG 亲眼看：三段读序清楚（①三岔 ②六积木条带 ③MLAModules→Wrapper 内嵌插座）。①三岔三箭头条件原文（use_mha/elif use_mla/else）与 use_mla 定义注（config/model.py:L1791-L1792）核源码原文一致（\"deepseek\" 双引号与源码逐字同）；②六积木名字+DSV3 形状逐一与 dsv3_shapes.weight_shapes 对（[2112,7168]/[1536]/[24576,1536]/[512]/[32768,512]/[7168,16384]），fused 双拼块 W_DQ→1536/W_DKV‖W_KR→576；③register('multi_head_latent_attention') 与 mla.py:L34-L36 逐字同，kv_b_proj=self.kv_b_proj 交接 + 蓝虚线引用直连插座（吸收重排站 4 拿权重）。CJK 无豆腐、无越界/相撞，箭头全贴框（geometry linter ✓）。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "2026-09-12 独立盲审（只看 PNG + explainer figure_spec，未看 gen_*.py/dossier/正文）：①只看图复述=MLA 不是运行时开关而是装配期定死的层类型：DecoderLayer 三岔选型（use_mha→老 Deepseek MHA / use_mla→DeepseekV2MLAAttention / else→普通），六块投影积木打包 MLAModules 注入 Wrapper（@PluggableLayer.register('multi_head_latent_attention')——OOT 可整体替换），内层 MLAAttention 插座经 kv_b_proj=self.kv_b_proj 接过引用供吸收重排拿权重——与 spec.claim 一致；②数字核对：三岔条件原文（model_type==\"deepseek\" or 全部 qk_nope/qk_rope/v_head_dim==0；elif use_mla；else）与 use_mla=is_deepseek_mla 且未设 VLLM_MLA_DISABLE（config/model.py:L1791-L1792）对 numbers[0][1]；六积木 DSV3 形状 [2112,7168]/[1536]/[24576,1536]/[512]/[32768,512]/[7168,16384] 与双拼 W_DQ→1536‖W_DKV+W_KR→576 融合一次 GEMM 对 numbers[2][3]；register 注册点（mla.py:L34-L36）与引用交接（mla.py:L110-L127）对 numbers[4][5]，全对无杜撰；③三段读序（三岔→积木条带→打包/Wrapper/插座）清楚，蓝虚线引用从积木直连插座无悬空，CJK 无豆腐。"
+   }
+  },
+  {
+   "figure_id": "ch25-fig-outer-chain",
+   "gen": "gen_ch25-fig-outer-chain.py",
+   "svg": "ch25-fig-outer-chain.svg",
+   "png": "ch25-fig-outer-chain.png",
+   "claim": "一个 token 流过外层只做三件事：一次融合 GEMM 同时把 q 压进 1536 维潜空间、把 KV 压进 576 维潜空间（512 潜+64 位置）；两刀 split 把位置段解耦出来；RoPE 只旋转 q 与 k 各自尾部的 64 维 rope 段——nope 段 128 维原样不动，这是后面吸收推导的数学前提。",
+   "numbers": [
+    {
+     "value": "融合输出宽 640（MINI）/ 2112（DSV3：q 潜 1536 + KV 段 576）",
+     "provenance": "traces/m02.json split_account.fused_out_width 与 dsv3_shapes.fused_out_width"
+    },
+    {
+     "value": "KV 段 576 = kv_c 512 + k_pe 64；cache 写腿输入即 576 维拼接，对照 MHA 等价 40960 元素 71.1 倍、GQA 2048 约 3.6 倍",
+     "provenance": "traces/m02.json split_account 与 cache_row_account"
+    },
+    {
+     "value": "RoPE 实证：nope 段逐位相等=true；rope 段 pos=0 差 0.0000、pos=1 差 0.9517",
+     "provenance": "traces/m02.json rope_decoupled_checks"
+    },
+    {
+     "value": "kv_a_layernorm 只打 kv_c（max diff 0.0000）",
+     "provenance": "traces/m02.json rope_decoupled_checks.kv_c_layernorm_only_max_abs_diff"
+    },
+    {
+     "value": "旋转调用点 rotary_emb(positions, q[..., P:], k_pe)",
+     "provenance": "vllm/model_executor/layers/mla.py:L201-L203"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "Read PNG 亲眼看：主带 hidden[7168]→融合 GEMM→比例分段条（q 潜 1536 | kv_c 512 | k_pe 64 宽度∝数值）；上 q 链（q_a_layernorm [1536]→q_b_proj [24576,1536]→view [S,128,192] 内 nope128|rope64 双色）；下 KV 链（kv_a_layernorm 只打 kv_c diff 0.0000→kv_c_normed 蓝条）；RoPE 作用域虚线框只罩 rope 切片与 k_pe（含调用点与 pos0/pos1 实证数字），nope 段从上方绕行直通标注『实测逐位相等』；右侧 mla_attn 插座收三路 + cache 写腿 576 拼接蓝框；底部 cache 行账红/蓝严格比例条（40960 vs 576，71.1 倍；GQA 2048 约 3.6 倍）。rotary_emb 调用点与 mla.py:L201-L203 源码核对（源码用 self.qk_nope_head_dim 切片，图按 spec 简记 q[...,P:]）。无越界/相撞，CJK 完好。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "2026-09-12 独立盲审（只看 PNG + explainer figure_spec，未看 gen_*.py/dossier/正文）：①只看图复述=一个 token 流过外层只做三件事：融合 GEMM 一次把 q 压进 1536 维潜空间、KV 压进 576 维（512 潜+64 位置）；split 把位置段解耦；RoPE 只旋转 q/k 尾部 64 维 rope 段、nope 128 维原样直通——低秩可吸收的数学前提——与 spec.claim 一致；②数字逐项核对：融合输出宽 2112（DSV3，q 潜 1536+KV 段 576）/MINI 640、q 链 q_a_layernorm[1536]→q_b_proj[24576,1536]→view[S,128,192]（nope128|rope64）、KV split[512,64]、kv_a_layernorm 只打 kv_c max diff 0.0000、RoPE 实证 pos=0 差 0.0000/pos=1 差 0.9517/nope 逐位相等=true、调用点 rotary_emb(positions, q[..., P:], k_pe)（mla.py:L201-L203）、cache 写腿 576 拼接、行账 MHA 40960 vs 576=71.1 倍/GQA 2048≈3.6 倍——与 spec numbers[0]-[4] 全对；③读序 主带→上 q 链/下 KV 链→右插座+写腿→底账 清楚，RoPE 虚线框只罩 rope 切片、nope 绕行标注无歧义，比例条宽度∝数值。"
+   }
+  },
+  {
+   "figure_id": "ch25-fig-mha-leg",
+   "gen": "gen_ch25-fig-mha-leg.py",
+   "svg": "ch25-fig-mha-leg.svg",
+   "png": "ch25-fig-mha-leg.png",
+   "claim": "prefill 腿把 576 维潜向量经 kv_b_proj 一次性上投影成 128 头完整 K/V（DSV3 每 token 40960 元素、71 倍于潜向量），拼上共享的 rope 段后交给标准 MHA kernel——算力支出换『通用后端都能算』的形状。",
+   "numbers": [
+    {
+     "value": "形状链 kv_c_normed [140,512] → [140,4,32] → k_nope/v [140,4,16]×2 → k [140,4,80]",
+     "provenance": "traces/m03.json shapes"
+    },
+    {
+     "value": "DSV3 每 token 上投影 128×(128+64)+128×128 = 40960 元素 vs 潜向量 576（71 倍）；kv_b_proj [32768,512]",
+     "provenance": "traces/m03.json up_projection_account"
+    },
+    {
+     "value": "与上投影 MHA 参照 max diff 0.000000",
+     "provenance": "traces/m03.json verification"
+    },
+    {
+     "value": "门：M=140 > FlashMLA 自报阈值 128（process small prefills with decode pathway）",
+     "provenance": "traces/m03.json params（flashmla.py:L121）"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "Read PNG 亲眼看：主带 潜向量窄条[140,512]→kv_b_proj（DSV3 [32768,512]/MINI [128,512]）→[140,4,32] 宽条（K半段16|V半段16 双色）→split k_nope/v→_concat_k_nope_k_pe（k_pe 广播注）→标准 MHA（run_prefill_new_tokens，q/k/v 三形状）；门槛盒 M=140>128（注释原话 process small prefills with decode pathway 与 flashmla.py:L121 逐字同）；验证盒 max diff 0.000000；底部元素账严格比例条 40960 vs 576（71 倍）+ MINI 384 伪象警示行。split/_concat_k_nope_k_pe/run_prefill_new_tokens 均与源码字面核对。无越界/相撞，CJK 完好。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "2026-09-12 独立盲审（只看 PNG + explainer figure_spec，未看 gen_*.py/dossier/正文）：①只看图复述=prefill 腿把潜向量经 kv_b_proj 一次性上投影成 128 头完整 K/V（DSV3 每 token 40960 元素、71 倍于潜向量），共享 rope 段广播拼接后交给标准 MHA kernel——用算力换『通用后端都能算』的形状——与 spec.claim 一致；②数字核对：形状链 kv_c_normed[140,512]→kv_b_proj[32768,512]（DSV3）/[128,512]（MINI）→[140,4,32]→k_nope/v[140,4,16]→拼 rope→k[140,4,80]、q[140,4,192] 对 numbers[0]；40960=128×(128+64)+128×128 vs 576（71 倍）对 numbers[1]；max diff 0.000000 对 numbers[2]；门 M=140>FlashMLA 自报阈值 128+原话 process small prefills with decode pathway（flashmla.py:L121）对 numbers[3]——全对；MINI 384 元素警示行为 trace 附注（4 头 16+16=32 维口径），与 DSV3 40960 无矛盾；③窄条→宽条的条宽对比直观呈现 576→40960 放大，k_pe 旁路广播注清楚，读序单向无歧义。"
+   }
+  },
+  {
+   "figure_id": "ch25-fig-mqa-leg",
+   "gen": "gen_ch25-fig-mqa-leg.py",
+   "svg": "ch25-fig-mqa-leg.svg",
+   "png": "ch25-fig-mqa-leg.png",
+   "claim": "decode 腿用乘法结合律把『每头上投影 K』换成『把 q 先吸收进潜空间』：两条路线算出同一分数（本例 1.569422，差 0.000000），cache 里 576 维潜向量一行不动、不为 128 头物化任何 K。",
+   "numbers": [
+    {
+     "value": "结合律实证：路线 A 1.569422 = 路线 B 1.569422，差 0.000000",
+     "provenance": "traces/m04.json associativity_proof_by_number"
+    },
+    {
+     "value": "bmm 形状账 (4,3,16)×(4,16,512)→(4,3,512)；(4,3,512)×(4,512,16)→(4,3,16)；拼 rope 后 (3,4,576)",
+     "provenance": "traces/m04.json bmm_shape_account 与 absorption_shapes"
+    },
+    {
+     "value": "读字节账（DSV3 fp16，25 行 cache）：MQA 28800 B vs MHA 等价 2048000 B",
+     "provenance": "traces/m04.json byte_account_per_decode_step"
+    },
+    {
+     "value": "每 decode token 两次 bmm：吸收 196608 + 上投影 196608 MAC",
+     "provenance": "traces/m04.json bmm_shape_account"
+    },
+    {
+     "value": "三锚点 bmm L888 / forward_mqa L919 / _v_up_proj L949",
+     "provenance": "mla_attention.py:L831-L949"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "Read PNG 亲眼看：上半双路对照（A 先上投影 c×W_UK^T→k_nope(16维) 每头复印一份 K；B 先吸收 q_nope×W_UK^T→q_l(512维潜语言) 翻译不复印），中缝等号徽标 + 『两路分数同为 1.569422，差 0.000000』+ 结合律公式行；下半三站（①torch.bmm(q_nope, W_UK_T) (4,3,16)×(4,16,512)→(4,3,512)；②forward_mqa q(3,4,576) 直读分页 cache，decode_seq_lens 8/4/13 共 25 行只读；③_v_up_proj (4,3,512)×(4,512,16)→(4,3,16) 输出 [3,64]），三锚点 L888/L919/L949；字节账细/粗双箭头 28800 B vs 2048000 B（71 倍）+ 两次 bmm 196608+196608 MAC 代价注。方法名与源码逐字核对。无越界/相撞，CJK 完好。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "2026-09-12 独立盲审（只看 PNG + explainer figure_spec，未看 gen_*.py/dossier/正文）：①只看图复述=decode 腿用乘法结合律把『每头上投影 K』换成『q 先吸收进潜空间』：路线 A 每头复印 K vs 路线 B 翻译不复印，两路同一分数 1.569422 差 0.000000；cache 576 维潜向量 25 行本拍只读一行不动、不为 128 头物化任何 K——与 spec.claim 一致；②数字核对：结合律 1.569422/0.000000 对 numbers[0]；bmm 账 (4,3,16)×(4,16,512)→(4,3,512)、(4,3,512)×(4,512,16)→(4,3,16)、拼 rope 后 (3,4,576) 对 numbers[1]；字节账 MQA 28800 B vs MHA 等价 2048000 B（71 倍）对 numbers[2]；两次 bmm 吸收 196608+上投影 196608 MAC 对 numbers[3]；三锚点 bmm L888/forward_mqa L919/_v_up_proj L949 对 numbers[4]——全对（25 行=decode_seq_lens 8+4+13 自洽，(q·W_UK^T)·c≡q·(W_UK^T·c) 恒等式与徽标一致）；③上半双路对照+等号徽标、下半三站流程+只读 cache 条+粗细悬殊字节箭头，读序清楚。"
+   }
+  },
+  {
+   "figure_id": "ch25-fig-weight-reorder",
+   "gen": "gen_ch25-fig-weight-reorder.py",
+   "svg": "ch25-fig-weight-reorder.svg",
+   "png": "ch25-fig-weight-reorder.png",
+   "claim": "process_weights_after_loading 把 kv_b_proj 同一份权重拆成两份 bmm 排布副本常驻：权重转置后按头拆 W_UK/W_UV，再重排成 W_UV(N,L,V) 与 W_UK_T(N,P,L)——prefill 腿用原形状、decode 腿用副本，同一份权重两种形状存两份。",
+   "numbers": [
+    {
+     "value": "拆分现场 kv_b_proj_weight.view(L,N,P+V).split([P,V],dim=-1) 出 W_UK(L,N,P)/W_UV(L,N,V)",
+     "provenance": "mla_attention.py:L1033-L1035"
+    },
+    {
+     "value": "DSV3 实测 [32768,512] → W_UK_T [128,128,512] + W_UV [128,512,128] 三种排布同驻",
+     "provenance": "traces/m02.json dsv3_shapes.weight_shapes"
+    },
+    {
+     "value": "MINI 同款 [128,512] 与 W_UK_T [4,16,512]/W_UV [4,512,16] 同驻（replace_parameter）",
+     "provenance": "traces/m04.json params"
+    },
+    {
+     "value": "注释原话：暂无量化 bmm 就存 fp16/bf16 副本做 16-bit bmm，开销 fairly low",
+     "provenance": "mla_attention.py:L995-L998"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "Read PNG 亲眼看：左 kv_b_proj 原权重大块（DSV3 [32768,512]/MINI [128,512] + 8×4 画格矩阵 + 输出宽 32768=128×(128+128) 注）；中三步 ①转置.T [512,32768] ②view [512,128,256] ③split(dim=-1) 出 W_UK(512,128,128)/W_UV(512,128,128) + K|V 切格示意；右 W_UK_T [128,128,512] (N,P,L) 吸收腿消费 / W_UV [128,512,128] (N,L,V) 输出上投影消费（斜纹区分），原形状旁『prefill 腿仍用它』+ 虚线原权重不动；底三处常驻横带（白底/浅绿/斜纹三纹理）+ 注释原话引用框 + MINI 同驻实测行。view/split 调用与 L1033-L1035 源码逐字同。无越界/相撞，CJK 完好。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "2026-09-12 独立盲审（只看 PNG + explainer figure_spec，未看 gen_*.py/dossier/正文）：①只看图复述=process_weights_after_loading 把 kv_b_proj 同一份权重转置、按头拆 W_UK/W_UV，再重排成 W_UK_T(N,P,L) 与 W_UV(N,L,V) 两份 bmm 排布副本常驻——prefill 腿用原形状、decode 腿用副本，三种排布同驻——与 spec.claim 一致（claim 的『两份副本』+原权重=图上三横带，口径一致）；②数字核对：拆分链 ①.T→[512,32768] ②view→[512,128,256] ③split(dim=-1)→W_UK/W_UV(512,128,128)（即 view(L,N,P+V).split([P,V]) 的 DSV3 实数化，L1033-L1035）对 numbers[0]；DSV3 [32768,512]→W_UK_T[128,128,512]+W_UV[128,512,128] 三排布同驻、输出宽 32768=128×(128+128) 对 numbers[1]；MINI [128,512]↔W_UK_T[4,16,512]/W_UV[4,512,16] 同驻（replace_parameter）对 numbers[2]；注释原话 fp16/bf16 副本 16-bit bmm 开销 fairly low（L995-L998）对 numbers[3]——全对；③左原权重大块→中三步→右两副本+底部三常驻横带（三纹理区分）读序清楚，『prefill 腿仍用它』+原权重虚线不动标注无歧义。"
+   }
+  },
+  {
+   "figure_id": "ch25-fig-mixed-cut",
+   "gen": "gen_ch25-fig-mixed-cut.py",
+   "svg": "ch25-fig-mixed-cut.svg",
+   "png": "ch25-fig-mixed-cut.png",
+   "claim": "同一次前向在 token 维切一刀：前 3 个 token（Sq/Skv≈0.09-0.17 的 decode 段）走 MQA 吸收、后 290 个（Sq/Skv≈0.75-0.82 的 prefill 段）走 MHA 上投影，两段写回同一 output 缓冲的不相交切片。",
+   "numbers": [
+    {
+     "value": "query_start_loc=[0,1,2,3,143,293]；切刀 num_mqa_tokens=3 / num_mha_tokens=290；切片 [0,3) 与 [3,293)",
+     "provenance": "traces/m06.json builder_counts 与 token_dim_cut"
+    },
+    {
+     "value": "Sq/Skv 逐请求 decode 0.091/0.167/0.111 vs prefill 0.824/0.750",
+     "provenance": "traces/m06.json sq_over_skv_per_request"
+    },
+    {
+     "value": "两腿合并与整批上投影 MHA 参照逐元素一致（max diff 0.000000）",
+     "provenance": "traces/m06.json verification"
+    },
+    {
+     "value": "num_mqa_tokens=attn_metadata.num_decode_tokens / num_mha_tokens=q.size(0)−num_mqa_tokens",
+     "provenance": "mla_attention.py:L771-L772"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "Read PNG 亲眼看：上带 293 token 按严格比例画（三 decode 各 1 token 共 13px 细条 + 两 prefill 长格 140/150，各标 query/seq 与 Sq/Skv 五值）；红切刀落第 3 行（刀标 num_mqa_tokens=num_decode_tokens=3 / num_mha_tokens=293−3=290，回指站 7-8 四区重排保证 decode 在前）；放大镜框给 3 条 decode 明细（1/11·0.091 等 + query_start_loc=[0,1,2,3,143,293]）；下带 MQA/MHA 双泳道（各三步）汇入同一 output 条的 [0,3)/[3,293) 不相交双色切片；底注 max diff 0.000000 + v0.27 同一 forward 形态 + 断言哨兵。无越界/相撞，CJK 完好。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "2026-09-12 独立盲审（只看 PNG + explainer figure_spec，未看 gen_*.py/dossier/正文）：①只看图复述=同一次前向在 token 维切一刀：前 3 个 token（Sq/Skv 0.091/0.167/0.111 的 decode 段）走 MQA 吸收、后 290 个（0.824/0.750 的 prefill 段）走 MHA 上投影，两段写回同一 output 缓冲的 [0,3)/[3,293) 不相交切片——与 spec.claim 一致（claim 的 0.09-0.17/0.75-0.82 区间与图上五值吻合）；②数字核对：token 条 1+1+1+140+150=293 按真实比例绘制、query_start_loc=[0,1,2,3,143,293]、切刀 num_mqa_tokens=num_decode_tokens=3/num_mha_tokens=293−3=290（mla_attention.py:L771-L772）、两腿合并 vs 整批参照 max diff 0.000000——与 spec numbers[0]-[3] 全对（各比值自洽：1/11=0.091、140/170=0.824 等）；③红切刀+放大镜 decode 明细+MQA/MHA 双泳道汇入双色 output 条，读序清楚，四区重排回指注解无悬空。"
+   }
+  },
+  {
+   "figure_id": "ch25-fig-chunked-merge",
+   "gen": "gen_ch25-fig-chunked-merge.py",
+   "svg": "ch25-fig-chunked-merge.svg",
+   "png": "ch25-fig-chunked-merge.png",
+   "claim": "上投影大张量永不整段物化：历史上下文按 workspace 容量切片（本例 64 token 一块，150 分成 64/64/22），每块 gather 潜向量→现场上投影→算一块→LSE 记账，块间与 suffix 全部用 merge_attn_states 精确合并——分块只省显存、不损一位精度。",
+   "numbers": [
+    {
+     "value": "手算档三轮：块1 24.6212/2.3133 → 合并权重 0.3348:0.6652 出 21.5470/3.4076 → 0.3444:0.6556 出 11.9588/4.4735 == 整块 softmax 11.9588/4.4735（差 0.000001/0.000000）",
+     "provenance": "traces/m08.json toy_merge"
+    },
+    {
+     "value": "实跑档 workspace=min(max(8×8,4×1×16),65536)=64；context 150 → 3 块 64/64/22；merge 共 3 次；与全量上投影参照 diff 0.000000",
+     "provenance": "traces/m08.json real_chunked_prefill"
+    },
+    {
+     "value": "字节账（64k 档 fp16）：workspace 75497472 B（72 MiB）vs 全量上投影仅 K 3221225472 B（3 GB）；源码注释自称 144mb 口径差 2 倍（勘误）",
+     "provenance": "traces/m08.json workspace_byte_account"
+    },
+    {
+     "value": "定容公式 min(max(8×max_model_len, 4×max_num_seqs×block_size), 64×1024)",
+     "provenance": "mla_attention.py:L1803-L1831"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "2026-09-12 盲审 FAIL 后修复重渲（玩具卡明细整套回填 traces/m08.json toy_merge 同一单 query 行），Read PNG 亲眼看 + 三处放大复核：上层三块卡（块1 scores [1.0,2.0]→probs [0.2689,0.7311]（=所示 scores 的 softmax）、out/LSE 24.6212/2.3133；块2 [3.0]→[1.0]、20.0000/3.0000；块3 [0.5,0.2,4.0]→[0.0287,0.0213,0.9501]、6.9214/4.0512）→merge ①（权重=e^LSE 归一 0.3348:0.6652→21.5470/3.4076）→merge ②（0.3444:0.6556→11.9588/4.4735）→等号徽标→整块参照框（11.9588/4.4735，差 0.000001/0.000000）+ 恒等式注（全局分母=Σe^(LSE_i)）；数字链已独立复算全自洽（权重=e^LSE 归一、合并 out=e^LSE 加权、合并 LSE=log Σe^LSE、终值==整块 softmax）；下层 workspace 锅（定容公式原文）内三块 64/64/22 现场上投影算完即弃 + 分块循环 iters=ceil(150/64)=3 回环 + suffix 140 新 token 框 + 终合并节点（末次块间 merge 的 LSE prefix 5.040/suffix 3.394，merge_attn_states ×3）+ diff 0.000000；底部字节账蓝/红条 75497472 B（72 MiB）vs 3221225472 B（3 GB，截断示意标注）+ 144mb 注释勘误行。无越界/相撞，CJK 完好。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "2026-09-12 独立盲审（只看 PNG + explainer figure_spec，未看 gen_*.py/dossier/正文；修复重渲后的新审）：①只看图复述=上投影大张量永不整段物化——上层手算档 6 个 key 分 3 块（2+1+3），每块自算 softmax 输出与 LSE，合并按 e^LSE 归一权重（0.3348:0.6652、0.3444:0.6556）加权，三轮后与整块 softmax 逐位相同（11.9588/4.4735，差 0.000001/0.000000），恒等式注『全局分母=Σ e^LSE_i』；下层实跑档 150 历史潜向量在 workspace=min(max(8×8,4×1×16),65536)=64 token 的锅里分 64/64/22 三批 gather→现场上投影→算完即弃（iters=ceil(150/64)=3），块间 2 次+context⊕suffix 终合并 1 次共 3 次 merge_attn_states，与全量上投影参照 max diff 0.000000——与 spec.claim 一致；②数字逐项核对（整图+原生分辨率逐带放大+逐字转写复核）：手算档 块1 [1.0,2.0]→[0.2689,0.7311] 24.6212/2.3133、块2 [3.0]→[1.0] 20.0000/3.0000、块3 [0.5,0.2,4.0]→[0.0287,0.0213,0.9501] 6.9214/4.0512、merge① 0.3348:0.6652→21.5470/3.4076、merge② 0.3444:0.6556→11.9588/4.4735、整块参照 11.9588/4.4735 差 0.000001/0.000000 对 numbers[0]；workspace 实例化定容与通用公式 min(max(8×max_model_len,4×max_num_seqs×block_size),64×1024)、3 块 64/64/22、merge 共 3 次、diff 0.000000 对 numbers[1][3]；字节账 75497472 B（72 MiB）vs 3221225472 B（3 GB）+ 144mb 口径差 2 倍勘误行对 numbers[2]；附带 LSE prefix 5.040/suffix 3.394、suffix 140 新 token、V=1 scale=1 与 explainer worked_example 表逐项一致；且图内数字独立复算自洽（softmax/LSE/加权合并/2B×576×65536/49152×65536 全对）；③可读性：上层手算→下层实跑→底部字节账三层读序清楚，无文字重叠/相撞、箭头均有落点、CJK 无豆腐、红蓝字节条悬殊对比直观（3 GB 条带截断有明示注）。"
+   }
+  },
+  {
+   "figure_id": "ch25-fig-two-backend-families",
+   "gen": "gen_ch25-fig-two-backend-families.py",
+   "svg": "ch25-fig-two-backend-families.svg",
+   "png": "ch25-fig-two-backend-families.png",
+   "claim": "特形 KV cache（num_kv_heads=1、head_size=576、形状不拆 K/V 维）与所有通用后端不兼容，MLA 因此有两套独立后端家族——decode 家族以 is_mla()=True 为身份证（forward_mha/forward_mqa 双抽象），prefill 家族 MLAPrefillBackendEnum 五选一，两轴独立选择。",
+   "numbers": [
+    {
+     "value": "身份证：get_kv_cache_shape 返回 (num_blocks, block_size, head_size)——无 K/V 拆维；get_supported_head_sizes=[320,576]；is_mla()=True",
+     "provenance": "mla_attention.py:L1360-L1397"
+    },
+    {
+     "value": "prefill 家族五成员 FLASH_ATTN/FLASHINFER/TRTLLM_RAGGED/TOKENSPEED_MLA/ROCM_AITER_FA（+CUSTOM 注册槽）",
+     "provenance": "vllm/v1/attention/backends/mla/prefill/registry.py:L34-L57"
+    },
+    {
+     "value": "decode 家族成员选择优先级表已由 ch21 立（回指），本章不重表",
+     "provenance": "dossier key_classes MLAPrefillBackend 章界注记"
+    },
+    {
+     "value": "装配位：__init__ 断言后端 is_mla（L423-L436）并装配第二套 prefill 后端（L520-L550）",
+     "provenance": "mla_attention.py:L423-L436、L520-L550"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "Read PNG 亲眼看：中轴 MLAAttention 插座（decode 轴抽象 forward_mha/forward_mqa 双行 + prefill 轴抽象 run_prefill_new_tokens + 装配位两行号）；左翼 decode 家族（身份证三件套：形状 (num_blocks, block_size, head_size) 无 K/V 拆维 / head_sizes [320,576] / is_mla()=True + 成员 FlashMLA/FlashInfer-MLA/Triton-MLA… + 自报阈值 128/512 + 『优先级表 ch21 已立（回指）』）；右翼五名牌 FLASH_ATTN/FLASHINFER/TRTLLM_RAGGED/TOKENSPEED_MLA/ROCM_AITER_FA 逐一与 registry.py 枚举名核对 + CUSTOM 虚线槽；两支『各选各的』独立箭头；底部特形 cache 注（head_size=kv_lora_rank+qk_rope_head_dim=576）。ch21<25 用回指措辞 ✓。无越界/相撞，CJK 完好。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "2026-09-12 独立盲审（只看 PNG + explainer figure_spec，未看 gen_*.py/dossier/正文）：①只看图复述=特形 KV cache（num_kv_heads=1、head_size=576、形状 (num_blocks, block_size, head_size) 不拆 K/V 维）通用后端不认，MLA 因此两套独立后端家族：decode 家族以 is_mla()=True 为身份证（forward_mha/forward_mqa 双抽象），prefill 家族 MLAPrefillBackendEnum 五选一，两轴各选各的——与 spec.claim 一致；②数字核对：身份证三件套 形状无 K/V 拆维/get_supported_head_sizes=[320,576]/is_mla()=True（mla_attention.py:L1360-L1397）对 numbers[0]；五名牌 FLASH_ATTN/FLASHINFER/TRTLLM_RAGGED/TOKENSPEED_MLA/ROCM_AITER_FA+CUSTOM 注册槽（registry.py:L34-L57）对 numbers[1]；decode 优先级表『ch21 已立』回指对 numbers[2]；装配位断言 is_mla+第二套 prefill 后端 L520-L550 对 numbers[3]（explainer 内联值写 L423-L426、provenance 写 L423-L436，图取 provenance 口径 L423-L436，二者同 spec 内并存非图错）；底部特形 cache 注 head_size=kv_lora_rank+qk_rope_head_dim=576、num_kv_heads=1 与 claim 一致；③中轴插座+左右翼+两支独立选择箭头布局清楚。"
+   }
+  },
+  {
+   "figure_id": "ch25-fig-spec-grouping",
+   "gen": "gen_ch25-fig-spec-grouping.py",
+   "svg": "ch25-fig-spec-grouping.svg",
+   "png": "ch25-fig-spec-grouping.png",
+   "claim": "模型层逐层自报什么 spec 直接决定这层落进哪个组、跟谁共享池：runner 遍历收 spec → get_kv_cache_groups 四级分流（全同 spec→一组 / 全同 token 槽数→一组 / DSV4 grouped→多组 / 页归一→多组），DSV4 一个模型三类子缓存（压缩层/SWA/indexer cache）同池分组。",
+   "numbers": [
+    {
+     "value": "MLAAttentionSpec(num_kv_heads=1, head_size=kv_lora_rank+qk_rope_head_dim=576)",
+     "provenance": "mla_attention.py:L1140-L1152"
+    },
+    {
+     "value": "四级分流链 is_kv_cache_spec_uniform → UniformType → group_and_unify（DSV4 grouped）→ unify_page_size 多组",
+     "provenance": "vllm/v1/core/kv_cache_utils.py:L1781-L1852"
+    },
+    {
+     "value": "merge 断言 cache_dtype_str/compress_ratio/model_version/block_stride 四字段全同",
+     "provenance": "vllm/v1/kv_cache_interface.py:L429-L468"
+    },
+    {
+     "value": "DSV4 三类子缓存：压缩层 MLAAttentionSpec(compress_ratio=4, alignment 576) + SWA SlidingWindowMLASpec（window 4096/block 64/page 65536 B）+ indexer cache",
+     "provenance": "traces/m12.json spec_self_report"
+    },
+    {
+     "value": "页协商：SWA block_size 64 与压缩层 storage 256//4=64 同一物理张量粒度",
+     "provenance": "sparse_swa.py:L77-L82 注释 + traces/m12.json"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "Read PNG 亲眼看：①层堆四卡（DSV3 MLAAttentionSpec(num_kv_heads=1, head_size=576) / DSV4 压缩层 compress_ratio=4 alignment 576 / SWA SlidingWindowMLASpec window 4096 block 64 / indexer 归 ch26 预告）三色区分→②runner 收集漏斗（get_kv_cache_spec 遍历 static_forward_context）→③四级分流竖链（is_kv_cache_spec_uniform/UniformType/group_and_unify/unify_page_size，未命中下移）→④组×3（各带 KVCacheManager ×1 徽标）汇入共享 BlockPool 长条（ch14 已立回指）；底板 merge 四字段名牌（indexes_kv_by_block_stride 与源码字段名逐字同）+ 页协商 256//4=64 实证 + DSV4 三类同池注。merge 四字段/分流函数名均与源码核对（group_and_unify 为 spec 简记，源码全名 group_and_unify_kv_cache_specs）。无越界/相撞，CJK 完好。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "2026-09-12 独立盲审（只看 PNG + explainer figure_spec，未看 gen_*.py/dossier/正文）：①只看图复述=模型层逐层自报 spec 直接决定落组与共享池：runner 遍历收 spec→get_kv_cache_groups 四级分流（全同 spec→一组/全同 token 槽数→一组/DSV4 grouped→多组/页归一→多组），DSV4 一个模型三类子缓存（压缩层/SWA/indexer）同池分组——与 spec.claim 一致；②数字核对：MLAAttentionSpec(num_kv_heads=1, head_size=kv_lora_rank+qk_rope_head_dim=576)（mla_attention.py:L1140-L1152）对 numbers[0]；四级链 is_kv_cache_spec_uniform→UniformType→group_and_unify→unify_page_size（kv_cache_utils.py:L1781-L1852）对 numbers[1]；merge 断言四字段 cache_dtype_str/compress_ratio/model_version/block_stride（kv_cache_interface.py:L429-L468）对 numbers[2]；DSV4 三卡 压缩层 compress_ratio=4 alignment 576/SlidingWindowMLASpec window 4096 block 64 page 65536 B/indexer cache 归 ch26 对 numbers[3]；页协商 SWA block_size 64=压缩层 storage 256//4=64（sparse_swa.py:L77-L82）对 numbers[4]——全对；③层堆→收集漏斗→四级竖链（未命中下移）→组×3（各带 KVCacheManager×1 徽标）→共享 BlockPool（ch14 回指）读序清楚。"
+   }
+  },
+  {
+   "figure_id": "ch25-fig-dsv4-bytes",
+   "gen": "gen_ch25-fig-dsv4-bytes.py",
+   "svg": "ch25-fig-dsv4-bytes.svg",
+   "png": "ch25-fig-dsv4-bytes.png",
+   "claim": "DSV4 把每存储格压到 584B（448B fp8 NoPE + 128B bf16 RoPE 不量化 + 8B scale）且每格覆盖 4 个 token——每 token 有效 146B，对照 DSV3 bf16 1152B 压 7.9 倍；RoPE 段三代始终不量化。",
+   "numbers": [
+    {
+     "value": "三代 1152 B（DSV3 bf16）→ 656 B（DSV3.2：512 fp8+16 scale+128 rope）→ 584 B/格（DSV4：448 fp8+128 rope+8 scale）÷ compress_ratio 4 = 146 B/token",
+     "provenance": "traces/m12.json byte_account"
+    },
+    {
+     "value": "节省比 DSV3.2/DSV3=1.76；DSV4/DSV3=7.9",
+     "provenance": "traces/m12.json byte_account.compression_vs_dsv3"
+    },
+    {
+     "value": "storage_block_size 256//4=64；real_page_size_bytes 64×584=37376 B；对齐后 37440（alignment 576）；语义 head_size 512",
+     "provenance": "traces/m12.json byte_account.dsv4_fp8_ds_mla"
+    },
+    {
+     "value": "compress_ratios 逐层 [1,4,128,4,1] 原样解析；MTP 层恒 1；max(1,·) 护栏钳 0 成 1",
+     "provenance": "traces/m12.json compress_ratio_per_layer"
+    },
+    {
+     "value": "584B 构成 448B fp8 NoPE + 128B bf16 RoPE + 8B scale（7 ue8m0 + 1B pad）",
+     "provenance": "vllm/v1/kv_cache_interface.py:L409-L413 注释 + traces/m12.json 同款实测"
+    }
+   ],
+   "selfcheck": {
+    "claim_readable_10s": true,
+    "numbers_match_spec": true,
+    "no_overlap": true,
+    "arrows_attached": true,
+    "cjk_rendered": true,
+    "reading_order_clear": true
+   },
+   "selfcheck_note": "Read PNG 亲眼看：三列储物柜（DSV3 bf16：格内 NoPE/RoPE 分段宽∝字节，=1152 B，1 token→1 格，page 73728 B；DSV3.2：512+16+128=656 B 省 1.76 倍，page 167936 B；DSV4：448+8+128=584 B，t1-t4 四 token 箭头汇入同一格，storage 256//4=64 page 37376 B 对齐 37440，每 token 有效 146B 省 7.9 倍）；比例条 1152/656/146（146=584÷4）+ RoPE 128B 三代恒 bf16 注；compress_ratios 色带 layer0-4 ratio 1/4/128/4/1 + MTP 恒 1 + max(1,·) 护栏 + 两本账注 + DeepseekCompressor 进出门注（indexer 归 ch26 预告）。分段字节构成与 m12.json byte_account 三档逐项一致。无越界/相撞，CJK 完好。",
+   "blind_review": {
+    "verdict": "PASS",
+    "notes": "2026-09-12 独立盲审（只看 PNG + explainer figure_spec，未看 gen_*.py/dossier/正文）：①只看图复述=三代 KV 字节账：DSV3 bf16 每格 1152 B（1 token→1 格）→DSV3.2 656 B（512 fp8+16 scale+128 rope）→DSV4 每存储格 584 B（448 fp8 NoPE+8 scale+128 bf16 RoPE）且每格覆盖 4 token=每 token 有效 146 B，对照 DSV3 压 7.9 倍，RoPE 段三代恒 bf16 不量化——与 spec.claim 一致；②数字逐项核对：1152/656/584/146、节省比 1.76/7.9、storage_block_size 256//4=64、real_page_size_bytes 64×584=37376 B→alignment 576 对齐 37440 B、语义 head_size 512 两本账、compress_ratios 逐层 [1,4,128,4,1]+MTP 恒 1+max(1,·) 护栏——与 spec numbers[0]-[4] 全对，且图内自洽：448+8+128=584、584÷4=146、1152÷146≈7.9、1152÷656≈1.76、576×65=37440、page 73728=64×1152/167936=256×656；③三列储物柜分段宽度∝字节、t1-t4 汇入同格箭头+逐层色带+底部比例条读序清楚，RoPE 三代恒 bf16 注醒目。"
+   }
+  }
+ ]
+}
