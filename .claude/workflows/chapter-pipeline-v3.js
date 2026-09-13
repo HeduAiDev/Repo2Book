@@ -51,10 +51,10 @@ const BIBLE = REPO + '/instances/vllm/book/bible'
 // A.models.<role> 可显式覆盖（含把视觉 agent 拉回主模型）。
 function mo(base, role, visual) {
   const o = Object.assign({}, base)
-  // 视觉 agent 暂降级主模型（exp-2026-08-21：fable+网关 effort 冲突两轮修不好——
-  // o.effort='high' 仍被 session effort=max 穿透，InvalidParameter 反复拉闸；
-  // 主模型读图完全胜任，Lead 亲读复核本就是主模型）。A.models.<role> 仍可显式指定 fable 恢复。
-  const m = (A.models && A.models[role]) || null
+  // 画图/读图（视觉作业）用 fable5（CLAUDE.md #7 + 用户 2026-09-13 重申「画图和审图都
+  // 使用 fable5」）。此前 2026-08-21 曾因网关 effort 冲突暂降主模型——现在恢复；若网关
+  // 再拒，o.effort='high' 兜底（fable 不收 max）。A.models.<role> 仍可显式覆盖。
+  const m = (A.models && A.models[role]) || (visual ? 'fable' : null)
   if (m) {
     o.model = m
     if (m === 'fable') o.effort = 'high'
