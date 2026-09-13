@@ -569,16 +569,18 @@ class FreeKVCacheBlockQueue:
         return max(0, num_computed_tokens - self.sliding_window + 1)
 ```
 
-- `num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks`：**已就位的实体块数**——已持的早分配过，命中的由 touch 复用别人的，都不走 get_new_blocks。命中天然以块为单位（1 块 = block_size 个 token，docstring 原话 kv_cache_manager.py:L418），这是五段图里 new_comp 段换算的出处。
+- `num_local_computed_blocks = len(new_computed_blocks) + num_req_blocks`：这个加法容易卡住——new_computed_blocks 是按内容哈希查池刚发现的命中块，**还没挂进**请求自己的逻辑块表（req_to_blocks），touch 要到后面的「挂命中块」一步才发生，此刻表里还看不到它们；num_req_blocks 数的才是表里已有的（入场时和之前几拍攒下的）。一笔数「表里已经有的」，一笔数「池里别人算过、这一拍刚匹配上的」，相加才是「已经有的 + 将免费拿到的」全量，即 **已就位的实体块数**——已持的早分配过，命中的由 touch 复用别人的，都不走 get_new_blocks。命中天然以块为单位（1 块 = block_size 个 token，docstring 原话 kv_cache_manager.py:L418），这是五段图里 new_comp 段换算的出处。
 - `num_skipped_blocks = num_skipped_tokens // self.block_size`：**floor（向下取整），不是 cdiv（向上取整）**。跨窗边界的块还有一角在窗内、必须保留实体（上例 token 0..3 落在窗外、但它所在的块还装着窗内的 token，换不得），只有整块全在窗外才换成 null 占位——null 块永不出租（站 1 贴封条那位），get_usage 的分母也永远少记它。为什么敢跳、跳了为什么正确（回收不变量），下一章显存账本推。
 - `num_new_blocks = max(required − max(skipped, local_computed), 0)`：内层 max 是「挂账之后无需新实体块的表长」。无跳段时 = 已持 + 命中；跳段压过已就位时以跳段为准——null 占位虽然不是实体块，**本身也占表长**（这个分支只在 ext_comp 抬高跳段基数的混合场景出现，下面的 E3 正是它）。
 - `num_skipped_new_computed_blocks`：命中块里落在跳段前缀内的那部分——它们不会被 touch（不离开自由队列），所以要从可驱逐计数里剔掉。
 - `num_evictable_blocks`：将被 touch 的命中块里 ref_cnt==0 且非 null 的（正躺在自由队列当驱逐候选）。touch 会把它们从自由队列**中间**摘走——上一节 remove 原语在这里等到了主人。命中块（别的请求算过、内容相同、可直接复用的块）既是「不用新分配」、又实打实离开空闲池，漏数它容量检查就失真（注释原话 so we must count it in the free-capacity check）。这条注释是第二条 why 链的另一半「预测器与分配器严格同构」的一个样本：预测用的数学必须和分配动作一一对应，漂移没有运行时校验、只有注释和单源公式防着。
 - 六行之外还跟一个尾巴：partial 命中（命中的长度停在某个块的中间）时 `num_new_blocks += 1`，为 CoW 预留一个私有块——CoW 的机制一句话：共享的块谁要接着写，谁先拷一份私有；什么时候真的发生，过线一节的[「CoW 六拍」](#cow-六拍partial-命中的共享尾块什么时候换私房)单独讲。
 
-![慢路径六行账的块关系：E2 实例各量在块上的空间位置](../diagrams/ch13-fig-slowpath-blocks.png)
+![慢路径六行账的块关系：E2 全注意力 vs E3 滑窗+外部，同一块号刻度尺对照](../diagrams/ch13-fig-slowpath-blocks.png)
 
-> *图注：E2 的 100 个 token 落在 7 块上的样子——上半 token 条带按五段劈开（命中 48 + 本拍要算 52），下半块条带把同一序列在块粒度对齐：块 0-2 是命中块（touch 摘走、ref_cnt 0→1），块 3-6 是新分配块（get_new_blocks 摘走）。底部公式流向把六行账串起来：required 7 → 减 max(skipped 0, local_computed 3) → new 4 → 加 evictable 3 → return 7（本拍从自由队列摘走的总块数）。块 6 尾 12 槽是 cdiv 取整的零头，不是 partial；CoW 尾巴（红虚线框）在 E2 的整块整除下不触发，真实时机见后文「CoW 六拍」。*
+> *图注：两景共用一条块号刻度尺逐块对齐，E2 缺席的跳段 null、跨界保留的块 3、外部块各占哪块，一对照就看清。上景 E2：命中 3 + 新 4 + 可驱逐 3 → return 7。下景 E3（滑窗 W=16 + 外部 32）：内层 max 落在跳段支，挂账 null×3 只占表，实体块 4（外部 1 + 新 3）——已算过 ≠ 不用分配。块 6 尾 12 槽是 cdiv 零头非 partial，CoW 红虚线框因此不触发；两景底部同一串流向：required → −max(skipped, local_computed) → new → +evictable → return。*
+
+上图 E2 的 token 条带上没有 comp 段，这不是画漏，是必然——**comp 和 new_comp/ext_comp 从不同时非零**。new_comp 的前提是前缀查找，而查找只在入场首拍做；ext_comp 的外部 token 也是入场时带进来的。首拍 comp=0，new_comp、ext_comp 才有出场资格；请求一旦跑起来（comp>0），查找不再跑、命中天然为空，记账位已写上的请求更被 fast-path 那句 assert 钉死：运行中不会有新命中。所以实践中五段图只有两种形态：跑起来的请求是 `comp | new | lookahead`；首拍或抢占恢复（comp 清回 0、重新入场）的请求是 `new_comp | ext_comp | new | lookahead`，其中 new_comp、ext_comp 各自也可为零——E2 的「已持 0、命中 3 块」正是后一种。五段图列的是五个位置的完整清单，不是一次调度同时点亮的状态快照。
 
 两条路的会合点钉死：全注意力、无命中、无外部 token 时，慢路径**严格退化为 fast-path**——skipped=0 使内层 max 恰等于 num_req_blocks（与 fast-path 的减数相同），命中空使可驱逐为 0、partial 不触发，逐项代入后就是同一句 `max(required − num_req, 0)`。所以「关缓存恒走慢路径」与「开缓存走 fast-path」算出的数永远一致，短请求晚几拍写上键也只是多走几遍全写——两条路是同一本账的简写与全写。
 
