@@ -34,7 +34,7 @@ lc.text(MX, 34, '分页总布局：130 token 的两条请求装进 9 块，r1 �
 lc.text(MX, 58, '整块 KV 显存切成 16 token 一页的等大块池（BlockPool），每个请求拿一张逻辑块表（req_to_blocks）——'
                 '论文类比「blocks as pages, tokens as bytes, requests as processes」',
         10.5, lc.C_MUTE, 'start', maxw=1030, tag='subtitle')
-_ch = '放大自 L0 显存账本列（kv_column）· 本章 L2 章图整幅总览'
+_ch = '放大自 L0 显存账本列（青色）· 本章 L2 章图整幅总览'
 _cw = lc.chip_w(_ch)
 lc.rect(BXR - _cw, 12, _cw, 20, '#ffffff', lc.C_MUTE, rx=9, sw=1.1, dash=True)
 lc.text(BXR - _cw / 2, 26.5, _ch, 9.5, lc.C_BEAT_T, 'middle', True, maxw=_cw - 4, tag='chip')
