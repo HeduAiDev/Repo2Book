@@ -29,7 +29,7 @@ lc.text(MX, 34, '共享半截块谁接着写？各自拷一本：CoW 换尾—�
         16.5, lc.C_TXT, 'start', True, maxw=1010, tag='title')
 lc.text(MX, 58, 'B 与 A 共享 48 token、落在 64-token 块内部：phase 1 满块链 miss，phase 2 探到 @48 边界命中；A 的块还在表里服务别人——B 写自己的 cow 拷贝',
         10.5, lc.C_MUTE, 'start', maxw=1030, tag='subtitle')
-_ch = 'L0 放大 · KV 账本列缓存区 · 命中主循环「CoW 换尾」'
+_ch = 'L0 放大 · KV 账本列缓存区 · 命中主循环「CoW 换尾 · 拷贝过线」'
 _cw = lc.chip_w(_ch)
 lc.rect(BXR - _cw, 12, _cw, 20, '#ffffff', lc.C_MUTE, rx=9, sw=1.1, dash=True)
 lc.text(BXR - _cw / 2, 26.5, _ch, 9.5, lc.C_BEAT_T, 'middle', True, maxw=_cw - 4, tag='chip')

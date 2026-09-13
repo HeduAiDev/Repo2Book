@@ -33,7 +33,7 @@ lc.text(MX, 34, '逐块查表、第一个 miss 即断：块 4 连查都不查—
         16.5, lc.C_TXT, 'start', True, maxw=1000, tag='title')
 lc.text(MX, 58, 'phase 1 沿满块哈希链逐块 get_cached_block，islice 以 max_length//block_size 为预算；全命中也必须退 1 个 token 重算（要 logits），块对齐再回退整块',
         10.5, lc.C_MUTE, 'start', maxw=1030, tag='subtitle')
-_ch = 'L0 放大 · KV 账本列缓存区 · 命中主循环「查」'
+_ch = 'L0 放大 · KV 账本列缓存区 · 命中主循环「查 → 链上走」'
 _cw = lc.chip_w(_ch)
 lc.rect(BXR - _cw, 12, _cw, 20, '#ffffff', lc.C_MUTE, rx=9, sw=1.1, dash=True)
 lc.text(BXR - _cw / 2, 26.5, _ch, 9.5, lc.C_BEAT_T, 'middle', True, maxw=_cw - 4, tag='chip')

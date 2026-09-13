@@ -109,7 +109,7 @@ lc.text(RXX + 16, WY + 63, '最后一个 token 拿 logits；上界 P：块全', 
         maxw=RWW - 32, tag='rg:l2')
 lc.text(RXX + 16, WY + 80, '被惰性驱逐时全量重 prefill。', 8.4, '#334155', 'start',
         maxw=RWW - 32, tag='rg:l3')
-lc.text(RXX + 16, WY + 97, '主线 16（25%）· 最坏 48/64', 8.4, GREEN, 'start', True,
+lc.text(RXX + 16, WY + 97, '主线 16（25%）· 最坏＝全量：支线场景 48、主线 P=64', 8.4, GREEN, 'start', True,
         maxw=RWW - 32, tag='rg:l4')
 
 # ---------------- 底部不变量条（全宽） ----------------
