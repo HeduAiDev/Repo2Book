@@ -46,7 +46,7 @@ lc.text(MX + 16, OY + 22, '旧设计 · 按 max_len 连续预分配（论文举�
         'start', True, maxw=560, tag='old:t')
 lc.text(BXR - 16, OY + 22, '预留即占用：货没来齐，仓位也空着', 9, lc.C_MUTE, 'end', maxw=300, tag='old:s')
 
-BAR_X, BAR_W, BAR_H = MX + 190, 950, 42
+BAR_X, BAR_W, BAR_H = MX + 190, 898, 42   # 右端止于 1148：论文实测盒自 1168 起，原 950 会被它切掉尾巴
 PPS = BAR_W / 2048.0            # px / 槽
 BARS = [
     (OY + 52, 'r1 预留 2048 槽', 100, C_R1, 'r1 实用 100 槽（终长 100）', '白买 1948 槽 · 从未写入（95.12% 内部碎片）'),

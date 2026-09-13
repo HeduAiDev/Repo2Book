@@ -130,6 +130,8 @@ for r in range(4):
         lc.rect(bx, by, BW_, BH_, '#ffffff', '#94a3b8', rx=3, sw=0.9)
         lc.rect(bx, by, BW_, BH_ / 2 - 1, F_K, C_K, rx=3, sw=0.7)
         lc.rect(bx, by + BH_ / 2 + 1, BW_, BH_ / 2 - 1, F_V, C_V, rx=3, sw=0.7)
+        # 砖号骑在 K/V 分界缝上会被 K 底边与 V 顶边两条线切开 → 垫一块无描边白牌再写号
+        lc.rect(bx + BW_ / 2 - 6, by + BH_ / 2 - 6, 12, 12, '#ffffff', 'none', rx=3, sw=0)
         lc.text(bx + BW_ / 2, by + BH_ / 2 + 3, str(idx), 7.5, '#475569', 'middle', maxw=30,
                 tag='wb%d' % idx)
 lc.text(MX + 18, WL_Y + 216, '每块上半 K / 下半 V · 共 10 块（0..9）', 8.5, lc.C_MUTE, 'start',

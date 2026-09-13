@@ -107,6 +107,9 @@ parcel(P4_X, RIV_Y + 60, P4_W, 118, '拍 3 · 双包裹',
 RS_X, RS_W = 1120, BXR - 1120
 parcel(RS_X, RIV_Y + 60, RS_W, 118, '拍 4 · 恢复者整箱重寄',
        ['抢占前 [1] → 恢复后 [2,3]', '整表替换非追加', 'assert req_index is None'], 'resume')
+# 拍 1 的上下两条下投线让开江面泳道标题（标题 ink 至 x≈270）——共用一个落点 x，
+# 否则同一箱的进出箭会左右错位
+P1_DROP_X = P1_X + P1_W / 2 + 40        # 290：仍在拍 1 箱内（100..400）
 
 # ---------------- worker 泳道内容 ----------------
 CS_X, CS_W = 90, 540
@@ -155,12 +158,12 @@ def vdrop(cx, y1, y2, color, marker='std', dash=False, sw=2.0):
     lc.seg(cx, y1, cx, y2, color, sw, marker, dash)
 
 # 台账 → 拍1/拍2/拍3 包裹顶
-vdrop(P1_X + P1_W / 2, SCH_Y + SCH_H + 2, RIV_Y + 58, lc.C_ENG_S, 'dn')
+vdrop(P1_DROP_X, SCH_Y + SCH_H + 2, RIV_Y + 58, lc.C_ENG_S, 'dn')
 vdrop(P2_X + P2_W / 2, SCH_Y + SCH_H + 2, RIV_Y + 58, '#94a3b8', 'std', dash=True, sw=1.4)
 vdrop(P3_X + P3_W / 2, SCH_Y + SCH_H + 2, RIV_Y + 58, lc.C_ENG_S, 'dn')
 vdrop(P4_X + P4_W / 2, SCH_Y + SCH_H + 2, RIV_Y + 58, lc.C_ENG_S, 'dn')
 # 包裹底 → worker 顶
-vdrop(P1_X + P1_W / 2, RIV_Y + 60 + 118 + 2, WRK_Y - 3, lc.C_GPU_S, 'dn')
+vdrop(P1_DROP_X, RIV_Y + 60 + 118 + 2, WRK_Y - 3, lc.C_GPU_S, 'dn')
 vdrop(P3_X + P3_W / 2, RIV_Y + 60 + 118 + 2, WRK_Y - 3, lc.C_GPU_S, 'dn')
 vdrop(P4_X + P4_W / 2, RIV_Y + 60 + 118 + 2, WRK_Y - 3, lc.C_GPU_S, 'dn')
 vdrop(RS_X + RS_W / 2, RIV_Y + 60 + 118 + 2, WRK_Y - 3, lc.C_GPU_S, 'dn')
@@ -170,7 +173,8 @@ lc.text(P2_X + P2_W / 2, RIV_Y + 60 + 118 + 24, '× worker 无动作', 8, '#94a3
 # 清零账旁路：自清零账盒左缘，走 拍4/恢复者小图 之间的竖巷，下投保洁盒
 lc.parrow([(ZRO_X - 1, SCH_Y + 106), (1108, SCH_Y + 106), (1108, WRK_Y + 92), (ZW_X - 3, WRK_Y + 92)],
           lc.C_ABORT, 1.4, 'ab', dash=True)
-lc.text(1100, 540, '旁路：new_block_ids_to_zero', 8, lc.C_ABORT, 'end', maxw=170, tag='bp:lbl')
+# 旁路标注挂到红色竖线（x=1108）右侧：原 end 锚在 x=1100，尾字被拍 4 的下投线（x=996）穿过
+lc.text(1117, 540, '旁路：new_block_ids_to_zero', 8, lc.C_ABORT, 'start', maxw=170, tag='bp:lbl')
 
 # ---------------- 图例 + 页脚 ----------------
 LEG_Y = WRK_Y + WRK_H + 24

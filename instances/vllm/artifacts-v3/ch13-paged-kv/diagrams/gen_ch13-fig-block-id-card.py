@@ -72,7 +72,8 @@ prev_y = CY + HDR + 4 * ROW_H + 12
 next_y = CY + HDR + 5 * ROW_H + 12
 for ry, lab in [(prev_y, 'prev'), (next_y, 'next')]:
     lc.circle(CX + 4, ry, RING_R, lc.C_KV_S, 1.8, dash=False)
-    lc.text(CX + 2, ry - 16, lab, 8, lc.C_KV_S, 'middle', maxw=60, tag='ring' + lab)
+    # 标签整体退到卡片左描边（x=CX=190）外侧：原先居中在边框上，字被竖线从中切开
+    lc.text(CX - 10, ry - 16, lab, 8, lc.C_KV_S, 'end', maxw=60, tag='ring' + lab)
 
 # 左邻居：fake_head 哨兵（六边形）
 HX, HY = 88, prev_y - 13          # 六边形右顶点 (HX+22, HY+13) 与 prev 挂环同高

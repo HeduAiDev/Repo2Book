@@ -39,18 +39,20 @@ lc.rect(BXR - _cw, 12, _cw, 20, '#ffffff', lc.C_MUTE, rx=9, sw=1.1, dash=True)
 lc.text(BXR - _cw / 2, 26.5, _ch, 9.5, lc.C_BEAT_T, 'middle', True, maxw=_cw - 4, tag='chip')
 
 # ---------------- 中：KV 池（砖墙，接 m10 画法） ----------------
-POOL_X, POOL_W = 560, 400
+POOL_X, POOL_W = 560, 370
 POOL_Y, POOL_H = 300, 300
 lc.rect(POOL_X, POOL_Y, POOL_W, POOL_H, '#ffffff', lc.C_GPU_S, rx=8, sw=1.8)
 lc.text(POOL_X + POOL_W / 2, POOL_Y + 22, 'KV 池（每层一张张量）', 11, lc.C_GPU_S, 'middle', True,
         maxw=POOL_W - 20, tag='pool:t')
-BW_, BH_ = 108, 56
+PAD_, BLK_GAP = 22, 10
+BW_ = (POOL_W - 2 * PAD_ - 3 * BLK_GAP) / 4     # 74：四列连同边距与三道缝必须整个落在池内
+BH_ = 56
 BLK_COL = {1: SEG_COL[1], 3: SEG_COL[0], 7: SEG_COL[2]}
 BLK_FILL = {1: SEG_FILL[1], 3: SEG_FILL[0], 7: SEG_FILL[2]}
 BLK_SEG = {1: 1, 3: 0, 7: 2}
 for i, blk in enumerate([0, 1, 2, 3, 4, 5, 6, 7]):
     r, c = divmod(i, 4)
-    bx = POOL_X + 22 + c * (BW_ + 10)
+    bx = POOL_X + PAD_ + c * (BW_ + BLK_GAP)
     by = POOL_Y + 38 + r * (BH_ + 12)
     hot = blk in BLK_COL
     lc.rect(bx, by, BW_, BH_, BLK_FILL.get(blk, '#f8fafc'), BLK_COL.get(blk, '#cbd5e1'),
@@ -71,8 +73,9 @@ lc.text(POOL_X + POOL_W / 2, POOL_Y + POOL_H - 10, '三个热块 = 块表行 [3,
         lc.C_MUTE, 'middle', maxw=POOL_W - 20, tag='pool:n')
 
 # ---------------- 左流：写腿 ----------------
-WL_X, WL_W = MX, 420
-lc.rect(WL_X, 108, WL_W, 560, '#ffffff', SEG_COL[0], rx=8, sw=1.6)
+WL_X, WL_W = MX, 408          # 面板与池之间留出 92px 走廊，容直塞标注（实测 80px）不贴两框边
+PANEL_H = 538                 # 面板底止于 646：F7 条自 658 起，原 560 会压进条内 10px
+lc.rect(WL_X, 108, WL_W, PANEL_H, '#ffffff', SEG_COL[0], rx=8, sw=1.6)
 lc.text(WL_X + WL_W / 2, 132, '写腿 · slot_mapping（直寻址）', 11, SEG_COL[0], 'middle', True,
         maxw=WL_W - 20, tag='wl:t')
 # 48 个 token 点
@@ -133,7 +136,7 @@ lc.text(WL_X + 18, 557, 'int64，逐 token 一个数', 8, lc.C_FAINT, 'start', m
 
 # ---------------- 右流：读腿 ----------------
 RL_X, RL_W = 1020, BXR - 1020
-lc.rect(RL_X, 108, RL_W, 560, '#ffffff', SEG_COL[2], rx=8, sw=1.6)
+lc.rect(RL_X, 108, RL_W, PANEL_H, '#ffffff', SEG_COL[2], rx=8, sw=1.6)
 lc.text(RL_X + RL_W / 2, 132, '读腿 · 块表张量（间接寻址）', 11, SEG_COL[2], 'middle', True,
         maxw=RL_W - 20, tag='rl:t')
 # 块表张量 [4,8]
@@ -167,7 +170,7 @@ lc.text(RL_X + 90, TT_Y + 210, '交 attention metadata builder）', 8, lc.C_MUTE
 HOP_Y = 420
 lc.parrow([(RL_X - 2, HOP_Y), (POOL_X + POOL_W + 4, HOP_Y)], SEG_COL[2], 2.2, 'std')
 lc.text((RL_X + POOL_X + POOL_W) / 2, HOP_Y - 14, '翻页：逐块跳着读', 8.5, SEG_COL[2], 'middle',
-        True, maxw=130, tag='rl:hop')
+        True, maxw=RL_X - (POOL_X + POOL_W) - 12, tag='rl:hop')   # 只许占池与面板之间的走廊
 # attention kernel 图标
 AK_Y = 460
 lc.rect(RL_X + 40, AK_Y, RL_W - 80, 70, SEG_FILL[2], SEG_COL[2], rx=8, sw=1.4)
@@ -179,8 +182,8 @@ lc.parrow([(RL_X + 60, TT_Y + 26 + 4 * TT_CH + 4), (RL_X + 60, AK_Y - 4)], SEG_C
 lc.text(RL_X + 66, (TT_Y + 26 + 4 * TT_CH + AK_Y) / 2, '查表', 8, SEG_COL[2], 'start', maxw=50,
         tag='rl:lookup')
 lc.parrow([(RL_X + RL_W - 60, AK_Y - 4), (RL_X + RL_W - 60, HOP_Y + 4)], SEG_COL[2], 1.8, 'std')
-lc.text(RL_X + RL_W - 54, (AK_Y + HOP_Y) / 2 + 8, '取数', 8, SEG_COL[2], 'end', maxw=50,
-        tag='rl:fetch')
+lc.text(RL_X + RL_W - 54, (AK_Y + HOP_Y) / 2 + 8, '取数', 8, SEG_COL[2], 'start', maxw=50,
+        tag='rl:fetch')     # 锚在取数竖线（x=1380）右侧：end 锚会让线从字中间穿过
 
 # ---------------- 汇聚注记 + F7 伏笔（预告 ch22）----------------
 CV_Y = POOL_Y + POOL_H + 24
