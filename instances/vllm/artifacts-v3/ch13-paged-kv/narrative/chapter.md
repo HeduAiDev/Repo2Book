@@ -576,6 +576,10 @@ class FreeKVCacheBlockQueue:
 - `num_evictable_blocks`：将被 touch 的命中块里 ref_cnt==0 且非 null 的（正躺在自由队列当驱逐候选）。touch 会把它们从自由队列**中间**摘走——上一节 remove 原语在这里等到了主人。命中块（别的请求算过、内容相同、可直接复用的块）既是「不用新分配」、又实打实离开空闲池，漏数它容量检查就失真（注释原话 so we must count it in the free-capacity check）。这条注释是第二条 why 链的另一半「预测器与分配器严格同构」的一个样本：预测用的数学必须和分配动作一一对应，漂移没有运行时校验、只有注释和单源公式防着。
 - 六行之外还跟一个尾巴：partial 命中（命中的长度停在某个块的中间）时 `num_new_blocks += 1`，为 CoW 预留一个私有块——CoW 的机制一句话：共享的块谁要接着写，谁先拷一份私有；什么时候真的发生，过线一节的[「CoW 六拍」](#cow-六拍partial-命中的共享尾块什么时候换私房)单独讲。
 
+![慢路径六行账的块关系：E2 实例各量在块上的空间位置](../diagrams/ch13-fig-slowpath-blocks.png)
+
+> *图注：E2 的 100 个 token 落在 7 块上的样子——上半 token 条带按五段劈开（命中 48 + 本拍要算 52），下半块条带把同一序列在块粒度对齐：块 0-2 是命中块（touch 摘走、ref_cnt 0→1），块 3-6 是新分配块（get_new_blocks 摘走）。底部公式流向把六行账串起来：required 7 → 减 max(skipped 0, local_computed 3) → new 4 → 加 evictable 3 → return 7（本拍从自由队列摘走的总块数）。块 6 尾 12 槽是 cdiv 取整的零头，不是 partial；CoW 尾巴（红虚线框）在 E2 的整块整除下不触发，真实时机见后文「CoW 六拍」。*
+
 两条路的会合点钉死：全注意力、无命中、无外部 token 时，慢路径**严格退化为 fast-path**——skipped=0 使内层 max 恰等于 num_req_blocks（与 fast-path 的减数相同），命中空使可驱逐为 0、partial 不触发，逐项代入后就是同一句 `max(required − num_req, 0)`。所以「关缓存恒走慢路径」与「开缓存走 fast-path」算出的数永远一致，短请求晚几拍写上键也只是多走几遍全写——两条路是同一本账的简写与全写。
 
 六问实测（预测器与分配器对账，两组各对一次、全部对上）：
