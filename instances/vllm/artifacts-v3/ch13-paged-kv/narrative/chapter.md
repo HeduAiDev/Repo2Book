@@ -473,7 +473,7 @@ class FreeKVCacheBlockQueue:
 
 ### 先数块：快慢两条路，同一本账
 
-三段式的第一段是 **容量检查**，开吃前先看冰箱。但「看冰箱」这一眼藏着两个容易被一笔带过的问题：这一眼走哪条公式——`if request_id in self.num_cached_block:` 下面那对快慢分岔，什么时候进哪条？数出来的数又是什么意思——它不全是「还缺几块」。核心算术都在 `get_num_blocks_to_allocate`（需块预测）里，这次把两条路完整摆开，先读整段：
+三段式的第一段是 **容量检查**，开吃前先看冰箱。这一眼要回答的问题只有一个：**这一拍要从自由队列摘走几块**——数出来的数超过空闲，整个 allocate_slots 当场拒绝。核心算术都在 `get_num_blocks_to_allocate`（需块预测）里，中间有一道快慢分岔，先读整段再拆：
 
 ```python
 # vllm/v1/core/single_type_kv_cache_manager.py:L144-L230
@@ -482,10 +482,8 @@ class FreeKVCacheBlockQueue:
         request_id: str,
         num_tokens: int,
         new_computed_blocks: Sequence[KVCacheBlock],
-        # … 省略：total_computed_tokens 等四个参数与 docstring（
-        #       admission cap 分支是滑窗类注意力组的准入上限，
-        #       注释点名「与启动期池大小器漂移会重演 issue #39734 的死锁」，
-        #       账归下一章显存账本）……
+        # … 省略：total_computed_tokens 等四个参数与 docstring，以及
+        #       滑窗类的准入上限分支（账归下一章显存账本）……
     ) -> int:
         num_required_blocks = cdiv(num_tokens, self.block_size)   # 主算术就这一行  # L178
         # … 省略：apply_admission_cap 分支（L179-L191，见上）……
@@ -530,25 +528,13 @@ class FreeKVCacheBlockQueue:
         return num_new_blocks + num_evictable_blocks               # L230
 ```
 
-**主算术**仍然只有一行：`cdiv(num_tokens, block_size)`，前文总账表立过的天花板除 ⌈n/k⌉（「100 个 token 装 16 一页的块要几页」）。真正的分岔在它下面那句 dict 成员测试。**进不进 fast-path 的开关，既不是请求状态、也不是 is_prefill（请求档案里「本拍是否首排」的状态位）、更不是调度相位，而是 `request_id in self.num_cached_block`**。`num_cached_block`（已缓存满块记账位，dict：请求 id → 已写回缓存的满块数）本是前缀缓存的增量游标，兼职了开关：这个键只要存在，说明请求已经过了首排、块表已在增长、不会再有新的前缀命中（断言钉死），账于是简化成一句差值 `max(num_required_blocks - num_req_blocks, 0)`（需块减已持、负数归零；max 给投机解码兜底——草稿 token 被拒后目标回缩，需块可能反而小于已持）。键不存在的一切请求走慢路径，也就是下面那六行完整账。
+**主算术**仍然只有一行：`cdiv(num_tokens, block_size)`，前文总账表立过的天花板除 ⌈n/k⌉（「100 个 token 装 16 一页的块要几页」）。真正的分岔在它下面那句 dict 成员测试：**进不进 fast-path 的开关是 `request_id in self.num_cached_block`**。`num_cached_block`（已缓存满块记账位，dict：请求 id → 已写回缓存的满块数）本是前缀缓存的增量游标，在这里兼职了开关：这个键只要存在，说明请求已经过了首排（本次入场的第一次调度，新请求与被抢占后恢复都算）、不会再有新的前缀命中（代码里那句 assert 钉死），账于是简化成一句差值 `max(num_required_blocks - num_req_blocks, 0)`（需块减已持、负数归零；max 给投机解码兜底——草稿 token 被拒后目标回缩，需块可能反而小于已持）。键不存在的一切请求走慢路径，也就是下面那六行完整账。
 
-**记账位什么时候「武装」（被写入）**：全源码只有三处，都发生在「至少一个整块落袋」的时刻——首排挂命中块时写 `len(req_blocks)`（single_type_kv_cache_manager.py:L282）；partial 命中时下修到整块边界 `block_idx`（L289，块内那半截不算已缓存）；每拍收尾写回满块时写 `num_full_blocks = num_tokens_to_cache // block_size`（num_tokens_to_cache 是本拍收尾要写回缓存的 token 数，L446、L477）。请求退场（完成或被抢占还块）时删除（pop_blocks_for_free，L515）。两个**永不武装**的边界都反直觉。其一，短请求：prompt 加已生成不足 block_size 时 `num_full_blocks` 恒为 0，收尾写回的幂等闸（同一状态重复写直接跳过的闸门）`num_cached_blocks >= num_full_blocks`（0 ≥ 0）早退、键永远不写——实跑（block_size=16、开缓存口径）：总长从 5 一路涨到 15 的每个收尾拍，键都不存在、请求一直走慢路径；总长到 16 的那一拍写回第 1 个满块（同理 100 token 的请求写回 6 个），键才出现、之后的拍才切到 fast-path。武装前后两条公式算出的数永远一致（见本节末的退化说明），所以这条边界无正确性影响，只有「谁在走哪条路」的解说价值。其二，关缓存（`--no-enable-prefix-caching`）：收尾写回整段被上层跳过（kv_cache_manager.py:L551-L552 的 `if not self.enable_caching ...: return`），挂命中块路径又只在有命中时进、而关缓存时命中恒空——键永不武装。这正是本章开头环境交代里「精简版关缓存恒走慢路径」的机制根源。
+这个键什么时候写、什么时候删？一句话：**有整块落袋才写，请求退场就删**。写它的主路是每拍收尾的写回满块——攒满几个整块就记几（代码在后面「三段式全景」一节）；首排挂命中块时也会顺手写一笔。两个不写的边界：短请求（prompt 加已生成不足 block_size）一个满块都攒不出，键一直不出现，只好每拍走慢路径——好在两条路算出的数永远一样，下文「两条路的会合点」一段逐项代入证过；关掉前缀缓存时写回整段被上层跳过，键永不出现，这正是本章开头环境交代里「精简版关缓存恒走慢路径」的机制根源。顺带一句：前缀查找只在入场首拍做（判定 `request.num_computed_tokens == 0`，scheduler.py:L744-L747）；被抢占的请求该值清 0、重新入场，自己的旧缓存可以被自己再命中——抢占「重算便宜」的根源之一。这半边的调度账[前缀缓存章（第 15 章）](../../ch15-prefix-caching/narrative/chapter.md)开门就讲。
 
-断言「running 请求无新命中」的保证人不在缓存管理器里，在调度器——顺带把「首排」说准：它是 **本次入场的第一次调度**（新请求首排、抢占恢复首排都算，running 中的每一拍都不算），不是一生一次：
+慢路径是这本账的完全体，六行逐行读。先把它数出来的东西说准：**返回值 = 本拍将从自由队列摘走多少块**。加进返回值的都是要真摘走的——新分配的块、被 touch 摘走的可驱逐命中块，个别场景还有一类写时复制（CoW）换来的私有块（见末条）；减掉的每一项，都是「这个表位不用从池里拿实体块」的理由：
 
-```python
-# vllm/v1/core/sched/scheduler.py:L744-L747 · Scheduler.schedule
-                # Get already-cached tokens.
-                if request.num_computed_tokens == 0:
-                    did_prefix_cache_lookup = True
-                    hit_diverged = False
-```
-
-只有 `num_computed_tokens == 0` 的入场首拍才做前缀查找（节选里 did_prefix_cache_lookup 标记「本拍做过查找」、hit_diverged 是同段初始化的命中分叉旗，都是簿记）；非首排一律拿空命中过账（scheduler.py:L854-L859）。被抢占的请求重新入场时 num_computed_tokens 被清 0、块全部归还（num_cached_block 键同步删除），恢复首排重新开闸查前缀——**自己的旧缓存可以被自己再命中**，这是抢占「重算便宜」的根源之一。协调器还有第二道闸（running 请求的挂命中调用直接 no-op 加 assert 全空，kv_cache_coordinator.py:L210-L217），两层护栏夹着，fast-path 里那句 assert 才敢写。
-
-慢路径是这本账的完全体，先把它数出来的东西说准：**返回值 = 本拍将从自由队列摘走多少块**——新分配的块、CoW 换来的私有块、被 touch 从自由队列摘走的可驱逐命中块，三类都实打实吃池子容量；而减掉的每一项，都是「这些表位不需要从池里拿实体块」的理由。六行逐行读：
-
-- `num_skipped_tokens = get_num_skipped_tokens(total_computed_tokens)`：注意力窗外、不再被读的 token 数（total_computed_tokens 是本地已算、本拍新命中、外部已算三者的 token 合计）。全注意力基类恒 0（L661-L672）；滑窗注意力（sliding window attention，每个 token 只看最近 W 个 token 的变体，W 为窗口宽度）的公式是 max(0, T − W + 1)，源码自带一个 ASCII 例，值得原样看：
+- `num_skipped_tokens = get_num_skipped_tokens(total_computed_tokens)`：注意力窗外、不再被读的 token 数（total_computed_tokens 是本地已算、本拍新命中、外部已算三者的 token 合计）。本章的全注意力下它恒 0（L661-L672，没有 token 会被跳过）；滑窗注意力（sliding window attention，每个 token 只看最近 W 个 token 的变体，W 为窗口宽度）的公式是 max(0, T − W + 1)，源码自带一个 ASCII 例，值得原样看：
 
 ```python
 # vllm/v1/core/single_type_kv_cache_manager.py:L1057-L1083 · 滑窗子类的 get_num_skipped_tokens
@@ -582,9 +568,9 @@ class FreeKVCacheBlockQueue:
 - `num_new_blocks = max(required − max(skipped, local_computed), 0)`：内层 max 是「挂账之后无需新实体块的表长」。无跳段时 = 已持 + 命中；跳段压过已就位时以跳段为准——null 占位虽然不是实体块，**本身也占表长**（这个分支只在 ext_comp 抬高跳段基数的混合场景出现，下面的 E3 正是它）。
 - `num_skipped_new_computed_blocks`：命中块里落在跳段前缀内的那部分——它们不会被 touch（不离开自由队列），所以要从可驱逐计数里剔掉。
 - `num_evictable_blocks`：将被 touch 的命中块里 ref_cnt==0 且非 null 的（正躺在自由队列当驱逐候选）。touch 会把它们从自由队列**中间**摘走——上一节 remove 原语在这里等到了主人。命中块（别的请求算过、内容相同、可直接复用的块）既是「不用新分配」、又实打实离开空闲池，漏数它容量检查就失真（注释原话 so we must count it in the free-capacity check）。这条注释是第二条 why 链的另一半「预测器与分配器严格同构」的一个样本：预测用的数学必须和分配动作一一对应，漂移没有运行时校验、只有注释和单源公式防着。
-- 六行之外还跟一个尾巴：partial 命中的 `+1` 是 CoW 预留——什么时候真的发生，过线一节的[「CoW 六拍」](#cow-六拍partial-命中的共享尾块什么时候换私房)单独讲。
+- 六行之外还跟一个尾巴：partial 命中（命中的长度停在某个块的中间）时 `num_new_blocks += 1`，为 CoW 预留一个私有块——CoW 的机制一句话：共享的块谁要接着写，谁先拷一份私有；什么时候真的发生，过线一节的[「CoW 六拍」](#cow-六拍partial-命中的共享尾块什么时候换私房)单独讲。
 
-两条路的会合点钉死：全注意力、无命中、无外部 token 时，慢路径**严格退化为 fast-path**——skipped=0 使内层 max 恰等于 num_req_blocks（与 fast-path 的减数相同），命中空使可驱逐为 0、partial 不触发，逐项代入后就是同一句 `max(required − num_req, 0)`。所以「关缓存恒走慢路径」与「开缓存走 fast-path」算出的数永远一致，短请求不武装也没有正确性影响——两条路是同一本账的简写与全写。
+两条路的会合点钉死：全注意力、无命中、无外部 token 时，慢路径**严格退化为 fast-path**——skipped=0 使内层 max 恰等于 num_req_blocks（与 fast-path 的减数相同），命中空使可驱逐为 0、partial 不触发，逐项代入后就是同一句 `max(required − num_req, 0)`。所以「关缓存恒走慢路径」与「开缓存走 fast-path」算出的数永远一致，短请求晚几拍写上键也只是多走几遍全写——两条路是同一本账的简写与全写。
 
 六问实测（预测器与分配器对账，两组各对一次、全部对上）：
 
@@ -600,7 +586,7 @@ class FreeKVCacheBlockQueue:
 
 （c/d/e 的 fast-path 需要一个缓存账位（num_cached_block），真实开缓存的部署由写回满块自然推进；精简版关缓存恒走慢路径，同一个 cdiv 差值公式、同样钳零，驱动脚本手工登记账位走通了 fast-path 支。e 的回缩是投机解码拒草稿场景，此处只取钳零算术。）
 
-六问表的主路径味道重，慢路径再补两个完整例（实跑：命中块由「取了再还」制造成驱逐候选、「只取不还」制造成热块，六行账本体是精简版真跑；E3 的滑窗公式按 pin 源码在驱动里覆写——精简版删了滑窗子类，见例后注）：
+六问表走的都是主路径，慢路径的六行账再用两个完整例压实（E2 两行的账实跑自精简版；E3 的滑窗公式在驱动里按 pin 源码覆写——精简版删了滑窗子类，例后注交代推演边界）：
 
 <!-- trace: s1 -->
 | 例 | 目标表长 | 已持 | 命中 | local_computed | skipped_blocks | 新块 num_new | 可驱逐 evictable | 预测返回 |
@@ -609,7 +595,9 @@ class FreeKVCacheBlockQueue:
 | E2 同局、全热（ref_cnt≥1 不在自由队列） | 7 | 0 | 3 | 3 | 0 | 4 | 0 | **4** |
 | E3 滑窗 W=16 + 外部 32 token | cdiv(100,16)=7 | 0 | 2 | 2 | 3 | 7−max(3,2)=4 | 0 | **4** |
 
-E2（全注意力，prompt=100、前缀命中 48 token——恰好 3 整块，命中不落在块中间，partial 不触发）：new_comp=48 使本拍只需新算 52，入账 num_tokens = 48+52 = 100，required = 7，local_computed = 3，新块 4。剩下看那 3 块命中的冷热：**全冷**（三块都躺自由队列，ref_cnt==0）→ 预测 4+3 = 7，分配侧实测恰好对上这个数——touch 3 块（离开自由队列）加 get_new_blocks(4)，自由队列净减 3+4 = 7，「返回值 = 本拍摘走多少块」的语义在这里验货；**全热**（三块都正被别的请求引用，ref_cnt≥1、不在自由队列）→ 可驱逐 0 → 预测 4。共享得越热、容量越省；这句话的另一面是预测器必须逐块看 ref_cnt，不能拿「命中了 3 块」一口吞。E3（滑窗 W=16，本地命中 2 块 + connector 外部缓存 32 token，total_computed = 64，本拍再算 36）：窗外 token = max(0, 64−16+1) = 49，跳段 = 49//16 = 3——floor 在这里救命：第 4 块跨 48/49 窗边界，token 49..63 还在窗内，必须留实体；内层 max 落在跳段支（ext_comp 抬高了跳段基数、却不进 local_computed），新块 = 7−max(3,2) = 4；命中的 2 块全落在跳段前缀内、被剔出可驱逐计数 → 预测 4。（E3 分配侧的对账是代码走读推演：外部段补块的 allocate_external_computed_blocks 在精简版已删、账归 KVConnector 章；真实挂账会是 [null, null, null] 占位 3 格、外部段另发 1 块、新块 3 块，实体块 1+3 = 4。）
+E2（全注意力，prompt=100、前缀命中 48 token——恰好 3 整块，命中不落在块中间，partial 不触发）：new_comp=48 使本拍只需新算 52，入账 num_tokens = 48+52 = 100，required = 7，local_computed = 3，新块 4。剩下全看那 3 块命中的冷热。**全冷**（三块都躺自由队列，ref_cnt==0）→ 预测 4+3 = 7，分配侧实测恰好对上这个数：touch 3 块（离开自由队列）加 get_new_blocks(4)，自由队列净减 3+4 = 7，「返回值 = 本拍摘走多少块」的语义在这里验货。**全热**（三块都正被别的请求引用，ref_cnt≥1、不在自由队列）→ 可驱逐 0 → 预测 4。共享得越热、容量越省；这句话的另一面是预测器必须逐块看 ref_cnt，不能拿「命中了 3 块」一口吞。
+
+E3（滑窗 W=16，本地命中 2 块 + connector 外部缓存 32 token，total_computed = 64，本拍再算 36）：窗外 token = max(0, 64−16+1) = 49，跳段 = 49//16 = 3——floor 在这里救命：第 4 块跨 48/49 窗边界，token 49..63 还在窗内，必须留实体。内层 max 落在跳段支（ext_comp 抬高了跳段基数、却不进 local_computed），新块 = 7−max(3,2) = 4；命中的 2 块全落在跳段前缀内、被剔出可驱逐计数 → 预测 4。（E3 分配侧的对账是代码走读推演：外部段补块的 allocate_external_computed_blocks 在精简版已删、账归 KVConnector 章；真实挂账会是 [null, null, null] 占位 3 格、外部段另发 1 块、新块 3 块，实体块 1+3 = 4。）
 
 六行账在手，回头把开头的五段图逐段对到块账参数上——这是最容易卡住的地方：docstring 把 comp、new_comp、ext_comp 都画成「前缀已算过」，但块账里三者的待遇完全不同（先补一词：ext_comp 里的 connector 指 KV connector，把别处算好的 KV 搬进本引擎的外挂传输模块，Part IV 压轴一站的主角）。先立住两个求和点（token 域怎么合成传进预测器的数）：
 
@@ -634,7 +622,7 @@ E2（全注意力，prompt=100、前缀命中 48 token——恰好 3 整块，�
         )
 ```
 
-（小心两个陷阱：其一，L458-L461 里这个钳过 max_model_len 的 total_computed_tokens 只是局部变量，真正传给预测器的是 L515-L516 未钳版本的「本地已算 + 外部已算」之和，滑窗跳段的基数用的是后者；其二，num_tokens_main_model 是**不带 lookahead** 的中间量——投机解码时主模型与草稿模型各算各的账，无投机时它就等于 num_tokens_need_slot。）逐段映射：
+两个陷阱先记下。其一，L458-L461 这个钳过 max_model_len 的 total_computed_tokens 只是局部变量，真正传给预测器的是 L515-L516 未钳版本的「本地已算 + 外部已算」之和，滑窗跳段的基数用的是后者。其二，num_tokens_main_model 是**不带 lookahead** 的中间量：投机解码时主模型与草稿模型各算各的账，无投机时它就等于 num_tokens_need_slot。逐段映射：
 
 | 五段（token 域） | 进块账哪一项 | 一句话 |
 |---|---|---|
@@ -668,7 +656,7 @@ E2（全注意力，prompt=100、前缀命中 48 token——恰好 3 整块，�
 
 ### 再拿块挂账：逻辑块表加长一段
 
-检查过了，第三段真拿块。`allocate_new_blocks` 的主干做三件事：算差值、取块、挂账；主干之前可能先响一段 CoW（copy-on-write，写时复制——多个请求共享同一物理块、谁要接着写谁才拷一份私有）的前奏：代码开头那句 `if request_id in self._partial_hit_reqs`（partial 命中登记表——哪些请求的命中停在块中间、需要换尾）为真时，取一块私有块、交给 `_apply_cow`（把共享尾块原地换成私有块的记账函数）顶进表位。这段前奏什么时候触发、触发了走哪几步，本章单组全注意力主路径上恒不出现，先挂个账，过线一节的[「CoW 六拍」](#cow-六拍partial-命中的共享尾块什么时候换私房)连着 worker 侧一起讲；这里把整段读全：
+检查过了，第三段真拿块。`allocate_new_blocks` 的主干做三件事：算差值、取块、挂账；主干之前可能先响一段 CoW 前奏（就是上一节末条预告的那个写时复制）：代码开头那句 `if request_id in self._partial_hit_reqs`（partial 命中登记表——哪些请求的命中停在块中间、需要换尾）为真时，取一块私有块、交给 `_apply_cow`（把共享尾块原地换成私有块的记账函数）顶进表位。这段前奏什么时候触发、触发了走哪几步，本章单组全注意力主路径上恒不出现，先挂个账，过线一节的[「CoW 六拍」](#cow-六拍partial-命中的共享尾块什么时候换私房)连着 worker 侧一起讲；这里把整段读全：
 
 ```python
 # vllm/v1/core/single_type_kv_cache_manager.py:L330-L369
@@ -972,13 +960,13 @@ worker 收到后维护自己的镜像，三种动作各归各位：
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)    # L1222
 ```
 
-注释原话就是 why 的全部："prevent stale NaN/data from corrupting attention or SSM computation"（防陈旧 NaN/数据污染注意力或 SSM 计算；SSM 是 Mamba 类状态空间模型的计算，见[下一章显存账本（第 14 章）](../../ch14-memory-ledger/narrative/chapter.md)）。`_zero_block_ids` 背后是 KVBlockZeroer：构造期预计算各段绝对地址表，每步用一个 Triton kernel（vLLM 写 GPU kernel 用的语言，下一节「槽位恒等式」正面介绍）把名单上的块整页清零（host 精简版走同地址表的 CPU 分支）。实跑一组混合精度两层池：预置陈旧字节 7 铺满两层 → 清 [1,2,3,4,5,6] → 两层的块 1..6 全归零、块 0（null）的陈旧字节原样保留（永不出租、无须清）；第二次排干 → None（排干语义）。还有个开关值得记：`needs_kv_cache_zeroing` 什么时候开？源码 docstring 给了两个真实触发（kv_cache_interface.py:L1014-L1022）：模型里有 Mamba 层（状态在写全之前就会被读，#35219）；混合精度 KV（回收块跨组被另一组按不同精度重新解释，陈旧字节解成 NaN/Inf；实跑那组混合精度两层池踩的正是这个触发）。均匀单组的纯注意力则免清零，通道直接关（None，scheduler.py:L1264-L1265），docstring 原话 "Uniform-precision caches skip zeroing"。为什么敢免：注意力只读 seq_len 内已写过的位置，没写过的槽位永远读不到（注意不是「新块马上会被整块覆写」；站 11 的节奏总账是现成反例：31/32 仍 2 块、33 才进第 3 块，新块当拍只住进 1 个 token 位，其余 15 个槽要等后续拍逐个写），清零是白付带宽。代价与豁免都摆在明处。这笔护栏属于一组更大的组合（整序列门、准入上限、CoW 拷贝管线）：整序列门与准入上限归下一章显存账本，CoW 拷贝管线紧接着讲——它在 worker 开场的执行位次，就在上一段那两行 if 的正后方。
+注释原话就是 why 的全部："prevent stale NaN/data from corrupting attention or SSM computation"（防陈旧 NaN/数据污染注意力或 SSM 计算；SSM 是 Mamba 类状态空间模型的计算，见[下一章显存账本（第 14 章）](../../ch14-memory-ledger/narrative/chapter.md)）。`_zero_block_ids` 背后是 KVBlockZeroer：构造期预计算各段绝对地址表，每步用一个 Triton kernel（vLLM 写 GPU kernel 用的语言，下一节「槽位恒等式」正面介绍）把名单上的块整页清零（host 精简版走同地址表的 CPU 分支）。实跑一组混合精度两层池：预置陈旧字节 7 铺满两层 → 清 [1,2,3,4,5,6] → 两层的块 1..6 全归零、块 0（null）的陈旧字节原样保留（永不出租、无须清）；第二次排干 → None（排干语义）。还有个开关值得记：`needs_kv_cache_zeroing` 什么时候开？源码 docstring 给了两个真实触发（kv_cache_interface.py:L1014-L1022）：模型里有 Mamba 层（状态在写全之前就会被读，#35219）；混合精度 KV（回收块跨组被另一组按不同精度重新解释，陈旧字节解成 NaN/Inf；实跑那组混合精度两层池踩的正是这个触发）。均匀单组的纯注意力则免清零，通道直接关（None，scheduler.py:L1264-L1265），docstring 原话 "Uniform-precision caches skip zeroing"。为什么敢免：注意力只读 seq_len 内已写过的位置，没写过的槽位永远读不到（注意不是「新块马上会被整块覆写」；站 11 的节奏总账是现成反例：31/32 仍 2 块、33 才进第 3 块，新块当拍只住进 1 个 token 位，其余 15 个槽要等后续拍逐个写），清零是白付带宽。代价与豁免都摆在明处。这笔护栏属于一组更大的组合（整序列门、准入上限、CoW 拷贝管线）：整序列门与准入上限归下一章显存账本，CoW 拷贝管线紧接着讲——worker 开场就排在清零那两行 if 的后面。
 
 ### CoW 六拍：partial 命中的共享尾块什么时候换私房
 
-先把适用面立住，免得读者在本章主路径上白找：CoW 的唯一触发条件是 **partial 命中**——本拍前缀命中的长度结束在某个块的**中间**。判定就两行（`len(new_computed_blocks) > 0` 且 `num_local_computed_tokens % block_size != 0`，single_type_kv_cache_manager.py:L132-L142）。这要求缓存查找能以比块更细的粒度命中；而本章的单组全注意力里 hash_block_size（哈希记账粒度：每多少 token 算一次内容哈希）与 block_size 相等（kv_cache_utils.py:L649-L651，单组直接返回一对相等的 (bs, bs)），协调器也把对齐粒度传成本组 block_size（kv_cache_coordinator.py:L486-L503）——命中长度恒为块整数倍，**永无 partial、永无 CoW**。这正是精简版把 CoW 整段删给前缀缓存章的原因；只有多组混合（哈希粒度取各组的公约数）或开了 prefix_match_unit（把多组对齐到一个公共命中单位的配置开关）覆盖的部署才走得到这条路。但它在 allocate_slots 账上的完整时机值得本章点透——六拍管线，前三拍在调度器侧（前文都见过），后三拍在过线与 worker 侧，正好把本章两半缝起来。
+先把适用面立住，免得在本章主路径上白找：CoW 的唯一触发是 **partial 命中**——本拍前缀命中的长度停在某个块的**中间**（判定就是「有命中、且命中长度不是块的整数倍」）。这要求缓存查找能以比块更细的粒度命中，而单组部署做不到：本章的单组全注意力里，哈希记账粒度与块大小相等（hash_block_size，每多少 token 算一次内容哈希；单组直接返回一对相等的 (bs, bs)，kv_cache_utils.py:L649-L651），命中长度恒为块整数倍，**永无 partial、永无 CoW**。这正是精简版把 CoW 整段删给前缀缓存章的原因；只有多组混合部署（哈希粒度取各组的公约数，命中才可能停在块中间）才走得到这条路。但它在 allocate_slots 账上的完整时机值得本章点透——六拍管线，前三拍在调度器侧（前文都见过），后三拍在过线与 worker 侧，正好把本章两半缝起来。
 
-**拍 1（预测 +1）**：`get_num_blocks_to_allocate` 末尾那句 `num_new_blocks += 1`（L226-L229，就是「先数块」代码块里标了 CoW 预留的那行）——容量检查为那个还不存在的私有块先占一个位，注释原话 Reserve the extra block that allocate_new_blocks pulls for the partial-hit CoW redirect。**拍 2（挂账登记）**：挂命中块的函数检测到 partial，记 `_partial_hit_reqs[请求] = (block_idx, 共享尾块)`（partial 命中登记表），并把 num_cached_block 下修到整块边界 `block_idx`（L283-L289）——块内那半截不算「已缓存」，私有拷贝写满后会重新走写回。**拍 3（换尾）**：`allocate_new_blocks` 开场消费登记——就是上一节代码块开头那段 CoW 前奏：get_new_blocks(1) 拿私有块，`_apply_cow` 把 `req_blocks[block_idx]` **原地**换成它。_apply_cow 本体与它的引用账：
+**拍 1（预测 +1）**：`get_num_blocks_to_allocate` 末尾那句 `num_new_blocks += 1`（L226-L229，就是「先数块」代码块里标了 CoW 预留的那行）——容量检查为那个还不存在的私有块先占一个位。**拍 2（挂账登记）**：挂命中块的函数检测到 partial，记 `_partial_hit_reqs[请求] = (block_idx, 共享尾块)`，并把 num_cached_block 下修到整块边界 `block_idx`（L283-L289）——块内那半截不算「已缓存」，私有拷贝写满后会重新走写回。**拍 3（换尾）**：`allocate_new_blocks` 开场消费登记——就是上一节代码块开头那段 CoW 前奏：get_new_blocks(1) 拿私有块，`_apply_cow` 把 `req_blocks[block_idx]` **原地**换成它。_apply_cow 本体与它的引用账：
 
 ```python
 # vllm/v1/core/single_type_kv_cache_manager.py:L405-L425
@@ -1005,7 +993,7 @@ worker 收到后维护自己的镜像，三种动作各归各位：
         cow_block.ref_cnt += 1
 ```
 
-docstring 就是账本：**两端都要活到 worker 拷完**。共享尾块 source 被 touch 过（挂账 +1）、被换出请求块表后**不减**——这就是保留引用，保证拷贝执行时源块没被别人回收；cow 块 = 请求持有 1 + 这里额外 +1 = 2。**拍 4（返回值分岔）**：换完尾再算差值（上一节的 L361 同款）——差值 ≤ 0 就只返回 cow_blocks（本拍 **只换不增**，典型形态：整条 prompt 都落在共享前缀上、没有越出命中的净新增）；> 0 就返回 cow_blocks + new_blocks（**又换又增**）。读者问的「什么条件返回哪个」就是 L363 / L369 那两个 return。**拍 5（过线）**：schedule() 收尾把 `_pending_cow_copies` 排干成 `KVCacheBlockCopy`（src_block_id、dst_block_id 两个 int 字段的 NamedTuple，命名元组）塞进 SchedulerOutput，两端块挂保留引用、按围栏（fence，等某个序号到达才放行的同步屏障——这里是调度步序号 sched_step_seq）延迟释放：
+docstring 就是账本：**两端都要活到 worker 拷完**。共享尾块 source 被 touch 过（挂账 +1）、被换出请求块表后**不减**——这就是保留引用，保证拷贝执行时源块没被别人回收；cow 块 = 请求持有 1 + 这里额外 +1 = 2。**拍 4（返回值分岔）**：换完尾再算差值（上一节的 L361 同款）——差值 ≤ 0 就只返回 cow_blocks（本拍 **只换不增**，典型形态：整条 prompt 都落在共享前缀上、没有越出命中的净新增）；> 0 就返回 cow_blocks + new_blocks（**又换又增**）。上一节代码块里标了「只换不增 / 又换又增」的那两个 return，分的就是这个岔。**拍 5（过线）**：schedule() 收尾把 `_pending_cow_copies` 排干成 `KVCacheBlockCopy`（只带 src/dst 两个块号的轻量记录）塞进 SchedulerOutput，两端块挂保留引用、按围栏（fence，等某个序号到达才放行的同步屏障——这里是调度步序号 sched_step_seq）延迟释放：
 
 ```python
 # vllm/v1/core/sched/scheduler.py:L1181-L1190
@@ -1036,7 +1024,7 @@ docstring 就是账本：**两端都要活到 worker 拷完**。共享尾块 sou
 
 （cow 块对 worker 来说就是新块——`allocate_new_blocks` 前奏里 `self.new_block_ids.append(cow_block.block_id)` 那行把它记进了清零名单。）拷贝本体 `copy_kv_cache_blocks_inplace` 把每层存储视为 `[num_blocks, page_bytes]` 的字节矩阵，对每个 (src, dst) 对执行一句 `blocks[dst] = blocks[src]` 整页搬运（vllm/v1/worker/utils.py:L528-L567）。
 
-走读一个完整例对账（E4，代码走读推演——精简版删了 CoW 整段无法实跑，数字按上列锚点逐步推演；块大小 32、多组部署哈希粒度 16、prompt=36、命中到 token 16）：查得 1 块命中但只盖 16 token——16 % 32 ≠ 0，partial 成立，登记 (block_idx=0, blkX)；预测段 required = cdiv(36,32) = 2、local_computed = 1 → 新块 1，blkX 冷（ref_cnt==0）可驱逐 1，partial +1 → 总预测 3；分配侧 touch blkX（净减 1）+ 换尾取 1（净减 1）+ 差值 cdiv(36,32)−1 = 1 再取 1（净减 1）→ 自由队列净减 3 = 预测 3，预测器与分配器在这条支上同样同构；过线 [(blkX → cow)]，worker 先清零（cow 与新块）再整页拷 32 槽字节，随后 prefill 的 token 16..35 写进 cow 的槽 16..31 和新块的槽 0..3——共享方 blkX 后半截的陈旧字节永远不被读到。半块命中既省了显存又不出错，闭环就在这六拍里。
+走读一个完整例对账（E4，代码走读推演——精简版删了 CoW 整段无法实跑，数字按上列锚点逐步推演；块大小 32、多组部署哈希粒度 16、prompt=36、命中到 token 16）。**预测段**：查得 1 块命中但只盖 16 token，16 % 32 ≠ 0，partial 成立，登记 (block_idx=0, blkX)；required = cdiv(36,32) = 2、local_computed = 1 → 新块 1；blkX 冷（ref_cnt==0）可驱逐 1；partial +1 → 总预测 3。**分配侧**：touch blkX（净减 1）、换尾取 1（净减 1）、差值 cdiv(36,32)−1 = 1 再取 1（净减 1）→ 自由队列净减 3 = 预测 3，预测器与分配器在这条支上同样同构。**worker 侧**：过线 [(blkX → cow)]，先清零（cow 与新块）再整页拷 32 槽字节，随后 prefill 的 token 16..35 写进 cow 的槽 16..31 和新块的槽 0..3——共享方 blkX 后半截的陈旧字节永远不被读到。半块命中既省显存又不出错，闭环就在这六拍里。
 
 与 v0 经典 CoW 的对比，pin 里的官方文档一段话讲完（v0 引擎代码本体已随旧架构删除，只能引文档原话）：
 
@@ -1076,7 +1064,7 @@ lot of complex code for a very uncommon feature.
 
 ### 一拍两次 RPC：EngineCore 与 worker 的消息往返清单
 
-块表差量、清零名单、CoW 拷贝对——过线的每一维都拆过了，还剩最后一问：这些消息整体怎么发、谁收、什么时候发什么时候收。先交代**部署门**，它决定这一切是否存在：执行器后端 `distributed_executor_backend`——单卡默认 uni（UniProcExecutor，单进程执行器：worker 对象与调度器同住 EngineCore 进程，execute_model 是一次普通方法调用，零消息队列；本章精简版跑的就是这个形态）；多卡默认 mp（MultiprocExecutor，多进程执行器：每个 worker 起成子进程），一拍才有两次真正的跨进程往返。mp 下 EngineCore 进程每拍的骨架（[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)拆过它的两段契约与逐拍耗时，本章看消息流）：
+块表差量、清零名单、CoW 拷贝对——过线的每一维都拆过了，还剩最后一问：这些消息整体怎么发、谁收、什么时候发什么时候收。先交代部署形态，它决定这一切是否存在：执行器后端 `distributed_executor_backend`——单卡默认 uni（UniProcExecutor，单进程执行器：worker 对象与调度器同住 EngineCore 进程，execute_model 是一次普通方法调用，零消息队列；本章精简版跑的就是这个形态）；多卡默认 mp（MultiprocExecutor，多进程执行器：每个 worker 起成子进程）。只有 mp 下一拍才有两次真正的跨进程往返。mp 下 EngineCore 进程每拍的骨架（[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)拆过它的两段契约与逐拍耗时，本章看消息流）：
 
 ```python
 # vllm/v1/engine/core.py:L584-L614 · EngineCore.step
@@ -1113,9 +1101,9 @@ lot of complex code for a very uncommon feature.
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 ```
 
-（with 那两句是观测与错误归因的上下文管理器，与消息流无关，看中间五句即可。）五拍里藏着两次 RPC。**第一次**：`execute_model` 带着 SchedulerOutput 以 `non_block=True` 下发——消息投进队列立刻拿到 Future（异步调用凭证，先拿票、稍后凭票取结果）返回，EngineCore 不等，转身在 CPU 上算结构化输出的语法位掩码（grammar bitmask，标记每个位置语法上允许哪些 token 的 int32 大数组——它就是下面 16MiB/24MiB 那个尺寸故事的主角）；掩码算完才 `future.result()` 收第一次应答——应答内容是 None，含义不是出错，而是「**前向已 launch、采样等第二次 RPC**」（worker 侧状态机钉死：execute_model 暂存 `ExecuteModelState`（前向的 logits 等现场容器）返回 None，sample_tokens 入口 assert 它必须先发生；空批/池化模型会返回非 None 常量、第二次 RPC 整段跳过，[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)实测过这个分支）。None 到手后发起**第二次** RPC：`sample_tokens` 把掩码发下去，worker 解包现场、把掩码盖在 logits 上、采样、D2H、组装 ModelRunnerOutput 回程。两次 RPC 之间那段时间，CPU 掩码计算与消息在途、GPU 前向三方**重叠**——这就是把一步劈成两次 RPC 的全部意义：掩码必须在采样前、又不必在前向前，于是被摘出关键路径。
+（with 那两句是观测与错误归因的上下文管理器，与消息流无关，看中间五句即可。）这五句里藏着两次 RPC。**第一次**：`execute_model` 带着 SchedulerOutput 以 `non_block=True` 下发——消息投进队列立刻拿到 Future（异步调用凭证，先拿票、稍后凭票取结果）返回，EngineCore 不等，转身在 CPU 上算结构化输出的语法位掩码（grammar bitmask，标记每个位置语法上允许哪些 token 的 int32 大数组）；掩码算完才 `future.result()` 收第一次应答。应答内容是 None，含义不是出错，而是「**前向已 launch、采样等第二次 RPC**」（空批等会返回非 None、第二次 RPC 整段跳过的分支，[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)实测过）。None 到手后发起**第二次** RPC：`sample_tokens` 把掩码发下去，worker 把掩码盖在 logits 上、采样、D2H（GPU 到 CPU）、组装 ModelRunnerOutput 回程。两次 RPC 之间那段时间，CPU 掩码计算与消息在途、GPU 前向三方**重叠**——这就是把一步劈成两次 RPC 的全部意义：掩码必须在采样前、又不必在前向前，于是被摘出关键路径。
 
-通道长什么样。**下行一条广播 MQ**（`rpc_broadcast_mq`，广播消息队列：仅 DP 组（数据并行组，一个组一个引擎副本）leader 节点创建 `MessageQueue(world_size, local_world_size)`——vLLM 自带的共享内存环形缓冲消息队列，一次入队全体 worker 各读一份，队列句柄随进程创建传进每个子进程）；**上行每 worker 一条应答 MQ**（`worker_response_mq`，`MessageQueue(1, 1)`：worker 是写者、EngineCore 侧的执行器是唯一读者，句柄随 READY 报到信回传重建）。应答不是全员回：下行消息里带 `output_rank`（唯一回话的 worker 编号 = world_size − tp×pcp，最后一个流水级的首个张量并行 worker；TP=8、PP=4 时 world_size=32 → 24；pcp 是 prefill 段上下文并行的分片数、无分片时为 1），其余 worker 算完就扔。执行器侧每次调用造一个 FutureWrapper 压进 futures_queue，result() 按调用顺序先排干前面的应答——「哪次调用收哪条应答」靠这个先进先出配对。载体是 pickle 第 5 协议（大数组不拷进字节流、走带外的 out-of-band 缓冲，CPU 张量 ≥1MiB 触发）；总量超块上限（`VLLM_MQ_MAX_CHUNK_BYTES_MB`，16MiB）标记 overflow 改走 zmq 的 XPUB/SUB（发布/订阅套接字对——消息库 ZeroMQ 的广播模式，本地走 ipc:// 域套接字、远端走 tcp://）；MessageQueue 自身 24MiB 默认值的注释点名尺寸依据正是语法掩码（1024 个请求的批量）。环形缓冲怎么写怎么读、zmq 怎么接，传输层内景归[第 17 章](../../ch17-executor-worker-model-runner/narrative/chapter.md)。
+通道就两条。**下行一条广播 MQ**（`rpc_broadcast_mq`，广播消息队列）：EngineCore 一次入队，全体 worker 各读一份，实现是 vLLM 自带的共享内存环形缓冲消息队列。**上行每个 worker 一条应答 MQ**（`worker_response_mq`）：worker 是写者、EngineCore 是读者。应答不是全员回：下行消息里带 `output_rank`（唯一回话的 worker 编号，按 TP/PP（张量并行/流水线并行，多卡切模型的两刀）布局落在最后一个流水级的头上——TP=8、PP=4 的 32 卡部署里是 24 号；编号公式归[第 17 章](../../ch17-executor-worker-model-runner/narrative/chapter.md)），其余 worker 算完就扔。顺带一个尺寸彩蛋：MQ 24MiB 默认值的注释点名，尺寸依据正是那个语法掩码（1024 个请求的批量）。至于序列化载体（pickle 带外缓冲、超上限改走 zmq）和应答怎么按调用顺序配对，传输层内景归[第 17 章](../../ch17-executor-worker-model-runner/narrative/chapter.md)。
 
 传什么、收什么，SchedulerOutput 的字段注释自己说得很清楚：
 
@@ -1148,7 +1136,7 @@ class SchedulerOutput:
     scheduled_encoder_inputs: dict[str, list[int]]
 ```
 
-（最后两个字段：投机解码的草稿 token 名单、多模态编码器的输入索引，本章主路径恒空。）四条 ownership 事实把「消息里有什么」钉死。其一，**差量协议**：新请求首帧全量档案（含本章站 5 的首帧全量块表与 prompt token），老请求只发增量（new_block_ids、num_scheduled_tokens 等）。其二，**token 流向不对称**：prompt 只过线一次；decode 拍的采样 token 由 worker 自己采、经 `ModelRunnerOutput.sampled_token_ids` 只回程一次——调度器不把生成 token 发回去（例外：投机草稿随下行，就是上面 scheduled_spec_decode_tokens）。其三，**消息体里永远没有 GPU 张量**：ModelRunnerOutput 的类注释原话 serialized and sent to the scheduler process / expensive for torch.Tensor so prefer to use list（要序列化发给调度进程、张量太贵、刻意用 list）；输入张量同样不跨进程——worker 拿 block_id 加 num_scheduled_tokens 在本地重建（上一小节的块表先行拷贝是其中一环，重建内景在执行篇持久批次章）。block_id 是两个进程唯一的共同语言，这句话在 mp 部署下是字面成立的。其四，一个例外：配了 KV connector 时 output_rank 置 None、全 rank 各回一份、执行器收齐后聚合（账归[KVConnector 章（第 16 章）](../../ch16-kv-connector/narrative/chapter.md)）。
+（最后两个字段：投机解码的草稿 token 名单、多模态编码器的输入索引，本章主路径恒空。）四条 ownership 事实把「消息里有什么」钉死。其一，**差量协议**：新请求首帧全量档案（含本章站 5 的首帧全量块表与 prompt token），老请求只发增量（new_block_ids、num_scheduled_tokens 等）。其二，**token 流向不对称**：prompt 只过线一次；decode 拍的采样 token 由 worker 自己采、经 `ModelRunnerOutput.sampled_token_ids` 只回程一次——调度器不把生成 token 发回去（例外：投机草稿随下行，就是上面 scheduled_spec_decode_tokens）。其三，**消息体里永远没有 GPU 张量**：ModelRunnerOutput 的类注释明说「要序列化发给调度进程、torch.Tensor 太贵，刻意用 list」；输入张量同样不跨进程，worker 拿 block_id 加 num_scheduled_tokens 在本地重建（上一小节的块表先行拷贝是其中一环，重建内景归执行篇）。block_id 是两个进程唯一的共同语言，这句话在 mp 部署下是字面成立的。其四，一个例外：配了 KV connector 时 output_rank 置 None、全 rank 各回一份、执行器收齐后聚合（账归[KVConnector 章（第 16 章）](../../ch16-kv-connector/narrative/chapter.md)）。
 
 ![一拍两次 RPC：EngineCore 与 worker 的消息往返清单](../diagrams/ch13-fig-core-worker-rpc.png)
 
