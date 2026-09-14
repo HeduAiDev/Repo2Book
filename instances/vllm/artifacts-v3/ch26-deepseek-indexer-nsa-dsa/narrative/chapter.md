@@ -50,7 +50,7 @@ I_{t,s}=\sum_{j=1}^{H^{I}} w_{t,j}\cdot\mathrm{ReLU}\!\left(q_{t,j}^{\top}k_s\ri
 
 **为什么权重 $`w_{t,j}`$ 可正可负**。它由当前 hidden 线性投影而来，逐 token 变化。负权重的含义是「这个头此刻不可信，它的高分反而压低总分」——64 个头的贡献是可学习地加权，不是简单平均。
 
-**query 从哪来**。$`q_{t,j}`$ 不是从头算的：它从 MLA 的 1536 维 q_c 潜向量上投而来（`wq_b` 干的活）。V4 论文把这个共享写成了明话：主注意力的潜 query 向量与索引器的 query，用的是同一条低秩链的上投。也就是说索引器与主注意力共用同一个低秩瓶颈（[第 24 章](../../ch24-primer-attn-variants/narrative/chapter.md)的 q_c，[第 25 章](../../ch25-mla-two-expansions/narrative/chapter.md)站 9 算出它之后顺手交给 indexer）。它不是长在模型外面的外挂，是插在低秩链上的一根细支。
+**query 从哪来**。$`q_{t,j}`$ 不是从头算的：它从 MLA 的 1536 维 q_c 潜向量上投而来（`wq_b` 干的活）。V4 论文把这个共享写成了明话：主注意力的潜 query 向量，同时也是索引器 query 的上投起点——同一条低秩链，末端分出两支上投。也就是说索引器与主注意力共用同一个低秩瓶颈（[第 24 章](../../ch24-primer-attn-variants/narrative/chapter.md)的 q_c，[第 25 章](../../ch25-mla-two-expansions/narrative/chapter.md)站 9 算出它之后顺手交给 indexer）。它不是长在模型外面的外挂，是插在低秩链上的一根细支。
 
 选完之后主注意力只对赢家算（论文 Eq.(2)）：
 
