@@ -1,0 +1,348 @@
+{
+  "chapter_id": "ch28-deepseek-v4-assembly",
+  "chapter_title": "实战：DeepSeek-V4 拼装",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "kind": "code",
+  "trace_environment": "本章 capstone 代码章、无精简版（dossier subtraction_plan 明示 Implement/Test 站跳过）。5 个 worked example 全部 trace_source=run：host `python`（Miniconda 3.11.11, torch 2.11.0+cu128 纯 CPU, numpy 1.26.4）实跑 explainer/traces/ 下 5 个自包含驱动脚本，脚本从 pin 树逐字拷贝真源函数/映射表/判定条件并逐一标注出处（host 无 vLLM 包、无 CUDA、未进容器——vLLM 相关运行约束见 INSTANCE.md，但本批机制均为纯 torch/纯 python 数学与控制流，host 可忠实复现）。与 pin 真实运行环境的结构性差异（writer 需就近挑明）：①m04 数值取自树内纯 torch 参考实现 tests/kernels/test_mhc_kernels.py 的 mhc_pre_ref/mhc_post_ref/hc_head_ref——它们是 tilelang 生产核（vllm/model_executor/kernels/mhc/）的对拍基准（测试 atol 5e-2），教学口径=生产核的参考语义，生产核本体是 tilelang 生成核、Python 侧无实现；②m09 数值取自 XPU/CPU 回退实现 _topk_softplus_sqrt_torch（CUDA 生产走 ops.topk_hash_softplus_sqrt 自定义算子，同数学）；③m10 的 finalize 变换/对称缓冲需 SM100+deep_gemm，不在 host 复现范围，仅代码引用；④m11 惰性解析是 vllm_config 时序问题，仅代码引用；⑤真实 DSV4 config.json 不在 pin 树内——旗舰级数字只引树内锚点（indexer n_head=64/head_dim=128/q_lora_rank=1536 的注释、DSv4-Flash bias≈8.08 注释、hc_mult=4 测试基线、eval 部署参数 tests/evals/gsm8k/configs/moe-refactor/DeepSeek-V4-Flash-deepgemm-mega-moe.yaml），不自造旗舰维度。",
+  "figure_policy": "dossier needs_figure=true 八机制（m04/m05/m06/m08/m10/m13/m14/m16）各配 1 张 figure_spec。开篇 L2 章图由同批 l2-specs/ch28.json 走 gen_L2 另产（Illustrate 站），本文件 8 张全是 FIGURE-SYSTEM §3.3 的正文机制图——每张 spec 的 l0_zoom 字段显式回答「它是 L0 哪一块的放大」，统一锚点 = L0 中列『GPU 执行臂』（gpu_column，绿色 C_GPU_S）第三块『模型层 forward + 编译』里的 DeepseekV4DecoderLayer/Model 主干；m06 横跨到 L0 的 KV 池列（kv_column 青色），m14 延伸到采样列交界的 drafter 重绑点。机制图一律用 l0_common 配色常量（GPU 执行臂恒绿、KV 恒青），不引入第二种架构画法；架构性内容回指 L0/L2。worked example 数字全部出自 traces/（trace_source=run），源码常量数字标 file:Lxxx。",
+  "mechanisms": [
+    {
+      "mechanism_id": "ch28-m04",
+      "name": "mHC 多流残差：hc_pre/post 门控、融合单核、首层 broadcast 展开、hc_head 压回",
+      "intuition": "标准残差是「原稿加修订」一条道；mHC 把残差升级成 hc_mult 条并行草稿流——每半层一个调度核，按学来的门（post_mix 决定新产出往各流放多少）和一个 Sinkhorn 归一的流间搬运矩阵（res_mix，行列和≈1、不创造不销毁流量）重新调和全部草稿，走完全程再由 hc_head 把多份草稿加权定稿成一份。",
+      "worked_example": {
+        "params": {
+          "本例": "T=1 token, hc_mult=2, H=2（小到可手查形状）",
+          "超参": "sinkhorn_repeat=20、eps=1e-6 对齐树内测试取值（真实模型读 config.hc_sinkhorn_iters/hc_eps，pin 树无 DSV4 config.json）；hc_post_mult_value=2.0 用模型硬编码真值（vllm/models/deepseek_v4/nvidia/model.py:L852，测试里用 1.0）",
+          "占位": "注意力/FFN 两半的子层输出用固定占位值（mHC 混合不关心 x 从哪来；注意力本体归 ch25/26）",
+          "参数形状": "hc_attn_fn/hc_ffn_fn 各 (mix_hc, hc_dim)=((2+hc_mult)·hc_mult, hc_mult·H)=(8,4)，hc_attn/ffn_base (8,)，hc_attn/ffn_scale (3,)，hc_head_fn (hc_mult, hc_dim)=(2,4)，hc_head_base (2,)，hc_head_scale (1,)——model.py:L849-L897、L1076-L1094",
+          "数学真源": "tests/kernels/test_mhc_kernels.py:L14-L90 的 mhc_pre_ref/mhc_post_ref/hc_head_ref（tilelang 生产核的对拍基准，逐字拷贝实跑）"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/ch28_m04_mhc_shape_math.json",
+        "table": {
+          "columns": ["站", "动作", "形状变化", "关键数值(实跑)"],
+          "rows": [
+            ["1", "首层 mhc_pre(broadcast)：2D 按流展开+pre 门控", "x0(1,2) → residual(1,2,2)+post_mix(1,2,1)+res_mix(1,2,2)+layer_input(1,2)", "post_mix=[1.3667,1.3345]，layer_input=[1.2422,2.4844]，res_mix=[[0.5056,0.4944],[0.4944,0.5056]]"],
+            ["2", "注意力半层（占位输出，本体归 ch25/26）", "(1,2) → (1,2)", "x_attn=[0.6016,-0.3008]"],
+            ["3", "融合核 post+pre（FFN 半）：mhc_post 再 mhc_pre 一核完成", "4 元组 → 4 元组", "residual→[[1.8203,1.5859],[1.8047,1.6016]]，layer_input=[2.2812,2.0]"],
+            ["4", "FFN/MoE 半层（占位输出）", "(1,2) → (1,2)", "x_ffn=[0.4004,0.8984]"],
+            ["5", "层尾 mhc_post：塌回多流残差", "(1,2)+三件套 → (1,2,2)", "residual_out=[[2.3438,2.7969],[2.3281,2.7656]]"],
+            ["6", "_mtp_hidden_buffer.copy_(flatten(1))：先于 hc_head 暂存", "(1,2,2) → (1,4)", "flat=[2.3438,2.7969,2.3281,2.7656]"],
+            ["7", "hc_head：加权压回单流", "(1,2,2) → (1,2)", "hidden_out=[2.7188,3.25]"],
+            ["附", "Sinkhorn 收敛（res_mix 行和偏差）", "repeat=1 → repeat=2 即收敛", "0.000247 → 1e-06"],
+            ["附", "首层 broadcast 可预折验证", "fn 沿流维求和后直接算 mixes ≡ 先展开再乘 fn", "allclose=true，最大差 1.2e-07"]
+          ]
+        },
+        "table_note": "数值=bfloat16 存储后的实跑值（参考实现按生产语义 .bfloat16() 落盘，0.6 显示为 0.6016——bf16 只有 8 位尾数）。生产核为 tilelang 生成核（mhc_fused_post_pre_tilelang 等，vllm/model_executor/kernels/mhc/tilelang.py:L410-L461），本表数值=树内对拍基准参考实现的输出；预折验证对应 finalize_mhc_broadcast_weights（model.py:L1371-L1380：fn.view(-1,hc_mult,H).sum(1)，2D 输入各流相同故可沿流维预折）。全部数值=traces/ch28_m04_mhc_shape_math.json 原样。"
+      },
+      "invariant": {
+        "claim": "全干形状不变量：每半层输出恒为 4 元组 (x, residual, post_mix, res_mix) 且三件套形状不变——residual (T,hc_mult,H)、post_mix (T,hc_mult,1)、res_mix (T,hc_mult,hc_mult)，子层接口恒 2D (T,H)；hc_head 是唯一收敛算子，把 (T,hc_mult,H) 一步压回 (T,H)。",
+        "argument": "mhc_post 的两项 x·post_mix（post_mix 沿 H 广播）与 comb_res_mixᵀ·residual（bmm 保形）形状均为 (T,hc_mult,H)；mhc_pre 的三件套由 mixes 的固定切片 [0:hc]/[hc:2hc]/[2hc:] 重塑而来，形状由 hc_mult 唯一决定。归纳：首层 broadcast 把 2D 展开成多流（基例），此后每半层调用一次融合核，4 元组进 4 元组出（归纳步）。终止：层尾 mhc_post 塌回 (T,hc_mult,H)，hc_head 对流维加权求和（dim=-2）得 (T,H)。附：res_mix 经 Sinkhorn 归一逼近双随机矩阵——本例 repeat=1 行和偏差 0.000247、repeat=2 起到 1e-06，「搬运矩阵不创造不销毁流量」的数值形态。"
+      },
+      "quantified": "参数账（hc_mult=4 为树内测试基线，tests/kernels/test_mhc_kernels.py:L99/L143/L187 parametrize [4]）：每层 hc_attn_fn/hc_ffn_fn 各 ((2+4)·4)×(4·H)=24×4H fp32——以测试 hidden_size=7168 计约 24×28672×4B≈2.75 MB/方向、双半层约 5.5 MB/层，另加 base/scale 小参数与 hc_head_fn (4,4H)；PP 载荷放大 hc_mult 倍：中间张量 (T,4,7168) bf16 = T×57344 B vs 单流 T×14336 B（make_empty_intermediate_tensors 注释 model.py:L1117-L1129）。对照 Llama 基线（ch23）：add-norm 残差参数 0、中间张量单流——这是「学习式混合」的价签。"
+      ,
+      "figure_specs": [
+        {
+          "figure_id": "ch28-fig-mhc-residual-journey",
+          "template": "tensor-flow",
+          "l0_zoom": "放大 L0 中列『GPU 执行臂』（gpu_column，绿 C_GPU_S）第三块『模型层 forward + 编译』里的 DecoderLayer 残差通道——ch23 的 LlamaDecoderLayer 在同一位置画的是 RMSNorm→attn→add；m04 把这一条道展开成 hc_mult 条流的穿针图（本章 L2 站 11 的机制版下钻）。",
+          "claim": "一个 token 的 hidden 在 DSV4 主干里是「2D 只在子层接口存在、多流活在层间残差」的旅程：embed 2D → 首层核内 broadcast 展开 hc_mult 流 → 4 元组 (x,residual,post_mix,res_mix) 逐层穿针（每半层一个融合核 post+pre+RMSNorm）→ 层尾 mhc_post 塌回 3D 先喂 _mtp_hidden_buffer 再 hc_head 压回 2D。",
+          "numbers": [
+            {"value": "旅程各站形状：x(1,2)→residual(1,2,2)+post_mix(1,2,1)+res_mix(1,2,2)→…→(1,2,2)→flat(1,4)→(1,2)；hidden_out=[2.7188,3.25]", "provenance": "traces/ch28_m04_mhc_shape_math.json journey"},
+            {"value": "hc 参数形状：hc_attn_fn/hc_ffn_fn (mix_hc,hc_dim)=((2+hc_mult)·hc_mult, hc_mult·H)=(8,4)本例/(24,4H)hc_mult=4；hc_head_fn (hc_mult,hc_dim)", "provenance": "vllm/models/deepseek_v4/nvidia/model.py:L849-L897、L1076-L1094"},
+            {"value": "Sinkhorn 收敛：行和偏差 0.000247(repeat=1)→1e-06(repeat≥2)", "provenance": "traces/ch28_m04_mhc_shape_math.json sinkhorn_convergence"},
+            {"value": "首层 broadcast 预折等价：allclose=true，最大差 1.2e-07", "provenance": "traces/ch28_m04_mhc_shape_math.json broadcast_prefold_check + model.py:L1371-L1380"},
+            {"value": "hc_post_mult_value=2.0（硬编码）；hc_mult=4 测试基线", "provenance": "vllm/models/deepseek_v4/nvidia/model.py:L852；tests/kernels/test_mhc_kernels.py:L99"},
+            {"value": "数学参考实现=生产 tilelang 核的对拍基准（atol 5e-2）", "provenance": "tests/kernels/test_mhc_kernels.py:L14-L90、L182-L186"}
+          ],
+          "caption_draft": "多流残差的主视图：DSV4 的 hidden_states 在子层之间永远是 2D，但「身份」活在 residual 的 hc_mult 条流里——每半层融合核用 post_mix 收纳子层新产出、用 Sinkhorn 双随机的 res_mix 在流间搬运，层尾 mhc_post 塌回 3D 后先分叉给 MTP（pre-hc_head 残差）再由 hc_head 定稿回单流。图上数值为 hc_mult=2、H=2 的实跑 trace；hc_mult=4 时三件套形状同构放大。",
+          "illustrator_notes": "横向 tensor-flow：顶行 2D x 轨道（子层接口），中行三件套轨道（residual 多条带=hc_mult 条流、post_mix 每流一格、res_mix 画 hc_mult×hc_mult 小方阵），每半层一个融合核方块（post+pre 融一核，RMSNorm weight/eps 进核——不再画独立 norm 层）；层尾画分叉：一条旁路 copy_ 进 _mtp_hidden_buffer（虚线，标 pre-hc_head），主路 hc_head→norm。数字全取 traces/ch28_m04_mhc_shape_math.json；配色 l0_common（GPU 执行臂绿系+中性刻度）；不画注意力/MoE 内部（占位框即可，标『归 ch25/26/站 13』）。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "ch28-m05",
+      "name": "第三代 MLA 装配：replicated 低秩瓶颈 + 双 rmsnorm + 输出侧低秩两段 + attn_sink 垫 -inf",
+      "intuition": "V4 注意力层的投影链是「两头低秩、中间平台核」：输入侧 fused_wqa_wkv 一枪出 q_lora+kv 潜向量（低秩瓶颈不切 TP、每卡全量复制——瓶颈瘦到切不动），中间交给平台核 forward_mqa，输出侧再走一段低秩 wo_a→wo_b（先按组压到 o_lora_rank 再回 hidden）——比 V3.2 多收了输出侧的低秩税，换来 attn_sink（逐头 -inf 垫位）这样的平台核自由度。",
+      "figure_specs": [
+        {
+          "figure_id": "ch28-fig-mla-gen3-projections",
+          "template": "flow",
+          "l0_zoom": "放大 L0 gpu_column『模型层 forward + 编译』块里 DecoderLayer 的注意力半层投影链（ch25 讲核内两种展开、本章讲装配侧数据流；L2 站 6/12 的机制版下钻）。",
+          "claim": "第三代 MLA 的模型侧装配是一条低秩进低秩出的数据流：fused_wqa_wkv（disable_tp=True 复制不切）一枪出 q_lora_rank+head_dim → split 后 fused_q_kv_rmsnorm 双归一 → wq_b 上投进 eager break（平台核 forward_mqa 写入 padded_heads 预分配缓冲）→ 输出切片真头数 → 逆 RoPE+FP8 量化 → fp8_einsum('bhr,hdr->bhd', wo_a) 按组低秩 → wo_b 回 hidden。",
+          "numbers": [
+            {"value": "fused_wqa_wkv=MergedColumnParallelLinear([q_lora_rank, head_dim], disable_tp=True)——『fused ReplicatedLinear』注释原文", "provenance": "vllm/models/deepseek_v4/attention.py:L229-L239"},
+            {"value": "head_dim=512、rope_head_dim=config.qk_rope_head_dim、n_groups=config.o_groups；wo_a: n_heads·head_dim/n_groups → n_groups·o_lora_rank（bmm 视图）；wo_b: n_groups·o_lora_rank → hidden", "provenance": "vllm/models/deepseek_v4/attention.py:L200-L262"},
+            {"value": "attn_sink 按 padded_heads 填 -float('inf') 初始化（装载只填前 n_local_heads 槽）", "provenance": "vllm/models/deepseek_v4/attention.py:L222-L228"},
+            {"value": "Q 头数垫到 64/128（'FP8 decode kernel only supports h_q = 64 or 128'）", "provenance": "vllm/models/deepseek_v4/nvidia/flashmla.py:L62-L67"},
+            {"value": "输出投影链：fused_inv_rope_fp8_quant → fp8_einsum('bhr,hdr->bhd') → wo_b；SM90/SM100 scale 布局由 compute_fp8_einsum_recipe 分派", "provenance": "vllm/models/deepseek_v4/nvidia/ops/o_proj.py:L13-L73"},
+            {"value": "主 KV 账 584B/token（fp8_ds_mla uint8，alignment 576）", "provenance": "vllm/v1/kv_cache_interface.py:L409-L413；attention.py:L655-L674"},
+            {"value": "eager break 边界：@eager_break_during_capture 挂在 attention_impl（metadata 相关段）", "provenance": "vllm/models/deepseek_v4/attention.py:L461-L540"}
+          ],
+          "caption_draft": "注意力插座的旗舰版接线图：与 ch25 的 V3.2 外层低秩链同构（fused_qkv_a_proj↔fused_wqa_wkv），但 V4 把低秩做到两头——输入瓶颈复制不切 TP，输出还要逆 RoPE+FP8 einsum 走 wo_a/wo_b 两段；attn_sink 按 padded_heads 垫 -inf、输出缓冲也按 padded 预分配，都是「平台核要求什么、装配层就长什么样」的实证（核内数学回指 ch25/26）。",
+          "illustrator_notes": "单层横向 flow：hidden →[fused_wqa_wkv（标 disable_tp=True 复制）]→ split(q_lora|kv) →[fused_q_kv_rmsnorm]→ wq_b → ‖eager break 虚线框（indexer/compressor 两支淡化标『归 ch26』+forward_mqa 平台核框）‖ → o(padded 64/128，attn_sink -inf 标注) → 逆RoPE+fp8 → wo_a（n_groups×o_lora 低秩）→ wo_b → hidden。投影框标 file:line；不展开核内（框内只写算子名）。配色 l0_common。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "ch28-m06",
+      "name": "一层四本 KV 账：主 MLA 584B/token / IndexerCache / CompressorStateCache / SWACache",
+      "intuition": "别的模型一层一本 KV 账，V4 一个注意力层开四本：主 MLA 账（潜向量按 fp8_ds_mla 存 584B/token）、稀疏索引账（indexer 的 FP4 打分缓存 68B/条）、压缩机状态账（fp32 部分和）、滑窗账（SWA 短窗副本）——四本各有 prefix、各自注册 static_forward_context、各有 builder，账本怎么分组全由模型层 spec 自报。",
+      "figure_specs": [
+        {
+          "figure_id": "ch28-fig-four-kv-ledgers",
+          "template": "layout",
+          "l0_zoom": "放大 L0 的 KV 池列（kv_column，青 C_KV_S）与 gpu_column 交界——ch14/ch25 立的『KV 账本按 spec 分组』机制在 V4 推到一层×4 的极致形态（L2 下排『四本 KV 账』注的机制版下钻）。",
+          "claim": "一个 V4 注意力层最多同时开四本 KV 账——主 MLA（MLAAttentionSpec：fp8_ds_mla uint8、584B/token、alignment 576、storage_block=block_size//compress_ratio）、IndexerCache（68B/条 FP4=64 打包值+4 UE8M0 或 132B FP8）、CompressorStateCache（fp32 状态、块 4/8）、SWACache（块 64）——后三本的块大小都被『与 KV 块共享物理张量』的页对齐约束锁死。",
+          "numbers": [
+            {"value": "主 MLA：584B/token = 448B NoPE + 128B RoPE + 8B fp8 scale；real_page_size_bytes=storage_block_size×584；alignment 576（fp8_ds_mla）/512（plain）", "provenance": "vllm/v1/kv_cache_interface.py:L409-L424；vllm/models/deepseek_v4/attention.py:L655-L674"},
+            {"value": "IndexerCache：FP4 68B/条 = head_dim/2=64 打包 + head_dim/32=4 UE8M0（MXFP4_BLOCK_SIZE=32）；FP8 132B/条 = 128 fp8 + 4 fp32 scale；alignment 576（FlashMLA）/512（FlashInfer #44577）", "provenance": "vllm/models/deepseek_v4/attention.py:L782-L810"},
+            {"value": "CompressorStateCache：fp32 状态、compress_ratio∈{4,128} 断言、block_size=4（C4）/8（C128）——注释原话：与 KV 块共享同一物理张量、必须同页大小（KV 块形状 [256//4, head_dim]=[64,584] 定死）", "provenance": "vllm/models/deepseek_v4/compressor.py:L155-L203"},
+            {"value": "SWACache：block_size=64（同一页对齐约束：与 C4A KV 块共享物理张量）；dtype uint8(fp8_ds_mla)/bf16/fp8e4m3 三布局", "provenance": "vllm/v1/attention/backends/mla/sparse_swa.py:L56-L96"},
+            {"value": "部署真值：block-size 256 + kv-cache-dtype fp8 + use_fp4_indexer_cache=True（DeepSeek-V4-Flash eval 配置）→ storage_block=256//4=64", "provenance": "tests/evals/gsm8k/configs/moe-refactor/DeepSeek-V4-Flash-deepgemm-mega-moe.yaml"},
+            {"value": "compress_ratio 逐层表：∈{1,4,128} 三类层；<=1 的层主账返回 None（滑窗账另开）", "provenance": "vllm/models/deepseek_v4/attention.py:L207-L213、L656-L659"}
+          ],
+          "caption_draft": "四本账的解剖图：主 MLA 账一条 584B/token 的潜向量（448+128+8），IndexerCache 一条 68B 的 FP4 打分缓存，CompressorStateCache 一格 fp32 部分和（块 4/8），SWACache 一格短窗副本（块 64）——后三本的页大小不是自己选的，是『与 KV 块共享物理张量』的页对齐约束定的；spec 自报→账本分组的机制（ch25 站 6）在旗舰上变成一层的四重奏。",
+          "illustrator_notes": "layout 模板：一个注意力层框内画四条并排的『账本条』（每条一个横条分格标字节构成，如 584=448|128|8 三段着色）；每条下方小字标 spec 类型/块大小/页对齐约束来源；compress_ratio 1/4/128 三类层用一个 3 行小表说明哪类层开哪几本（C4A 四本全开、C128 三本、SWA-only 一本）。数字全带 file:L 出处；KV 相关恒用 C_KV_S 青系。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "ch28-m08",
+      "name": "MoE 装配：gate 三模式（sqrtsoftplus/noaux_tc/hash）+ shared_experts + 双后端二岔",
+      "intuition": "MoE 层像一栋楼：gate 是前台打分员（fp32 出分、选 top-k），专家是楼层——同一份前台名单后面可接两种完全不同的楼：MegaMoE 专属大厦（只收 FP4+EP+sqrtsoftplus 租客，一步直达 deep_gemm 单算子）或通用 FusedMoE 商场（什么精度都收、走 TP）；前 num_hash_layers 层的前台干脆不打分，按 token 身份证查表派单（tid2eid）。",
+      "worked_example": {
+        "params": {
+          "本例": "E=4 专家 top-2、num_hash_layers=1、EP world=2（num_local=2）、H=I=128、玩具 vocab=16",
+          "形状来源": "H=128/I=128/E=4/local=2 取自树内真实测试构造 tests/models/test_deepseek_v4_mega_moe.py:L58-L67",
+          "判定条件": "逐字复刻 vllm/models/deepseek_v4/nvidia/model.py:L530-L613（三条 NotImplementedError 消息原文）与 L805-L813（_use_sequence_parallel 四条件合取）",
+          "旋钮": "kernel_config.moe_backend（vllm/config/kernel.py:L121-L131 合法值表、L191 默认 'auto'）"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/ch28_m08_moe_assembly_branch.json",
+        "table": {
+          "columns": ["场景", "输入条件", "装配判定", "建出的参数(形状)", "后端/报错"],
+          "rows": [
+            ["S1 层0(hash层)", "moe_backend=deep_gemm_mega_moe，EP=on", "is_hash_moe=true → tid2eid；dtype=int64", "tid2eid(16,2) int64；gate(128,4) fp32", "MegaMoE(EP)：w13(2,256,64) uint8 + scale(2,256,4)；shared reduce_results=true"],
+            ["S2 层1", "同上", "noaux_tc → e_score_correction_bias", "bias(4,) fp32；gate(128,4) fp32", "同 MegaMoE(EP)"],
+            ["S3 层1", "moe_backend=auto", "use_mega_moe=false", "bias(4,) fp32；tid2eid 不建", "FusedMoE 工厂(TP)；shared reduce_results=false"],
+            ["S4", "mega=on 但 EP=off", "NotImplementedError", "—", "消息原文：requires expert parallel. Enable it with --enable-expert-parallel, or pick a different moe backend."],
+            ["S5", "mega=on 但 scoring=softmax", "NotImplementedError", "—", "消息原文：currently supports sqrtsoftplus routing only."],
+            ["S6", "mega=on 但 expert_dtype=fp8", "NotImplementedError", "—", "消息原文：only supports fp4 experts… Drop --kernel-config moe_backend=deep_gemm_mega_moe for this checkpoint."],
+            ["SP门", "pp=1∧EP∧tp=2∧mega", "use_sequence_parallel=true", "tp=1→false；pp=2→false；dp=2+auto→true", "attn 段 sp_all_gather/sp_reduce_scatter 包裹（SP 原理深讲归分布式章）"]
+          ]
+        },
+        "table_note": "tid2eid 本例用 randint 示形——真实模型从 checkpoint 装载训练好的表，randint 只是 dummy 模式（--load-format=dummy）的防 garbage 初始化（model.py:L575-L581 注释原话）。三条报错都是 fail-fast 不静默降级、消息自带修法提示。全部形状/判定=traces/ch28_m08_moe_assembly_branch.json 原样。"
+      },
+      "invariant": {
+        "claim": "装配期穷举不变量：每个 MoE 层恰好建 1 个 gate、0 或 1 个路由附件（tid2eid 与 e_score_correction_bias 由 if/elif 互斥）、恰好 1 个专家后端（mega xor fused）、0 或 1 个 shared_experts；use_mega_moe 一旦成立， EP/sqrtsoftplus/fp4 三前置必须全真，否则在建专家之前当场 NotImplementedError。",
+        "argument": "构造代码是线性 if 链：is_hash_moe（layer_idx<num_hash_layers）→ tid2eid，elif topk_method=='noaux_tc' → bias，else 不挂附件——两分支互斥由 elif 结构保证；use_mega_moe 是布尔二值，_init_mega_moe_experts 与 _init_fused_moe_experts 恰走一支；三条 raise 位于任何专家参数分配之前（L536-L561），失败时零参数落地。SP 门是四条件合取，本例四 case 数值验证（A=true/B tp=1 false/C dp=2 true/D pp=2 false）。"
+      },
+      "quantified": "真旗舰部署形态（树内 eval 配置）：DeepSeek-V4-Flash 以 --moe-backend deep_gemm_mega_moe + --enable-expert-parallel + TP=2 + MTP 2 token 跑 GSM8K（tests/evals/gsm8k/configs/moe-refactor/DeepSeek-V4-Flash-deepgemm-mega-moe.yaml）——mega 三重限定全部满足的活体。路由开销账：gate GEMM=H×E fp32 出（GateLinear 六级分派，vllm/model_executor/layers/fused_moe/router/gate_linear.py:L18-L48），本例 128×4；路由测试参数化到 num_experts 512/topk 16（tests/kernels/moe/test_topk_softplus_sqrt.py:L83-L84）——旗舰 E 数百时 gate 输出 [T,E] fp32 也进显存账。hash 层免 topk 但 gate 仍算（权重要分数，见 m09 案例C）。",
+      "figure_specs": [
+        {
+          "figure_id": "ch28-fig-moe-dual-backend",
+          "template": "flow",
+          "l0_zoom": "放大 L0 gpu_column『模型层 forward + 编译』块里 DecoderLayer 的 FFN 半层（ch23 同位置是 dense SwiGLU MLP；L2 站 7/13 的机制版下钻）。",
+          "claim": "同一份 gate/路由代码后面是两个完全不同的专家后端：mega 路 gate→fused_topk_bias→experts(topk_weights/ids, activation_clamp=swiglu_limit)→shared 外部相加（reduce_results=use_mega_moe 免 all_reduce）；fused 路 is_internal_router 时 router 进 MoERunner 内部（hidden 直喂）、否则外部 gate 先算再进 FusedMoE（shared 聚合在内部）——分岔权在 kernel_config.moe_backend 装配期一次定死。",
+          "numbers": [
+            {"value": "use_mega_moe=(kernel_config.moe_backend=='deep_gemm_mega_moe')；三条前置：EP 强制/sqrtsoftplus-only/fp4-only（NotImplementedError 带修法提示）", "provenance": "vllm/models/deepseek_v4/nvidia/model.py:L533-L561"},
+            {"value": "mega 专家字节形状 w13(2,256,64)uint8+scale(2,256,4)——E_local=2/H=I=128 测试构造", "provenance": "traces/ch28_m08_moe_assembly_branch.json S1 + tests/models/test_deepseek_v4_mega_moe.py:L58-L67"},
+            {"value": "hash 层 tid2eid(16,2) int64（mega）/int32（fused）；noaux_tc 层 bias(4,) fp32", "provenance": "traces/ch28_m08_moe_assembly_branch.json S1/S2 + model.py:L569-L593"},
+            {"value": "mega 前向一算子：deep_gemm.fp8_fp4_mega_moe(y, l1, l2, symm_buffer, activation_clamp, fast_math)；对称缓冲按 7 元组键跨层复用", "provenance": "vllm/models/deepseek_v4/nvidia/model.py:L439-L512、L364-L391"},
+            {"value": "fused 路 is_internal_router 分岔：MoERunner 内置 router vs 外部 gate；shared 聚合位置两路相反", "provenance": "vllm/models/deepseek_v4/nvidia/model.py:L745-L764"},
+            {"value": "部署真值：--moe-backend deep_gemm_mega_moe + EP + TP=2（DeepSeek-V4-Flash eval）", "provenance": "tests/evals/gsm8k/configs/moe-refactor/DeepSeek-V4-Flash-deepgemm-mega-moe.yaml"}
+          ],
+          "caption_draft": "MoE 装配/一拍二合一数据流：gate（fp32）打分交给 fused_topk_bias（sqrtsoftplus 三分离见 m09），随后分岔——mega 路进 EP 单算子专家（FP4 字节布局+对称缓冲+finalize 变换），shared_experts 在外部相加且 reduce_results=use_mega_moe；fused 路进通用 FusedMoE 工厂（TP 切），shared 聚合在内部。一个旋钮（moe_backend）装配期定终身，三条 NotImplementedError 是这道门的守卫。",
+          "illustrator_notes": "上半画 gate→fused_topk_bias 公共段，下半左右分岔两路专家框（mega 左：fp4 uint8 字节参数+symm buffer+单算子；fused 右：FusedMoE 工厂+TP 切），shared_experts 的相加位置在两路画在不同侧（外部 vs 内部）；hash 层用一个小旁路标『ids 查表免打分』。配色 l0_common，专家框 plain、gate 框 GPU 绿系。file:line 全标。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "ch28-m09",
+      "name": "sqrtsoftplus 路由：scores=sqrt(softplus(g))、bias 只影响选择、hash 查表免打分",
+      "intuition": "路由三分离像招聘：gate 打分（softplus 开平方，恒非负），选择用「分数+bias」排序——偏置只决定谁入围、不决定工资，工资按无偏分数发（再归一化、乘 scaling）；hash 层是内推：岗位由 token 身份证查表定死，分数只用来定工资。",
+      "worked_example": {
+        "params": {
+          "本例": "E=4 专家 top-2、2 token、renormalize=true、routed_scaling_factor=1.5（取自 tests/kernels/moe/test_topk_softplus_sqrt.py:L90 参数化 [1.0,1.5]；模型默认 1.0，model.py:L543）",
+          "bias": "[0,0.3,0,0] 本例自选——故意让 token0 的选择被 bias 翻转（非平凡分支）；DSv4-Flash 真机 bias≈8.08 近均匀（fused_topk_bias_router.py:L101-L104 注释实证：偏置当权重会把分布压平）",
+          "hash 表": "tid2eid[7]=[3,2]、tid2eid[3]=[0,2]（本例固定表；真实模型从 checkpoint 装载，dummy 模式才 randint）",
+          "数学真源": "_topk_softplus_sqrt_torch 逐字拷贝自 vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py:L75-L119（XPU/CPU 回退实现；CUDA 生产走 ops.topk_hash_softplus_sqrt，同数学）"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/ch28_m09_sqrtsoftplus_routing.json",
+        "table": {
+          "columns": ["token/案例", "scores=sqrt(softplus(g))", "选择(ids)", "无bias会选", "权重(无偏gather→归一→×1.5)", "判定"],
+          "rows": [
+            ["A·token0（带bias）", "[1.2097,0.9243,0.6885,1.4584]", "[3,1]", "[3,0]", "[0.9181,0.5819]", "bias=0.3 把 e0 顶掉换 e1 入围（选择翻转）"],
+            ["A·token1（带bias）", "[0.8628,1.4281,0.9555,0.5597]", "[1,2]", "[1,2]", "[0.8987,0.6013]", "边距大，bias 翻不动（对照）"],
+            ["B·token0（无bias基线）", "[1.2097,0.9243,0.6885,1.4584]", "[3,0]", "[3,0]", "[0.8199,0.6801]", "无偏基线"],
+            ["C·token7（hash层）", "同 token0 分数", "[3,2]", "[3,0]", "[1.0189,0.4811]", "ids 查表定死（表含 e2 不含 e0），分数只算权重"],
+            ["C·token3（hash层）", "同 token1 分数", "[0,2]", "[1,2]", "[0.7117,0.7883]", "e0 分低仍被表选中——hash 不看分"]
+          ]
+        },
+        "table_note": "手算复核（标准库 log1p(exp) 与 torch 对拍）在 trace hand_check：softplus(2.0)=2.126928→sqrt=1.458399、softplus(-0.5)=0.474077→sqrt=0.688532——负 gate 也有非零分。表中五行（A 两行、B 一行、C 两行）weights 求和恒 1.5=routed_scaling_factor（renormalize 的不变量实测）。全部数值=traces/ch28_m09_sqrtsoftplus_routing.json 原样。"
+      },
+      "invariant": {
+        "claim": "renormalize=true 时对任意 token：sum(topk_weights)≡routed_scaling_factor（本例恒 1.5，表中五行实测全部 1.5）；权重恒非负且与 e_score_correction_bias 无关、与 hash 表无关——「选择」与「加权」分离。",
+        "argument": "softplus(g)∈(0,∞) 对任意实数 g 成立 ⇒ sqrt 后仍非负；weights 从无偏 scores gather（代码路径里 gather 的索引是 ids，源是无偏 scores 张量），归一化除以自身和 ⇒ 和为 1，乘 scaling ⇒ 和恒等于 scaling。bias 只进 scores_for_choice 的 topk 比较、hash 表只覆写 ids——两者都不触及权重来源，路径分离即证明；数值上表中五行 sum 全部=1.5。"
+      },
+      "quantified": "分数域的形状：softplus 把任意实数 gate 映到 (0,∞)（softplus(2.0)=2.126928、softplus(-0.5)=0.474077——负分不死，只是分低），sqrt 再压动态范围（2.126928→1.458399，压缩比约 1.46；0.474077→0.688532，反而抬高——越小的分被相对放大，分布更平）。手算对拍与 torch 完全一致（trace hand_check）。DSv4-Flash 真机全部 bias≈8.08 近均匀——「bias 只影响选择不影响权重」的设计正是为了让这种量级的偏置可以大胆调选择而不压平权重分布（fused_topk_bias_router.py:L101-L104 注释原话的实证背景）。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "ch28-m10",
+      "name": "MegaMoE 专家：FP4 字节布局 + finalize 变换 + 对称缓冲 + 单算子前向",
+      "intuition": "FP4 权重像「两人合租一个字节」：两个 4 位房间挤进一个 uint8；每 32 个值配一位只会说 2 的幂的管理员（UE8M0 尺度字节，2^(b-127)）；装载时管理员工牌必须按字节原样搬运——数值换算（copy_）会把 2^-7 的工牌直接抹成 0。",
+      "worked_example": {
+        "params": {
+          "本例": "E_local=2、H=128、I=128（E_total=4、EP world=2）——取自树内真实测试构造 tests/models/test_deepseek_v4_mega_moe.py:L58-L67",
+          "形状真源": "vllm/models/deepseek_v4/nvidia/model.py:L202-L246 verbatim：w13=[E_local,2I,H//2] uint8、w13_scale=[E_local,2I,H//32] uint8（quant_method='block'）、w2 同构",
+          "解码真源": "_ue8m0_uint8_to_float=(sf.to(int32)<<23).view(float32) 逐字拷贝自 model.py:L310-L312；树内测试断言 [0,126,127,128]→[0.0,0.5,1.0,2.0]（tests/models/test_deepseek_v4_mega_moe.py:L43-L54），本脚本复跑对拍",
+          "copy_ 破坏": "model.py:L1268-L1279 注释原文的实机复现（host torch 2.11 有 float8_e8m0fnu dtype）"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/ch28_m10_megamoe_fp4_bytes.json",
+        "table": {
+          "columns": ["条目", "形状(uint8)", "字节", "对照/语义"],
+          "rows": [
+            ["w13_weight", "[2,256,64]", "32768", "两个 fp4 打包一字节（H//2 列）"],
+            ["w13_weight_scale", "[2,256,4]", "2048", "每 32 值一个 UE8M0 字节（H//32 列）"],
+            ["w2_weight", "[2,128,64]", "16384", "同构（I//2 列）"],
+            ["w2_weight_scale", "[2,128,4]", "1024", "同构（I//32 列）"],
+            ["合计", "—", "52224", "bf16 同逻辑权重 196608 → 压缩 3.7647×；尺度开销占比 0.0588"],
+            ["UE8M0 解码", "bytes [0,120,126,127,128]", "—", "→[0.0,0.0078125,0.5,1.0,2.0]；树内测试 [0,126,127,128]→[0.0,0.5,1.0,2.0] 对拍通过"],
+            ["copy_ 破坏现场", "值 0.0078125（byte 120）", "—", "数值 copy_ → uint8 得 0；.view(uint8) 保住原始字节 120（对照值 1.0/8.0 → 数值 copy 得 1/8 无损，只有小于 uint8 量化步长的尺度死）"]
+          ]
+        },
+        "table_note": "字节账恒等式：每专家 w13 = 2I·(H/2) + 2I·(H/32) = 16384+1024（本例），每值成本 0.53125B=1/2+1/32。finalize_weights（model.py:L324-L362）变换成 DeepGEMM 布局后把四个原参数全部置 None（需 SM100+deep_gemm，不在 host 复现范围——代码引用）；对称缓冲按 7 元组键 (group,device,E,max_tokens,topk,H,I) 跨层复用（L364-L391）。全部数值=traces/ch28_m10_megamoe_fp4_bytes.json 原样。"
+      },
+      "invariant": {
+        "claim": "字节账恒等式：FP4 块量化的每值存储成本恒为 1/2+1/32=0.53125 字节——与 E/I/H 具体值无关，只由「两个 4 位共享一字节、每 32 值一个 UE8M0 尺度字节」两条打包规则决定；对 bf16（2 B/值）恒为 2/0.53125≈3.7647× 压缩。",
+        "argument": "打包项：值数/2 字节（w13 每行 H 个值占 H/2 字节）；尺度项：值数/32 字节（MXFP4 组尺度，OCP 组大小 32）；两项相加=值数×(1/2+1/32)。实测对拍：本例 52224 B vs 196608 B=3.7647。UE8M0 语义不变量：尺度只能是 2 的幂——(b<<23) 恰把 b 放进 fp32 指数字段，值=2^(b-127)、b=0 特判 0.0；树内测试 [0,126,127,128]→[0.0,0.5,1.0,2.0] 对拍通过即该映射的锚。"
+      },
+      "quantified": "真旗舰口径：DeepSeek-V4-Flash 用 fp4 专家+mega 后端（eval yaml）；尺度开销占比 5.88%（0.0588）是「每 32 值一字节」的固定税；UE8M0 纯指数 ⇒ 尺度无尾数位，块内动态范围靠 2 的幂台阶适配（量化数学归 ch27，本章只讲字节账）。装载纪律：e8m0fnu scale 必须 .view(torch.uint8) 按原始字节装（数值 copy_ 把 0.0078125 转成 0——实机复现）；finalize 后原参数置 None，权重热更新/EPLB 重排走 get_expert_weights 专用视图（model.py:L407-L434）。对照 KV 侧同族布局：主 MLA 584B/token（8B scale 管 576 值）与 indexer 68B/条（4B UE8M0 管 64 值）——组尺度哲学贯穿权重与缓存。",
+      "figure_specs": [
+        {
+          "figure_id": "ch28-fig-fp4-byte-layout",
+          "template": "layout",
+          "l0_zoom": "放大 L0 gpu_column『模型层 forward + 编译』块里 MoE 专家参数的内存布局——ch27 讲 FP4 格点数学，本图讲它在 vLLM 参数张量里的字节落位（L2 站 7/9 的机制版下钻）。",
+          "claim": "一行 w13 权重的字节解剖：H 个 fp4 值打包成 H/2 个 uint8（两格一字节）+ H/32 个 UE8M0 尺度字节（每 32 值一个、只存 2 的幂指数）——参数以『已打包的 uint8 字节流』形态直接装载，finalize 时才变换成 DeepGEMM 布局并丢弃原参数。",
+          "numbers": [
+            {"value": "w13=[2,256,64] uint8=32768B + scale=[2,256,4] uint8=2048B；w2=[2,128,64]=16384B + scale=[2,128,4]=1024B；合计 52224B vs bf16 196608B=3.7647×", "provenance": "traces/ch28_m10_megamoe_fp4_bytes.json byte_ledger/totals"},
+            {"value": "UE8M0 解码：bytes [0,120,126,127,128]→[0.0,0.0078125,0.5,1.0,2.0]（公式 (sf.to(int32)<<23).view(float32)）", "provenance": "traces/ch28_m10_megamoe_fp4_bytes.json ue8m0_decode + model.py:L310-L312"},
+            {"value": "copy_ 破坏：数值 copy_→0；.view(uint8)→120", "provenance": "traces/ch28_m10_megamoe_fp4_bytes.json copy_destruction + model.py:L1268-L1279"},
+            {"value": "finalize 后 w13_weight/w13_weight_scale/w2_weight/w2_weight_scale 全置 None", "provenance": "vllm/models/deepseek_v4/nvidia/model.py:L324-L362"},
+            {"value": "对称缓冲 7 元组键 (group,device,E,max_tokens,topk,H,I) 跨层复用", "provenance": "vllm/models/deepseek_v4/nvidia/model.py:L364-L391"}
+          ],
+          "caption_draft": "FP4 字节布局解剖图：一行权重=H/2 个『双人格』字节（两个 4 位值挤一格）+ H/32 个 UE8M0 尺度字节（每 32 值一位只说 2 的幂的管理员）；装载必须按字节原样搬（数值 copy_ 会把 0.0078125 抹成 0），finalize 变换后原参数清零让位给 DeepGEMM 布局——52224 vs 196608 字节的账单就是 3.76× 压缩的来源（含 5.88% 尺度税）。",
+          "illustrator_notes": "layout 模板：上半画一个专家的 w13 一行——左段 H/2 格双色半格（示意两值一字节），右段 H/32 格尺度条（每格标 2^k）；下半小流程：checkpoint e8m0fnu --.view(uint8)--> uint8 参数 --finalize--> DeepGEMM 布局（原参数置 None 画叉）；旁注 copy_ 死亡现场（0.0078125→0 vs 120）。数字全取 traces/ch28_m10_megamoe_fp4_bytes.json；字节格用 l0_common 中性色+强调色标尺度位。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "ch28-m11",
+      "name": "FP4/FP8 expert_dtype 分发：惰性解析 + override_quantization_method + get_quant_method 分发树",
+      "intuition": "同一个 '.scale' 后缀是一词多义：fp4 checkpoint 里专家的 scale 是 UE8M0 尺度（参数名 weight_scale、无 _inv），其他线性层的是 FP8 块尺度（weight_scale_inv）；换成 fp8 checkpoint 全部都叫 weight_scale_inv——模型在装配期就按 expert_dtype 选好翻译词典（per-instance mapper），装载逐键翻译，词典选错就是静默错路（silently misroute Flash-Base）。",
+      "worked_example": {
+        "params": {
+          "真源": "_make_deepseek_v4_weights_mapper 映射表逐字拷贝自 vllm/models/deepseek_v4/nvidia/model.py:L1383-L1417；WeightsMapper 应用顺序（regex→substr→prefix→suffix）复刻自 vllm/model_executor/models/utils.py:L98-L138；make_deepseek_v4_expert_params_mapping 逐字拷贝自 model.py:L149-L165",
+          "对拍": "树内测试 tests/models/test_deepseek_v4_mega_moe.py:L20-L33 断言 mapping(2) 输出 6 元组——本脚本复跑同参对拍通过",
+          "惰性解析": "不在 host 复现范围——vllm_config 时序问题，引 quant_config.py:L43-L70 docstring NOTE 原话（构造发生在 set_current_vllm_config 之前，急切读恒见默认 'fp4' 且 'silently misroute Flash-Base checkpoints'）"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/ch28_m11_scale_suffix_mapper.json",
+        "table": {
+          "columns": ["checkpoint 键", "fp4 路径产物", "fp8 路径产物"],
+          "rows": [
+            ["layers.3.ffn.experts.17.w1.scale", "model.layers.3.ffn.experts.17.w1.weight_scale", "model.layers.3.ffn.experts.17.w1.weight_scale_inv"],
+            ["layers.3.ffn.experts.17.w2.scale", "model.layers.3.ffn.experts.17.w2.weight_scale", "model.layers.3.ffn.experts.17.w2.weight_scale_inv"],
+            ["layers.3.ffn.gate.scale", "model.layers.3.ffn.gate.weight_scale_inv", "model.layers.3.ffn.gate.weight_scale_inv"],
+            ["layers.3.self_attn.wq_a.scale", "model.layers.3.self_attn.wq_a.weight_scale_inv", "model.layers.3.self_attn.wq_a.weight_scale_inv"],
+            ["layers.3.ffn.shared_experts.w2.scale", "model.layers.3.ffn.shared_experts.down_proj.weight_scale_inv", "model.layers.3.ffn.shared_experts.down_proj.weight_scale_inv"],
+            ["head.weight", "lm_head.weight", "lm_head.weight"],
+            ["embed.weight", "model.embed_tokens.weight", "model.embed_tokens.weight"],
+            ["（mapper 之后）model.layers.3.ffn.experts.1.w1.weight_scale", "→ experts.w13_weight_scale（w1/w3 共享 w13 打包）", "同构（fp8 走 w13_weight_scale_inv）"]
+          ]
+        },
+        "table_note": "shared_experts 行演示 regex 与 substr 各管一段互不相干的字符串区段（一个改尾缀 .scale$→.weight_scale_inv、一个改名字 .shared_experts.w2→.down_proj），两条先后无所谓；真正的顺序约束在 fp4 词典 regex 表内部：专家专属规则 ((\\.experts\\.\\d+\\.w[123])\\.scale$) 必须排在通用 .scale$ 兜底之前，顺序反了专家 scale 先被兜底翻成 weight_scale_inv、专属规则不再命中（fp4 路径翻车）。expert_mapping 落位（第 8 行）与树内测试 make_deepseek_v4_expert_params_mapping(2) 对拍通过（trace expert_mapping_tree_test_cross_check.ok=true）。全部映射=traces/ch28_m11_scale_suffix_mapper.json 原样。"
+      },
+      "invariant": {
+        "claim": "两条路径的产物后缀必居其一：专家 w{1,2,3} 的 scale 在 fp4 路径必为 .weight_scale、其余一切 scale（gate/attention/shared）与 fp8 路径的全部 scale 必为 .weight_scale_inv；专家 regex 先于通用 .scale$ 执行且其产物不会被第二条 rematch。",
+        "argument": "映射表是穷举的有序 regex：第一条锚定 (\\.experts\\.\\d+\\.w[123])\\.scale$，命中即改写为 \\1.weight_scale——产物尾缀是 '_scale'（前无点），第二条 \\.scale$ 要求字面 '.scale' 结尾故不可能再命中；WeightsMapper 按序应用（utils.py regex 循环逐条 search+sub），实测代表性键在两条路径全部落位、无一双重改写。惰性解析保证词典定型发生在 set_current_vllm_config 生效后（构造期读恒返回默认 'fp4'），定型后 _resolved_expert_dtype 缓存不再变——同一进程内词典唯一。"
+      },
+      "quantified": "分发树规模：get_quant_method（quant_config.py:L173-L199）对 RoutedExperts 一层三岔——fp4+NVFP4→ModelOptNvFp4FusedMoE、fp4→Mxfp4MoEMethod、fp8→落回父类 Fp8MoEMethod；is_scale_e8m0=(expert_dtype=='fp4') 再决定线性 scale 是 UE8M0 还是 f32——两个布尔叉出四种组合，全部在装配期定死。「同文件两类 scale 后缀」的排障成本：旗舰 MoE 专家参数占绝对大头（E 数百×三层权重），fp4 路径下绝大多数 .scale 键走 weight_scale、少数线性键走 weight_scale_inv——排障要时刻知道自己在哪条路径；mtp.py:L69-L77 有同款镜像注释（draft 侧同一张税单）。"
+      ,
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "ch28-m13",
+      "name": "多流 overlap 与 eager break：3 aux 流+events、阈值门控、breakable cudagraph 回退、scratch 池",
+      "intuition": "一拍注意力像四条泳道的接力：最重的 fused_wqa_wkv 游默认道，三个轻 GEMM 各占一条 aux 道；到了要查缓存元数据的赛段（eager break）整体跳出图捕获、默认道游 wq_b+RoPE，另两条道同时游 indexer 和 compressor——但两道闸门守着：批太大（>1024 token）多流赚不回切换开销就关，cudagraph 捕获期多流非法也关。",
+      "figure_specs": [
+        {
+          "figure_id": "ch28-fig-multistream-timeline",
+          "template": "swimlane",
+          "l0_zoom": "放大 L0 gpu_column『模型层 forward + 编译』块内一拍注意力的执行细节——L2 站 12 的机制版下钻（流时间线；ch19 的 cudagraph 机制在此处被 @eager_break_during_capture 打断）。",
+          "claim": "Attention 一拍内的三路 overlap 时间线：默认流 fused_wqa_wkv（最重）+aux[0..2] 三个轻 GEMM（compressor kv_score / indexer.weights_proj / indexer.compressor kv_score）并行，join 后 split+双 rmsnorm 回默认流；eager break 内默认流跑 wq_b+qnorm+RoPE+kv_insert，aux[0] 跑整个 indexer、aux[1] 跑 compressor（TRT-LLM PR #14142 Level 1），最后 forward_mqa+o_proj 回默认流——两个门（token 数 ≤1024 才开多流；breakable cudagraph 捕获期强制顺序）守住切换。",
+          "numbers": [
+            {"value": "3 条 aux 流（注释点名三个轻 GEMM 归属；fused_wqa_wkv 留默认流）；ln_events 4 个事件（[0] fan-out 起点兼 post-GEMM event0，[1..3] 各 aux 完成事件）", "provenance": "vllm/models/deepseek_v4/nvidia/model.py:L1020-L1024；attention.py:L317-L321"},
+            {"value": "阈值门：enable = hidden_states.shape[0] <= VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD（默认 1024）——大批关多流", "provenance": "vllm/models/deepseek_v4/attention.py:L454-L456；vllm/envs.py:L277"},
+            {"value": "捕获门：BreakableCUDAGraphCapture.is_active() 时 aux_stream=None 顺序回退（maybe_execute_in_parallel/execute_in_parallel 共用）", "provenance": "vllm/utils/multi_stream_utils.py:L52-L55"},
+            {"value": "eager break 边界：@eager_break_during_capture 挂 attention_impl——捕获图在此断开、注意力段 eager 跑", "provenance": "vllm/models/deepseek_v4/attention.py:L461-L470"},
+            {"value": "3 路 overlap 谱系锚：注释原话 'matches TRT-LLM PR #14142 Level 1'；ROCm aux_streams=None 顺序回退", "provenance": "vllm/models/deepseek_v4/attention.py:L493-L497"},
+            {"value": "scratch 池：eager break 内的分配不经图缓存，DeepseekV4EagerScratchPool 预分配 q/FP4 indexer/global/compressor 四组 256 对齐草稿区", "provenance": "vllm/models/deepseek_v4/eager_scratch.py:L12-L60；nvidia/model.py:L1028-L1040"}
+          ],
+          "caption_draft": "一拍之内的四泳道时间线：输入 GEMM 段（默认流重 GEMM + 三轻 GEMM 并行）→ join → eager break 段（默认流 wq_b+kv_insert ‖ indexer ‖ compressor 三路）→ forward_mqa+o_proj 收尾；两道闸门（token≤1024、捕获期禁多流）决定泳道何时坍缩成单道顺序——breakable cudagraph 与多流 overlap 是一对互相退让的优化。",
+          "illustrator_notes": "swimlane 模板、UML 时序图文法（FIGURE-SYSTEM §0 时序图种规约）：4 条竖直生命线（默认流+aux0/1/2，GPU 绿系），共享时间轴纵向下行；活动条按时长比例（重 GEMM 长条、轻 GEMM 短条），跨道同步用水平事件线（ln_events[0] fan-out、[1..3] join）；eager break 段用浅色背景带横跨全图+左右两个闸门标记（1024 阈值 / capture active）。不画具体 kernel 内部。file:line 全标。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "ch28-m14",
+      "name": "MTP 钩子：_mtp_hidden_buffer（pre-hc_head 残差）+ runner getattr 重绑 + draft 侧 hc_head 延迟",
+      "intuition": "MTP 钩子是主干尾部开的一条「样品分流口」：成品（hc_head 定稿后的单流 hidden）照常出厂给采样线，定型前的多流残差（pre-hc_head）先舀一勺存进缓冲区给 draft 车间当原料——runner 靠 hasattr 式探测找这条分流口，模型与 runner 谁也不 import 谁。",
+      "figure_specs": [
+        {
+          "figure_id": "ch28-fig-mtp-hook-fork",
+          "template": "flow",
+          "l0_zoom": "放大 L0 gpu_column『模型层 forward + 编译』块尾部与采样列交界的 drafter 重绑点——hidden_states 出模型、进 drafter 之前的分叉（L2 站 14 的机制版下钻；驱动机制 propose/verify 归 ch32/33，本图止步钩子两端）。",
+          "claim": "MTP 钩子三段接力：模型层在层尾 mhc_post 之后、hc_head 之前把多流残差 copy_ 进 _mtp_hidden_buffer（get_mtp_target_hidden_states 暴露）；runner 在采样后 getattr 探测该钩子重绑 drafter 输入（'Let the target override the hidden state fed to the drafter'）；draft 侧 e_proj/h_proj 融合 embed+prev residual 后复用整层 DecoderLayer、hc_head 推迟到自己的 compute_logits——pre-hc_head 形态全程保持。",
+          "numbers": [
+            {"value": "_mtp_hidden_buffer 形状 (max_num_batched_tokens, hc_mult×hidden_size)，spec_config 用 eagle/draft_model 才建", "provenance": "vllm/models/deepseek_v4/nvidia/model.py:L1095-L1106"},
+            {"value": "层尾顺序：mhc_post → buffer.copy_(flatten(1)) → hc_head → norm（先暂存后定型）", "provenance": "vllm/models/deepseek_v4/nvidia/model.py:L1200-L1212"},
+            {"value": "runner 侧：getattr(model,'get_mtp_target_hidden_states',lambda:None)() 重绑（注释点名 'DeepSeek V4 MTP needs the pre-hc_head residual'）", "provenance": "vllm/v1/worker/gpu_model_runner.py:L5198-L5206"},
+            {"value": "draft 侧：fused_mtp_input_rmsnorm（mask 首位+enorm+hnorm 一核）→ h_proj(prev)+e_proj(embed) → 复用整层 DecoderLayer → 返回 flat pre-hc_head 残差（num_speculative_tokens>1 可续喂）", "provenance": "vllm/models/deepseek_v4/nvidia/mtp.py:L144-L189"},
+            {"value": "hc_head 延迟落点：draft 的 compute_logits 里才跑 hc_head_fused_kernel_tilelang+shared_head", "provenance": "vllm/models/deepseek_v4/nvidia/mtp.py:L253-L279"},
+            {"value": "部署真值：speculative_config.method=mtp、num_speculative_tokens=2（DeepSeek-V4-Flash eval）；MTP 层缺权重即报错（完整性检查）", "provenance": "tests/evals/gsm8k/configs/moe-refactor/DeepSeek-V4-Flash-deepgemm-mega-moe.yaml；mtp.py:L493-L504"}
+          ],
+          "caption_draft": "主干尾部的分叉图：mhc_post 塌回的多流残差在这里走两条路——主路 hc_head 压回单流进 norm/采样，旁路 copy_ 进 _mtp_hidden_buffer 等 runner 采样后来取（getattr 探测重绑 drafter 输入）；draft 车间把 flat 残差 reshape 回训练期 3D、e/h 双投影后复用整层 DecoderLayer，hc_head 推迟到自己的 compute_logits——「还没被输出头定型的残差」这个形态在单流模型里根本不存在，正是 mHC 多流给 MTP 的红利。",
+          "illustrator_notes": "flow 模板三分区：左=模型层尾部（mhc_post→buffer→hc_head→norm，旁路虚线进 buffer 框）；中=runner 采样后（getattr 探测框，标注双向解耦：模型不 import runner、runner 不 import 模型）；右=draft 侧（reshape 3D→fused norm→e/h proj→复用 DecoderLayer→flat 残差，hc_head 画在 compute_logits 之后的延迟位置）。配色：模型层 GPU 绿、采样列 C_SAMPLE、draft 框 plain。file:line 全标。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "ch28-m16",
+      "name": "forward 主干：2D embed→首层核内展开→4 元组穿层→aux 流重建→mhc_post→hc_head 的完整旅程",
+      "intuition": "全干形状主线一句话：2D 进、2D 出、多流活在层间——embed 出的 2D 在首层被核内广播展开成 hc_mult 条残差流，此后每层穿的是 4 元组针脚，EAGLE3 要的 aux 流中途重建，层尾塌回 3D 先喂 MTP 再压回 2D 交给采样；PP 中间 rank 干脆以多流形状打包传递。",
+      "figure_specs": [
+        {
+          "figure_id": "ch28-fig-trunk-shape-journey",
+          "template": "tensor-flow",
+          "l0_zoom": "= L0 gpu_column『模型层 forward + 编译』块的整条主干（本章 L2 章图 ⑥⑦ 的机制版主图——L2 给装配全景，本图给形状旅程单线索）。",
+          "claim": "DeepseekV4Model.forward 的形状主线：embed 出 2D (T,H)（不再显式 repeat——首层 mhc_pre_broadcast 核内展开）→ 逐层 4 元组 (hidden_states, residual, post_mix, res_mix) 穿针（hidden_states 恒 2D、多流活在 residual）→ EAGLE3 命中层中途 mhc_post 重建 aux 流（mean(dim=1)）→ 层尾 mhc_post 塌回 (T,hc_mult,H) → 先 copy_ 进 _mtp_hidden_buffer 再 hc_head 压回 (T,H) → norm；PP 非末 rank 以多流形状直接交 IntermediateTensors，mega_moe 下 input_ids 先 int64 化（hash 路由查表要）。",
+          "numbers": [
+            {"value": "PP 中间张量 (T, hc_mult, hidden)——注释原话 'V4 expands the token embedding to hc_mult streams before the first decoder layer and keeps that shape until hc_head() collapses it'（严格说穿层 hidden_states 是 2D，多流活在 residual，PP 载荷才是 3D）", "provenance": "vllm/models/deepseek_v4/nvidia/model.py:L1111-L1129"},
+            {"value": "首层特判：x.dim()==2 → mhc_pre_broadcast_tilelang（用 finalize 预折的 fn_broadcast）；3D → 普通 mhc_pre", "provenance": "vllm/models/deepseek_v4/nvidia/model.py:L908-L943"},
+            {"value": "aux 流重建：idx+1 ∈ aux_hidden_state_layers 时 mhc_post+mean(dim=1)（末层结果复用避免重复 mhc_post）", "provenance": "vllm/models/deepseek_v4/nvidia/model.py:L1163-L1188"},
+            {"value": "hc_head 融合核：(T,hc_mult,H)→(T,H) bf16、空批早退", "provenance": "vllm/model_executor/kernels/mhc/tilelang.py:L720-L748"},
+            {"value": "mega 下 input_ids.to(int64)（hash 路由查表要）；SP 时 sp_shard 入口", "provenance": "vllm/models/deepseek_v4/nvidia/model.py:L1146-L1158"}
+          ],
+          "caption_draft": "全干形状主线的机制主图：从 embed 的 2D 到 compute_logits 前的 2D，中间是 hc_mult 条流的一生——首层核内展开（省掉显式 repeat 的物化）、逐层 4 元组穿针（子层只见 2D）、中途按需重建 aux 流（EAGLE3）、层尾塌回 3D 分叉 MTP 后压回单流；PP 中间 rank 以 3D 多流载荷交接。与 m04 单层门控图互为表里：m04 讲一层的两半，本图讲全干的形状旅程。",
+          "illustrator_notes": "tensor-flow 横幅长图：一条主时间轴从 embed 到 norm，每层画成一对半层块（融合核×2），层间穿 4 条针线（x 2D 粗线 + residual 多流带 + post_mix/res_mix 细线）；首层块标 broadcast 特判、某中间层标 aux 重建分叉（EAGLE3 虚线）、层尾标 mhc_post→MTP buffer→hc_head 三连；PP 断点画一个 rank 边界竖线标 IntermediateTensors(3D)。配色 l0_common；数字/形状全带 file:L 或 trace 出处。"
+        }
+      ]
+    }
+  ]
+}

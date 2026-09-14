@@ -1,0 +1,697 @@
+{
+  "chapter_id": "ch28",
+  "part": "VI",
+  "title": "实战：DeepSeek-V4 拼装",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "chapter_kind": "code",
+  "note_on_kind": "Part VI 收官 capstone 代码章（非 primer），**无精简版**（Lead 指令：subtraction_plan 留空，Implement/Test 站跳过）——writer 直接吃 embed_excerpts + stations + mechanisms。本章性质：把 ch23（拼装契约/registry/权重流入）、ch25（MLA 两种展开）、ch26（稀疏索引器/compressor/三类层）、ch27（FP8/FP4 量化数学）四块积木装回一台真实旗舰 DeepSeek-V4，验证 Part VI hook『接入新架构只需拼层——Attention 是插座不是实现』的成色与接入税。v0.27 关键事实：DSV4 已从 v2 时代的扁平 model_executor/models/deepseek_v4.py（v0.21）整体迁入 vllm/models/deepseek_v4/{common,nvidia,amd,xpu} 硬件隔离新布局（git 287471b99 '[Model Refactoring] Migrate DeepSeek V4 to vllm/models/ [1/N]' #43004）——v2 档案全部行号作废、本章锚点已逐个对 v0.27.1 重核。与 v0.21 的结构差（正文要点）：①残差展开从 Model.forward 里显式 unsqueeze/repeat 变成首层 mhc_pre_broadcast_tilelang 核内广播（fn_broadcast 预折权重重算）；②hc 核从 torch.ops.vllm.mhc_pre/post 自定义算子换成 tilelang 核族封装（kernels/mhc/tilelang.py），post+pre 融合成单核且 RMSNorm 可融；③MoE 双后端选择权从探测逻辑上收为 kernel_config.moe_backend 显式旋钮；④新增 hash MoE（前 num_hash_layers 层按 token id 查表路由）、EPLB 冗余专家装载、序列并行（sp_shard/all_gather/reduce_scatter）；⑤attention 拆成包根平台 ABC（attention.py）+ nvidia/amd/xpu 子类（forward_mqa/_o_proj/get_padded_num_q_heads 抽象方法）；⑥breakable cudagraph：attention_impl 挂 @eager_break_during_capture。考纲第三条『code→diagram 方法论』：末节教读者从 config.json+源码树自己画出本章的模型层全景图（registry 查表→__init__ 树→forward 走线三步法）——L2 图即样板答案。边界：MLA 两种展开与后端家族归 ch25、indexer/compressor/一核双源归 ch26、量化数学归 ch27（本章只讲布局与字节账）、投机解码驱动归 ch32/33（本章只讲 MTP 钩子）、EP/SP 深讲归 ch34、D4-Flash 部署实战归 ch35。",
+  "hook_suggestion": "「ch23 说接入新架构只需拼层、Attention 是插座——期末考来了：把 DeepSeek-V4 这台真旗舰摆上装配线，Llama 五件套还剩几件？残差怎么从『加回去』变成 hc_mult 条流、每层学一组混合门、最后还要用 hc_head 压回单流？一个注意力层凭什么开四本 KV 账、输出还要再走一段低秩？MoE 的 gate 打完分交给谁算——为什么同一份路由代码后面是两个完全不同的专家后端（DeepGEMM 单算子 vs 通用 FusedMoE），选哪个谁说了算？FP4 的 scale 为什么必须按原始字节装、走 copy_ 会发生什么？最前几层不用 gate 打分的 hash MoE 又是什么路数？最后：给你一份 config.json 和这棵源码树，你能自己画出这台机器的形状吗？」（从 Part VI hook『Attention 是插座不是实现』+ 本章 introduces『MoE 拼装 / FP4 落地 / code→diagram 方法论』+ deepread/model-sample why_chains[8] DSV4 接入清单段 + notes『capstone；末节教读者画图』提炼）",
+  "one_line": "模型定义层拼装术的期末考：DeepseekV4ForCausalLM 的模型文件仍只做层组装+权重名映射（ch23 契约原样成立），但每一块积木都升了级——①残差：标准 add-norm → mHC 多流残差，hidden 以 (residual, post_mix, res_mix) 三件套+2D layer 输入在层间穿针，每半层一个 mhc_fused_post_pre_tilelang 融合核（post+pre+RMSNorm 一核），首层 2D embed 由 mhc_pre_broadcast 核内展开成 hc_mult 条流、层尾 mhc_post 塌回 3D 后先喂 _mtp_hidden_buffer（pre-hc_head 残差）再 hc_head 压回单流；②注意力：第三代 MLA——包根平台 ABC DeepseekV4Attention（fused_wqa_wkv 复制不切 TP 的低秩瓶颈 + attn_sink 垫 -inf + wo_a/wo_b 输出低秩 + 四本 KV 账：主 MLA 584B/token fp8_ds_mla / IndexerCache / CompressorStateCache / SWACache）+ nvidia/amd/xpu 子类实现 forward_mqa/_o_proj（FlashMLA 子类把头垫到 64/128、输出侧 fused_inv_rope_fp8_quant→fp8_einsum(wo_a)→wo_b）；③FFN：DeepseekV4MoE 双后端——kernel_config.moe_backend=='deep_gemm_mega_moe' 时 EP+SM100+fp4+sqrtsoftplus 全限定走 DeepseekV4MegaMoEExperts（w13=[E,2I,H/2]uint8 + scale=[E,2I,H/32]UE8M0 的 FP4 字节布局，finalize_weights 变换成 DeepGEMM 布局后丢弃装载参数），否则走通用 FusedMoE 工厂；路由 scores=sqrt(softplus(gate))、e_score_correction_bias 只影响选择不影响权重，前 num_hash_layers 层 tid2eid 查表免打分；④数值：DeepseekV4FP8Config 按 expert_dtype 惰性分发 Mxfp4MoEMethod/Fp8MoEMethod/NVFP4，e8m0fnu scale 必须 .view(uint8) 装载；⑤出口：compute_logits 契约原样 + get_mtp_target_hidden_states 钩子（runner 侧 getattr 探测重绑 drafter 输入，draft 侧 e_proj/h_proj 融合后复用整层 DecoderLayer、hc_head 推迟到 compute_logits）。接入税的真实账单：平台子类×3、四本账 spec、三处手动 static_forward_context 注册、per-expert_dtype 权重 mapper、多流 overlap 的 eager break 与 scratch 池。",
+  "code_spine": [
+    "vllm/model_executor/models/registry.py:L95  arch 'DeepseekV4ForCausalLM' 条目=('vllm.models.deepseek_v4', …) 全限定模块路径——_resolve_module_name（L1439-L1446）见 vllm. 前缀原样保留；两行之上 V3.2 仍走扁平 deepseek_v2（L94），新旧布局同表并存；DSpark L617 / MTP L643 同款",
+    "vllm/models/deepseek_v4/__init__.py:L17-L32  current_platform 三岔分发 → amd/xpu/nvidia 各自的 ForCausalLM+MTP+DSpark，re-export 四个公共名",
+    "vllm/models/deepseek_v4/nvidia/model.py:L1457-L1510  DeepseekV4ForCausalLM.__init__：expert_dtype→per-instance mapper；Model+lm_head+logits_processor；set_moe_parameters 登记 MoE 元数据",
+    "vllm/models/deepseek_v4/nvidia/model.py:L996-L1106  DeepseekV4Model 骨架：3×aux stream + eager_scratch 池 + 共享 topk_indices_buffer + hc_head 参数 + _mtp_hidden_buffer（spec 才建）",
+    "vllm/models/deepseek_v4/nvidia/model.py:L816-L897  DecoderLayer 装配：平台注意力子类（_select_dsv4_attn_cls L771-L802）+ DeepseekV4MoE + 双 RMSNorm + hc 混合参数（fp32 (2+hc_mult)×hc_mult×H）",
+    "vllm/models/deepseek_v4/attention.py:L179-L348  MLA 第三代装配：fused_wqa_wkv（disable_tp=True）/q_norm/wq_b/kv_norm/wo_a/wo_b/attn_sink；compress_ratio==4 才建 indexer、>1 建 compressor；fp8_ds_mla uint8；SWACache；手动注册 static_forward_context",
+    "vllm/models/deepseek_v4/attention.py:L655-L674  get_kv_cache_spec：MLAAttentionSpec(num_kv_heads=1, head_size=512, dtype=uint8, compress_ratio, alignment=576, model_version='deepseek_v4')——584B/token（kv_cache_interface.py:L411）",
+    "vllm/models/deepseek_v4/nvidia/model.py:L519-L702  MoE 装配：use_mega_moe=kernel_config.moe_backend；EP 强制+fp4-only+sqrtsoftplus-only 断言；GateLinear+hash MoE(tid2eid)/noaux_tc(e_score_correction_bias)；shared_experts；MegaMoE 或 FusedMoE 工厂二岔",
+    "vllm/models/deepseek_v4/quant_config.py:L134-L199  FP4/FP8 分发：override_quantization_method→'deepseek_v4_fp8'（quantization/__init__.py:L164 注册）；get_quant_method(RoutedExperts)→Mxfp4MoEMethod / ModelOptNvFp4FusedMoE / Fp8MoEMethod",
+    "vllm/models/deepseek_v4/nvidia/model.py:L1217-L1380  权重流入：stacked 映射（wq_a+wkv→fused_wqa_wkv、compressor wkv+wgate）+ expert_mapping + e8m0fnu→.view(uint8) + attn_sink TP 窄切 + shared_expert 块对齐补零 + finalize 两步（MegaMoE transform / hc broadcast 预折）",
+    "vllm/models/deepseek_v4/nvidia/model.py:L1131-L1215  运行期 forward：embed 2D→（首层核内 broadcast 展开 hc_mult 流）→逐层 4 元组穿针→aux 流重建（EAGLE3）→mhc_post 塌回→_mtp_hidden_buffer copy_→hc_head→norm",
+    "vllm/models/deepseek_v4/nvidia/model.py:L899-L992  单层两半：residual None?（首层 broadcast/普通 pre）: fused_post_pre → attn（SP 包裹）→ fused_post_pre → ffn",
+    "vllm/models/deepseek_v4/attention.py:L350-L459  Attention 一拍①：多流输入 GEMM（attn_gemm_parallel_execute：fused_wqa_wkv 默认流 + 三轻 GEMM aux 流，VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD 门控）+ split + fused_q_kv_rmsnorm",
+    "vllm/models/deepseek_v4/attention.py:L461-L540  Attention 一拍②（eager break）：wq_b+qnorm+RoPE+kv_insert（默认流）vs indexer（aux[0]）/compressor（aux[1]）三路 overlap → forward_mqa → _o_proj",
+    "vllm/models/deepseek_v4/nvidia/flashmla.py:L69-L363  forward_mqa（平台核）：warmup 假跑占 workspace / prefill 分块 gather+combine_topk_swa_indices+flash_mla_sparse_fwd / decode 一核双源 flash_mla_with_kvcache（k_cache=SWA+extra_k_cache=压缩 KV+attn_sink）——kernel 细节归 ch25/26",
+    "vllm/models/deepseek_v4/nvidia/ops/o_proj.py:L13-L73  输出投影：compute_fp8_einsum_recipe（SM90/SM100 scale 布局）→ fused_inv_rope_fp8_quant → fp8_einsum('bhr,hdr->bhd', wo_a) → wo_b",
+    "vllm/models/deepseek_v4/nvidia/model.py:L704-L764  MoE 一拍：mega=gate→fused_topk_bias→experts→+=shared；fused=is_internal_router?（MoERunner 内置 router）:外部 gate→FusedMoE",
+    "vllm/models/deepseek_v4/nvidia/model.py:L1515-L1538  出口：compute_logits→LogitsProcessor（ch23 站 12 同款）；get_mtp_target_hidden_states 暴露 pre-hc_head 残差",
+    "vllm/v1/worker/gpu_model_runner.py:L5198-L5206  runner 消费：采样后 getattr 探测 get_mtp_target_hidden_states 重绑 drafter 输入",
+    "vllm/models/deepseek_v4/nvidia/mtp.py:L144-L279  MTP draft：fused_mtp_input_rmsnorm（mask 首位+enorm+hnorm）→h_proj(prev)+e_proj(embed)→mtp_block（复用整层 DecoderLayer）→flat pre-hc_head 残差；compute_logits 里才跑 hc_head+shared_head"
+  ],
+  "stations": [
+    {
+      "n": 1,
+      "where": "vllm/model_executor/models/registry.py:L95",
+      "what": "arch 字符串进厂：hf_config.architectures=['DeepseekV4ForCausalLM'] 查表得 ('vllm.models.deepseek_v4','DeepseekV4ForCausalLM')——新布局条目写全限定模块路径，_resolve_module_name（L1439-L1446）见 vllm. 前缀原样保留、其余拼 model_executor.models 前缀；同一张表往上两行（L94）DeepseekV32ForCausalLM 仍走扁平 deepseek_v2——新旧两套布局并存（ch23 站 1 已立机制，本章看真身）。DSparkDraftModel（L617）与 DeepSeekV4MTPModel（L643）条目同款。"
+    },
+    {
+      "n": 2,
+      "where": "vllm/models/deepseek_v4/__init__.py:L17-L32",
+      "what": "平台分发：current_platform.is_rocm()/is_xpu() 三岔 import amd/xpu/nvidia 各自的 DeepseekV4ForCausalLM+DeepSeekV4MTP+DSparkDeepseekV4ForCausalLM 并 re-export——registry 与量化查找只认 __all__ 四个公共名（L34-L39）；DeepseekV4FP8Config 在包根无平台分。『一层到底谁实现』自此跨目录：基座在包根 attention.py，平台子类在 nvidia/。"
+    },
+    {
+      "n": 3,
+      "where": "vllm/models/deepseek_v4/nvidia/model.py:L1457-L1510",
+      "what": "顶层拼装：DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3, DeepseekV4MixtureOfExperts)——bases 即 ch23 站 5 的 hasattr 探测靶。__init__ 读 expert_dtype（默认 fp4）选 per-instance 的 hf_to_vllm_mapper（类属性默认 fp4 版、实例覆盖，L1462-L1473）；装 DeepseekV4Model + 末 rank ParallelLMHead + LogitsProcessor；make_empty_intermediate_tensors 挂别名；set_moe_parameters（L1493-L1510）遍历层登记 moe_mlp_layers/expert 数——EPLB/分布式要的 MoE 元数据装配期一次算好。"
+    },
+    {
+      "n": 4,
+      "where": "vllm/models/deepseek_v4/nvidia/model.py:L996-L1106",
+      "what": "骨架与三池：DeepseekV4Model.__init__ 除 embed/make_layers/norm 外开三个全模型共享池——①3 条 cuda.Stream（注释点名给 compressor kv_score/indexer.weights_proj/indexer.compressor kv_score 三个轻 GEMM，fused_wqa_wkv 留默认流）②DeepseekV4EagerScratchPool（eager break 里不再裸分配）③topk_indices_buffer [max_num_batched_tokens, index_topk]（ch26 站 1 同款）；再加 hc_head_fn/base/scale 三个 fp32 参数与 _mtp_hidden_buffer（spec_config 用 eagle/draft_model 才建，L1095-L1106）。PP 中间张量=(T, hc_mult, hidden)——多流在首层前展开、hc_head 前不塌缩（L1111-L1129 注释）。"
+    },
+    {
+      "n": 5,
+      "where": "vllm/models/deepseek_v4/nvidia/model.py:L816-L897",
+      "what": "DecoderLayer 装配：attn=_select_dsv4_attn_cls（L771-L802：按 attention_config.backend+设备能力选 FlashMLA/FlashInfer(SM120)/FlashInfer 子类，不显式指定时 SM12 默认 FlashInfer、其余 FlashMLA）；ffn=DeepseekV4MoE；attn_norm/ffn_norm 两个 RMSNorm（weight/eps 后面喂给 hc 核——norm 融进核）；hc_attn_fn/hc_ffn_fn/hc_attn_base/hc_ffn_base/hc_attn_scale/hc_ffn_scale 六组 fp32 混合参数，形状 (2+hc_mult, hc_mult×hidden)——『学习式混合』的参数账。"
+    },
+    {
+      "n": 6,
+      "where": "vllm/models/deepseek_v4/attention.py:L179-L348",
+      "what": "MLA 第三代装配（平台 ABC 的共享 __init__）：fused_wqa_wkv=Merged([q_lora_rank, head_dim]) 且 disable_tp=True（低秩瓶颈复制不切 TP）；q_norm→wq_b 列切上投；kv_norm(head_dim)；wo_a（n_groups×o_lora_rank，bmm 视图）/wo_b 行切=输出侧低秩两段；attn_sink 按 padded_heads 填 -inf；compress_ratio==4 才建 DeepseekV4Indexer（复用 aux_stream_list[2]）、>1 建 DeepseekCompressor；kv_cache_dtype 解析成 fp8_ds_mla/uint8 并回写 cache_config；DeepseekV4SWACache；**手动**注册 static_forward_context（重复名即 raise）。"
+    },
+    {
+      "n": 7,
+      "where": "vllm/models/deepseek_v4/nvidia/model.py:L519-L702",
+      "what": "MoE 装配：use_mega_moe=（kernel_config.moe_backend=='deep_gemm_mega_moe'）——mega 必须 EP、只支持 sqrtsoftplus、只支持 expert_dtype=fp4（三条 NotImplementedError 都带修法提示，L536-L561）；gate=GateLinear(out_dtype=fp32)；hash MoE——前 num_hash_layers 层 gate.tid2eid=randint(vocab, topk)（dummy 模式用 randint 防 garbage、注释原话）；topk_method=='noaux_tc' 时挂 e_score_correction_bias；shared_experts=DeepseekV4MLP（mega 下 reduce_results=use_mega_moe——EP 下免 all_reduce）；_init_mega_moe_experts（EP 切物理专家+冗余专家账）/_init_fused_moe_experts（FusedMoE 工厂，TP 切）二岔。"
+    },
+    {
+      "n": 8,
+      "where": "vllm/models/deepseek_v4/quant_config.py:L29-L199",
+      "what": "FP4/FP8 分发：override_quantization_method（L134-L152）把 fp8/deepseek_v4_fp8/Quark-MXFP4-OCP 的 V4 checkpoint 报名成 'deepseek_v4_fp8'（注册于 vllm/model_executor/layers/quantization/__init__.py:L164）；expert_dtype **惰性**解析（构造时 set_current_vllm_config 还没生效，急切读恒见默认 fp4 且 silently misroute Flash-Base——docstring NOTE 原话，L43-L47）；get_quant_method（L173-L194）：RoutedExperts+fp4→Mxfp4MoEMethod（moe_quant_algo=='NVFP4' 时 ModelOptNvFp4FusedMoE）、fp8→落回 Fp8Config 的 Fp8MoEMethod；is_scale_e8m0=（expert_dtype=='fp4'）——线性 scale 是 UE8M0 还是 f32 由它定。"
+    },
+    {
+      "n": 9,
+      "where": "vllm/models/deepseek_v4/nvidia/model.py:L1217-L1380",
+      "what": "权重流入+finalize：stacked 映射 wq_a+wkv→fused_wqa_wkv、compressor wkv+wgate→fused_wkv_wgate、w1/w3→gate_up（L1218-L1226）；expert_mapping 一次性预计算（mega 用 make_deepseek_v4_expert_params_mapping、fused 用 fused_moe_make_expert_params_mapping，L1353-L1365）；e8m0fnu scale 必须 .view(torch.uint8) 装载（数值 copy_ 会 destroy 原始指数字节，L1270-L1279 注释）；attn_sink 按 head_rank 窄切（L1307-L1314）；block-FP8 shared_experts 按 TP 块对齐补零（_pad_shared_expert_weight L1328-L1351）；load_weights 尾部两步 finalize——finalize_mega_moe_weights（transform_weights_for_mega_moe 后丢弃原参数）+ finalize_mhc_broadcast_weights（首层 fn.view(-1,hc_mult,H).sum(1) 预折，L1371-L1380）。"
+    },
+    {
+      "n": 10,
+      "where": "vllm/models/deepseek_v4/nvidia/model.py:L1131-L1215",
+      "what": "运行期主干：首 rank embed 出 2D (T,H)——不再显式 repeat，首层核内广播展开；mega_moe 下 input_ids 先 int64 化（hash 路由查表要）；sp_shard 序列并行入口；逐层 4 元组 (hidden_states, residual, post_mix, res_mix) 穿针；aux_hidden_state_layers 命中层用 mhc_post 重建 aux 流（EAGLE3 draft 要）；层尾 mhc_post 塌回 (T, hc_mult, H) → **先** copy_ 进 _mtp_hidden_buffer（pre-hc_head 残差，MTP 的原料）**再** hc_head 压回单流 → norm。PP 非末 rank 以多流形状直接打包 IntermediateTensors。"
+    },
+    {
+      "n": 11,
+      "where": "vllm/models/deepseek_v4/nvidia/model.py:L899-L992",
+      "what": "单层两半（hc 门控骨架）：residual is None 时首层特判——x.dim()==2 走 mhc_pre_broadcast_tilelang（用 finalize 预折的 fn_broadcast）、否则普通 mhc_pre；其后每半层一个 mhc_fused_post_pre_tilelang（上一个 post+下一个 pre+RMSNorm 融合成单核）；attn 半被 sp_all_gather/sp_reduce_scatter 包住（序列并行只在 attn 段生效）；ffn 半收尾返回 4 元组。RMSNorm 不再是独立层——weight/eps 拆出来传给 hc 核。"
+    },
+    {
+      "n": 12,
+      "where": "vllm/models/deepseek_v4/attention.py:L350-L540",
+      "what": "Attention 一拍：forward（L350-L396）预分配 padded_heads 输出缓冲 → attn_gemm_parallel_execute（L403-L459：fused_wqa_wkv 默认流 + compressor/indexer 三轻 GEMM aux 流，VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD 门控、ROCm 顺序回退）→ split+fused_q_kv_rmsnorm → attention_impl（L461-L540，@eager_break_during_capture：C4A 三路 overlap——默认流 wq_b+qnorm+RoPE+kv_insert / aux[0] 整个 indexer / aux[1] compressor；breakable cudagraph 捕获期多流禁用回退顺序）→ forward_mqa（平台核）→ _o_proj（fused_inv_rope_fp8_quant→fp8_einsum(wo_a)→wo_b）。"
+    },
+    {
+      "n": 13,
+      "where": "vllm/models/deepseek_v4/nvidia/model.py:L704-L764",
+      "what": "MoE 一拍：mega 路=gate(hidden)→fused_topk_bias（scores=sqrt(softplus(g))、bias 只影响选择；hash 层直接查 tid2eid）→experts(topk_weights/ids, activation_clamp=swiglu_limit)（内部 prepare_megamoe_inputs 量化+重排进对称缓冲 → deep_gemm.fp8_fp4_mega_moe 单算子）→+=shared_experts；fused 路=is_internal_router 时 router 在 MoERunner 内部（hidden 直喂）、否则外部 gate 先算再进 FusedMoE（shared_experts 聚合在内部）。"
+    },
+    {
+      "n": 14,
+      "where": "vllm/models/deepseek_v4/nvidia/model.py:L1515-L1538",
+      "what": "出口与 MTP 钩子：compute_logits→LogitsProcessor（与 Llama 同款两行——采样位切片策略仍归 runner，ch23 站 11/12 契约在旗舰上原样成立）；get_mtp_target_hidden_states 返回 _mtp_hidden_buffer（pre-hc_head 残差 (max_num_batched_tokens, hc_mult×H)）。消费端：runner 在采样后 getattr 探测重绑 drafter 输入（vllm/v1/worker/gpu_model_runner.py:L5198-L5206）；draft 侧 DeepSeekV4MTP（nvidia/mtp.py）e_proj/h_proj 融合 embed+prev residual → 复用整层 DecoderLayer → 返回 flat 残差、hc_head 推迟到自己的 compute_logits（L253-L279）。驱动机制（propose/verify/拒绝采样）归 ch32/33。"
+    }
+  ],
+  "stations_note": "站号 = DSV4 在模型层的生命周期流经顺序：第 1-9 站装配幕（一生一次：registry→平台分发→顶层→骨架→DecoderLayer→MLA→MoE→FP4 分发→权重流入），第 10-14 站运行幕（一拍之内：主干→单层两半→Attention 一拍→MoE 一拍→出口+MTP 钩子）。正文建议编排：开场用 delta over Llama 对照立『这台旗舰比基线多了什么』（capstone 主题句），沿装配幕 1-9 走（每站强调『ch23 契约哪条没变、哪条升级了』），再沿运行幕 10-14 走一拍（hc 4 元组穿针是主线暗线：数据形状从 2D→hc_mult 流→2D 的完整旅程），收在出口+MTP 钩子；末节『code→diagram 方法论』（考纲 introduces 第三条）：教读者三步法——①registry 查表定位模型类 ②读 __init__ 树画积木框 ③沿 forward 走线画数据流——自己复现本章 L2 图。与前后章衔接：ch23 站 1/4/5/12 是本章 1/3/9/14 的直系前站；ch25 站 9（MLA 外层低秩链）与 ch26 全章（indexer/compressor/一核双源）是站 6/12 的内核侧；ch27 的 FP8/FP4 数学是站 8 的数值侧；ch32/33 消费站 14 的 MTP；ch34 深讲站 7 的 EP/SP；ch35（D4-Flash 进 96GB 部署实战）整章消费本章装配出的机器。",
+  "key_classes": [
+    {
+      "name": "DeepseekV4ForCausalLM",
+      "file": "vllm/models/deepseek_v4/nvidia/model.py:L1457",
+      "responsibility": "顶层入口（NVIDIA 平台实现）：四件套契约（forward/compute_logits/load_weights/make_empty_intermediate_tensors）+get_mtp_target_hidden_states；bases 的 SupportsPP/SupportsEagle3/DeepseekV4MixtureOfExperts 是接口探测靶；set_moe_parameters 登记 MoE 元数据。对照 ch23 的 LlamaForCausalLM。"
+    },
+    {
+      "name": "DeepseekV4Model",
+      "file": "vllm/models/deepseek_v4/nvidia/model.py:L995",
+      "responsibility": "主干：embed→逐层（hc 4 元组穿针）→mhc_post→_mtp_hidden_buffer→hc_head→norm；持有三池（aux streams/eager scratch/topk buffer）与 PP 多流中间张量契约。EagleModelMixin 提供 aux 流重建。"
+    },
+    {
+      "name": "DeepseekV4DecoderLayer",
+      "file": "vllm/models/deepseek_v4/nvidia/model.py:L816",
+      "responsibility": "单层两半：attn（平台子类）+ffn（MoE）+双 RMSNorm（融进 hc 核）+六组 fp32 hc 混合参数；forward 是 mHC 门控骨架的字面载体。"
+    },
+    {
+      "name": "DeepseekV4Attention",
+      "file": "vllm/models/deepseek_v4/attention.py:L123",
+      "responsibility": "第三代 MLA 平台 ABC（包根，永不直接实例化）：共享投影装配（fused_wqa_wkv/q_norm/wq_b/kv_norm/wo_a/wo_b/attn_sink）+共享 forward（多流 GEMM+eager break）+四本账 spec 自报；平台子类实现 forward_mqa/_o_proj/get_padded_num_q_heads/backend_cls 四个抽象点。"
+    },
+    {
+      "name": "DeepseekV4FlashMLAAttention",
+      "file": "vllm/models/deepseek_v4/nvidia/flashmla.py:L34",
+      "responsibility": "NVIDIA FlashMLA 平台子类：头垫到 64/128；forward_mqa 分 prefill（分块 gather+combine+flash_mla_sparse_fwd）/decode（一核双源 flash_mla_with_kvcache）；_o_proj 走 deep_gemm_fp8_o_proj。同目录另有 FlashInfer 两子类（SM120/普通），amd/xpu 各有对应。"
+    },
+    {
+      "name": "DeepseekV4MoE",
+      "file": "vllm/models/deepseek_v4/nvidia/model.py:L519",
+      "responsibility": "MoE 层：gate 路由（sqrtsoftplus/hash/noaux_tc 三模式）+shared_experts+双后端专家（MegaMoE/FusedMoE 二岔）；use_mega_moe 由 kernel_config.moe_backend 决定。"
+    },
+    {
+      "name": "DeepseekV4MegaMoEExperts",
+      "file": "vllm/models/deepseek_v4/nvidia/model.py:L168",
+      "responsibility": "DeepGEMM MegaMoE 专家（EP 专用）：fp4 uint8 字节参数+UE8M0 scale；finalize_weights 变换 DeepGEMM 布局；对称缓冲跨层复用；手动注册 static_forward_context。SM100 限定。"
+    },
+    {
+      "name": "DeepseekV4MLP",
+      "file": "vllm/models/deepseek_v4/nvidia/model.py:L89",
+      "responsibility": "dense MLP（shared_experts 用）：gate_up/down SwiGLU；block-FP8 下按 TP 块对齐补 intermediate 维（trailing ranks 落零垫）。"
+    },
+    {
+      "name": "GateLinear",
+      "file": "vllm/model_executor/layers/fused_moe/router/gate_linear.py:L18",
+      "responsibility": "MoE gate 线性层（ReplicatedLinear 子类）：六级 GEMM 分派（cuteDSL/DSV3 特化/fp32 特化/ cuBLAS/兜底）；out_dtype=fp32；挂 tid2eid（hash MoE）与 e_score_correction_bias（noaux_tc）两个路由附件。"
+    },
+    {
+      "name": "DeepseekV4FP8Config",
+      "file": "vllm/models/deepseek_v4/quant_config.py:L29",
+      "responsibility": "V4 量化配置（Fp8Config 子类，注册名 deepseek_v4_fp8）：expert_dtype 惰性解析驱动 Mxfp4/Fp8/NvFp4 专家分发与线性 scale 精度（is_scale_e8m0）；override_quantization_method 是接入点。"
+    },
+    {
+      "name": "DeepseekV4Indexer",
+      "file": "vllm/models/deepseek_v4/attention.py:L718",
+      "responsibility": "C4A 层的稀疏索引器（仅 compress_ratio==4 建）——ch26 主角，本章作积木引用：压缩坐标系+FP4/FP8 缓存+与 compressor 双流并行。"
+    },
+    {
+      "name": "DeepseekCompressor",
+      "file": "vllm/models/deepseek_v4/compressor.py:L211",
+      "responsibility": "KV/score 压缩机（compress_ratio>1 建）——ch26 已深讲，本章作积木引用：fused_wkv_wgate 一枪出 KV+score→save_partial_states→压缩写缓存。"
+    },
+    {
+      "name": "DeepseekV4SWACache",
+      "file": "vllm/v1/attention/backends/mla/sparse_swa.py:L56",
+      "responsibility": "滑窗支路缓存（每注意力层一本）：块 64 与 C4A KV 块共享物理张量（页大小对齐的约束源）；fp8_ds_mla uint8 或 plain bf16/fp8 双布局。"
+    },
+    {
+      "name": "DeepSeekV4MTP",
+      "file": "vllm/models/deepseek_v4/nvidia/mtp.py:L282",
+      "responsibility": "MTP draft 模型：多层 DeepSeekV4MultiTokenPredictorLayer（e_proj/h_proj+复用 DecoderLayer）；forward 返 pre-hc_head 残差、compute_logits 里补 hc_head+shared_head；load_weights 带 mtp.* 重映射与完整性检查（缺层即报错，L493-L504）。"
+    },
+    {
+      "name": "DeepseekV4EagerScratchPool",
+      "file": "vllm/models/deepseek_v4/eager_scratch.py:L12",
+      "responsibility": "eager break 内的全模型输出/草稿池（q_out/indexer_q/global_topk/compressor_scratch，256 对齐）——cudagraph 捕获段外的分配不经图缓存，池化防每拍裸分配。"
+    }
+  ],
+  "data_flow": "本章不做独立 data_flow 重挖——沿 deepread/model-sample.json data_flow 步骤 2（模型前向段）下钻到 DSV4：该步骤里 Llama 的『LlamaModel.forward 逐层 LlamaDecoderLayer：RMSNorm→LlamaAttention→RMSNorm→MLP』在 V4 替换为 hc 门控两半+第三代 MLA+MoE。一拍之内（decode 步、单卡、无 spec）：① runner set_forward_context 挂全层 metadata（ch18/23 已立；V4 每层四本账各有 builder）→ ② 站 10：embed 出 2D hidden → 首层 mhc_pre_broadcast 核内展开 hc_mult 流（4 元组从此在层间穿针）→ ③ 站 11-12 每层两半：attn 半=mhc_fused_post_pre→[sp_all_gather]→多流输入 GEMM→fused_q_kv_rmsnorm→eager break（wq_b+kv_insert ‖ indexer ‖ compressor 三路）→forward_mqa（SWA+压缩 top-k 双源，归 ch26 站 14）→_o_proj（逆 RoPE+fp8 einsum 低秩）→[sp_reduce_scatter]；ffn 半=mhc_fused_post_pre→MoE（站 13：gate→sqrtsoftplus top-k→MegaMoE/FusedMoE→+=shared）→ ④ 层尾 mhc_post 塌回 3D→_mtp_hidden_buffer暂存→hc_head 压回→norm → ⑤ 站 14：runner 切采样位调 compute_logits（ch23 站 12 同款）；spec 开启时 drafter 输入被重绑为 pre-hc_head 残差（gpu_model_runner.py:L5198-L5206）→ MTP draft（e_proj/h_proj→复用 DecoderLayer→flat 残差，hc_head 推迟到 draft 的 compute_logits）。装配期（一生一次）流：arch 查表（站 1）→平台分发（站 2）→顶层/骨架/DecoderLayer/MLA/MoE/FP4 逐级 __init__（站 3-8）→权重流入+两步 finalize（站 9）→eval()。",
+  "why_chains": [
+    {
+      "source_card": "deepread/model-sample.json why_chains[8]（模型定义层=纯拼装+硬件隔离新布局）——本章主链",
+      "decision": "模型定义层 = 平台无关层的纯拼装（模型文件只做层组装+权重名映射，attention 是插座不是实现）+ v0.27 新政：旗舰架构走 vllm/models/<name>/ 硬件隔离布局",
+      "old_design": "HF modeling_*.py 每个模型自带注意力实现与 KV 管理；vLLM 旧世代 model_executor/models/ 扁平目录一个 .py 塞全部平台分支（DSV4 迁移动机：git 287471b99 '[Model Refactoring] Migrate DeepSeek V4 to vllm/models/ [1/N]' #43004，2026-05）。v0.21 的 deepseek_v4.py 就是扁平布局的产物。",
+      "pain": "新架构 = 重写一遍 attention+TP+量化胶水；同一 FlashAttention kernel 要为几十个模型各改一遍；平台分支（CUDA/ROCm/XPU）混在同一文件越长越不可维护——DSV4 这种深度依赖平台 kernel（FlashMLA/FlashInfer sparse/MegaMoE）的模型在扁平布局里已经没法读。",
+      "solution": "本章站 1-6 逐条实证接入清单：①模型四件套+MTP 钩子（nvidia/model.py:L1457-L1548）②registry 条目全限定路径（registry.py:L95，_resolve_module_name L1439-L1446）③__init__.py 按 current_platform 分发（deepseek_v4/__init__.py:L17-L32）④注意力层平台 ABC：forward_mqa/_o_proj/get_padded_num_q_heads/backend_cls 四个抽象点（attention.py:L136-L173），nvidia/amd/xpu 各一份子类 ⑤量化分发 override（quant_config.py:L134-L152，注册进 quantization/__init__.py:L164）⑥static_forward_context 手动注册（attention.py:L327-L332、model.py:L253-L256——普通 Attention 自动做、V4 的 MoE/ABC 要手动）。",
+      "cost": "接入税重（本章就是税单）：新架构作者要同时懂模型层契约（PP/TP/EPLB 接口、TP 头数整除断言）+ KV cache 规格体系（V4 一层四本账）+ 量化分发 + 编译装饰器；平台子类让『一层到底谁实现』要跨目录追（包根 ABC vs nvidia/amd/xpu）；新旧两套布局并存（DSV3.2 仍走 deepseek_v2.py 扁平，registry.py:L92-L94），读者要能分辨。"
+    },
+    {
+      "source_card": "deepread/model-sample.json why_chains[9]（MLA 三代演化）——DSV4 第三代段，本章 capstone 视角",
+      "decision": "MLA 三代演化：KV cache 只存压缩潜向量；DSV4 第三代=统一 head_dim=512 语义+fp8_ds_mla 584B/token+compress_ratio 上下文压缩+输出侧低秩",
+      "old_design": "MHA/GQA 每 token 缓存 K、V 各 num_kv_heads×head_dim；DSV2/V3 世代 576 维潜向量（ch24/25 已讲）。",
+      "pain": "长上下文批量并发的显存天花板（ch25 的 40960→576 账）；V3.2 再上稀疏索引（ch26）后，KV 的『形状』成为三代分型的主轴。",
+      "solution": "DSV4（vllm/models/deepseek_v4/attention.py）：统一 head_dim=512；fp8_ds_mla UE8M0 块缩放 uint8 布局 584B/token（448 NoPE+128 RoPE+8 scale，vllm/v1/kv_cache_interface.py:L389-L420）；compress_ratio 逐层表（1/4/128 三类层，仅 C4A 带 indexer——L207-L213）；输出侧 o_lora_rank/o_groups 低秩（wo_a/wo_b，L245-L262）；alignment 576B 页对齐（L663-L674）；一层最多四本 KV 账（主 MLA/IndexerCache/CompressorStateCache/SWACache）。",
+      "cost": "特形 KV 与所有通用后端不兼容→需要独立 backend 家族（MLAAttentionSpec 的 cache_dtype_str/alignment/compress_ratio 字段就是给 KV 账本分组的）；compress_ratio>1 的层读写都要经过压缩器，cache 命中/共享语义与普通层不同（ch26 已深讲）；prefill 上投影 workspace 的账（eager_scratch.py 即其产物）。"
+    },
+    {
+      "source_card": "deepread/model-sample.json why_chains[0]（forward 与 compute_logits 拆分）——本章在旗舰上的复验",
+      "decision": "forward 与 compute_logits 拆分：模型前向只出 hidden_states，lm_head 由 runner 在采样位切片后另调",
+      "old_design": "HF ForCausalLM.forward 一口气跑 lm_head 返回全位置 logits（训练语义）。",
+      "pain": "decode 批每请求只有最后 1 个 token 需要下一词分布；vocab≈13 万全量物化纯浪费；TP 下 gather 通信同倍放大。",
+      "solution": "DSV4 原样遵守（nvidia/model.py:L1522-L1532 forward 透传 hidden_states；L1515-L1520 compute_logits 两行调 LogitsProcessor）；采样位切片策略仍归 runner（gpu_model_runner.py:L4484-L4485，ch23 站 11）。V4 的新意：hc_head（多流压回单流）放在 Model.forward 尾部、compute_logits 之前——hidden_states 的『最终形态』在模型内部就定型；MTP draft 反向利用这一点把 hc_head 推迟到自己的 compute_logits（mtp.py:L253-L279），让 draft 消费 pre-hc_head 残差。",
+      "cost": "模型类必须同时实现两方法+make_empty_intermediate_tensors（V4 还要多一个 get_mtp_target_hidden_states 可选钩子）；『哪里要 logits』策略分散在 runner。"
+    },
+    {
+      "source_card": "本章新增分析（analyst 深读 v0.27.1 nvidia/model.py L519-L764 + config/kernel.py L121-L131）",
+      "decision": "MoE 双后端：同一份 gate/路由代码后面是两个完全不同的专家实现——kernel_config.moe_backend=='deep_gemm_mega_moe' 走 DeepseekV4MegaMoEExperts（EP 单算子），否则走通用 FusedMoE 工厂（TP）",
+      "old_design": "通用 FusedMoE：TP 切专家、FusedMoEMethod 按量化方法分派 kernel——任何模型任何精度都能跑，但 DSV4 的 fp4 专家在通用路径上吃不到 SM100 的 DeepGEMM mega 融合红利。",
+      "pain": "旗舰 MoE 的 expert GEMM 是算力大头：fp4 权重+top-k 散射在通用管线里要多次物化中间激活；EP（专家并行）才是大规模部署形态，通用 TP 路径对 EP 的对称缓冲/冗余专家没有一等支持。",
+      "solution": "显式配置旋钮 kernel_config.moe_backend（vllm/config/kernel.py:L121-L131 合法值表、L191 字段）选 'deep_gemm_mega_moe'：①EP 强制（L536-L541，无 EP 直接 NotImplementedError 带修法提示）②sqrtsoftplus-only、fp4-only（L552-L561）③专家参数直接以 fp4 字节布局装载（w13=[E,2I,H/2]uint8+scale=[E,2I,H/32]UE8M0，L202-L246）④finalize_weights 变换成 DeepGEMM 布局后丢弃装载参数（L324-L362）⑤forward 一算子 deep_gemm.fp8_fp4_mega_moe(y, l1, l2, symm_buffer, activation_clamp, fast_math)（L505-L512），prepare_megamoe_inputs 把激活量化+top-k 重排进跨层复用的对称缓冲（get_symm_buffer 按 7 元组键缓存，L364-L391）。shared_experts 在 mega 路径 reduce_results=use_mega_moe（EP 下免 all_reduce）外部相加；fused 路径聚合进 FusedMoE。EPLB 冗余专家在 weight_loader 的 _map_global_expert_id（一逻辑专家可落多物理槽，L258-L266）。hash MoE：前 num_hash_layers 层免打分——tid2eid 查表（randint 初始化防 dummy 模式 garbage，L573-L587），路由数学归 fused_topk_bias 的 hash 分支（router L99-L107）。",
+      "cost": "①mega 三重限定（EP+SM100+fp4+sqrtsoftplus）——硬件/部署强绑定，通用部署走 fused 路径②两套专家装配/装载/前向代码要并行维护（_init_mega/_init_fused、两套 expert_mapping）③对称缓冲按 max_num_batched_tokens 预分配（显存账）④finalize 后原参数置 None——权重热更新/EPLB 重排要走 get_expert_weights 的专用视图。"
+    },
+    {
+      "source_card": "本章新增分析（analyst 深读 v0.27.1 quant_config.py 全文 + model.py L1217-L1417 权重装载）",
+      "decision": "FP4 落地=配置期惰性分发 + 字节级装载：expert_dtype 决定 Mxfp4MoEMethod/Fp8MoEMethod/NVFP4 与两套 scale 命名，e8m0fnu scale 以 uint8 原始字节装载",
+      "old_design": "把量化决策写死在模型代码里（v0.21 的 DeepseekV4FP8Config 在 __init__ 急切读 hf_config）；scale 当普通张量 copy_。",
+      "pain": "①VllmConfig 构造时 set_current_vllm_config 还没生效——急切读 expert_dtype 恒见默认 'fp4'，Flash-Base（fp8 专家）checkpoint 会被 silently misroute（quant_config.py:L43-L47 docstring NOTE 原话）②MXFP4 的 scale 是 UE8M0（纯指数浮点），torch 数值 copy_ 会把 2^-7 转成 0（model.py:L1270-L1279 注释：'destroying the raw exponent bytes'）③Mxfp4MoEMethod 与 Fp8LinearMethod 的 scale 注册名不同（weight_scale vs weight_scale_inv）——一套 checkpoint 名要按 expert_dtype 翻成两套参数名。",
+      "solution": "①expert_dtype 做成 property 惰性解析（首次读到已生效的 vllm_config 才定型并 info_once）②装载期 float8_e8m0fnu → .view(torch.uint8) 按原始字节装（MegaMoE 的 _ue8m0_uint8_to_float=(sf.to(int32)<<23).view(float32) 在 finalize 时才还原，L310-L312）③per-instance WeightsMapper（model.py:L1383-L1417）：fp4 时 experts 的 '.scale'→'.weight_scale'、其余 '.scale'→'.weight_scale_inv'；fp8 时全部→'.weight_scale_inv'——模型类 __init__ 按 expert_dtype 选 mapper 实例。get_quant_method 分发树（quant_config.py:L173-L199）：RoutedExperts+fp4→Mxfp4MoEMethod（NVFP4 checkpoint 经 moe_quant_algo 走 ModelOptNvFp4FusedMoE）；fp8→Fp8MoEMethod。is_scale_e8m0=(expert_dtype=='fp4') 决定线性 scale 是 UE8M0 还是 f32。",
+      "cost": "①『同一文件两类 scale 后缀』——读者/排障要时刻知道自己在哪条路径（mtp.py:L69-L77 专门注释镜像同款）②Quark 导出还要 from_config 翻译 schema（L154-L171）③block-FP8 的 TP 块对齐要求 shared_experts 装载补零（_pad_shared_expert_weight）——量化与并行的耦合又一处。"
+    },
+    {
+      "source_card": "deepread/model-sample.json why_chains[7]（spec decode drafter 谱系）MTP 段 + 本章新增分析（mhc/tilelang.py 与 L1131-L1215 主干）",
+      "decision": "mHC 多流残差 + MTP 钩子：残差从『加回去』升级为 hc_mult 条流的学习式混合；pre-hc_head 残差经 _mtp_hidden_buffer 喂 MTP draft",
+      "old_design": "标准 add-norm 残差：hidden = hidden + attn_out，一条流（ch23 的 Llama 基线）；v0.21 的 DSV4 在 Model.forward 里显式 unsqueeze/repeat 展开多流、mhc 是 torch.ops.vllm 自定义算子。",
+      "pain": "单流残差是信息瓶颈（梯度/表征都要挤一条道）；深模型里『加回去』的固定权重限制表达；而 MTP 要的 draft 输入必须是『还没被输出头定型』的残差形态——单流模型里这个中间形态根本不存在。",
+      "solution": "v0.27.1 形态：①残差流形=(residual (T,hc_mult,H), post_mix (T,hc_mult), comb_mix (T,hc_mult,hc_mult)) 三件套+2D layer 输入，层间 4 元组穿针（model.py:L899-L992）②每半层一个 mhc_fused_post_pre_tilelang（post+pre+RMSNorm 融合单核，tilelang.py:L433-L461）；首层 2D embed 由 mhc_pre_broadcast_tilelang 核内展开——finalize_mhc_broadcast_weights 把 (2+hc_mult,hc_mult,H) 的混合权预先对流维求和（fn_broadcast，L1371-L1380），因为 2D 输入各流相同③层尾 mhc_post 塌回 (T,hc_mult,H) 后**先** copy_ 进 _mtp_hidden_buffer（pre-hc_head 残差，L1200-L1202）再 hc_head 压回单流（L720-L748）④MTP 钩子：get_mtp_target_hidden_states（L1534-L1538）+ runner 侧 getattr 探测重绑（gpu_model_runner.py:L5198-L5206，'Let the target override the hidden state fed to the drafter'）⑤draft（mtp.py）：fused_mtp_input_rmsnorm 一核做 mask 首位+enorm+hnorm，hidden=h_proj(prev)+e_proj(embed)，复用整层 DeepseekV4DecoderLayer，返回 flat 残差、hc_head 推迟到自己的 compute_logits（L253-L279）——num_speculative_tokens>1 时 flat 残差还能续喂下一步。",
+      "cost": "①每层六组 fp32 混合参数（(2+hc_mult)×hc_mult×H 量级）+Sinkhorn 归一超参（hc_sinkhorn_iters/hc_eps/hc_post_alpha=2.0）——参数与核复杂度税②PP 中间张量=多流形状（载荷×hc_mult）③hc 核真身在 tilelang_kernels（生成的核），Python 侧只见形状契约——教学只能讲到形状/数据流层（诚实边界，worked example 同此边界）④MTP draft 复用整层 DecoderLayer=每 draft 层一份 MoE 权重装载（mtp 完整性检查 L493-L504：checkpoint 缺 MTP 层直接报错）。"
+    }
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/models/deepseek_v4/__init__.py",
+      "lines": "L1-L39",
+      "what": "硬件隔离入口（整文件）：current_platform.is_rocm()/is_xpu() 三岔 import amd/xpu/nvidia 各自的 ForCausalLM/MTP/DSpark 并 re-export——registry 与量化查找只认 __all__ 四个公共名；DeepseekV4FP8Config 在包根（无平台分）。docstring 原话 'picks the right one for the current platform'。",
+      "elide": [],
+      "code": "# SPDX-License-Identifier: Apache-2.0\n# SPDX-FileCopyrightText: Copyright contributors to the vLLM project\n\"\"\"DeepSeek V4 model — hardware-isolated entry point.\n\nThe actual implementation lives under ``nvidia/`` and ``amd/``; this module\npicks the right one for the current platform and re-exports the public\nclasses used by the model registry and quantization config lookup.\n\"\"\"\n\nfrom vllm.platforms import current_platform\n\nfrom .quant_config import DeepseekV4FP8Config\n\n# Pick the per-platform implementation. The NVIDIA branch is the static\n# default that mypy sees; the ROCm/XPU branches override at runtime and are\n# kept type-compatible via ``# type: ignore[assignment]``.\nif current_platform.is_rocm():\n    from .amd.dspark import (  # type: ignore[assignment]\n        DSparkDeepseekV4ForCausalLM,\n    )\n    from .amd.model import DeepseekV4ForCausalLM\n    from .amd.mtp import DeepSeekV4MTP\nelif current_platform.is_xpu():\n    from .xpu.dspark import DSparkDeepseekV4ForCausalLM  # type: ignore[assignment]\n    from .xpu.model import DeepseekV4ForCausalLM  # type: ignore[assignment]\n    from .xpu.mtp import DeepSeekV4MTP  # type: ignore[assignment]\nelse:\n    from .nvidia.dspark import (  # type: ignore[assignment]\n        DSparkDeepseekV4ForCausalLM,\n    )\n    from .nvidia.model import DeepseekV4ForCausalLM  # type: ignore[assignment]\n    from .nvidia.mtp import DeepSeekV4MTP  # type: ignore[assignment]\n\n__all__ = [\n    \"DSparkDeepseekV4ForCausalLM\",\n    \"DeepSeekV4MTP\",\n    \"DeepseekV4FP8Config\",\n    \"DeepseekV4ForCausalLM\",\n]"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/model.py",
+      "lines": "L1457-L1510",
+      "what": "DeepseekV4ForCausalLM 顶层：bases 的 SupportsPP/SupportsEagle3/DeepseekV4MixtureOfExperts 就是 ch23 站 5 的 hasattr 探测靶；__init__ 按 expert_dtype（默认 fp4）选 per-instance 权重 mapper（类属性默认 fp4 版）；装 Model+lm_head+LogitsProcessor；set_moe_parameters 遍历层登记 MoE 元数据（EPLB/分布式的账在装配期一次算好）。",
+      "elide": [],
+      "code": "class DeepseekV4ForCausalLM(\n    nn.Module, SupportsPP, SupportsEagle3, DeepseekV4MixtureOfExperts\n):\n    model_cls = DeepseekV4Model\n\n    # Default mapper assumes the original FP4-expert checkpoint layout.\n    # Overridden per-instance in __init__ when expert_dtype != \"fp4\".\n    hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(\"fp4\")\n\n    def __init__(self, *, vllm_config: VllmConfig, prefix: str = \"\"):\n        super().__init__()\n\n        config = vllm_config.model_config.hf_config\n        self.config = config\n        expert_dtype = getattr(config, \"expert_dtype\", \"fp4\")\n        if expert_dtype != \"fp4\":\n            self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)\n\n        self.model = self.model_cls(\n            vllm_config=vllm_config, prefix=maybe_prefix(prefix, \"model\")\n        )\n        if get_pp_group().is_last_rank:\n            self.lm_head = ParallelLMHead(\n                config.vocab_size,\n                config.hidden_size,\n                prefix=maybe_prefix(prefix, \"lm_head\"),\n            )\n        else:\n            self.lm_head = PPMissingLayer()\n        self.logits_processor = LogitsProcessor(config.vocab_size)\n        self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]\n            self.model.make_empty_intermediate_tensors\n        )\n\n        self.set_moe_parameters()\n\n    def set_moe_parameters(self) -> None:\n        self.num_expert_groups = getattr(self.config, \"n_group\", 1)\n        self.num_moe_layers = self.config.num_hidden_layers\n        self.moe_layers: list[nn.Module] = []\n        self.moe_mlp_layers: list[DeepseekV4MoE] = []\n        example_moe: DeepseekV4MoE | None = None\n        for layer in self.model.layers:\n            if isinstance(layer, PPMissingLayer):\n                continue\n            if not isinstance(layer, DeepseekV4DecoderLayer):\n                continue\n            if isinstance(layer.ffn, DeepseekV4MoE):\n                example_moe = layer.ffn\n                self.moe_mlp_layers.append(layer.ffn)\n                self.moe_layers.append(layer.ffn.experts)\n\n        self.num_moe_layers = len(self.moe_layers)\n        self.extract_moe_parameters(example_moe)"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/model.py",
+      "lines": "L1512-L1548",
+      "what": "契约方法与 MTP 钩子：compute_logits（logits_processor 两行）、forward（透传出 hidden_states）、get_mtp_target_hidden_states（docstring 自述 'Pre-hc_head residual stream buffer … for the MTP draft model'）、load_weights（AutoWeightsLoader skip 'mtp.' + 两步 finalize）。",
+      "elide": [],
+      "code": "    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:\n        return self.model.embed_input_ids(input_ids)\n\n    def compute_logits(\n        self,\n        hidden_states: torch.Tensor,\n    ) -> torch.Tensor | None:\n        logits = self.logits_processor(self.lm_head, hidden_states)\n        return logits\n\n    def forward(\n        self,\n        input_ids: torch.Tensor,\n        positions: torch.Tensor,\n        intermediate_tensors: IntermediateTensors | None = None,\n        inputs_embeds: torch.Tensor | None = None,\n    ) -> torch.Tensor | IntermediateTensors:\n        hidden_states = self.model(\n            input_ids, positions, intermediate_tensors, inputs_embeds\n        )\n        return hidden_states\n\n    def get_mtp_target_hidden_states(self) -> torch.Tensor | None:\n        \"\"\"Pre-hc_head residual stream buffer (max_num_batched_tokens,\n        hc_mult * hidden_size) for the MTP draft model. Populated by\n        forward(); valid after each target step.\"\"\"\n        return getattr(self.model, \"_mtp_hidden_buffer\", None)\n\n    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n        loader = AutoWeightsLoader(self, skip_substrs=[\"mtp.\"])\n        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)\n        self.model.finalize_mega_moe_weights()\n        self.model.finalize_mhc_broadcast_weights()\n        return loaded_params\n\n    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:\n        return self.model.get_expert_mapping()"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/model.py",
+      "lines": "L1020-L1106",
+      "what": "DeepseekV4Model.__init__ 中段（L996-L1019 样板略）：三个全模型共享池——①3 条 cuda.Stream（注释点名三个轻 GEMM：compressor kv_score / indexer.weights_proj / indexer.compressor kv_score，fused_wqa_wkv 留默认流）②DeepseekV4EagerScratchPool（eager break 里不再裸分配）③topk_indices_buffer（ch26 站 1 同款裸 buffer）；hc_head_fn/base/scale 三个 fp32 参数；_mtp_hidden_buffer 只在 speculative_config 用 eagle/draft_model 时建。",
+      "elide": [],
+      "code": "        # Three aux streams: one per non-default input GEMM in\n        # DeepseekV4Attention.attn_gemm_parallel_execute\n        # (compressor kv_score, indexer.weights_proj, indexer.compressor\n        # kv_score). fused_wqa_wkv stays on the default stream.\n        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]\n        padded_heads = _select_dsv4_attn_cls(vllm_config).get_padded_num_q_heads(\n            config.num_attention_heads // get_tensor_model_parallel_world_size()\n        )\n        self.eager_scratch_pool: DeepseekV4EagerScratchPool | None = None\n        if not vllm_config.parallel_config.use_ubatching:\n            # TODO: support dbo if needed\n            # this requires the buffer to have ubatch dim\n            self.eager_scratch_pool = DeepseekV4EagerScratchPool(\n                vllm_config.scheduler_config.max_num_batched_tokens,\n                padded_heads,\n                config.head_dim,\n                config.index_n_heads,\n                config.index_head_dim,\n                config.index_topk,\n                current_platform.device_type,\n            )\n\n        # Reserved topk indices buffer for all Indexer layers to reuse.\n        self.topk_indices_buffer = torch.empty(\n            vllm_config.scheduler_config.max_num_batched_tokens,\n            config.index_topk,\n            dtype=torch.int32,\n        )\n\n        if get_pp_group().is_first_rank:\n            self.embed_tokens = VocabParallelEmbedding(\n                config.vocab_size,\n                config.hidden_size,\n                quant_config=quant_config,\n                prefix=f\"{prefix}.embed_tokens\",\n            )\n        else:\n            self.embed_tokens = PPMissingLayer()\n\n        self.start_layer, self.end_layer, self.layers = make_layers(\n            config.num_hidden_layers,\n            lambda prefix: DeepseekV4DecoderLayer(\n                vllm_config,\n                prefix=prefix,\n                topk_indices_buffer=self.topk_indices_buffer,\n                aux_stream_list=aux_stream_list,\n                eager_scratch_pool=self.eager_scratch_pool,\n            ),\n            prefix=f\"{prefix}.layers\",\n        )\n\n        if get_pp_group().is_last_rank:\n            self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)\n        else:\n            self.norm = PPMissingLayer()\n\n        self.hc_head_fn = nn.Parameter(\n            torch.empty(\n                self.hc_mult,\n                self.hc_dim,\n                dtype=torch.float32,\n            ),\n            requires_grad=False,\n        )\n        self.hc_head_base = nn.Parameter(\n            torch.empty(\n                self.hc_mult,\n                dtype=torch.float32,\n            ),\n            requires_grad=False,\n        )\n        self.hc_head_scale = nn.Parameter(\n            torch.empty(1, dtype=torch.float32),\n            requires_grad=False,\n        )\n        spec_config = vllm_config.speculative_config\n        needs_mtp_hidden_states = spec_config is not None and (\n            spec_config.use_eagle() or spec_config.uses_draft_model()\n        )\n        if get_pp_group().is_last_rank and needs_mtp_hidden_states:\n            self._mtp_hidden_buffer = torch.empty(\n                vllm_config.scheduler_config.max_num_batched_tokens,\n                self.hc_dim,\n                dtype=vllm_config.model_config.dtype,\n            )\n        else:\n            self._mtp_hidden_buffer = None"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/model.py",
+      "lines": "L1131-L1215",
+      "what": "运行期主干 DeepseekV4Model.forward：首 rank embed 出 2D (T,H)（不再显式 repeat——首层 broadcast 核内展开）；sp_shard 序列并行入口；逐层 4 元组 (hidden_states, residual, post_mix, res_mix) 穿针；EAGLE3 的 aux_hidden_state_layers 在中间层 mhc_post 重建 aux 流；层尾 mhc_post_tilelang 塌回 (T, hc_mult, H) → _mtp_hidden_buffer 先 copy_（pre-hc_head！）→ hc_head 压回单流 → norm。PP 非末 rank 直接以多流形状交 IntermediateTensors。",
+      "elide": [],
+      "code": "    def forward(\n        self,\n        input_ids: torch.Tensor,\n        positions: torch.Tensor,\n        intermediate_tensors: IntermediateTensors | None,\n        inputs_embeds: torch.Tensor | None = None,\n    ) -> torch.Tensor | IntermediateTensors:\n        if get_pp_group().is_first_rank:\n            if inputs_embeds is not None:\n                hidden_states = inputs_embeds\n            else:\n                hidden_states = self.embed_input_ids(input_ids)\n        else:\n            assert intermediate_tensors is not None\n            hidden_states = intermediate_tensors[\"hidden_states\"]\n\n        if self.use_mega_moe:\n            input_ids = input_ids.to(torch.int64)\n\n        full_num_tokens = positions.shape[0]\n        if self.use_sequence_parallel:\n            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():\n                forward_context = get_forward_context()\n                forward_context.is_padding = sp_padding_mask(\n                    forward_context.is_padding, hidden_states\n                )\n            hidden_states = sp_shard(hidden_states)\n            input_ids = sp_shard(input_ids)\n\n        residual, post_mix, res_mix = None, None, None\n        aux_hidden_states: list[torch.Tensor] = []\n        final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call\n        for idx, layer in enumerate(\n            islice(self.layers, self.start_layer, self.end_layer),\n            start=self.start_layer,\n        ):\n            hidden_states, residual, post_mix, res_mix = layer(\n                hidden_states,\n                positions,\n                input_ids,\n                post_mix,\n                res_mix,\n                residual,\n            )\n            if idx + 1 in self.aux_hidden_state_layers:\n                # Reconstruct the aux hidden state for draft models\n                aux_recon = mhc_post_tilelang(\n                    hidden_states, residual, post_mix, res_mix\n                )\n                aux_hidden_state = aux_recon.mean(dim=1)\n                if self.use_sequence_parallel:\n                    aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]\n                aux_hidden_states.append(aux_hidden_state)\n                final_aux_recon = aux_recon\n        if layer is not None:\n            # Reuse if the last layer was captured as an aux hidden state\n            if self.end_layer in self.aux_hidden_state_layers:\n                hidden_states = final_aux_recon\n            else:\n                hidden_states = mhc_post_tilelang(\n                    hidden_states, residual, post_mix, res_mix\n                )\n\n        if not get_pp_group().is_last_rank:\n            return IntermediateTensors({\"hidden_states\": hidden_states})\n\n        if self.use_sequence_parallel:\n            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]\n\n        if self._mtp_hidden_buffer is not None:\n            num_tokens = hidden_states.shape[0]\n            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))\n\n        hidden_states = hc_head_fused_kernel_tilelang(\n            hidden_states,\n            self.hc_head_fn,\n            self.hc_head_scale,\n            self.hc_head_base,\n            self.rms_norm_eps,\n            self.hc_eps,\n        )\n        hidden_states = self.norm(hidden_states)\n        if len(aux_hidden_states) > 0:\n            return hidden_states, aux_hidden_states\n        return hidden_states"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/model.py",
+      "lines": "L899-L992",
+      "what": "单层两半 DeepseekV4DecoderLayer.forward——hc 门控骨架：residual is None 时首层特判（x.dim()==2 走 mhc_pre_broadcast_tilelang，否则普通 mhc_pre_tilelang），其余走 mhc_fused_post_pre_tilelang（上一个 post 与下一个 pre 融合成一个核）；attn 半与 ffn 半各一次；use_sequence_parallel 时 sp_all_gather/sp_reduce_scatter 包住 attn。注意 RMSNorm 的 weight/eps 被拆出来传给核（norm 融进 hc 核）。",
+      "elide": [],
+      "code": "    def forward(\n        self,\n        x: torch.Tensor,\n        positions: torch.Tensor,\n        input_ids: torch.Tensor | None,\n        post_mix: torch.Tensor | None = None,\n        res_mix: torch.Tensor | None = None,\n        residual: torch.Tensor | None = None,\n    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:\n        attn_norm_weight = self.attn_norm.weight.data\n        attn_norm_eps = self.attn_norm.variance_epsilon\n        if residual is None:\n            # Run standalone mhc_pre on first layer\n            if x.dim() == 2:\n                assert self.hc_attn_fn_broadcast is not None\n                residual, post_mix, res_mix, x = mhc_pre_broadcast_tilelang(\n                    x,\n                    self.hc_attn_fn,\n                    self.hc_attn_scale,\n                    self.hc_attn_base,\n                    self.rms_norm_eps,\n                    self.hc_eps,\n                    self.hc_eps,\n                    self.hc_post_alpha,\n                    self.hc_sinkhorn_iters,\n                    norm_weight=attn_norm_weight,\n                    norm_eps=attn_norm_eps,\n                    fn_broadcast=self.hc_attn_fn_broadcast,\n                )\n            else:\n                residual = x\n                post_mix, res_mix, x = mhc_pre_tilelang(\n                    x,\n                    self.hc_attn_fn,\n                    self.hc_attn_scale,\n                    self.hc_attn_base,\n                    self.rms_norm_eps,\n                    self.hc_eps,\n                    self.hc_eps,\n                    self.hc_post_alpha,\n                    self.hc_sinkhorn_iters,\n                    norm_weight=attn_norm_weight,\n                    norm_eps=attn_norm_eps,\n                )\n        else:\n            residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(\n                x,\n                residual,\n                post_mix,\n                res_mix,\n                self.hc_attn_fn,\n                self.hc_attn_scale,\n                self.hc_attn_base,\n                self.rms_norm_eps,\n                self.hc_eps,\n                self.hc_eps,\n                self.hc_post_alpha,\n                self.hc_sinkhorn_iters,\n                n_splits=1,\n                tile_n=1,\n                norm_weight=attn_norm_weight,\n                norm_eps=attn_norm_eps,\n            )\n\n        if self.use_sequence_parallel:\n            x = sp_all_gather(x)[: positions.shape[0]]\n\n        x = self.attn(positions, x, None)\n        if self.use_sequence_parallel:\n            x = sp_reduce_scatter(x)\n\n        ffn_norm_weight = self.ffn_norm.weight.data\n        ffn_norm_eps = self.ffn_norm.variance_epsilon\n        residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(\n            x,\n            residual,\n            post_mix,\n            res_mix,\n            self.hc_ffn_fn,\n            self.hc_ffn_scale,\n            self.hc_ffn_base,\n            self.rms_norm_eps,\n            self.hc_eps,\n            self.hc_eps,\n            self.hc_post_alpha,\n            self.hc_sinkhorn_iters,\n            n_splits=1,\n            tile_n=1,\n            norm_weight=ffn_norm_weight,\n            norm_eps=ffn_norm_eps,\n        )\n\n        x = self.ffn(x, input_ids)\n        return x, residual, post_mix, res_mix"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/attention.py",
+      "lines": "L179-L262",
+      "what": "DeepseekV4Attention.__init__ 前半（平台 ABC 的共享装配）：维度账（head_dim=512、q_lora_rank、o_lora_rank、o_groups、compress_ratios 逐层表→compress_ratio，MTP 层恒 1）；attn_sink 按平台 padded_heads 填 -inf；fused_wqa_wkv=MergedColumnParallelLinear([q_lora_rank, head_dim]) 且 disable_tp=True（'fused ReplicatedLinear'——低秩瓶颈不切 TP）；q_norm/wq_b 列切；kv_norm；wo_a（n_groups×o_lora_rank，bmm 视图标记）/wo_b 行切——输出侧低秩两段。",
+      "elide": [
+        "L188-L215 维度读取与 compress_ratio 表可一句带过（细节归 ch26 站 1/三类层注）"
+      ],
+      "code": "    def __init__(\n        self,\n        vllm_config: VllmConfig,\n        prefix: str,\n        topk_indices_buffer: torch.Tensor | None = None,\n        aux_stream_list: list[torch.cuda.Stream] | None = None,\n        eager_scratch_pool: \"DeepseekV4EagerScratchPool | None\" = None,\n    ) -> None:\n        super().__init__()\n        config = vllm_config.model_config.hf_config\n        quant_config = vllm_config.quant_config\n        cache_config = vllm_config.cache_config\n        tp_size = get_tensor_model_parallel_world_size()\n        layer_id = extract_layer_index(prefix)\n\n        self.prefix = prefix  # Alias for compatibility with compressor\n        self.hidden_size = config.hidden_size\n        self.n_heads = config.num_attention_heads\n        assert self.n_heads % tp_size == 0\n        self.n_local_heads = self.n_heads // tp_size\n        self.q_lora_rank = config.q_lora_rank\n        self.o_lora_rank = config.o_lora_rank\n        self.head_dim = config.head_dim\n        self.rope_head_dim = config.qk_rope_head_dim\n        self.nope_head_dim = self.head_dim - self.rope_head_dim\n        self.n_groups = config.o_groups\n        self.n_local_groups = self.n_groups // tp_size\n        self.window_size = config.sliding_window\n        # NOTE(zyongye) Compress ratio can't be 0\n        # we do this for because MTP layer is not included\n        # in the compress ratio list\n        if layer_id < config.num_hidden_layers:\n            self.compress_ratio = max(1, config.compress_ratios[layer_id])\n        else:\n            self.compress_ratio = 1\n        self.eps = config.rms_norm_eps\n        self.scale = self.head_dim**-0.5\n\n        # Padded Q head count is dictated by the platform subclass.\n        self.padded_heads = self.get_padded_num_q_heads(self.n_local_heads)\n        # Sink padded to the same head count, initialized to -inf (no sink\n        # effect). Weight loading fills the first n_local_heads slots.\n        self.attn_sink = nn.Parameter(\n            torch.full((self.padded_heads,), -float(\"inf\"), dtype=torch.float32),\n            requires_grad=False,\n        )\n\n        self.fused_wqa_wkv = MergedColumnParallelLinear(\n            self.hidden_size,\n            [self.q_lora_rank, self.head_dim],\n            bias=False,\n            quant_config=quant_config,\n            prefix=f\"{prefix}.fused_wqa_wkv\",\n            disable_tp=True,  # fused ReplicatedLinear\n        )\n        self.q_norm = RMSNorm(self.q_lora_rank, self.eps)\n        self.wq_b = ColumnParallelLinear(\n            self.q_lora_rank,\n            self.n_heads * self.head_dim,\n            bias=False,\n            quant_config=quant_config,\n            return_bias=False,\n            prefix=f\"{prefix}.wq_b\",\n        )\n\n        self.kv_norm = RMSNorm(self.head_dim, self.eps)\n        self.wo_a = ColumnParallelLinear(\n            self.n_heads * self.head_dim // self.n_groups,\n            self.n_groups * self.o_lora_rank,\n            bias=False,\n            quant_config=quant_config,\n            return_bias=False,\n            prefix=f\"{prefix}.wo_a\",\n        )\n        self.wo_a.is_bmm = True\n        self.wo_a.bmm_batch_size = self.n_local_groups\n        self.wo_b = RowParallelLinear(\n            self.n_groups * self.o_lora_rank,\n            self.hidden_size,\n            bias=False,\n            quant_config=quant_config,\n            return_bias=False,\n            prefix=f\"{prefix}.wo_b\",\n        )"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/attention.py",
+      "lines": "L264-L348",
+      "what": "DeepseekV4Attention.__init__ 后半——接线与四本账之源：rotary_emb（解耦 RoPE，compress_ratio 传入）；indexer 只在 compress_ratio==4（注释 'Only C4A uses sparse attention'）且复用 aux_stream_list[2]（注释点名外层 GEMM 已 join、内层 overlap）；kv_cache_dtype 经 _resolve_dsv4_ds_mla_dtype 定为 fp8_ds_mla/uint8（回写 cache_config）；DeepseekV4SWACache；**手动**注册 static_forward_context[prefix]=self（普通 Attention 在 __init__ 自动做、V4 要手动——重复名即 raise）；compressor 只在 compress_ratio>1 建。",
+      "elide": [],
+      "code": "        # Initialize rotary embedding before the indexer/compressor consume it.\n        self.rotary_emb = build_deepseek_v4_rope(\n            config,\n            head_dim=self.head_dim,\n            rope_head_dim=self.rope_head_dim,\n            max_position_embeddings=config.max_position_embeddings,\n            compress_ratio=self.compress_ratio,\n        )\n        self.indexer_rotary_emb = self.rotary_emb\n        self.topk_indices_buffer = topk_indices_buffer\n        self.eager_scratch_pool = eager_scratch_pool\n\n        self.indexer = None\n        if self.compress_ratio == 4:\n            # Only C4A uses sparse attention and hence has indexer.\n            # aux_stream_list[2] is free here (outer GEMMs joined) for the inner\n            # overlap of wq_b+fused_indexer_q_rope_quant vs compressor. None on\n            # ROCm, where aux_stream_list is None.\n            indexer_aux_stream = (\n                aux_stream_list[2] if aux_stream_list is not None else None\n            )\n            self.indexer = DeepseekV4Indexer(\n                vllm_config,\n                config=config,\n                hidden_size=self.hidden_size,\n                q_lora_rank=self.q_lora_rank,\n                quant_config=quant_config,\n                cache_config=cache_config,\n                topk_indices_buffer=topk_indices_buffer,\n                compress_ratio=self.compress_ratio,\n                prefix=f\"{prefix}.indexer\",\n                aux_stream=indexer_aux_stream,\n                eager_scratch_pool=eager_scratch_pool,\n            )\n\n        # Will be None on ROCm for now.\n        self.aux_stream_list = aux_stream_list\n        # [0]: GEMM start / post-GEMM event0. [1..3]: GEMM done events;\n        # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins\n        # before post-GEMM starts.\n        self.ln_events = [torch.cuda.Event() for _ in range(4)]\n\n        assert cache_config is not None, \"DeepseekV4 attention requires cache_config\"\n        # ---- Attention / KV-cache setup ----\n        self.max_num_batched_tokens = (\n            vllm_config.scheduler_config.max_num_batched_tokens\n        )\n        self.max_model_len = vllm_config.model_config.max_model_len\n\n        # Resolve the kv-cache dtype from this backend's block format. The same\n        # resolution drives the SWA cache tensor dtype below.\n        self.kv_cache_dtype, self.kv_cache_torch_dtype = _resolve_dsv4_kv_cache_dtype(\n            self._uses_fp8_ds_mla_layout(), cache_config.cache_dtype, cache_config\n        )\n\n        self.swa_cache_layer = DeepseekV4SWACache(\n            head_dim=self.head_dim,\n            window_size=self.window_size,\n            dtype=self.kv_cache_torch_dtype,\n            prefix=f\"{prefix}.swa_cache\",\n            cache_config=cache_config,\n        )\n\n        # Register with compilation context for metadata lookup.\n        compilation_config = vllm_config.compilation_config\n        if prefix and prefix in compilation_config.static_forward_context:\n            raise ValueError(f\"Duplicate layer name: {prefix}\")\n        if prefix:\n            compilation_config.static_forward_context[prefix] = self\n        self.kv_cache = torch.tensor([])\n\n        # Create the compressor for layers with compress_ratio > 1; after the\n        # attention setup above so its KV-cache prefix (self.prefix) is set.\n        self.compressor = None\n        if self.compress_ratio > 1:\n            self.compressor = DeepseekCompressor(\n                vllm_config=vllm_config,\n                compress_ratio=self.compress_ratio,\n                hidden_size=self.hidden_size,\n                head_dim=self.head_dim,\n                rotate=True,\n                prefix=f\"{prefix}.compressor\",\n                k_cache_prefix=self.prefix,\n                eager_scratch_pool=eager_scratch_pool,\n            )"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/attention.py",
+      "lines": "L350-L396",
+      "what": "DeepseekV4Attention.forward：预分配 padded_heads 输出缓冲（平台核要求 64/128 头）；attn_gemm_parallel_execute 做多流输入 GEMM；split(q_lora_rank, head_dim) 后 fused_q_kv_rmsnorm 一次核出 qr/kv；attention_impl（@eager_break_during_capture）做 metadata 相关段；最后 _o_proj（平台实现）。",
+      "elide": [],
+      "code": "    def forward(\n        self,\n        positions: torch.Tensor,\n        hidden_states: torch.Tensor,\n        llama_4_scaling: torch.Tensor | None = None,\n    ) -> torch.Tensor:\n        # Pre-allocate attention output with FlashMLA-padded head count.\n        # The op writes into `o_padded`; we slice to n_local_heads after.\n        num_tokens = hidden_states.shape[0]\n        o_padded = torch.empty(\n            (num_tokens, self.padded_heads, self.head_dim),\n            dtype=hidden_states.dtype,\n            device=hidden_states.device,\n        )\n\n        # Metadata-independent input GEMMs + RMSNorm stay in the captured\n        # graph; the metadata-dependent rest (q up-proj + kv-insert, indexer,\n        # compressor, MLA attention) runs in the eager break.\n        qr_kv, kv_score, indexer_kv_score, indexer_weights = (\n            self.attn_gemm_parallel_execute(hidden_states)\n        )\n        qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)\n        qr, kv = fused_q_kv_rmsnorm(\n            qr,\n            kv,\n            self.q_norm.weight.data,\n            self.kv_norm.weight.data,\n            self.eps,\n        )\n\n        # attention_impl is wrapped with @eager_break_during_capture: this is\n        # where the breakable cudagraph capture breaks (the attention op runs\n        # eagerly between captured graph segments).\n        self.attention_impl(\n            hidden_states,\n            qr,\n            kv,\n            kv_score,\n            indexer_kv_score,\n            indexer_weights,\n            positions,\n            o_padded,\n        )\n        o = o_padded[:, : self.n_local_heads, :]\n\n        # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).\n        return self._o_proj(o, positions)"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/attention.py",
+      "lines": "L461-L540",
+      "what": "attention_impl——eager break 边界与 3 路 overlap：C4A 层默认流跑 wq_b+qnorm+RoPE+kv_insert，aux[0] 跑整个 indexer、aux[1] 跑 MLA compressor（注释 'matches TRT-LLM PR #14142 Level 1'；ROCm aux_streams=None 顺序回退）；C>1 无 indexer 层双路；SWA-only 层无 overlap；收尾 forward_mqa(q, kv, positions, out) 平台核写入预分配输出。@eager_break_during_capture：breakable cudagraph 在此断开（捕获段之间 eager 跑）。",
+      "elide": [
+        "L533-L536 SWA-only 分支可略（无 compressor 无 overlap 的退化形）"
+      ],
+      "code": "    @eager_break_during_capture\n    def attention_impl(\n        self,\n        hidden_states: torch.Tensor,\n        qr: torch.Tensor,\n        kv: torch.Tensor,\n        kv_score: torch.Tensor,\n        indexer_kv_score: torch.Tensor,\n        indexer_weights: torch.Tensor,\n        positions: torch.Tensor,\n        out: torch.Tensor,  # [num_tokens, padded_heads, head_dim], written in place\n    ) -> None:\n        forward_context = get_forward_context()\n        attn_metadata = forward_context.attn_metadata\n\n        # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride\n        # on the default stream so q stays on its consumer stream (forward_mqa\n        # downstream reads q on default). Indexer/compressor go on aux for\n        # overlap with default's GEMM + cache write.\n        if self.indexer is not None:\n            aux_streams = self.aux_stream_list\n            indexer = self.indexer\n            # Local ref so the closure keeps a non-None type for mypy.\n            assert self.compressor is not None\n            compressor = self.compressor\n\n            def wq_b_kv_insert() -> torch.Tensor:\n                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)\n                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)\n                return q\n\n            # 3-way overlap (matches TRT-LLM PR #14142 Level 1): default runs\n            # wq_b+kv_insert; slot [0] runs the full indexer; slot [1] runs the\n            # MLA compressor. Slot [2] is reserved for the indexer's inner\n            # overlap. ROCm (aux_streams is None) falls back to sequential.\n            q, _ = execute_in_parallel(\n                wq_b_kv_insert,\n                [\n                    lambda: indexer(\n                        hidden_states,\n                        qr,\n                        indexer_kv_score,\n                        indexer_weights,\n                        positions,\n                        self.indexer_rotary_emb,\n                    ),\n                    lambda: compressor(kv_score, positions, self.rotary_emb),\n                ],\n                self.ln_events[0],\n                [self.ln_events[1], self.ln_events[2]],\n                [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,\n                enable=aux_streams is not None,\n            )\n        elif self.compressor is not None:\n            # wq_b + kv_insert on default, compressor on aux.\n            aux_stream = (\n                self.aux_stream_list[0] if self.aux_stream_list is not None else None\n            )\n            compressor = self.compressor\n\n            def wq_b_kv_insert() -> torch.Tensor:\n                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)\n                q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)\n                return q\n\n            q, _ = maybe_execute_in_parallel(\n                wq_b_kv_insert,\n                lambda: compressor(kv_score, positions, self.rotary_emb),\n                self.ln_events[0],\n                self.ln_events[1],\n                aux_stream,\n            )\n        else:\n            # SWA-only layer: no compressor, no overlap.\n            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)\n            q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)\n\n        # MLA attention writes into the pre-allocated `out` buffer\n        # ([num_tokens, padded_heads, head_dim]).\n        self.forward_mqa(q, kv, positions, out)"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/attention.py",
+      "lines": "L655-L674",
+      "what": "get_kv_cache_spec——四本账之一（主 MLA）：MLAAttentionSpec(block_size, num_kv_heads=1, head_size=512, dtype=uint8, compress_ratio, cache_dtype_str='fp8_ds_mla', alignment=576, model_version='deepseek_v4')；compress_ratio<=1 的 SWA-only 层返回 None（滑窗账在 DeepseekV4SWACache 另开）。584B/token 的字节账在 kv_cache_interface.py:L411（448 NoPE+128 RoPE+8 fp8 scale）。",
+      "elide": [],
+      "code": "    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:\n        if (\n            self.compress_ratio <= 1\n        ):  # SWA part. Allocated separately as DeepseekV4SWACache.\n            return None\n        # fp8_ds_mla is a UE8M0 block-scaled uint8 layout and needs 576B\n        # alignment; plain bf16 / per-tensor fp8 rows use natural element-size\n        # pages.\n        uses_fp8_ds_mla_layout = self.kv_cache_dtype == \"fp8_ds_mla\"\n        return MLAAttentionSpec(\n            block_size=vllm_config.cache_config.block_size,\n            num_kv_heads=1,\n            head_size=self.head_dim,\n            dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,\n            compress_ratio=self.compress_ratio,\n            cache_dtype_str=self.kv_cache_dtype,\n            alignment=576 if uses_fp8_ds_mla_layout else 512,\n            model_version=\"deepseek_v4\",\n            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),\n        )"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/flashmla.py",
+      "lines": "L34-L67",
+      "what": "平台子类（NVIDIA/FlashMLA）：backend_cls=DeepseekV4FlashMLABackend；get_padded_num_q_heads 把头数垫到 64/128（'FP8 decode kernel only supports h_q = 64 or 128'——attn_sink/输出缓冲按 padded_heads 分配的根据）；_o_proj 调 deep_gemm_fp8_o_proj（逆 RoPE+FP8 量化+einsum+wo_b）。",
+      "elide": [],
+      "code": "class DeepseekV4FlashMLAAttention(DeepseekV4Attention):\n    \"\"\"FlashMLA sparse MLA attention layer for DeepSeek V4 (CUDA).\"\"\"\n\n    backend_cls = DeepseekV4FlashMLABackend\n\n    def __init__(self, *args, **kwargs) -> None:\n        super().__init__(*args, **kwargs)\n        self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()\n\n    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:\n        return deep_gemm_fp8_o_proj(\n            o,\n            positions,\n            self.rotary_emb.cos_sin_cache,\n            self.wo_a,\n            self.wo_b,\n            n_groups=self.n_local_groups,\n            heads_per_group=self.n_local_heads // self.n_local_groups,\n            nope_dim=self.nope_head_dim,\n            rope_dim=self.rope_head_dim,\n            o_lora_rank=self.o_lora_rank,\n            einsum_recipe=self._einsum_recipe,\n            tma_aligned_scales=self._tma_aligned_scales,\n        )\n\n    @classmethod\n    def get_padded_num_q_heads(cls, num_heads: int) -> int:\n        # FP8 decode kernel only supports h_q = 64 or 128.\n        if num_heads > 128:\n            raise ValueError(\n                f\"DeepseekV4 FlashMLA does not support {num_heads} heads \"\n                \"(FP8 decode kernel requires h_q in {64, 128}).\"\n            )\n        return 64 if num_heads <= 64 else 128"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/ops/o_proj.py",
+      "lines": "L13-L73",
+      "what": "输出投影算子：compute_fp8_einsum_recipe 按 SM90/SM100 选 scale 布局；deep_gemm_fp8_o_proj = fused_inv_rope_fp8_quant（注意力输出先解开 RoPE——V4 的 RoPE 在输出侧可逆）→ fp8_einsum('bhr,hdr->bhd', o_fp8, wo_a) → wo_b 回 hidden。Shared by FlashMLA/FlashInfer 两个 CUDA 后端。",
+      "elide": [],
+      "code": "def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:\n    \"\"\"fp8_einsum recipe + scale layout for the current GPU arch.\n\n    SM90: FP32 block scales stay [g, r/128, d/128] → sfb_gran_mn=128.\n    SM100: INT32 packed scales become [g, r, ...] → sfb_gran_mn=1.\n\n    Returns ``(einsum_recipe, tma_aligned_scales)`` for ``deep_gemm_fp8_o_proj``.\n    \"\"\"\n    cap = current_platform.get_device_capability()\n    assert cap is not None, \"DeepseekV4 attention requires a CUDA device\"\n    einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)\n    tma_aligned_scales = cap.major >= 10\n    return einsum_recipe, tma_aligned_scales\n\n\ndef deep_gemm_fp8_o_proj(\n    o: torch.Tensor,\n    positions: torch.Tensor,\n    cos_sin_cache: torch.Tensor,\n    wo_a: nn.Module,\n    wo_b: nn.Module,\n    *,\n    n_groups: int,\n    heads_per_group: int,\n    nope_dim: int,\n    rope_dim: int,\n    o_lora_rank: int,\n    einsum_recipe: tuple[int, int, int],\n    tma_aligned_scales: bool,\n) -> torch.Tensor:\n    \"\"\"O projection: inverse RoPE + FP8 quant + einsum + wo_b.\n\n    Shared by the FlashMLA and FlashInfer CUDA backends. ``einsum_recipe`` /\n    ``tma_aligned_scales`` come from ``compute_fp8_einsum_recipe``.\n    \"\"\"\n    o_fp8, o_scale = fused_inv_rope_fp8_quant(\n        o,\n        positions,\n        cos_sin_cache,\n        n_groups=n_groups,\n        heads_per_group=heads_per_group,\n        nope_dim=nope_dim,\n        rope_dim=rope_dim,\n        tma_aligned_scales=tma_aligned_scales,\n    )\n    z = torch.empty(\n        (o.shape[0], n_groups, o_lora_rank),\n        device=o.device,\n        dtype=torch.bfloat16,\n    )\n    weight_scale = (\n        wo_a.weight_scale if hasattr(wo_a, \"weight_scale\") else wo_a.weight_scale_inv\n    )\n    fp8_einsum(\n        \"bhr,hdr->bhd\",\n        (o_fp8, o_scale),\n        (wo_a.weight, weight_scale),\n        z,\n        recipe=einsum_recipe,\n    )\n    return wo_b(z.flatten(1))"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/model.py",
+      "lines": "L519-L613",
+      "what": "DeepseekV4MoE.__init__：use_mega_moe=（kernel_config.moe_backend=='deep_gemm_mega_moe'）且必须 EP（否则 NotImplementedError 带修法提示）；scoring_func 默认 sqrtsoftplus、mega 只支持它；mega 只支持 expert_dtype=fp4（带'换个 moe_backend'提示）；gate=GateLinear(fp32 出)；hash MoE——前 num_hash_layers 层 tid2eid=randint(vocab, topk)（注释：dummy 模式用 randint 防 garbage）；topk_method=='noaux_tc' 时 e_score_correction_bias；shared_experts（mega 路径 reduce_results=use_mega_moe——EP 下不走 all_reduce）；两后端装配分岔 _init_mega_moe_experts/_init_fused_moe_experts。",
+      "elide": [],
+      "code": "class DeepseekV4MoE(nn.Module):\n    def __init__(\n        self,\n        vllm_config: VllmConfig,\n        prefix: str = \"\",\n        use_sequence_parallel: bool = False,\n    ):\n        super().__init__()\n\n        self.tp_size = get_tensor_model_parallel_world_size()\n        config = vllm_config.model_config.hf_config\n        quant_config = vllm_config.quant_config\n        self.prefix = prefix\n        self.use_sequence_parallel = use_sequence_parallel\n        self.use_mega_moe = (\n            vllm_config.kernel_config.moe_backend == \"deep_gemm_mega_moe\"\n        )\n        if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:\n            raise NotImplementedError(\n                \"DeepSeek V4 MegaMoE currently requires expert parallel. \"\n                \"Enable it with --enable-expert-parallel, or pick a different \"\n                \"moe backend.\"\n            )\n\n        self.routed_scaling_factor = getattr(config, \"routed_scaling_factor\", 1.0)\n        self.hidden_size = config.hidden_size\n\n        self.n_routed_experts = config.n_routed_experts\n        self.n_activated_experts = config.num_experts_per_tok\n        self.moe_intermediate_size = config.moe_intermediate_size\n        self.swiglu_limit = config.swiglu_limit\n        self.renormalize = config.norm_topk_prob\n        self.scoring_func = getattr(config, \"scoring_func\", \"sqrtsoftplus\")\n        if self.use_mega_moe and self.scoring_func != \"sqrtsoftplus\":\n            raise NotImplementedError(\n                \"DeepSeek V4 MegaMoE currently supports sqrtsoftplus routing only.\"\n            )\n        if self.use_mega_moe and getattr(config, \"expert_dtype\", \"fp4\") != \"fp4\":\n            raise NotImplementedError(\n                \"DeepSeek V4 MegaMoE only supports fp4 experts; got expert_dtype=\"\n                f\"{config.expert_dtype!r}. Drop --kernel-config moe_backend=\"\n                \"deep_gemm_mega_moe for this checkpoint.\"\n            )\n\n        self.gate = GateLinear(\n            input_size=config.hidden_size,\n            output_size=config.n_routed_experts,\n            bias=False,\n            out_dtype=torch.float32,\n            prefix=f\"{prefix}.gate\",\n        )\n\n        self.gate.e_score_correction_bias = None\n        self.gate.tid2eid = None\n        is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers\n        self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32\n        if is_hash_moe:\n            # hash MoE doesn't use e_score_correction_bias\n            # Use randint instead of empty to avoid garbage values causing\n            # invalid memory access in dummy mode (--load-format=\"dummy\")\n            self.gate.tid2eid = nn.Parameter(\n                torch.randint(\n                    0,\n                    config.n_routed_experts,\n                    (config.vocab_size, config.num_experts_per_tok),\n                    dtype=self.hash_indices_dtype,\n                ),\n                requires_grad=False,\n            )\n        elif getattr(config, \"topk_method\", None) == \"noaux_tc\":\n            self.gate.e_score_correction_bias = nn.Parameter(\n                torch.empty(config.n_routed_experts, dtype=torch.float32),\n                requires_grad=False,\n            )\n\n        if config.n_shared_experts is None:\n            self.shared_experts = None\n        else:\n            intermediate_size = config.moe_intermediate_size * config.n_shared_experts\n\n            self.shared_experts = DeepseekV4MLP(\n                hidden_size=config.hidden_size,\n                intermediate_size=intermediate_size,\n                hidden_act=config.hidden_act,\n                swiglu_limit=self.swiglu_limit,\n                quant_config=quant_config,\n                reduce_results=self.use_mega_moe,\n                is_sequence_parallel=use_sequence_parallel,\n                prefix=f\"{prefix}.shared_experts\",\n            )\n\n        if self.use_mega_moe:\n            self._init_mega_moe_experts(vllm_config, config, prefix)\n        else:\n            self._init_fused_moe_experts(vllm_config, config, quant_config, prefix)"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/model.py",
+      "lines": "L704-L764",
+      "what": "DeepseekV4MoE.forward 两路：mega=gate→fused_topk_bias(sqrtsoftplus 路由)→experts(topk_weights/ids+activation_clamp=swiglu_limit)→+=shared_experts；fused=FusedMoE 工厂件——is_internal_router 时 router 在 MoERunner 内部跑（连 hidden 都直接喂）、否则外部 gate 先算。hash MoE 要求 input_ids（mega 下已 int64 化）。",
+      "elide": [],
+      "code": "    def forward(\n        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None\n    ) -> torch.Tensor:\n        if self.gate.tid2eid is not None and input_ids is None:\n            raise ValueError(\"DeepSeek V4 hash MoE routing requires input_ids.\")\n\n        if not self.use_mega_moe:\n            return self._forward_fused_moe(hidden_states, input_ids)\n\n        org_shape = hidden_states.shape\n        router_logits, _ = self.gate(hidden_states)\n        topk_weights, topk_ids = fused_topk_bias(\n            hidden_states=hidden_states,\n            gating_output=router_logits,\n            scoring_func=self.scoring_func,\n            e_score_correction_bias=self.gate.e_score_correction_bias.data\n            if self.gate.e_score_correction_bias is not None\n            else None,\n            topk=self.n_activated_experts,\n            renormalize=self.renormalize,\n            indices_type=self.hash_indices_dtype,\n            input_tokens=input_ids,\n            hash_indices_table=self.gate.tid2eid,\n            routed_scaling_factor=self.routed_scaling_factor,\n        )\n        activation_clamp = (\n            float(self.swiglu_limit) if self.swiglu_limit is not None else None\n        )\n        final_hidden_states = self.experts(\n            hidden_states,\n            topk_weights,\n            topk_ids,\n            activation_clamp=activation_clamp,\n        )\n\n        if self.shared_experts is not None:\n            shared_output = self.shared_experts(hidden_states)\n            final_hidden_states += shared_output\n\n        return final_hidden_states.view(org_shape)\n\n    def _forward_fused_moe(\n        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None\n    ) -> torch.Tensor:\n        org_shape = hidden_states.shape\n        if self.experts.is_internal_router:\n            # In this case, the gate/router runs inside the MoERunner class\n            final_hidden_states = self.experts(\n                hidden_states=hidden_states,\n                router_logits=hidden_states,\n                input_ids=input_ids,\n            )\n        else:\n            router_logits, _ = self.gate(hidden_states)\n            final_hidden_states = self.experts(\n                hidden_states=hidden_states,\n                router_logits=router_logits,\n                input_ids=input_ids,\n            )\n\n        return final_hidden_states.view(org_shape)"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/model.py",
+      "lines": "L199-L256",
+      "what": "MegaMoE 专家参数——FP4 字节布局的字面证据：w13_weight=[num_local_experts, 2I, H//2] uint8（两个 fp4 打包一字节）+ w13_weight_scale=[E, 2I, H//32] uint8（每 32 值一个 UE8M0 字节）；w2 同构；quant_method='block' 标记；手动注册 static_forward_context[prefix]=self（MoE 不走 Attention 自动注册——torch.compile 图内自定义算子按名找模块的根据）；重复 prefix 即 raise。",
+      "elide": [],
+      "code": "        self.eplb_state = EplbLayerState()\n\n        weight_attrs = {\"weight_loader\": self.weight_loader}\n        self.w13_weight = nn.Parameter(\n            torch.zeros(\n                num_local_experts,\n                2 * intermediate_size,\n                hidden_size // 2,\n                dtype=torch.uint8,\n            ),\n            requires_grad=False,\n        )\n        set_weight_attrs(self.w13_weight, weight_attrs)\n\n        self.w13_weight_scale = nn.Parameter(\n            torch.zeros(\n                num_local_experts,\n                2 * intermediate_size,\n                hidden_size // 32,\n                dtype=torch.uint8,\n            ),\n            requires_grad=False,\n        )\n        set_weight_attrs(self.w13_weight_scale, weight_attrs)\n        self.w13_weight_scale.quant_method = \"block\"\n\n        self.w2_weight = nn.Parameter(\n            torch.zeros(\n                num_local_experts,\n                hidden_size,\n                intermediate_size // 2,\n                dtype=torch.uint8,\n            ),\n            requires_grad=False,\n        )\n        set_weight_attrs(self.w2_weight, weight_attrs)\n\n        self.w2_weight_scale = nn.Parameter(\n            torch.zeros(\n                num_local_experts,\n                hidden_size,\n                intermediate_size // 32,\n                dtype=torch.uint8,\n            ),\n            requires_grad=False,\n        )\n        set_weight_attrs(self.w2_weight_scale, weight_attrs)\n        self.w2_weight_scale.quant_method = \"block\"\n\n        self._transformed_l1_weights: tuple[torch.Tensor, torch.Tensor] | None = None\n        self._transformed_l2_weights: tuple[torch.Tensor, torch.Tensor] | None = None\n\n        # Register in the static forward context so the custom-op wrapper\n        # can look up this module by name from within a torch.compile graph.\n        compilation_config = vllm_config.compilation_config\n        if prefix in compilation_config.static_forward_context:\n            raise ValueError(f\"Duplicate layer name: {prefix}\")\n        compilation_config.static_forward_context[prefix] = self"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/model.py",
+      "lines": "L1249-L1326",
+      "what": "load_weights 主循环（L1218-L1226 的 stacked 映射表见锚点）：block-FP8 shared_experts 先按 TP 块对齐补零（trailing ranks 落零垫）；'.experts.' 走 expert_mapping 逐 expert 定位（return_success=True——EPLB 冗余专家可能多槽）；e8m0fnu scale 必须 .view(torch.uint8) 装载（注释原话：数值 copy_ 会 'destroying the raw exponent bytes'，如 2^-7→0）；attn_sink 按 head_rank_start:end TP 窄切。",
+      "elide": [
+        "L1254-L1268 gate_up/其它 stacked 分支与 ch23 站 5 同构，可对照略读"
+      ],
+      "code": "        for name, loaded_weight in weights:\n            if pad_shared_expert and \".shared_experts.\" in name:\n                loaded_weight = self._pad_shared_expert_weight(\n                    self.quant_config, name, loaded_weight\n                )\n            for param_name, weight_name, shard_id in stacked_params_mapping:\n                # Skip non-stacked layers and experts (experts handled below).\n                if \".experts.\" in name:\n                    continue\n                if weight_name not in name:\n                    continue\n                name = name.replace(weight_name, param_name)\n\n                if is_pp_missing_parameter(name, self):\n                    break\n                param = params_dict[name]\n                weight_loader = param.weight_loader\n                weight_loader(param, loaded_weight, shard_id)\n                loaded_params.add(name)\n                break\n            else:\n                if \".experts.\" in name:\n                    # E8M0 scales are stored as float8_e8m0fnu in\n                    # checkpoints but the MoE param is uint8. copy_()\n                    # would do a numeric conversion (e.g. 2^-7 → 0),\n                    # destroying the raw exponent bytes.\n                    if (\n                        \"weight_scale\" in name\n                        and loaded_weight.dtype == torch.float8_e8m0fnu\n                    ):\n                        loaded_weight = loaded_weight.view(torch.uint8)\n                    for mapping in expert_mapping:\n                        param_name, weight_name, expert_id, expert_shard_id = mapping\n                        if weight_name not in name:\n                            continue\n                        name_mapped = name.replace(weight_name, param_name)\n                        if is_pp_missing_parameter(name_mapped, self):\n                            continue\n                        param = params_dict[name_mapped]\n                        # We should ask the weight loader to return success or not\n                        # here since otherwise we may skip experts with other\n                        # available replicas.\n                        weight_loader = typing.cast(\n                            Callable[..., bool], param.weight_loader\n                        )\n                        success = weight_loader(\n                            param,\n                            loaded_weight,\n                            name_mapped,\n                            shard_id=expert_shard_id,\n                            expert_id=expert_id,\n                            return_success=True,\n                        )\n                        if success:\n                            name = name_mapped\n                            break\n                    loaded_params.add(name_mapped)\n                    continue\n                elif \"attn_sink\" in name:\n                    if is_pp_missing_parameter(name, self):\n                        continue\n                    narrow_weight = loaded_weight[head_rank_start:head_rank_end]\n                    n = narrow_weight.shape[0]\n                    params_dict[name][:n].copy_(narrow_weight)\n                    loaded_params.add(name)\n                    continue\n                else:\n                    if is_pp_missing_parameter(name, self):\n                        continue\n                    param = params_dict[name]\n                    weight_loader = getattr(\n                        param, \"weight_loader\", default_weight_loader\n                    )\n                    weight_loader(param, loaded_weight)\n                    loaded_params.add(name)\n                    continue\n\n        return loaded_params"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/model.py",
+      "lines": "L1383-L1417",
+      "what": "_make_deepseek_v4_weights_mapper——expert_dtype 决定 scale 后缀：fp4 走 Mxfp4MoEMethod（专家 scale 注册名 'w{1,2,3}_weight_scale' 无 _inv，其它 FP8 linear 是 'weight_scale_inv'）；fp8 走 Fp8MoEMethod（全部 '.scale'→'.weight_scale_inv'）。前缀/后缀/子串三张表把 DeepSeek 原生 checkpoint 名（embed./norm./hc_head/mtp./head.weight/.ffn.gate.bias/.shared_experts.w2）翻成 vLLM 参数名。",
+      "elide": [],
+      "code": "def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:\n    if expert_dtype == \"fp4\":\n        # MXFP4 experts use Mxfp4MoEMethod, which registers scales as\n        # ``w{1,2,3}_weight_scale`` (no _inv suffix). FP8 linear and\n        # shared experts use Fp8LinearMethod's block scales, which\n        # register as ``weight_scale_inv``.\n        scale_regex = {\n            re.compile(r\"(\\.experts\\.\\d+\\.w[123])\\.scale$\"): r\"\\1.weight_scale\",\n            re.compile(r\"\\.scale$\"): \".weight_scale_inv\",\n        }\n    else:\n        # FP8 experts use Fp8MoEMethod (block_quant=True), which registers\n        # scales as ``w{13,2}_weight_scale_inv``. Map all ``.scale`` keys\n        # there.\n        scale_regex = {\n            re.compile(r\"\\.scale$\"): \".weight_scale_inv\",\n        }\n    return WeightsMapper(\n        orig_to_new_prefix={\n            \"layers.\": \"model.layers.\",\n            \"embed.\": \"model.embed.\",\n            \"norm.\": \"model.norm.\",\n            \"hc_head\": \"model.hc_head\",\n            \"mtp.\": \"model.mtp.\",\n        },\n        orig_to_new_regex=scale_regex,\n        orig_to_new_suffix={\n            \"head.weight\": \"lm_head.weight\",\n            \"embed.weight\": \"embed_tokens.weight\",\n            \".ffn.gate.bias\": \".ffn.gate.e_score_correction_bias\",\n        },\n        orig_to_new_substr={\n            \".shared_experts.w2\": \".shared_experts.down_proj\",\n        },\n    )"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/quant_config.py",
+      "lines": "L29-L84",
+      "what": "DeepseekV4FP8Config——FP4 落地的配置真相源：docstring 自述 V4 linear/attention 恒 FP8 block、专家按 checkpoint 分 fp4(MXFP4+ue8m0 线性 scale)/fp8(block+f32 scale) 两族；expert_dtype 惰性解析（NOTE 原话：构造发生在 set_current_vllm_config 之前，急切读会恒见默认 'fp4' 且 'silently misroute Flash-Base checkpoints'）；is_scale_e8m0=（expert_dtype=='fp4'）。",
+      "elide": [],
+      "code": "class DeepseekV4FP8Config(Fp8Config):\n    \"\"\"FP8 config for DeepSeek V4 with expert-dtype-aware MoE dispatch.\n\n    DeepSeek V4 checkpoints always use FP8 block quantization for\n    linear/attention layers. The MoE expert weights vary by checkpoint:\n    - ``expert_dtype=\"fp4\"`` (e.g. DeepSeek-V4-Flash): MXFP4 experts\n      with ue8m0 (e8m0fnu) FP8 linear scales.\n    - ``expert_dtype=\"fp8\"`` (e.g. DeepSeek-V4-Flash-Base): FP8 block\n      experts with float32 FP8 linear scales.\n\n    The dispatch and the linear scale dtype are both keyed off\n    ``expert_dtype`` from the model's hf_config; missing values default\n    to ``\"fp4\"`` so existing FP4 checkpoints stay unchanged.\n\n    NOTE: ``expert_dtype`` is resolved lazily because this config is\n    constructed during VllmConfig setup, before ``set_current_vllm_config``\n    is active. Reading hf_config eagerly in ``__init__`` would always see\n    the default ``\"fp4\"`` and silently misroute Flash-Base checkpoints.\n    \"\"\"\n\n    def __init__(self, *args, **kwargs):\n        super().__init__(*args, **kwargs)\n        self._resolved_expert_dtype: str | None = None\n        self._resolved_moe_quant_algo: str | None = None\n        self._nvfp4_config: ModelOptNvFp4Config | None = None\n        # ``is_scale_e8m0`` is a property that resolves on first read,\n        # by which time the current vllm_config has been set.\n\n    @property\n    def expert_dtype(self) -> str:\n        if self._resolved_expert_dtype is None:\n            try:\n                hf_config = get_current_vllm_config().model_config.hf_config\n            except Exception:\n                # vllm_config not yet set; defer the decision until a\n                # later call lands inside set_current_vllm_config.\n                return \"fp4\"\n            expert_dtype = getattr(hf_config, \"expert_dtype\", \"fp4\")\n            if expert_dtype not in _DEEPSEEK_V4_EXPERT_DTYPES:\n                raise ValueError(\n                    f\"Unsupported DeepSeek V4 expert_dtype={expert_dtype!r}; \"\n                    f\"expected one of {_DEEPSEEK_V4_EXPERT_DTYPES}.\"\n                )\n            self._resolved_expert_dtype = expert_dtype\n            from vllm.logger import init_logger\n\n            init_logger(__name__).info_once(\n                \"DeepSeek V4 expert_dtype resolved to %r\", expert_dtype\n            )\n        return self._resolved_expert_dtype\n\n    @property\n    def is_scale_e8m0(self) -> bool:\n        # FP4 checkpoints store FP8 linear scales as e8m0fnu; FP8 expert\n        # checkpoints (Flash-Base) store them as float32.\n        return self.expert_dtype == \"fp4\""
+    },
+    {
+      "path": "vllm/models/deepseek_v4/quant_config.py",
+      "lines": "L134-L152",
+      "what": "override_quantization_method——量化分发的入口：hf quant_method∈{fp8,deepseek_v4_fp8}（或 AMD-Quark MXFP4-OCP 导出）且 model_type=='deepseek_v4' → 报名 'deepseek_v4_fp8'（注册表 quantization/__init__.py:L164）。",
+      "elide": [],
+      "code": "    @classmethod\n    def override_quantization_method(\n        cls, hf_quant_cfg, user_quant, hf_config=None\n    ) -> QuantizationMethods | None:\n        if not (\n            isinstance(hf_quant_cfg, dict)\n            and (\n                hf_quant_cfg.get(\"quant_method\") in (\"fp8\", \"deepseek_v4_fp8\")\n                or (\n                    hf_quant_cfg.get(\"quant_method\") == \"quark\"\n                    and cls._is_quark_mxfp4_ocp(hf_quant_cfg)\n                )\n            )\n        ):\n            return None\n        model_type = getattr(hf_config, \"model_type\", None)\n        if model_type == \"deepseek_v4\" or user_quant == \"deepseek_v4_fp8\":\n            return \"deepseek_v4_fp8\"\n        return None"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/quant_config.py",
+      "lines": "L173-L199",
+      "what": "get_quant_method——RoutedExperts 的分发树：ignored→Unquantized；expert_dtype=fp4→（moe_quant_algo=='NVFP4' 时 ModelOptNvFp4FusedMoE，否则）Mxfp4MoEMethod；fp8→落回父类 Fp8Config 返回 Fp8MoEMethod（block f32 scale）。is_mxfp4_quant 同口径。",
+      "elide": [],
+      "code": "    def get_quant_method(self, layer, prefix):\n        if isinstance(layer, RoutedExperts):\n            if is_layer_skipped(\n                prefix=prefix,\n                ignored_layers=self.ignored_layers,\n                fused_mapping=self.packed_modules_mapping,\n            ):\n                return UnquantizedFusedMoEMethod(layer.moe_config)\n            if self.expert_dtype == \"fp4\":\n                if self.moe_quant_algo == \"NVFP4\":\n                    from vllm.model_executor.layers.quantization.modelopt import (\n                        ModelOptNvFp4FusedMoE,\n                    )\n\n                    return ModelOptNvFp4FusedMoE(\n                        quant_config=self._get_nvfp4_config(),\n                        moe_config=layer.moe_config,\n                    )\n                return Mxfp4MoEMethod(layer.moe_config)\n            # expert_dtype == \"fp8\": fall through to Fp8Config which\n            # returns Fp8MoEMethod with block-wise float32 scales.\n        return super().get_quant_method(layer, prefix)\n\n    def is_mxfp4_quant(self, prefix, layer):\n        if not isinstance(layer, RoutedExperts) or self.expert_dtype != \"fp4\":\n            return False\n        return self.moe_quant_algo != \"NVFP4\""
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/mtp.py",
+      "lines": "L144-L189",
+      "what": "MTP 层 forward：target 暂存的 flat (T, hc_mult·D) 残差 reshape 回训练期 3D；fused_mtp_input_rmsnorm 一核做 mask 首位+enorm+hnorm；hidden = h_proj(prev)+e_proj(embed).unsqueeze(-2)（V4 拆开 e_/h_ 投影，注释：V3 是融合 eh_proj）；mtp_block 复用 DeepseekV4DecoderLayer 整层（含 MoE）；返回 flat pre-hc_head 残差——hc_head 推迟到 compute_logits（num_speculative_tokens>1 时还能续喂下一步）。",
+      "elide": [],
+      "code": "    def forward(\n        self,\n        input_ids: torch.Tensor,\n        positions: torch.Tensor,\n        previous_hidden_states: torch.Tensor,\n        inputs_embeds: torch.Tensor | None = None,\n        spec_step_index: int = 0,\n    ) -> torch.Tensor:\n        assert inputs_embeds is not None\n        # Target stashes pre-hc_head residual as flat (T, hc_mult * D);\n        # reshape to (T, hc_mult, D) — the training-time layout — before\n        # the fused norm pass so both inputs are 3D-friendly.\n        previous_hidden_states = previous_hidden_states.view(\n            -1, self.hc_mult, self.config.hidden_size\n        )\n        # Fused: mask inputs at position 0 (not needed by MTP), enorm, hnorm.\n        inputs_embeds, previous_hidden_states = fused_mtp_input_rmsnorm(\n            inputs_embeds,\n            positions,\n            previous_hidden_states,\n            self.enorm.weight.data,\n            self.hnorm.weight.data,\n            self.enorm.variance_epsilon,\n            self.hc_mult,\n        )\n        if self.mtp_block.use_sequence_parallel:\n            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():\n                forward_context = get_forward_context()\n                forward_context.is_padding = sp_padding_mask(\n                    forward_context.is_padding, inputs_embeds\n                )\n            inputs_embeds = sp_shard(inputs_embeds)\n            previous_hidden_states = sp_shard(previous_hidden_states)\n        hidden_states = self.h_proj(previous_hidden_states) + self.e_proj(\n            inputs_embeds\n        ).unsqueeze(-2)\n        hidden_states, residual, post_mix, res_mix = self.mtp_block(\n            positions=positions, x=hidden_states, input_ids=None\n        )\n        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)\n        if self.mtp_block.use_sequence_parallel:\n            hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]\n        # Return the flat pre-hc_head residual so it can be re-fed as the\n        # next spec step's `previous_hidden_states` when\n        # num_speculative_tokens > 1. hc_head is deferred to compute_logits.\n        return hidden_states.flatten(1)"
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/mtp.py",
+      "lines": "L253-L279",
+      "what": "draft 的 compute_logits：把 forward 返回的 pre-hc_head 残差先过 hc_head_fused_kernel_tilelang 压回稠密 hidden，再 mtp_shared_head_rmsnorm+shared_head 出 logits——'hc_head is deferred to compute_logits' 的字面落点（对比主模型：hc_head 在 Model.forward 尾部）。",
+      "elide": [],
+      "code": "    def compute_logits(\n        self,\n        hidden_states: torch.Tensor,\n        spec_step_idx: int = 0,\n    ) -> torch.Tensor:\n        current_step_idx = spec_step_idx % self.num_mtp_layers\n        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]\n        # MTP forward returns the pre-hc_head residual (T, hc_mult * D); apply\n        # hc_head here so logits are computed from the dense hidden state.\n        hidden_states = hidden_states.view(\n            -1, mtp_layer.hc_mult, mtp_layer.config.hidden_size\n        )\n        hidden_states = hc_head_fused_kernel_tilelang(\n            hidden_states,\n            mtp_layer.hc_head_fn,\n            mtp_layer.hc_head_scale,\n            mtp_layer.hc_head_base,\n            mtp_layer.rms_norm_eps,\n            mtp_layer.hc_eps,\n        )\n        hidden_states = mtp_shared_head_rmsnorm(\n            hidden_states,\n            mtp_layer.shared_head.norm.weight.data,\n            mtp_layer.shared_head.norm.variance_epsilon,\n        )\n        logits = self.logits_processor(mtp_layer.shared_head.head, hidden_states)\n        return logits"
+    },
+    {
+      "path": "vllm/model_executor/kernels/mhc/tilelang.py",
+      "lines": "L410-L461",
+      "what": "mhc 核族 Python 封装（tilelang_kernels 里是真核）：mhc_post（4 元组→残差）；mhc_fused_post_pre——'Run one MHC post block followed by the next MHC pre block'，norm_weight 传入时 RMSNorm 融合进 layer_input 写路径（DecoderLayer.forward 里每半层只调这一个核的原因）。形状契约见 docstring：residual (..., hc_mult, hidden)、post_mix (..., hc_mult)、comb_mix (..., hc_mult, hc_mult)。",
+      "elide": [],
+      "code": "def mhc_post_tilelang(\n    x: torch.Tensor,\n    residual: torch.Tensor,\n    post_layer_mix: torch.Tensor,\n    comb_res_mix: torch.Tensor,\n) -> torch.Tensor:\n    from vllm.model_executor.kernels.mhc.tilelang_kernels import (\n        mhc_post_tilelang as _mhc_post_kernel,\n    )\n\n    out = torch.empty_like(residual)\n    _mhc_post_kernel(\n        comb_res_mix,\n        residual,\n        post_layer_mix.squeeze(-1),\n        x,\n        out,\n        residual.shape[-2],\n        residual.shape[-1],\n    )\n    return out\n\n\ndef mhc_fused_post_pre_tilelang(\n    x: torch.Tensor,\n    residual: torch.Tensor,\n    post_layer_mix: torch.Tensor,\n    comb_res_mix: torch.Tensor,\n    fn: torch.Tensor,\n    hc_scale: torch.Tensor,\n    hc_base: torch.Tensor,\n    rms_eps: float,\n    hc_pre_eps: float,\n    hc_sinkhorn_eps: float,\n    hc_post_mult_value: float,\n    sinkhorn_repeat: int,\n    n_splits: int = 1,\n    tile_n: int = 1,\n    norm_weight: torch.Tensor | None = None,\n    norm_eps: float = 1e-6,\n) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:\n    \"\"\"\n    Run one MHC post block followed by the next MHC pre block.\n\n    When ``norm_weight`` is provided, the layer_input_cur output is the\n    RMSNorm'd activation (fused into the kernel); otherwise it is the\n    raw pre-norm activation as before.\n\n    Returns:\n        residual_cur: post-mapped residual, shape (..., hc_mult, hidden_size)\n        post_mix_cur: shape (..., hc_mult, 1)\n        comb_mix_cur: shape (..., hc_mult, hc_mult)"
+    },
+    {
+      "path": "vllm/model_executor/kernels/mhc/tilelang.py",
+      "lines": "L720-L748",
+      "what": "hc_head_fused_kernel_tilelang——多流压回单流的出口核：(T, hc_mult, H)→(T, H) bf16；空批早退；真核 hc_head_fuse_tilelang（tilelang_kernels）。",
+      "elide": [],
+      "code": "def hc_head_fused_kernel_tilelang(\n    hs_flat: torch.Tensor,\n    fn: torch.Tensor,\n    hc_scale: torch.Tensor,\n    hc_base: torch.Tensor,\n    rms_eps: float,\n    hc_eps: float,\n) -> torch.Tensor:\n    \"\"\"Apply the fused hc_head kernel and return the (T, H) bf16 result.\"\"\"\n    num_tokens, hc_mult, hidden_size = hs_flat.shape\n    out = torch.empty(\n        num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_flat.device\n    )\n    if num_tokens == 0:\n        return out\n    from vllm.model_executor.kernels.mhc.tilelang_kernels import hc_head_fuse_tilelang\n\n    hc_head_fuse_tilelang(\n        hs_flat,\n        fn,\n        hc_scale,\n        hc_base,\n        out,\n        hidden_size,\n        rms_eps,\n        hc_eps,\n        hc_mult,\n    )\n    return out"
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L5198-L5206",
+      "what": "runner 侧消费（MTP 钩子的另一端）：采样之后、喂 drafter 之前，getattr(model, 'get_mtp_target_hidden_states')() 重绑 hidden_states——注释点名 'DeepSeek V4 MTP needs the pre-hc_head residual'。模型层钩子 + runner 侧 opt-in 探测的接口形态（模型不 import runner、runner 不 import 模型）。",
+      "elide": [],
+      "code": "            # Let the target override the hidden state fed to the drafter\n            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). Safe to\n            # rebind here: hidden_states was already consumed for sampling\n            # above and is not used again in this branch.\n            alt = getattr(\n                self.get_model(), \"get_mtp_target_hidden_states\", lambda: None\n            )()\n            if alt is not None:\n                hidden_states = alt"
+    },
+    {
+      "path": "vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py",
+      "lines": "L75-L119",
+      "what": "sqrtsoftplus 路由的纯 torch 参考实现（XPU/CPU 回退路径，CUDA 走 ops.topk_hash_softplus_sqrt）：scores=sqrt(softplus(gating))；e_score_correction_bias 只加给选择不加给权重（注释：偏置当权重会把分布压平——DSv4-Flash 全部 bias≈8.08 的实证）；hash MoE 分支 expert_ids 直接查表 [M, topk]、权重仍从无偏 scores gather；renormalize 后乘 routed_scaling_factor。",
+      "elide": [],
+      "code": "def _topk_softplus_sqrt_torch(\n    topk_weights: torch.Tensor,\n    topk_indices: torch.Tensor,\n    token_expert_indices: torch.Tensor,\n    gating_output: torch.Tensor,\n    renormalize: bool = False,\n    e_score_correction_bias: torch.Tensor | None = None,\n    input_tokens: torch.Tensor | None = None,\n    hash_indices_table: torch.Tensor | None = None,\n    routed_scaling_factor: float = 1.0,\n) -> tuple[torch.Tensor, ...]:\n    \"\"\"Pure PyTorch fallback for topk_softplus_sqrt (XPU/CPU).\"\"\"\n    # scores = sqrt(softplus(gating_output))\n    scores = torch.sqrt(F.softplus(gating_output.float()))\n\n    # Bias is used for expert SELECTION only, not for weight computation.\n    # Using biased scores as weights flattens the distribution when the bias\n    # is near-uniform (e.g., DSv4-Flash where all biases ≈ 8.08).\n    if e_score_correction_bias is not None:\n        scores_for_choice = scores + e_score_correction_bias.float()\n    else:\n        scores_for_choice = scores\n\n    topk = topk_weights.shape[-1]\n\n    if hash_indices_table is not None and input_tokens is not None:\n        # Hash MoE: expert indices predetermined by lookup table\n        # hash_indices_table: [vocab_size, topk] mapping token_id -> expert_ids\n        expert_ids = hash_indices_table[input_tokens.long()]  # [M, topk]\n        topk_indices.copy_(expert_ids)\n        # Gather weights from unbiased scores\n        weights = scores.gather(1, expert_ids.long())\n    else:\n        # Standard topk selection using biased scores\n        _, indices = torch.topk(scores_for_choice, k=topk, dim=-1)\n        topk_indices.copy_(indices)\n        # Gather weights from unbiased scores\n        weights = scores.gather(1, indices)\n\n    if renormalize:\n        weights = weights / (weights.sum(dim=-1, keepdim=True).clamp(min=1e-20))\n\n    topk_weights.copy_(weights * routed_scaling_factor)\n    return topk_weights, topk_indices\n"
+    }
+  ],
+  "theory": [
+    "mHC 多流残差的形状账（本章可讲清的边界=形状与数据流，核内数学在 tilelang_kernels 不在 Python 侧）：残差流形三件套 residual (T,hc_mult,H) / post_mix (T,hc_mult) / comb_mix (T,hc_mult,hc_mult)；layer 输入恒为 2D (T,H)（每半层由 hc 核从流形里混合投影出来）；混合参数形状 (2+hc_mult, hc_mult×H)——『2』是 post/pre 两类门、hc_mult 是流间门。首层 broadcast 特化可预折的根据：2D 输入时各流相同，(2+hc_mult,hc_mult,H) 对流维求和等价（finalize_mhc_broadcast_weights，L1371-L1380）。PP 中间张量=(T,hc_mult,H)（make_empty_intermediate_tensors 注释：'V4 expands the token embedding to hc_mult streams before the first decoder layer and keeps that shape until hc_head() collapses it'——严格说穿层的 hidden_states 是 2D，多流形态活在 residual 里，PP 载荷才是 3D）。",
+    "MoE 路由数学（sqrtsoftplus，torch 参考实现 router L75-L120）：scores=sqrt(softplus(gating))；选择用 scores+e_score_correction_bias、权重从无偏 scores gather（注释实证：DSv4-Flash 全部 bias≈8.08，偏置当权重会把分布压平）；renormalize 后 ×routed_scaling_factor。hash MoE：expert_ids=tid2eid[input_tokens]（免打分），权重仍从 scores gather（该层 gate 仍在算——权重要）。worked example 建议：4 专家 top-2 手算一遍（scores→加 bias 选人→无偏 scores 取权→归一→乘 scaling_factor），hash 层对照（ids 查表定死、只算权重）。",
+    "FP4 字节账（worked example 的物料）：MegaMoE w13_weight=[E, 2I, H/2] uint8=两个 fp4 打包一字节；w13_weight_scale=[E, 2I, H/32] uint8=每 32 值一个 UE8M0 字节（OCP MXFP4 组尺度）；UE8M0→fp32 还原=(sf.to(int32)<<23).view(float32)（纯指数位模式，L310-L312）；装载侧 float8_e8m0fnu 必须 .view(uint8)（数值 copy_ 会把 2^-7 变 0）。对照 KV 侧同族布局：fp8_ds_mla 584B/token=448 NoPE+128 RoPE+8 UE8M0 scale（kv_cache_interface.py:L411）；indexer FP4 68B/条=64B 打包值+4B UE8M0（attention.py:L783-L785，归 ch26）。F10（量化与 kernel 耦合）在专家侧的活体：scale 布局直接决定 DeepGEMM 吃哪个 kernel。",
+    "一层四本 KV 账的分组含义（capstone 把 ch25 站 6 的组化账推到极致）：主 MLA（MLAAttentionSpec：num_kv_heads=1、head_size=512 语义、uint8 fp8_ds_mla、compress_ratio、alignment=576、model_version='deepseek_v4'——584B/token 的字节账由 real_page_size_bytes 按版本分支定）；IndexerCache（compress_ratio 坐标系、68B FP4 或 132B FP8）；CompressorStateCache（fp32 部分状态、块 4/8 由『与 KV 块共享物理张量』的页对齐约束定，compressor.py:L177-L189 注释）；SWACache（块 64、SlidingWindowMLASpec、同一页对齐约束 sparse_swa.py:L77-L82）。四本账各有 prefix 注册 static_forward_context、各有 builder——KV 账本分组（ch14/25）的原料全由模型层自报。",
+    "接入税清单（why_chains[0] cost 的量化版，capstone 的『考试要点』）：①平台子类×3 套（nvidia/amd/xpu 各实现 forward_mqa/_o_proj/get_padded_num_q_heads/backend_cls）②四本账 spec+页对齐约束（alignment 576/512）③手动 static_forward_context 注册（attention ABC/MegaMoE/IndexerCache/CompressorStateCache/SWACache 五处——普通 Attention 是自动的）④per-expert_dtype 权重 mapper（两套 scale 后缀）⑤多流 overlap：VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD 门控+BreakableCUDAGraphCapture 捕获期回退（multi_stream_utils.py:L52-L53）+eager scratch 池⑥PP 多流载荷+SP 门（_use_sequence_parallel：PP=1∧EP∧TP>1∧(mega∨DP>1)）。『只需拼层』的准确表述：拼的是平台无关积木+平台子类四点，税在各积木的规格自报与手动注册。",
+    "delta over Llama 五类（v2 讲法迁移、行号全部 v0.27.1 重核）：①注意力：qkv_proj/o_proj → fused_wqa_wkv（disable_tp 低秩瓶颈）+q_norm/wq_b+kv_norm+wo_a/wo_b（输出低秩）+attn_sink+解耦 RoPE+四本账；②FFN：dense SwiGLU MLP → gate（sqrtsoftplus/hash/noaux_tc）+top-k 专家+shared_experts 双后端；③残差：add-norm → mHC 多流混合（hc_pre/post 融合核+hc_head）；④解码头：单 lm_head → lm_head+MTP draft（pre-hc_head 残差钩子）；⑤数值：bf16 → FP8 block 强制+专家 MXFP4/FP8+KV fp8_ds_mla。（ch23 站 8 的 LlamaDecoderLayer 是左列的锚。）"
+  ],
+  "mechanisms": [
+    {
+      "id": "ch28-m01",
+      "name": "硬件隔离布局与平台分发：registry 全限定条目 + __init__.py current_platform 三岔",
+      "kind": "config",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/model_executor/models/registry.py:L95",
+        "vllm/model_executor/models/registry.py:L1439-L1446",
+        "vllm/models/deepseek_v4/__init__.py:L17-L32",
+        "vllm/model_executor/layers/quantization/__init__.py:L164"
+      ],
+      "note": "ch23 站 1 已立 _resolve_module_name 机制，本章看真身：新旧布局同表并存（L94 V3.2 扁平 vs L95 V4 全限定）。无独立图——L2 站 1/2 即可视化。"
+    },
+    {
+      "id": "ch28-m02",
+      "name": "ForCausalLM 契约四件套 + set_moe_parameters 元数据登记 + per-instance mapper",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/nvidia/model.py:L1457-L1510",
+        "vllm/models/deepseek_v4/nvidia/model.py:L1512-L1548",
+        "vllm/models/deepseek_v4/nvidia/model.py:L1420-L1454"
+      ],
+      "note": "ch23 站 4/12 契约在旗舰上复验+两处升级：expert_dtype 选 mapper 实例、MoE 元数据（EPLB/分布式消费）装配期登记。"
+    },
+    {
+      "id": "ch28-m03",
+      "name": "骨架三池：3×aux stream / eager scratch 池 / 共享 topk_indices_buffer / _mtp_hidden_buffer",
+      "kind": "layout",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/nvidia/model.py:L1020-L1047",
+        "vllm/models/deepseek_v4/nvidia/model.py:L1095-L1106",
+        "vllm/models/deepseek_v4/eager_scratch.py:L12-L31"
+      ],
+      "note": "全模型共享的裸资源（无所有权封装——ch26 站 1 同款哲学）；scratch 池存在的原因=eager break 内分配不经 cudagraph 缓存。"
+    },
+    {
+      "id": "ch28-m04",
+      "name": "mHC 多流残差：hc_pre/post 门控、融合单核、首层 broadcast 展开、hc_head 压回",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/nvidia/model.py:L899-L992",
+        "vllm/models/deepseek_v4/nvidia/model.py:L1076-L1094",
+        "vllm/models/deepseek_v4/nvidia/model.py:L1200-L1212",
+        "vllm/model_executor/kernels/mhc/tilelang.py:L90-L140",
+        "vllm/model_executor/kernels/mhc/tilelang.py:L410-L461",
+        "vllm/model_executor/kernels/mhc/tilelang.py:L720-L748",
+        "vllm/models/deepseek_v4/nvidia/model.py:L1371-L1380"
+      ],
+      "note": "worked example：hc_mult=2 走一个 token 的完整旅程（2D embed→broadcast 展开→三件套形状→两半层各一次融合核→mhc_post 塌回→hc_head 出 2D），标注形状与参数形状 ((2+hc_mult), hc_mult×H)；**诚实边界：核内 Sinkhorn/门控数学在 tilelang_kernels（生成核）不在 Python 侧，worked example 讲到形状与数据流为止，不杜撰数值**。图：多层管线里 4 元组穿针的主视图（writer 配 L2 ⑦ 或机制图）。"
+    },
+    {
+      "id": "ch28-m05",
+      "name": "第三代 MLA 装配：replicated 低秩瓶颈 + 双 rmsnorm + 输出侧低秩两段 + attn_sink 垫 -inf",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/attention.py:L179-L262",
+        "vllm/models/deepseek_v4/attention.py:L350-L396",
+        "vllm/models/deepseek_v4/nvidia/ops/o_proj.py:L13-L73",
+        "vllm/models/deepseek_v4/nvidia/flashmla.py:L43-L67"
+      ],
+      "note": "与 ch25 的 V3.2 MLA 对照讲（外层低秩链同构：fused_qkv_a_proj↔fused_wqa_wkv；差异：V4 输出也低秩 wo_a/wo_b、attn_sink 逐头、fused_wqa_wkv 复制不切 TP、逆 RoPE 在输出侧）。图：模型侧投影数据流（hidden→fused_wqa_wkv→split→双 rmsnorm→wq_b→[核]→o→逆RoPE+fp8 einsum→wo_b），核内归 ch25/26 回指。"
+    },
+    {
+      "id": "ch28-m06",
+      "name": "一层四本 KV 账：主 MLA 584B/token / IndexerCache / CompressorStateCache / SWACache",
+      "kind": "layout",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/attention.py:L655-L674",
+        "vllm/models/deepseek_v4/attention.py:L677-L710",
+        "vllm/models/deepseek_v4/compressor.py:L155-L203",
+        "vllm/v1/attention/backends/mla/sparse_swa.py:L56-L96",
+        "vllm/v1/kv_cache_interface.py:L389-L420"
+      ],
+      "note": "capstone 的『形状』收获：spec 自报→分组（ch25 站 6）机制在 V4 一层×4；页对齐约束连环（compressor 块 4/8 与 SWA 块 64 都由『与 KV 块共享物理张量』决定）。worked example 不需要；图：一层四账的解剖小图（字节账标注）。"
+    },
+    {
+      "id": "ch28-m07",
+      "name": "Attention 平台 ABC：forward_mqa/_o_proj/get_padded_num_q_heads/backend_cls 四个插座点",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/attention.py:L123-L177",
+        "vllm/models/deepseek_v4/nvidia/flashmla.py:L34-L67",
+        "vllm/models/deepseek_v4/nvidia/model.py:L771-L802"
+      ],
+      "note": "『Attention 是插座不是实现』的 v0.27 完全体：插座从 ch23 的通用 Attention 层进化成模型自带 ABC+平台子类；_select_dsv4_attn_cls 是 CUDA 内的二级选择（backend+SM 架构）。头数垫 64/128 的根据（FP8 decode kernel 限定）。"
+    },
+    {
+      "id": "ch28-m08",
+      "name": "MoE 装配：gate 三模式（sqrtsoftplus/noaux_tc/hash）+ shared_experts + 双后端二岔",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/nvidia/model.py:L519-L613",
+        "vllm/models/deepseek_v4/nvidia/model.py:L615-L702",
+        "vllm/config/kernel.py:L121-L131",
+        "vllm/config/kernel.py:L191-L193",
+        "vllm/model_executor/layers/fused_moe/router/gate_linear.py:L18-L48"
+      ],
+      "note": "worked example：4 专家 top-2 手算 sqrtsoftplus 路由（见 theory[1]）+hash 层对照；三条 NotImplementedError 都带修法提示（工程友好性细节）。图：MoE 装配/一拍二合一数据流（gate→top-k→双后端分岔→shared 相加位置差异）。"
+    },
+    {
+      "id": "ch28-m09",
+      "name": "sqrtsoftplus 路由：scores=sqrt(softplus(g))、bias 只影响选择、hash 查表免打分",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py:L75-L120",
+        "vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py:L121-L163",
+        "vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py:L176-L235",
+        "vllm/models/deepseek_v4/nvidia/model.py:L704-L743"
+      ],
+      "note": "m08 的路由内核单列（讲清『谁打分、谁选择、谁加权』三分离）；CUDA 走 ops.topk_hash_softplus_sqrt、XPU 走 torch 参考实现（教学锚）。无独立图（并入 m08 图）。"
+    },
+    {
+      "id": "ch28-m10",
+      "name": "MegaMoE 专家：FP4 字节布局 + finalize 变换 + 对称缓冲 + 单算子前向",
+      "kind": "layout",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/nvidia/model.py:L195-L256",
+        "vllm/models/deepseek_v4/nvidia/model.py:L310-L362",
+        "vllm/models/deepseek_v4/nvidia/model.py:L364-L391",
+        "vllm/models/deepseek_v4/nvidia/model.py:L439-L513",
+        "vllm/models/deepseek_v4/nvidia/ops/prepare_megamoe.py:L1-L11"
+      ],
+      "note": "worked example：FP4 字节账（theory[2]物料：[E,2I,H/2]uint8+[E,2I,H/32]UE8M0、(int32<<23) 还原）；finalize 后原参数置 None 的显存/所有权故事；对称缓冲按 7 元组键跨层复用。图：字节布局解剖图（一行权重怎么打包）。"
+    },
+    {
+      "id": "ch28-m11",
+      "name": "FP4/FP8 expert_dtype 分发：惰性解析 + override_quantization_method + get_quant_method 分发树",
+      "kind": "config",
+      "difficulty": "core",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/quant_config.py:L29-L84",
+        "vllm/models/deepseek_v4/quant_config.py:L134-L152",
+        "vllm/models/deepseek_v4/quant_config.py:L173-L199",
+        "vllm/model_executor/layers/quantization/__init__.py:L164"
+      ],
+      "note": "worked example：同一 '.scale' 后缀在 fp4/fp8 两条路径分别翻成 weight_scale/weight_scale_inv（mapper 表走一遍）；惰性解析的 why（set_current_vllm_config 时序）是 config 章回指的好材料。量化数学本身归 ch27，本章只讲分发与字节。"
+    },
+    {
+      "id": "ch28-m12",
+      "name": "权重流入：stacked/expert/attn_sink 三型装载 + e8m0fnu→uint8 + 块对齐补零 + 两步 finalize",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/nvidia/model.py:L1217-L1247",
+        "vllm/models/deepseek_v4/nvidia/model.py:L1249-L1326",
+        "vllm/models/deepseek_v4/nvidia/model.py:L1328-L1380",
+        "vllm/models/deepseek_v4/nvidia/model.py:L1383-L1417"
+      ],
+      "note": "ch23 站 5 装载三型的旗舰版（多了 expert 多槽/EPLB、attn_sink 窄切、补零、finalize）；finalize_mhc_broadcast_weights 的可预折性是 m04 的装配期对偶。"
+    },
+    {
+      "id": "ch28-m13",
+      "name": "多流 overlap 与 eager break：3 aux 流+events、阈值门控、breakable cudagraph 回退、scratch 池",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/attention.py:L398-L459",
+        "vllm/models/deepseek_v4/attention.py:L461-L540",
+        "vllm/utils/multi_stream_utils.py:L20-L66",
+        "vllm/utils/multi_stream_utils.py:L69-L136",
+        "vllm/models/deepseek_v4/nvidia/model.py:L1020-L1024"
+      ],
+      "note": "图：一拍内的流时间线（默认流+3 aux+join 点）；VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD（大批关多流）与 BreakableCUDAGraphCapture.is_active()（捕获期关多流）两个门；TRT-LLM PR #14142 Level 1 注释是谱系锚。"
+    },
+    {
+      "id": "ch28-m14",
+      "name": "MTP 钩子：_mtp_hidden_buffer（pre-hc_head 残差）+ runner getattr 重绑 + draft 侧 hc_head 延迟",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/nvidia/model.py:L1095-L1106",
+        "vllm/models/deepseek_v4/nvidia/model.py:L1200-L1202",
+        "vllm/models/deepseek_v4/nvidia/model.py:L1534-L1538",
+        "vllm/v1/worker/gpu_model_runner.py:L5198-L5206",
+        "vllm/models/deepseek_v4/nvidia/mtp.py:L144-L189",
+        "vllm/models/deepseek_v4/nvidia/mtp.py:L253-L279"
+      ],
+      "note": "接口形态=模型层可选钩子+runner 侧 opt-in 探测（双向解耦）；驱动机制（propose/verify）归 ch32/33——本章止步钩子。图：主干尾部分叉小图（hc_head 前 copy_ 一条旁路）。"
+    },
+    {
+      "id": "ch28-m15",
+      "name": "序列并行门：_use_sequence_parallel（PP=1∧EP∧TP>1∧(mega∨DP>1)）+ sp_shard/all_gather/reduce_scatter 包 attn",
+      "kind": "config",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/nvidia/model.py:L805-L813",
+        "vllm/models/deepseek_v4/nvidia/model.py:L963-L968",
+        "vllm/models/deepseek_v4/nvidia/model.py:L1151-L1158",
+        "vllm/models/common/ops/sequence_parallel.py:L1-L40"
+      ],
+      "note": "只讲门与包裹位置（attn 段 gather/scatter、MoE 段 shard），SP 原理深讲归 ch34；sp_shard 下 hidden 形状变化与 SP 权重复制（disable_tp）一句带过。"
+    },
+    {
+      "id": "ch28-m16",
+      "name": "forward 主干：2D embed→首层核内展开→4 元组穿层→aux 流重建→mhc_post→hc_head 的完整旅程",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/nvidia/model.py:L1108-L1215",
+        "vllm/models/deepseek_v4/nvidia/model.py:L1111-L1129",
+        "vllm/model_executor/kernels/mhc/tilelang.py:L303-L330"
+      ],
+      "note": "capstone 的主视图机制（与 m04 互为表里：m04 讲单层门控、m16 讲全干形状旅程）；EAGLE3 aux 流重建（中间层 mhc_post+mean）一句点到（深讲归 ch33）。图=L2 ⑥⑦ 或机制图主图。"
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": [],
+    "note": "本章为 capstone 拼装章，无精简版（Lead 指令）——Implement/Test 站跳过，lint_fidelity 不适用；writer 直接消费 embed_excerpts/stations/mechanisms。"
+  },
+  "foreshadow_due": {
+    "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，不跑）",
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "pedagogy-plan.foreshadows 十条无一 planted=28 或 paid=28——本章不埋不收。途经伏笔（不回收、只回指）：F10（量化与 kernel 的耦合，19→27 已收）在 FP4 字节账/MegaMoE 单算子处是活的——正文一句『F10 的耦合在专家侧的极致形态』；F9（L0 逐章点亮）在末节 code→diagram 方法论处天然联动（教读者画的就是 L0 模型层块）。收尾回指段按 WRITING-CONTRACT §7 埋下一 Part 种子：hidden_states 交付后 13 万维 logits 怎么变成 1 个 token（Part VII ch29 Sampler 9 步管线）；ch35 部署实战（D4-Flash 进 96GB）整章消费本章装配出的机器。"
+  },
+  "l2_spec": "book/cartography/l2-specs/ch28.json（同批产出；stations 与本档 stations 同一份账本）"
+}
