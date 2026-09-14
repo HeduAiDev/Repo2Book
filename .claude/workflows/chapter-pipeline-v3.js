@@ -713,7 +713,7 @@ if (reviewV && reviewV.verdict !== 'APPROVED') {
   const reverify = await agent(
     '你是终局复验员（轻量：只核清单、不开新维度全审）。对下面每条上轮 blocking 项，逐条对照**当前最新**文件核实是否已解决：正文 ' + CH + '/narrative/chapter.md、图 ' + CH + '/diagrams/（PNG 用 Read 打开亲眼看、manifest 的 blind_review 状态），必要时跑对应 linter（' + REPO + '/scripts/lint_*.py）。清单：\n' +
     JSON.stringify(lastBlocking) +
-    '\n已解决=从清单去掉；未解决=进 uncleared（problem + evidence 引最新稿/最新图证据）。全部解决 → all_cleared=true。宁严勿宽：拿不准的算未解决。',
+    '\n已解决=从清单去掉；未解决=进 uncleared（problem + evidence 引最新稿/最新图证据）。全部解决 → all_cleared=true。宁严勿宽：拿不准的算未解决。（rev2 注记：若本清单曾升级后由 Lead 组织修复落盘，本轮为修复后重验——一切以你本轮对盘上文件的亲验为准，清单里携带的旧 evidence（时间戳/旧文件内容摘录）是修复前的历史快照，不代表当前实况，不复述。）',
     mo({ schema: FINAL_VERIFY_SCHEMA, label: 'review-final-verify', phase: 'Review', agentType: 'general-purpose' }, 'review', false)
   )
   const fdec = finalReviewDecision(reverify, lastBlocking)
