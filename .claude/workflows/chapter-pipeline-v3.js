@@ -561,7 +561,15 @@ function routeIssues(issues) {
   for (const i of issues || []) {
     if (!i) continue
     if (!i.blocking) { nonBlocking.push(i); continue }
-    if (i.dimension === 'figure-integration') figIssues.push(i)
+    if (i.dimension === 'figure-integration') {
+      // exp-2026-09-14 ch26：figure-integration 阻断项若修法落点在正文/图注
+      // （narrative/chapter.md 是 writer 地盘），按维度一刀切派图侧只会被
+      // 对称纪律弹回升级。按 suggested_fix 落点分流：提 diagrams//gen_/
+      // 重渲/图面/manifest 的才走图轨，其余（改图注文字/改行文）归文轨。
+      const fx = String(i.suggested_fix || '')
+      if (/diagrams\/|gen_|重渲|图面|manifest/i.test(fx)) figIssues.push(i)
+      else textIssues.push(i)
+    }
     else textIssues.push(i)
   }
   return { figIssues, textIssues, nonBlocking }
