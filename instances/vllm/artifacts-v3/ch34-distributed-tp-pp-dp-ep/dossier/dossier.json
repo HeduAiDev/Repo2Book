@@ -1,0 +1,1114 @@
+{
+ "chapter_id": "ch34",
+ "part": "VIII",
+ "title": "分布式 TP/PP/DP/EP",
+ "pin": "vLLM v0.27.1 (6e448d0ea9bf3d88d898b65449ca6dc2aec170ac)——全部锚点与 embed 已对当前 pin sed 逐行现核（2026-09-14）；v2 artifacts/ch20-distributed-parallelism 与 ch21-async-engine 的行号是 v0.21.0/f3fef123 旧线索，只作迁移候选与讲法参考、未照抄任何行号。相对 v2 的关键演进（全部已现核）：① LB score 公式重写为 max(client_count×inflight, waiting+running)+KV 压力斜坡+起点轮转（v2 是 waiting*4+running——禁迁移旧叙述）；② 非 MoE DP 引擎就地按 DP=1 独立跑（core.py:L1311-L1318）；③ GroupCoordinator 新增 use_all2all 参数 + VLLM_DISTRIBUTED_USE_SPLIT_GROUP 实验门 + Handle Protocol 类型化异步句柄；④ all2all 后端家族扩容（MoRI/DeepEP-v2/nixl/flashinfer NVLink 单双侧）；⑤ 两阶段暂停（pending_pause/ignore_start_dp_wave）是 v2 之后新增的竞态闭环。",
+ "chapter_kind": "code",
+ "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。本章把 L0 的『多实例视角』放大镜兑现成代码：单实例之外的一切——四个并行轴怎么切（建组）、切完怎么通信（TP 层内集合/PP 段间 P2P/EP 全网重排）、M 台引擎怎么协同（DP 选路/wave 共识/批对齐）。Part VIII《走向生产》开篇：真实服务不止一个引擎。",
+ "hook_suggestion": "「模型大到一张卡装不下，流量大到一台引擎接不住——切，是唯一的路。但切什么大有讲究：TP 切一层之内的权重、每层付一次 all_reduce；PP 切层序、段间点对点传激活；DP 干脆整个引擎复制 M 份；EP 把专家摊到各卡、每个 MoE 层全网重排 token。四种切法各收什么、各付什么通信税？更要命的是 M 台引擎 N 个前端：请求发给谁、输出怎么找回路？第 4 章盖进请求的 client_index、第 5 章带信封的 ROUTER，都在等这一章兑现。」（从 Part VIII hook『真实服务不止一个引擎』+ 章主题 + why 链提炼；writer 可润色，不许降格成陈述句）",
+ "scope_note": "主线四段：(A) 启动装配（站 1-7）——5 维 rank 张量切出 TP/PP/DP/EP、GroupCoordinator 双群组、worker 入全局 world、引擎与 coordinator 的出生分叉；(B) 请求进集群（站 8-10）——前端三分支、LB 打分、盖章定向（F3/F4 回收）；(C) 一拍内的数据面（站 11-14）——TP all_reduce 链、PP 懒同步接力与 token 回传、EP dispatch/combine；(D) 拍间控制面（站 15-16）——DP 批对齐、wave 共识。边界（不讲，只回指）：Executor/Worker 三层与 collective_rpc 控制面（ch17 已立，本章只展开其 PP 段）；TP 切头数学与模型层两方法契约（ch23）；SchedulerOutput 差量协议与 new_token_ids 过线（ch18）；GPU 回填 prev_sampled_token_ids（ch12）；DeepSeek MoE 层结构（ch26，本章只看它的 dispatch/combine 消费面）；DeepEP 等真 A2A 内核内幕（一段带过，不作主线）；弹性 EP/EPLB/weight transfer/fault tolerance（ch39 生产运维话题，只留门牌）；P/D 分离与 KV disagg（ch36，属另一根轴）。运行约束：多卡 NCCL 场景本机不可跑——不实跑，全部走读源码（explainer 素材若需数值，用可跑的单机退化形态或标注建模值）。",
+ "code_spine": [
+  "vllm/distributed/parallel_state.py:L1812-L1950 — initialize_model_parallel：5 维 rank 张量 + TP/PP/DP/EP 四刀（多实例拓扑的出生地）",
+  "vllm/distributed/parallel_state.py:L409-L527 — GroupCoordinator.__init__：双群组 device_group(NCCL)+cpu_group(gloo) + device_communicator + 可选 mq_broadcaster",
+  "vllm/v1/worker/gpu_worker.py:L1347-L1389 — init_worker_distributed_environment：worker 入全局 world（DP>1 时 rank 偏移 world_size_across_dp，parallel_state.py:L1608-L1622）→ ensure_model_parallel_initialized",
+  "vllm/v1/engine/core.py:L1306-L1318 — run_engine_core DP 分叉：MoE→DPEngineCoreProc(wave 锁步) / 非 MoE→就地 DP=1 独立",
+  "vllm/v1/engine/utils.py:L1091-L1101 — launch_core_engines：needs_dp_coordinator → dp_rank 0 起 DPCoordinator 进程",
+  "vllm/v1/engine/core_client.py:L116-L139 — make_async_mp_client：AsyncMPClient / DPAsyncMPClient(外部 LB) / DPLBAsyncMPClient(内部 LB) 三分支",
+  "vllm/v1/engine/core_client.py:L1468-L1519 — DPLBAsyncMPClient.get_core_engine_for_request：score 打分选引擎 + reqs_in_flight 登记",
+  "vllm/v1/engine/core_client.py:L1410-L1423 — add_request_async：current_wave/client_index 双盖章 → ROUTER 按引擎 identity 定向 → FIRST_REQ 抢先唤醒",
+  "vllm/model_executor/layers/linear.py:L1748-L1774 — RowParallelLinear.forward：TP 消费现场（L1767 all_reduce；bias 只在 rank0 加）",
+  "vllm/distributed/communication_op.py:L12-L43 — tensor_model_parallel_* 自由函数：模型层与分布式层的接缝",
+  "vllm/distributed/parallel_state.py:L152-L197, L352-L368 — 模块级集合算子 + fake 实现 + direct_register_custom_op 注册（集合通信进编译图）",
+  "vllm/distributed/parallel_state.py:L662-L748 — GroupCoordinator.all_reduce/all_gather/reduce_scatter 用户面：短路 + custom-op/直接双路径",
+  "vllm/distributed/device_communicators/cuda_communicator.py:L275-L341 — CudaCommunicator.all_reduce 七级回退链",
+  "vllm/v1/worker/gpu_worker.py:L1017-L1107 — Worker.execute_model：PP isend/irecv 接力（ch17 站 9 的展开）",
+  "vllm/distributed/parallel_state.py:L1019-L1074, L1114-L1198 — isend/irecv_tensor_dict：metadata 走 cpu_group、张量走 device_group、TP 切片优化",
+  "vllm/v1/worker/gpu_model_runner.py:L4842-L4869 — PP 采样 token 末段 GPU broadcast 回首段（async 版）",
+  "vllm/v1/worker/dp_utils.py:L36-L91, L164-L225 — _run_ar/_post_process_dp_padding/coordinate_batch_across_dp：DP 批对齐一次 all-reduce",
+  "vllm/distributed/device_communicators/all2all.py:L44-L150 — AgRsAll2AllManager：dispatch=all_gatherv / combine=reduce_scatterv（默认 EP 后端）",
+  "vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py:L158-L164, L207-L209 — MoE prepare/finalize 调 get_ep_group().dispatch/combine（EP 消费现场）",
+  "vllm/v1/engine/core.py:L2075-L2090, L2124-L2188 — DPEngineCoreProc：stats 发布（-1 哨兵）+ busy loop 的 dummy batch/wave 共识",
+  "vllm/config/parallel.py:L727-L762 — has_unfinished_dp(MAX=OR) + sync_dp_state(2 元素 SUM 双共识)",
+  "vllm/v1/engine/coordinator.py:L23-L57, L252-L283, L457-L467 — DPCoordinator：wave 语义 docstring + 三 socket 发布循环 + START_DP_WAVE 广播"
+ ],
+ "stations": [
+  {
+   "n": 1,
+   "where": "parallel_state.py:L1812-L1827",
+   "what": "建组地基：全部 rank 排进 (ExtDP, DP, PP, PCP, TP) 5 维张量——注释原话公式：任一维度 transpose 到末维→reshape 2D→unbind 机械导出；TP 最内层=同组 rank 物理相邻"
+  },
+  {
+   "n": 2,
+   "where": "parallel_state.py:L1829-L1916",
+   "what": "三刀：TP=相邻切、独享 SHM mq_broadcaster；PP=transpose(2,4) 拿跨段 rank；DP=transpose(1,4) 拿『同槽位跨引擎』的 rank——DP 组员正是各引擎里干同一份活的那批 worker"
+  },
+  {
+   "n": 3,
+   "where": "parallel_state.py:L1918-L1950",
+   "what": "EP 刀：EP 组=同一 PP 段内 DP×PCP×TP 全合并（transpose(1,2)），PP=1 时即全伙；'Don't create EP group for dense models'；use_all2all=dp>1 或 SP-MoE 或 (EP∧PCP>1)（parallel.py:L690-L696）"
+  },
+  {
+   "n": 4,
+   "where": "parallel_state.py:L409-L527",
+   "what": "GroupCoordinator.__init__：每组 new_group 出 device_group(NCCL)+cpu_group(gloo) 双群组；world_size>1 才建平台 device_communicator（use_all2all 透传）；一个并行维度=一个实例"
+  },
+  {
+   "n": 5,
+   "where": "gpu_worker.py:L1347-L1389",
+   "what": "worker 入 world：DP>1 时 rank 偏移 dp_rank×world_size、world 扩成 across_dp（parallel_state.py:L1608-L1622）——各引擎 worker 同处一个全局 world，DP/EP 组才建得起来"
+  },
+  {
+   "n": 6,
+   "where": "core.py:L1306-L1318",
+   "what": "引擎出生分叉：MoE∧DP>1→DPEngineCoreProc（wave 锁步）；非 MoE→'completely independent, so treat like DP=1' 就地改回配置、完全独立——一行注释是 DP 两种形态的分水岭"
+  },
+  {
+   "n": 7,
+   "where": "vllm/v1/engine/utils.py:L1091-L1101",
+   "what": "控制面出生：needs_dp_coordinator（vllm.py:L661——MoE+DP>1 为 wave；非 MoE 内部/混合 LB 为 stats）→ dp_rank 0 起 DPCoordinator 独立进程，wave 协调仅 MoE 开"
+  },
+  {
+   "n": 8,
+   "where": "core_client.py:L116-L139",
+   "what": "前端家族分发：DP=1→AsyncMPClient；外部 LB→DPAsync（每 client 绑引擎，均衡交给外面）；内部 LB→DPLB（client 替全部引擎做均衡）"
+  },
+  {
+   "n": 9,
+   "where": "core_client.py:L1468-L1519",
+   "what": "内部 LB 打分：score=max(client_count×inflight, waiting+running)——inflight 地板是本地精确计数、兜 100ms 快照 race；KV>50% 起罚满载 3 倍；起点轮转消平局；选中即 reqs_in_flight 登记（abort 回路）"
+  },
+  {
+   "n": 10,
+   "where": "core_client.py:L1410-L1423",
+   "what": "盖章+定向：current_wave/client_index 双盖章→_send_input(ADD, chosen_engine)——ROUTER 按引擎 identity 精确投递（F4 回收）；暂停期 FIRST_REQ 经 PAIR 抢先唤醒全体（F3 见第 8 站分桶）"
+  },
+  {
+   "n": 11,
+   "where": "linear.py:L1767 → cuda_communicator.py:L275-L341",
+   "what": "TP 全链：RowParallel 部分和→tensor_model_parallel_all_reduce→world_size==1 短路 / torch.ops.vllm.all_reduce（只传 group_name，fake 实现供编译期形状推断）→device_communicator 七级回退"
+  },
+  {
+   "n": 12,
+   "where": "gpu_worker.py:L1064-L1105",
+   "what": "PP 接力双向：非首段 irecv 成 AsyncIntermediateTensors（碰 .tensors 才 wait——接收与本地准备重叠）；非末段 isend 非阻塞、句柄 _pp_send_work 下拍收割；metadata 走 cpu_group、张量走 device_group"
+  },
+  {
+   "n": 13,
+   "where": "gpu_model_runner.py:L4842-L4869",
+   "what": "PP token 回传：async 下末段把 sampled_token_ids 从 GPU broadcast 回首段（pp.device_group，不过 CPU/调度器），首段写 prev_sampled_token_ids 供下拍回填（ch12）；sync 版走 new_token_ids 差量（ch18）"
+  },
+  {
+   "n": 14,
+   "where": "naive_dp_ep.py:L158 → all2all.py:L101-L150",
+   "what": "EP 数据面：MoE prepare 调 get_ep_group().dispatch 全网重排（各 rank 只算命中本地专家的 token）→finalize combine 归位；默认 AgRs=dispatch 是 all_gatherv、combine 是 reduce_scatterv——两次集合通信凑的 A2A"
+  },
+  {
+   "n": 15,
+   "where": "dp_utils.py:L164-L225",
+   "what": "DP 批对齐（调用点 gmr.py:L4004-L4027）：一次 4×dp all-reduce 互见 (orig,padded,ubatch,cg_mode)——cg_mode 取 min（一人 NONE 全体 NONE）、启用时全员 pad 到 max；num_tokens_across_dp 进 DPMetadata"
+  },
+  {
+   "n": 16,
+   "where": "core.py:L2144-L2188 → parallel.py:L727-L762",
+   "what": "wave 共识：每 32 步 2 元素 SUM AR——[0]>0=OR（任一有活全体继续）、[1]==dp_size=全体同意暂停；无活引擎跑 dummy batch 维持锁步（EP all2all 缺席者挂死）；共识后 ignore_start_dp_wave 丢弃在途唤醒"
+  }
+ ],
+ "stations_note": "站号 = 讲解装配顺序（启动 1-7 → 请求进集群 8-10 → 一拍数据面 11-14 → 拍间控制面 15-16），非单请求时序——多实例章的『请求流经』横跨 M 台引擎，正文按讲解需要编排。与 ch17 衔接：其站 5『init_device 的 DP 修正』与站 9『PP 接力』在此展开成整章；与 ch18：非 async PP 的 token 回传走 new_token_ids 差量字段；与 ch12：async PP 的 GPU 回填已立、本章补 broadcast 来源；与 ch26：DeepSeek MoE 层是 EP dispatch/combine 的消费现场；与 ch5：-1 哨兵与 ROUTER 信封在此兑现（F4/F3）。",
+ "key_classes": [
+  {
+   "name": "GroupCoordinator",
+   "file": "vllm/distributed/parallel_state.py",
+   "responsibility": "单个并行维度（TP/PP/DP/EP/...）的统一抽象：cpu_group(gloo)+device_group(NCCL) 双群组 + 平台 device_communicator + 可选 SHM mq_broadcaster；对外 all_reduce/all_gather/reduce_scatter/gather/broadcast(_tensor_dict) 与 P2P send/recv(isend/irecv_tensor_dict)。每个维度一个进程级单例（_TP/_PP/_DP/_EP），经 get_*_group() 零参数取用。"
+  },
+  {
+   "name": "DeviceCommunicatorBase / CudaCommunicator",
+   "file": "vllm/distributed/device_communicators/base_device_communicator.py · cuda_communicator.py",
+   "responsibility": "device 端集合通信抽象与 CUDA 实现：默认 torch.distributed 实现 + CudaCommunicator 的多级回退（CustomAllreduce/pynccl/flashinfer/symm-mem...）；EP 时还持 all2all_manager（按 all2all_backend 旋钮选型）。GroupCoordinator 只管群组与分发，具体内核挑选全下沉到这里。"
+  },
+  {
+   "name": "All2AllManagerBase / AgRsAll2AllManager",
+   "file": "vllm/distributed/device_communicators/all2all.py",
+   "responsibility": "EP 全网重排的管理者族：dispatch（token 按路由发往专家所在 rank）/combine（结果归位求和）/query_active_mask 等；默认 AgRs 后端用 all_gatherv+reduce_scatterv 凑出等价 all-to-all，DeepEP/MoRI/nixl/flashinfer 等真 A2A 后端实现同接口。"
+  },
+  {
+   "name": "DPCoordinator / DPCoordinatorProc",
+   "file": "vllm/v1/engine/coordinator.py",
+   "responsibility": "DP 控制面独立进程：持 front_publish(XPUB→前端)/back_publish(XPUB→引擎)/output_back(PULL←引擎统计) 三 socket；聚合每引擎 (waiting,running,kv_cache_usage) 按 100ms/5s 发布；跟踪 wave 与 running 态，广播 START_DP_WAVE。请求与输出的数据面完全不经过它。"
+  },
+  {
+   "name": "DPAsyncMPClient / DPLBAsyncMPClient",
+   "file": "vllm/v1/engine/core_client.py",
+   "responsibility": "DP 前端客户端两层：DPAsync=外部 LB（每 client 绑定引擎，XSUB 订阅聚合统计、PAIR first_req_socket 转投 FIRST_REQ）；DPLB=内部 LB（在 DPAsync 之上加 score 打分选引擎 + reqs_in_flight/engine_inflight 在飞记账 + abort 按引擎路由）。"
+  },
+  {
+   "name": "DPEngineCoreProc",
+   "file": "vllm/v1/engine/core.py",
+   "responsibility": "MoE DP 引擎的忙循环：assert is_moe；持 current_wave/step_counter/pending_pause/ignore_start_dp_wave 状态机；每拍发布 stats（client_index=-1 哨兵）、无活跑 dummy batch 维持锁步、每 32 步 2 元素 SUM all-reduce 做全局去留共识；引擎级 dp_group 是 stateless gloo 组（引擎进程无 CUDA 设备）。"
+  },
+  {
+   "name": "AsyncIntermediateTensors / IntermediateTensors",
+   "file": "vllm/v1/worker/gpu_worker.py · vllm/sequence.py",
+   "responsibility": "PP 段间载荷与其懒同步包装：IntermediateTensors 是非末段 forward 的返回载体（张量字典，手写 __init__ 保 Dynamo 溯源）；AsyncIntermediateTensors 把 irecv 句柄推迟到首次访问 .tensors 才 wait——接收等待与本地输入准备重叠。"
+  },
+  {
+   "name": "ParallelConfig",
+   "file": "vllm/config/parallel.py",
+   "responsibility": "多实例拓扑全部旋钮的家：tensor/pipeline/data/prefill_context/decode_context_parallel_size、data_parallel_rank(_local)、enable_expert_parallel、all2all_backend、use_all2all/use_sequence_parallel_moe 属性、stateless_init_dp_group（gloo）、sync_dp_state/has_unfinished_dp 共识原语。"
+  }
+ ],
+ "data_flow": [
+  "【前端段，引 deepread/api-entry data_flow 步 5 + core_client】AsyncLLM.add_request → InputProcessor 产 EngineCoreRequest（ch4 已立）→ make_async_mp_client 按 DP 形态分发：内部 LB 走 DPLBAsyncMPClient（core_client.py:L116-L139）。",
+  "【选路】DPLBAsyncMPClient.get_core_engine_for_request：读 coordinator 聚合的 lb_engines 快照 + 本地 engine_inflight 精确地板 → score 选引擎 → reqs_in_flight[request_id]=engine 登记（core_client.py:L1468-L1519）。",
+  "【盖章过线，F3/F4 回收】add_request_async：request.current_wave/client_index 双盖章 → _send_input(ADD, request, chosen_engine)——ROUTER 按目标引擎 identity 定向（core_client.py:L1410-L1423）；engines 暂停时另发 FIRST_REQ 抢先唤醒（L1418-L1421）。",
+  "【引擎段，引 deepread/ipc-stage data_flow 步 5-6】选中引擎的输入 IO 线程 DEALER 收件 → busy loop add_request 入 scheduler；MoE 引擎每拍 _maybe_publish_request_counts 把 stats 经 client_index=-1 哨兵发往 coordinator（core.py:L2075-L2090 → L1788-L1793）。",
+  "【一拍·控制面前置】Worker 端 _determine_batch_execution_and_padding 先 coordinate_batch_across_dp：一次 4×dp all-reduce 对齐 padding/ubatch/cudagraph 档位，num_tokens_across_dp 进 DPMetadata（dp_utils.py:L164-L225 → forward_context.py:L72-L128）。",
+  "【一拍·PP 接力】非首 PP rank Worker.execute_model irecv_tensor_dict 成 AsyncIntermediateTensors（懒同步）；非末段算完 isend_tensor_dict 非阻塞发下段、句柄 _pp_send_work 下拍收割（gpu_worker.py:L1017-L1107；metadata 走 cpu_group、张量走 device_group、TP 切片只发 1/tp，parallel_state.py:L1019-L1074）。",
+  "【一拍·层内】forward 中 RowParallelLinear 部分和 → tensor_model_parallel_all_reduce → custom-op/直接双路径 → device_communicator 回退链（linear.py:L1748-L1774 → cuda_communicator.py:L275-L341）；MoE 层 prepare/finalize 调 get_ep_group().dispatch/combine 全网重排（naive_dp_ep.py:L158/L207 → all2all.py:L101-L150）。",
+  "【一拍·收尾】末段采样 → _pp_broadcast_prev_sampled_token_ids 把 token 从 GPU 广播回首段（异步版，gpu_model_runner.py:L4842-L4869）；output_rank 收割 ModelRunnerOutput → update_from_output 按 request.client_index 分桶（scheduler.py:L1924, L2015-L2016）→ 输出线程 sockets[client_index] PUSH 回发起前端（core.py:L1785-L1805，ch5 已立）。",
+  "【拍间·共识】DPEngineCoreProc 每 32 步 sync_dp_state 2 元素 SUM all-reduce：全体无活 → wave_complete 上报（dp_rank 0）、current_wave+=1；coordinator 聚合后 XPUB 广播 START_DP_WAVE 唤醒（core.py:L2124-L2188 → coordinator.py:L457-L467）。"
+ ],
+ "why_chains": [
+  {
+   "id": "WC1",
+   "card": "deepread/ipc-stage.json why_chains[10]（原样引用）",
+   "decision": "数据面与控制面分离：DP 部署另起 DPCoordinator 进程（XPUB/XSUB + PULL 三 socket），请求/输出数据面完全不经过它",
+   "old_design": "早期 DP（v1 初期）靠引擎间 all-reduce 同步全局状态，前端无从得知各引擎负载；朴素做法是把负载统计混进数据通道或让前端轮询各引擎。",
+   "pain": "内部 LB 的前端需要『每引擎 (waiting, running, kv_cache_usage)』做路由决策，但 M 引擎 × N 前端若两两直连统计，连接数与消息量平方级膨胀；MoE DP lockstep 还需要全局 wave 号广播（一台收新请求要唤醒全部暂停中的引擎）。",
+   "solution": "v0.27.1 落点：DPCoordinator 独立进程（vllm/v1/engine/coordinator.py:L23-L137）持三个 socket——back_publish(XPUB) 给引擎订阅控制指令、back_output(PULL) 收引擎统计、front_publish(XPUB) 给前端发布聚合统计（coordinator.py:L208-L256）；引擎侧输入线程加一条 XSUB 订阅 START_DP_WAVE（core.py:L1672-L1682，订阅帧 b'\\x01'），统计经输出线程 client_index=-1 哨兵路由到 coordinator（core.py:L1788-L1792，来源 _maybe_publish_request_counts core.py:L2075-L2090——注释 'Publish our request counts (if they've changed)'）；前端 DPAsyncMPClient 用 XSUB 订阅聚合统计、用进程内 inproc PAIR socket（first_req_send_socket）把 FIRST_REQ/SCALE_ELASTIC_EP 通知转投 coordinator（core_client.py:L1281-L1291,L1293-L1408）；coordinator 周期 100ms 发布（coordinator.py:L158,L256-L283）。",
+   "cost": "多一个常驻进程与三条额外 socket；统计是 100ms 级快照（LB 打分要用客户端本地 in-flight 计数兜底，core_client.py:L1485-L1493 注释承认 snapshot 会 race——v0.27.1 已把 inflight 地板做进 score 主式）；wave 协调只服务 MoE lockstep（enable_wave_coordination 按模型类型开关，coordinator.py:L79-L83）；控制面故障域又多一个（coordinator 启动等待 120s 超时，coordinator.py:L59-L77）。"
+  },
+  {
+   "id": "WC2",
+   "card": "deepread/api-entry.json why_chains[8]（原样引用，F3 回收素材）",
+   "decision": "多 API server 水平扩展：前端可多进程扩展（--api-server-count），每个 API server 持完整三件套，回程输出按 client_index 路由回发起方",
+   "old_design": "此前单 API server 单 AsyncLLM；DP 扩展只在引擎侧做，前端事件循环（HTTP+SSE+tokenize+detokenize 共享一个单核）是隐含的规模天花板。",
+   "pain": "GPU 扩了（DP/TP）前端先饱和：一个事件循环装不下所有连接的 SSE 写出 + 预处理 + 输出处理；API 进程数与 GPU 数绑死则无法独立伸缩，也违背「API 进程零 GPU、可独立部署」的拆分初衷。",
+   "solution": "AsyncLLM 携 client_count/client_index（async_llm.py:L86-88、L171）；add_request_async 给每个 EngineCoreRequest 盖 client_index（core_client.py:L1145-1148 → v1/engine/__init__.py:L120-122 'Index of the client, used to ensure outputs are sent back to the same client'）；引擎侧输出线程按 client_index 选 PUSH socket 回发（core.py:L1785-1793、L1804 sockets[client_index]）；MPClient 支持外部管理模式（client_addresses：绑 ROUTER/PULL 并回报实际端口给父进程转发，core_client.py:L547-585）；拓扑与进程数公式文档化（arch_overview.md:L89、L119-142：API server 数默认 = DP size，多对多 ZMQ）。",
+   "cost": "引擎侧每 API server 一个 PUSH 输出 socket（输出扇出 × N）；请求归属必须随请求过线（client_index 进 EngineCoreRequest 线格式）——引擎要记住「谁发的」才能路由回去，是跨进程契约的又一笔状态；多 API server 启动有 TOCTOU 竞态修补史（PR #42585 EADDRINUSE）；单 API server 内部仍是单事件循环——扩展靠进程数，不靠线程。"
+  },
+  {
+   "id": "WC3",
+   "card": "v2 artifacts/ch20 design_decisions[1][2]（迁移候选，锚点已对 v0.27.1 现核）",
+   "decision": "双群组分工：每个 GroupCoordinator 同时持有 cpu_group(gloo) 与 device_group(NCCL)，按数据类型分流；集合原语注册成 vLLM 自定义算子并各配 fake 实现",
+   "old_design": "单进程组直连 torch.distributed：控制面对象广播与数据面张量集合挤同一 NCCL 组；集合原语直接调 torch.distributed——对 torch.compile 完全不透明（Dynamo 无法符号化 ProcessGroup 对象，遇副作用即 graph break）。",
+   "pain": "控制面（pickle 序列化的 metadata/对象/barrier）天然在 CPU 上完成，走 NCCL 要无谓的 GPU↔CPU 拷贝；且 NCCL barrier 内部是带隐式 GPU 张量的 broadcast、易搞乱 current device（v0.27.1 源码注释原话仍在 parallel_state.py:L1200-L1206）；而编译图里每次遇到集合通信就断图，piecewise 编译（ch19）的融合收益被砍。",
+   "solution": "__init__ 对每组 ranks 双 new_group：device_group 用平台后端、cpu_group 用 gloo（parallel_state.py:L455-L470）；barrier 刻意走 cpu_group（L1200-L1207）；broadcast_tensor_dict 按张量 is_cpu 分流（L885-L965）。集合算子侧：all_reduce/reduce_scatter/all_gather 注册成 torch.ops.vllm.*（direct_register_custom_op，L352-L368），接口只含 (tensor, group_name:str)——字符串可符号化；各配 fake 实现供编译期形状推断（L152-L197）；out-of-place 满足 custom op 不可原地约束（L662-L684 docstring 自述缘由）。",
+   "cost": "每个组双份 ProcessGroup（进程组是稀缺资源，维度多了有配额压力）；custom-op 路径多一层间接（group_name 查表）；平台不支持时 use_custom_op_call=False 回直接路径——两条路径都要测试；fake 实现必须与真实现 shape 语义严格一致，否则编译期推断错。"
+  },
+  {
+   "id": "WC4",
+   "card": "v2 artifacts/ch20 design_decisions[3][5]（迁移候选，锚点已对 v0.27.1 现核）",
+   "decision": "一个 5 维 rank 张量统一切分所有并行维度 + 每维度一个进程级单例 GroupCoordinator（EP 群组只对 MoE 模型创建）",
+   "old_design": "为每个并行维度手写 rank 索引分配（Megatron 早期做法），或把通信组对象沿模型调用链层层透传。",
+   "pain": "TP/PP/DP/PCP/EP/DCP/EPLB 维度组合爆炸，手写索引必错且难审计；模型 forward 在任意深度都要拿到当前维度的通信组，透传会绑架所有 forward 签名（与 ch23 的『Attention 插座契约』同病）。",
+   "solution": "all_ranks = arange(world).reshape(-1, dp, pp, pcp, tp)——TP 最内层保相邻；任一维度 transpose 到末维→reshape→unbind 机械导出 group_ranks（L1812-L1827 注释即公式）；逐维 init_model_parallel_group 建 _TP/_PP/_DP/_EP 单例（L1829-L1950），模型代码经 get_*_group() 零参数取用（L1390-L1452），communication_op 即其薄封装（communication_op.py:L12-L43）；EP 组仅 is_moe 创建（L1920-L1921 注释 'Don't create EP group for dense models'）。",
+   "cost": "维度间有隐含序（TP 相邻假设 rank 物理布局配合——docstring 提醒 caller 保证同 DGX box 相邻，L1771-L1774）；单例是进程级可变全局状态（重复初始化靠 assert 防御）；新增维度（DCP/PCP/EPLB）都要在同一函数里加刀，函数已长 245 行。"
+  },
+  {
+   "id": "WC5",
+   "card": "v2 artifacts/ch21-async-engine design_decisions[0][1]（迁移候选，锚点已对 v0.27.1 现核）",
+   "decision": "PP 双向懒同步：接收侧 AsyncIntermediateTensors 把 irecv 的 wait 推迟到首次访问 .tensors；发送侧 isend 句柄延迟到下一轮 execute_model 开头才收割",
+   "old_design": "PP 逐段同步 send/recv：上一段算完阻塞发送、下一段阻塞接收后再开始准备输入——通信串行在关键路径上。",
+   "pain": "irecv 发出后接收方还要做输入准备、KV 取址、注意力元数据构建等与接收无关的本地工作——同步等待把这段可重叠时间白白串行；发送方发完隐藏状态也不必原地等对端收完。decode 一拍几十 ms，段间气泡直接吃吞吐。",
+   "solution": "接收侧：Worker.execute_model 非首段调 irecv_tensor_dict 拿 (tensor_dict, comm_handles, comm_postprocess)，包成 AsyncIntermediateTensors——__getattribute__ 钩子保证『谁先碰 .tensors 谁负责 wait_for_comm』，对 ModelRunner 透明（gpu_worker.py:L96-L125, L1064-L1076）；发送侧：非末段 isend_tensor_dict 返回句柄列表存 self._pp_send_work（L175-L176 初始化），下一拍 execute_model 开头统一收割（L1022-L1026）；metadata 先行走 cpu_group send_object、张量各自 isend/irecv（parallel_state.py:L1019-L1074, L1114-L1198）。",
+   "cost": "__getattribute__ 全局拦截属性访问——调试栈更绕、任何提前触碰 .tensors 都会静默触发同步（钩子是约定不是类型）；句柄跨拍存活要求张量 record_stream 防提前回收（L1070-L1071）；v0.27.1 异步调度下采样 token 回传也要 GPU broadcast 补一条路（gpu_model_runner.py:L4842-L4869），PP 状态面变宽。"
+  },
+  {
+   "id": "WC6",
+   "card": "v2 artifacts/ch21-async-engine design_decisions[3][4][5][6]（迁移候选，锚点已对 v0.27.1 现核）",
+   "decision": "DP wave 共识：每 32 步一次 2 元素 SUM all-reduce 同时裁决『有无未完成』与『是否全体暂停』；wave 编号由 dp_rank0 经 coordinator 单点广播；两阶段暂停挡在途唤醒",
+   "old_design": "每步全量同步（开销大）；或完全不同步（MoE DP 各引擎步调漂移）。",
+   "pain": "MoE 的 DP 要求各 rank 步调一致——EP dispatch/combine 是集合通信，一台缺席全员挂死；但『是否还有请求』变化不频繁，每步 all-reduce 是纯浪费；而 naive 的暂停协议会被管道里在飞的旧唤醒消息打回 running，破坏全体一致暂停。",
+   "solution": "DPEngineCoreProc._has_global_unfinished_reqs：step_counter 每 32 步才做一次 sync_dp_state——单次 2 元素 SUM：[0]>0 ≡ OR（任一有活全体继续）、[1]==dp_size ≡ 全体同意暂停（config/parallel.py:L727-L762）；期间无 ready 请求的引擎跑 dummy batch 维持对齐（core.py:L2133-L2137）；全体无活 → dp_rank0 发 wave_complete（-1 哨兵走 coordinator，L2149-L2164）、current_wave+=1；暂停走两阶段：pending_pause 置位后继续空转到 all-reduce 确认，共识即置 ignore_start_dp_wave 丢弃在途 START_DP_WAVE（L1944-L1950, L2058-L2060, L2183-L2186）；stale wave 请求由引擎上报 start_wave 触发 coordinator 补广播（L2008-L2022 → coordinator.py:L436-L451）。",
+   "cost": "最坏 31 步的滞留感知（请求到别的引擎了，本引擎最多空转 31 步 dummy batch 才发现该停）；dummy batch 白烧一小段 GPU；wave 竞态处理链路长（FIRST_REQ 抢先通知/stale wave 上报/coordinator 去重 exclude）——三处代码合力才闭得住环，是本章最精细的协议；非 MoE 引擎完全不走这套（core.py:L1311-L1318），读者要分清两种形态。"
+  },
+  {
+   "id": "WC7",
+   "card": "v2 artifacts/ch21-async-engine design_decisions[7][8][9]（迁移候选；score 公式 v0.27.1 已重写——禁迁移旧公式）",
+   "decision": "内部 LB 打分选路（v0.27.1 重写版）：score=max(client_count×inflight, waiting+running) + KV 压力斜坡；external LB 模式每 client 绑一个引擎；engines 暂停时新请求经 PAIR socket 抢先唤醒",
+   "old_design": "v0.21.0：score=waiting*4+running 静态权重，且快照 race 只靠本地预增 waiting 缓解。",
+   "pain": "coordinator 统计是 100ms 级快照——burst 期间多个前端看同一份旧 counts 会全挤向同一引擎；纯快照打分永远追不上突发；waiting 的痛感与 KV 压力耦合（KV-bound 引擎的队列泄得慢），静态权重表达不了。",
+   "solution": "DPLBAsyncMPClient.get_core_engine_for_request（core_client.py:L1468-L1519）：inflight 地板=本地精确在飞计数×client_count（'exact and can't be erased by a snapshot rebind'，L1485-L1493 注释）；score 主式 max(地板, waiting+running)；waiting×6.0×max(0, kv_usage-0.5) 斜坡——>50% 才起罚、满载 3 倍（L1494-L1501 注释给理由）；eng_start_index 轮转消平局偏置（L1508-L1513）；选中即 engine_inflight+=1、finished 时 process_engine_outputs 回收（L1532-L1539）；abort 按 reqs_in_flight 路由到正确引擎（L1587-L1602）。外部 LB：DPAsyncMPClient 每 client 绑定引擎、get_core_engine_for_request 原样返回（L1427-L1428）。暂停期唤醒：add_request_async 里 FIRST_REQ 经 inproc PAIR 直投 stats 任务 → coordinator 立即广播 START_DP_WAVE（L1418-L1421 → L1369-L1378 → coordinator.py:L347-L365）。",
+   "cost": "打分公式是经验参数（6.0/0.5 阈值无自适应）；inflight 计数要求 finished_requests 严格回收（泄漏=分数永久虚高）；每请求两次字典操作（登记+回收）在热路径上；外部 LB 模式引擎不发 stats、前端只在 wave/running 变化时收到通知——负载视图是盲的（均衡责任全在外部均衡器）。"
+  },
+  {
+   "id": "WC8",
+   "card": "deepread/ipc-stage.json why_chains[2]（节引——ch5 已详讲拓扑史，本章只取 payoff 视角，F4 回收素材）",
+   "decision": "输入通道 client ROUTER(bind) / engine DEALER(connect, identity=engine_index 两字节小端)，且每前端一条——DP 多引擎下 ROUTER 信封成为定向投递的基础设施",
+   "old_design": "初版 PUSH/PULL 匿名管道（#9826）；#15906 首改 ROUTER/DEALER 次日被 revert；#17546（2025-05-30）随 many-to-many 真正立住。",
+   "pain": "（ch5 已详讲）PUSH 无寻址能力——DP 下 client 要定向发给 N 个引擎之一；单前端假设被 API-server 水平扩展打破。",
+   "solution": "v0.27.1 落点：client 每条消息首帧带目标引擎 identity（core_client.py:L887,L1113-L1123）；DP 内部 LB 的 chosen_engine identity 就是那帧信封（L1410-L1423）——N 前端 × M 引擎的 fan-out 全靠它；外部 LB/每 client 绑定引擎（DPAsyncMPClient）与内部 LB（DPLB 全权选路）是同一寻址能力的两种用法。",
+   "cost": "ROUTER 信封每条消息多一个帧；『对端必须先发言』成为硬约束（ch5 已立 ready-first 协议）；DP=1 的普通部署也在为它用不上的寻址能力付信封开销——本章兑现收益，这笔账终于算平。"
+  }
+ ],
+ "embed_excerpts": [
+  {
+   "path": "vllm/distributed/parallel_state.py",
+   "lines": "L1812-L1827",
+   "what": "建组地基：全部 rank 排进一个 5 维张量，layout 顺序 ExternalDP × DP × PP × PCP × TP；注释给出机械切分公式——任一维度的 group_ranks 都是『transpose 到末维 → reshape 2D → unbind』导出。TP 放最内层 = 同组 rank 物理相邻（同机/同 NVLink 岛，通信最频繁的 all_reduce 走最高带宽）。",
+   "code": "    # the layout order is: ExternalDP x DP x PP x PCP x TP\n    # ExternalDP is the data parallel group that is not part of the model,\n    # every dp rank can generate independently (in verl integration).\n    # DP is the data parallel group that is part of the model,\n    # all the ranks in the same DP group should generate simultaneously,\n    # i.e. the `generate` call in the same DP group should be called together,\n    # otherwise it will cause deadlock.\n    # to get group_ranks for each dimension, transpose that dimension to the\n    # last dimension, then reshape to 2D, then unbind the last dimension\n    all_ranks = torch.arange(world_size).reshape(\n        -1,\n        data_parallel_size,\n        pipeline_model_parallel_size,\n        prefill_context_model_parallel_size,\n        tensor_model_parallel_size,\n    )  # noqa",
+   "elide": [
+    "ExternalDP 注释里的 verl 集成场景一句带过即可。"
+   ]
+  },
+  {
+   "path": "vllm/distributed/parallel_state.py",
+   "lines": "L1829-L1899",
+   "what": "TP/PP 两刀的完整源码：TP 用 view(-1, tp) 直接相邻切、独享 mq_broadcaster（SHM 广播）；PP 用 transpose(2,4) 拿到跨段 rank 序列。中间夹着的 DCP（L1846-L1862）/PCP（L1864-L1881）两段切法同构，是进阶维度。",
+   "code": "    # Build the tensor model-parallel groups.\n    global _TP\n    assert _TP is None, \"tensor model parallel group is already initialized\"\n    group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)\n    group_ranks = [x.tolist() for x in group_ranks]\n    if enable_elastic_ep:\n        group_ranks = local_all_ranks.view(-1, tensor_model_parallel_size).unbind(0)\n        group_ranks = [x.tolist() for x in group_ranks]\n    # message queue broadcaster is only used in tensor model parallel group\n    _TP = init_model_parallel_group(\n        group_ranks,\n        get_world_group().local_rank,\n        backend,\n        use_message_queue_broadcaster=True,\n        group_name=\"tp\",\n    )\n\n    # Build the DCP model-parallel groups.\n    global _DCP\n    assert _DCP is None, \"decode context model parallel group is already initialized\"\n    dcp_size = decode_context_model_parallel_size or 1\n    dcp_ranks = local_all_ranks if enable_elastic_ep else all_ranks\n    if dcp_size > 1:\n        # DCP spans PCP first, then TP for full TP x PCP groups.\n        dcp_ranks = dcp_ranks.transpose(-1, -2)\n    group_ranks = dcp_ranks.reshape(-1, dcp_size).unbind(0)\n    group_ranks = [x.tolist() for x in group_ranks]\n    _DCP = init_model_parallel_group(\n        group_ranks,\n        get_world_group().local_rank,\n        backend,\n        use_message_queue_broadcaster=True,\n        group_name=\"dcp\",\n    )\n\n    global _PCP\n    assert _PCP is None, \"prefill context parallel group is already initialized\"\n    group_ranks = (\n        all_ranks.transpose(3, 4)\n        .reshape(-1, prefill_context_model_parallel_size)\n        .unbind(0)\n    )\n    group_ranks = [x.tolist() for x in group_ranks]\n    if enable_elastic_ep:\n        group_ranks = (\n            local_all_ranks.transpose(1, 2)\n            .reshape(-1, prefill_context_model_parallel_size)\n            .unbind(0)\n        )\n        group_ranks = [x.tolist() for x in group_ranks]\n    _PCP = init_model_parallel_group(\n        group_ranks, get_world_group().local_rank, backend, group_name=\"pcp\"\n    )\n\n    # Build the pipeline model-parallel groups.\n    global _PP\n    assert _PP is None, \"pipeline model parallel group is already initialized\"\n    group_ranks = (\n        all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)\n    )\n    group_ranks = [x.tolist() for x in group_ranks]\n    if enable_elastic_ep:\n        group_ranks = (\n            local_all_ranks.transpose(0, 2)\n            .reshape(-1, pipeline_model_parallel_size)\n            .unbind(0)\n        )\n        group_ranks = [x.tolist() for x in group_ranks]\n    _PP = init_model_parallel_group(\n        group_ranks, get_world_group().local_rank, backend, group_name=\"pp\"\n    )",
+   "elide": [
+    "DCP（decode context parallel，L1846-L1862）与 PCP（prefill context parallel，L1864-L1881）两段与 TP/PP 切法完全同构——正文一句带过（PCP 会在 EP 组公式里再出现一次），不逐段讲。"
+   ]
+  },
+  {
+   "path": "vllm/distributed/parallel_state.py",
+   "lines": "L1901-L1950",
+   "what": "DP 刀 + EP 刀：DP=transpose(1,4)，组员是『同 (tp,pp,pcp) 槽位跨引擎』的 rank；EP 组 = 同一 PP 段内 DP×PCP×TP 全合并（transpose(1,2) 后 reshape）——注释明言 'Don't create EP group for dense models'，dense 模型 _EP 保持 None；use_all2all 从 parallel_config 读入；enable_eplb 时另建同 rank 的隔离 EPLB 组（注释给理由：隔离 EPLB 通信与 MoE 前向集合通信、防 torch.distributed 死锁）。",
+   "code": "    global _DP\n    assert _DP is None, \"data parallel group is already initialized\"\n    group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)\n    group_ranks = [x.tolist() for x in group_ranks]\n    if enable_elastic_ep:\n        _DP = _init_stateless_group(\n            group_ranks,\n            \"dp\",\n            parallel_config.data_parallel_master_ip,\n            backend,\n            coord_store=coord_store,\n        )\n    else:\n        _DP = init_model_parallel_group(\n            group_ranks, get_world_group().local_rank, backend, group_name=\"dp\"\n        )\n\n    global _EP\n    assert _EP is None, \"expert parallel group is already initialized\"\n    # Don't create EP group for dense models.\n    if config.model_config is None or config.model_config.is_moe:\n        group_ranks = (\n            all_ranks.transpose(1, 2)\n            .reshape(\n                -1,\n                data_parallel_size\n                * prefill_context_model_parallel_size\n                * tensor_model_parallel_size,\n            )\n            .unbind(0)\n        )\n        group_ranks = [x.tolist() for x in group_ranks]\n        use_all2all = parallel_config.use_all2all\n        if enable_elastic_ep:\n            _EP = _init_stateless_group(\n                group_ranks,\n                \"ep\",\n                parallel_config.data_parallel_master_ip,\n                backend,\n                coord_store=coord_store,\n                use_all2all=use_all2all,\n            )\n        else:\n            _EP = init_model_parallel_group(\n                group_ranks,\n                get_world_group().local_rank,\n                backend,\n                group_name=\"ep\",\n                use_all2all=use_all2all,\n            )",
+   "elide": [
+    "enable_elastic_ep 的两个分支（_init_stateless_group）属弹性扩缩容，本章按非弹性主线跳过（弹性 EP 归 ch39 生产运维话题）；EPLB 组正文一句带过。"
+   ]
+  },
+  {
+   "path": "vllm/distributed/parallel_state.py",
+   "lines": "L409-L527",
+   "what": "GroupCoordinator.__init__：对每组 ranks 同时 new_group 出 device_group（NCCL 等设备后端）与 cpu_group（gloo）——注释原话 'to allow direct coordination between processes through the CPU'；world_size>1 才解析平台 device_communicator 类（use_all2all 透传给它）；TP 组独享 mq_broadcaster；use_custom_op_call 由平台能力决定。类顶的 4-rank/2-node 表格是三套坐标（rank/local_rank/rank_in_group）的钥匙。",
+   "code": "    def __init__(\n        self,\n        group_ranks: list[list[int]],\n        local_rank: int,\n        torch_distributed_backend: str | Backend,\n        use_device_communicator: bool,  # whether to use device communicator\n        use_message_queue_broadcaster: bool = False,\n        group_name: str | None = None,\n        use_all2all: bool = False,\n    ):\n        group_name = group_name or \"anonymous\"\n        self.unique_name = _get_unique_name(group_name)\n        _register_group(self)\n\n        self.rank = torch.distributed.get_rank()\n        self.local_rank = local_rank\n        self.device_index: int\n        assert local_rank >= 0, (\n            \"local_rank must be provided when creating the world group\"\n        )\n        self.device_index = local_rank\n\n        self_device_group = None\n        self_cpu_group = None\n\n        # VLLM_DISTRIBUTED_USE_SPLIT_GROUP gates the new ``split_group``\n        # codepath. Default (False) preserves the legacy ``new_group`` path.\n        if envs.VLLM_DISTRIBUTED_USE_SPLIT_GROUP:\n            self_device_group, self_cpu_group = _create_subgroups_split_group(\n                group_ranks, group_name, torch_distributed_backend\n            )\n            for ranks in group_ranks:\n                if self.rank in ranks:\n                    self.ranks = ranks\n                    self.world_size = len(ranks)\n                    self.rank_in_group = ranks.index(self.rank)\n                    break\n        else:\n            from vllm.distributed.utils import (\n                get_cpu_distributed_timeout_or_none,\n                get_distributed_timeout_or_none,\n            )\n\n            timeout = get_cpu_distributed_timeout_or_none()\n            device_timeout = get_distributed_timeout_or_none()\n\n            for ranks in group_ranks:\n                device_group = torch.distributed.new_group(\n                    ranks,\n                    backend=torch_distributed_backend,\n                    timeout=device_timeout,\n                )\n                # a group with `gloo` backend, to allow direct coordination between\n                # processes through the CPU.\n                with suppress_stdout():\n                    cpu_group = torch.distributed.new_group(\n                        ranks, backend=\"gloo\", timeout=timeout\n                    )\n                if self.rank in ranks:\n                    self.ranks = ranks\n                    self.world_size = len(ranks)\n                    self.rank_in_group = ranks.index(self.rank)\n                    self_device_group = device_group\n                    self_cpu_group = cpu_group\n\n        assert self_cpu_group is not None\n        assert self_device_group is not None\n\n        self.group_ranks = group_ranks\n        self.torch_distributed_backend = torch_distributed_backend\n\n        self.cpu_group = self_cpu_group\n        self.device_group = self_device_group\n\n        from vllm.platforms import current_platform\n\n        if current_platform.is_cuda_alike():\n            visible_device_index = (\n                current_platform.logical_device_id_to_visible_device_id(\n                    self.device_index\n                )\n            )\n            self.device = torch.device(f\"cuda:{visible_device_index}\")\n        elif current_platform.is_xpu():\n            self.device = torch.device(f\"xpu:{self.device_index}\")\n        elif current_platform.is_out_of_tree():\n            self.device = torch.device(\n                f\"{current_platform.device_name}:{self.device_index}\"\n            )\n        else:\n            self.device = torch.device(\"cpu\")\n\n        self.use_device_communicator = use_device_communicator\n        self.device_communicator = None\n        if use_device_communicator and self.world_size > 1:\n            device_comm_cls = resolve_obj_by_qualname(\n                current_platform.get_device_communicator_cls()\n            )\n            self.device_communicator = device_comm_cls(\n                cpu_group=self.cpu_group,\n                device=self.device,\n                device_group=self.device_group,\n                unique_name=self.unique_name,\n                use_all2all=use_all2all,\n            )\n\n        from vllm.distributed.device_communicators.shm_broadcast import MessageQueue\n\n        self.mq_broadcaster: MessageQueue | None = None\n        if use_message_queue_broadcaster and self.world_size > 1:\n            self.mq_broadcaster = MessageQueue.create_from_process_group(\n                self.cpu_group, 1 << 22, 6\n            )\n\n        # TODO(#35915): Remove is_tpu() check once tpu_inference\n        # overrides use_custom_op_collectives() to return True.\n        self.use_custom_op_call = (\n            current_platform.is_tpu() or current_platform.use_custom_op_collectives()\n        )",
+   "elide": [
+    "L434-L445 的 VLLM_DISTRIBUTED_USE_SPLIT_GROUP 实验分支（split_group 替代 new_group，默认关）一句带过；L485-L499 的 xpu/out_of_tree 设备分支只保留 cuda 与 cpu 两支语义；L529-L533 use_cpu_custom_send_recv 是 CPU 后端旁路，跳过。"
+   ]
+  },
+  {
+   "path": "vllm/distributed/parallel_state.py",
+   "lines": "L152-L197",
+   "what": "三个模块级集合算子 + 各自的 fake(meta) 实现：真身只做『按 group_name 字符串查回 GroupCoordinator → 调其 _*_out_place』；fake 版只构造正确 shape 的空张量——供 torch.compile 在编译期（meta 设备）做形状推断而不真正通信（all_gather 第 dim 维 ×world_size、reduce_scatter ÷world_size）。",
+   "code": "def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:\n    assert group_name in _groups, f\"Group {group_name} is not found.\"\n    group = _groups[group_name]()\n    if group is None:\n        raise ValueError(f\"Group {group_name} is destroyed.\")\n    return group._all_reduce_out_place(tensor)\n\n\ndef all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:\n    return torch.empty_like(tensor)\n\n\ndef reduce_scatter(\n    tensor: torch.Tensor, dim: int, world_size: int, group_name: str\n) -> torch.Tensor:\n    assert group_name in _groups, f\"Group {group_name} is not found.\"\n    group = _groups[group_name]()\n    if group is None:\n        raise ValueError(f\"Group {group_name} is destroyed.\")\n    return group._reduce_scatter_out_place(tensor, dim)\n\n\ndef reduce_scatter_fake(\n    tensor: torch.Tensor, dim: int, world_size: int, group_name: str\n) -> torch.Tensor:\n    new_shape = list(tensor.shape)\n    new_shape[dim] = tensor.shape[dim] // world_size\n    return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)\n\n\ndef all_gather(\n    tensor: torch.Tensor, dim: int, world_size: int, group_name: str\n) -> torch.Tensor:\n    assert group_name in _groups, f\"Group {group_name} is not found.\"\n    group = _groups[group_name]()\n    if group is None:\n        raise ValueError(f\"Group {group_name} is destroyed.\")\n    return group._all_gather_out_place(tensor, dim)\n\n\ndef all_gather_fake(\n    tensor: torch.Tensor, dim: int, world_size: int, group_name: str\n) -> torch.Tensor:\n    new_shape = list(tensor.shape)\n    new_shape[dim] = tensor.shape[dim] * world_size\n    return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)",
+   "elide": [
+    "L200-L249 的 patched_fused_scaled_matmul_reduce_scatter 是绕 pytorch 2.9 一个 bug 的 fp8 融合算子，TODO 注释自认待删——边缘特性，跳过。"
+   ]
+  },
+  {
+   "path": "vllm/distributed/parallel_state.py",
+   "lines": "L352-L368",
+   "what": "把三个集合算子注册成 vLLM 自定义算子（direct_register_custom_op 各配 fake_impl）。注册后以 torch.ops.vllm.all_reduce 等形式存在，torch.compile 可把它们当作不透明节点编进图——这是『集合通信进 compiled graph 而不 graph break』的关键动作。",
+   "code": "direct_register_custom_op(\n    op_name=\"all_reduce\",\n    op_func=all_reduce,\n    fake_impl=all_reduce_fake,\n)\n\ndirect_register_custom_op(\n    op_name=\"reduce_scatter\",\n    op_func=reduce_scatter,\n    fake_impl=reduce_scatter_fake,\n)\n\ndirect_register_custom_op(\n    op_name=\"all_gather\",\n    op_func=all_gather,\n    fake_impl=all_gather_fake,\n)",
+   "elide": [
+    "第 4 个注册（patched_fused_scaled_matmul_reduce_scatter，L373-L377）连同 TODO 注释跳过，理由同上。"
+   ]
+  },
+  {
+   "path": "vllm/distributed/parallel_state.py",
+   "lines": "L662-L748",
+   "what": "三大集合原语的用户面方法（all_reduce/all_gather/reduce_scatter）与私有 out-of-place 实现。共同骨架：world_size==1 直接短路返回原张量；否则按 use_custom_op_call 二选一——torch.ops.vllm.*（编译友好，只传 group_name 字符串）或直接 _*_out_place（落 device_communicator）。all_reduce 的 docstring 道破迂回缘由：Dynamo 不支持把任意对象（self）传给 custom op；PyTorch custom op 不许原地改/同 op 返回新张量，故一律 out-of-place。",
+   "code": "    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        User-facing all-reduce function before we actually call the\n        all-reduce operation.\n\n        We need this because Dynamo does not support passing an arbitrary\n        object (`self` in this case) to a custom op. We need to pass the\n         group name as a string, and then look up the group coordinator from\n         the group name, dispatch the all-reduce operation to the group\n         coordinator.\n\n        In addition, PyTorch custom ops do not support mutation or returning\n        a new tensor in the same op. So we always make the all-reduce operation\n        out-of-place.\n        \"\"\"\n        # Bypass the function if we are using only 1 GPU.\n        if self.world_size == 1:\n            return input_\n\n        if self.use_custom_op_call:\n            return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)\n        else:\n            return self._all_reduce_out_place(input_)\n\n    def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:\n        if self.device_communicator is None:\n            raise ValueError(\"No device communicator found\")\n        return self.device_communicator.all_reduce(input_)\n\n    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:\n        world_size = self.world_size\n        # Bypass the function if we are using only 1 GPU.\n        if world_size == 1:\n            return input_\n        assert -input_.dim() <= dim < input_.dim(), (\n            f\"Invalid dim ({dim}) for input tensor with shape {input_.size()}\"\n        )\n\n        if self.use_custom_op_call:\n            return torch.ops.vllm.all_gather(\n                input_, dim, world_size, group_name=self.unique_name\n            )\n        else:\n            return self._all_gather_out_place(input_, dim)\n\n    def _all_gather_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:\n        if self.device_communicator is None:\n            raise ValueError(\"No device communicator found\")\n        return self.device_communicator.all_gather(input_, dim)\n\n    def all_gatherv(\n        self,\n        input_: torch.Tensor | list[torch.Tensor],\n        dim: int = 0,\n        sizes: list[int] | None = None,\n    ):\n        if self.device_communicator is None:\n            raise ValueError(\"No device communicator found\")\n        return self.device_communicator.all_gatherv(input_, dim, sizes)\n\n    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:\n        world_size = self.world_size\n        # Bypass the function if we are using only 1 GPU.\n        if world_size == 1:\n            return input_\n        assert -input_.dim() <= dim < input_.dim(), (\n            f\"Invalid dim ({dim}) for input tensor with shape {input_.size()}\"\n        )\n\n        if self.use_custom_op_call:\n            return torch.ops.vllm.reduce_scatter(\n                input_, dim, world_size, group_name=self.unique_name\n            )\n        else:\n            return self._reduce_scatter_out_place(input_, dim)\n\n    def reduce_scatterv(\n        self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None\n    ) -> torch.Tensor:\n        if self.device_communicator is None:\n            raise ValueError(\"No device communicator found\")\n        return self.device_communicator.reduce_scatterv(input_, dim, sizes)\n\n    def _reduce_scatter_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:\n        if self.device_communicator is None:\n            raise ValueError(\"No device communicator found\")\n        return self.device_communicator.reduce_scatter(input_, dim)",
+   "elide": [
+    "all_gatherv/reduce_scatterv（不等长 sizes 变体，L712-L720/L738-L743）是 EP dispatch/combine 的底层积木，正文在 EP 节回点。"
+   ]
+  },
+  {
+   "path": "vllm/distributed/device_communicators/cuda_communicator.py",
+   "lines": "L275-L341",
+   "what": "CudaCommunicator.all_reduce 的多级回退：NCCL symmetric-memory → quick reduce（仅 ROCm MI3*）→ flashinfer → aiter（ROCm）→ CustomAllreduce（vLLM 自研低延迟小张量 AR）→ symm_mem → pynccl → 兜底 torch.distributed.all_reduce(device_group)。对读者的关键认知：GroupCoordinator 之下，device_communicator 才是真正挑具体内核的地方，这条链对调用方完全透明；末段注释自述『跑模型时 allreduce 只发生在 TP 组，那里总 custom AR 或 pynccl 可用』。",
+   "code": "    def all_reduce(self, input_):\n        # since currently we perform copy input -> symm_input -> out-of-place AR\n        # return symm_output, we don't need to check if input is symmetric\n        if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(\n            self.pynccl_comm.world_size, input_\n        ):\n            out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)\n            if out is not None:\n                return out\n        # always try quick reduce first, then flashinfer, then the AITER or vLLM\n        # custom allreduce, and then pynccl. (quick reduce just for ROCM MI3*)\n        qr_comm = self.qr_comm\n        if (\n            qr_comm is not None\n            and not qr_comm.disabled\n            and qr_comm.should_quick_allreduce(input_)\n        ):\n            out = qr_comm.quick_all_reduce(input_)\n            assert out is not None\n            return out\n        fi_ar_comm = self.fi_ar_comm\n        if (\n            fi_ar_comm is not None\n            and not fi_ar_comm.disabled\n            and fi_ar_comm.should_use_fi_ar(input_)\n        ):\n            out = fi_ar_comm.all_reduce(input_)\n            assert out is not None\n            return out\n        aiter_ar_comm = self.aiter_ar_comm\n        if (\n            aiter_ar_comm is not None\n            and not aiter_ar_comm.disabled\n            and aiter_ar_comm.should_custom_ar(input_)\n        ):\n            out = aiter_ar_comm.custom_all_reduce(input_)\n            assert out is not None\n            return out\n        ca_comm = self.ca_comm\n        if (\n            ca_comm is not None\n            and not ca_comm.disabled\n            and ca_comm.should_custom_ar(input_)\n        ):\n            out = ca_comm.custom_all_reduce(input_)\n            assert out is not None\n            return out\n        symm_mem_comm = self.symm_mem_comm\n        if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):\n            out = symm_mem_comm.all_reduce(input_)\n            assert out is not None\n            return out\n        pynccl_comm = self.pynccl_comm\n        if pynccl_comm is None or pynccl_comm.disabled:\n            out = input_.clone()\n            torch.distributed.all_reduce(out, group=self.device_group)\n            return out\n        assert pynccl_comm is not None\n        out = pynccl_comm.all_reduce(input_)\n        if out is None:\n            # fall back to the default all-reduce using PyTorch.\n            # this usually happens during testing.\n            # when we run the model, allreduce only happens for the TP\n            # group, where we always have either custom allreduce or pynccl.\n            out = input_.clone()\n            torch.distributed.all_reduce(out, group=self.device_group)\n        return out",
+   "elide": [
+    "qr_comm/fi_ar_comm/aiter_ar_comm 三个中间分支与 ca_comm/symm_mem 结构同构（disabled 检查 + should_* 判定 + 调用），正文点明『一条优先级回退链』即可，不必逐分支讲；_log_all_reduce_backend_selection 的日志拼装不进正文。"
+   ]
+  },
+  {
+   "path": "vllm/distributed/communication_op.py",
+   "lines": "L12-L43",
+   "what": "模型 forward 实际调用的公共 API：薄到只是 get_tp_group().<op>——把『TP 维度的集合通信』钉死在一组自由函数上，模型代码无需知道 GroupCoordinator 的存在。这是连接『模型层（ch23 已立 TP 切头数学）』与本章『分布式层』的接缝。",
+   "code": "def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:\n    \"\"\"All-reduce the input tensor across model parallel group.\"\"\"\n    return get_tp_group().all_reduce(input_)\n\n\ndef tensor_model_parallel_all_gather(\n    input_: torch.Tensor, dim: int = -1\n) -> torch.Tensor:\n    \"\"\"All-gather the input tensor across model parallel group.\"\"\"\n    return get_tp_group().all_gather(input_, dim)\n\n\ndef tensor_model_parallel_reduce_scatter(\n    input_: torch.Tensor, dim: int = -1\n) -> torch.Tensor:\n    \"\"\"Reduce-Scatter the input tensor across model parallel group.\"\"\"\n    return get_tp_group().reduce_scatter(input_, dim)\n\n\ndef tensor_model_parallel_gather(\n    input_: torch.Tensor, dst: int = 0, dim: int = -1\n) -> torch.Tensor | None:\n    \"\"\"Gather the input tensor across model parallel group.\"\"\"\n    return get_tp_group().gather(input_, dst, dim)\n\n\ndef broadcast_tensor_dict(\n    tensor_dict: dict[Any, torch.Tensor | Any] | None = None, src: int = 0\n):\n    if not torch.distributed.is_initialized():\n        return tensor_dict\n    return get_tp_group().broadcast_tensor_dict(tensor_dict, src)",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/layers/linear.py",
+   "lines": "L1748-L1774",
+   "what": "TP 的消费现场：RowParallelLinear.forward——每个 TP rank 算出部分和，reduce_results 且 tp_size>1 时调 tensor_model_parallel_all_reduce 聚合；注释写明 bias 只在 rank 0 融进 GEMM（'bias will not be added more than once in TP>1 case'）。与 ch23 的切头数学对接：列切权重、行切输出，靠这一次 all_reduce 合拢。",
+   "code": "    def forward(\n        self,\n        input_,\n    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:\n        if self.input_is_parallel:\n            input_parallel = input_\n        else:\n            split_input = split_tensor_along_last_dim(\n                input_, num_partitions=self.tp_size\n            )\n            input_parallel = split_input[self.tp_rank].contiguous()\n\n        # Matrix multiply.\n        # Only fuse bias add into GEMM for rank 0 (this ensures that\n        # bias will not get added more than once in TP>1 case)\n        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias\n        output_parallel = self.quant_method.apply(self, input_parallel, bias_)\n\n        if self.reduce_results and self.tp_size > 1:\n            output = tensor_model_parallel_all_reduce(output_parallel)\n        else:\n            output = output_parallel\n\n        if not self.return_bias:\n            return output\n        output_bias = self.bias if self.skip_bias_add else None\n        return output, output_bias",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_worker.py",
+   "lines": "L96-L125",
+   "what": "AsyncIntermediateTensors：PP 中间激活的懒同步包装——irecv 发出后不等，comm_handles/postprocess 存着；__getattribute__ 钩子保证『谁先碰 .tensors 谁负责 wait_for_comm』，对 ModelRunner 完全透明。接收等待与 KV 取址/注意力元数据构建等本地工作重叠，缩短 PP 气泡。",
+   "code": "class AsyncIntermediateTensors(IntermediateTensors):\n    \"\"\"IntermediateTensors with lazy comm synchronization\"\"\"\n\n    def __init__(\n        self,\n        tensors: dict[str, torch.Tensor],\n        comm_handles: list[Handle] | None = None,\n        comm_postprocess: list[Callable[[], None]] | None = None,\n    ) -> None:\n        super().__init__(tensors)\n        self._comm_handles = comm_handles\n        self._comm_postprocess = comm_postprocess\n        self._comm_waited = False\n\n    def wait_for_comm(self) -> None:\n        if self._comm_waited:\n            return\n        if self._comm_handles:\n            for handle in self._comm_handles:\n                handle.wait()\n        if self._comm_postprocess:\n            for fn in self._comm_postprocess:\n                fn()\n        self._comm_waited = True\n\n    def __getattribute__(self, name: str):\n        # ensure `.tensors` is ready before use\n        if name == \"tensors\" and not object.__getattribute__(self, \"_comm_waited\"):\n            object.__getattribute__(self, \"wait_for_comm\")()\n        return object.__getattribute__(self, name)",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_worker.py",
+   "lines": "L1017-L1107",
+   "what": "Worker.execute_model 的 PP 段（ch17 站 9 的完整展开）：先收割上拍 isend 句柄（L1022-L1026）；非首 PP rank irecv_tensor_dict 成 AsyncIntermediateTensors（L1064-L1076）；转调 model_runner.execute_model；产出若是 IntermediateTensors 且非末段，isend_tensor_dict 非阻塞发往下一段、句柄存 _pp_send_work 下拍再收（L1100-L1105）。",
+   "code": "    @torch.inference_mode()\n    @with_gpu_sync_check\n    def execute_model(\n        self, scheduler_output: \"SchedulerOutput\"\n    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:\n        # ensure any previous non-blocking PP sends are complete\n        if self._pp_send_work:\n            for handle in self._pp_send_work:\n                handle.wait()\n            self._pp_send_work = []\n\n        intermediate_tensors = None\n        forward_pass = scheduler_output.total_num_scheduled_tokens > 0\n        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens\n        all_gather_tensors = {}\n        compilation_config = self.vllm_config.compilation_config\n        parallel_config = self.vllm_config.parallel_config\n\n        if (\n            parallel_config.pipeline_parallel_size > 1\n            and compilation_config.pass_config.enable_sp\n            and forward_pass\n        ):\n            # currently only supported by V1 GPUModelRunner\n            assert not self.use_v2_model_runner\n            num_scheduled_tokens_np = np.array(\n                list(scheduler_output.num_scheduled_tokens.values()),\n                dtype=np.int32,\n            )\n            # TODO(lucas): This is pretty gross; ideally we should only ever call\n            # `_determine_batch_execution_and_padding` once (will get called again\n            # in `execute_model`) but this requires a larger refactor of PP.\n            _, batch_desc, _, _, _ = (\n                self.model_runner._determine_batch_execution_and_padding(\n                    num_tokens=num_scheduled_tokens,\n                    num_reqs=len(num_scheduled_tokens_np),\n                    num_scheduled_tokens_np=num_scheduled_tokens_np,\n                    max_num_scheduled_tokens=num_scheduled_tokens_np.max(),\n                    use_cascade_attn=False,  # TODO(lucas): Handle cascade attention\n                )\n            )\n            all_gather_tensors = {\n                \"residual\": not is_residual_scattered_for_sp(\n                    self.vllm_config, batch_desc.num_tokens\n                )\n            }\n\n        if forward_pass and not get_pp_group().is_first_rank:\n            tensor_dict, comm_handles, comm_postprocess = (\n                get_pp_group().irecv_tensor_dict(\n                    all_gather_group=get_tp_group(),\n                    all_gather_tensors=all_gather_tensors,\n                )\n            )\n            assert tensor_dict is not None\n            intermediate_tensors = AsyncIntermediateTensors(\n                tensor_dict,\n                comm_handles=comm_handles,\n                comm_postprocess=comm_postprocess,\n            )\n\n        with self.annotate_profile(scheduler_output):\n            output = self.model_runner.execute_model(\n                scheduler_output, intermediate_tensors\n            )\n            if (\n                self.use_v2_model_runner\n                and self.model_runner.is_pooling_model\n                and output is None\n            ):\n                output = self.model_runner.pool()  # type: ignore\n            if isinstance(\n                output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType\n            ):\n                return output\n\n        assert isinstance(output, IntermediateTensors)\n        parallel_config = self.vllm_config.parallel_config\n        assert (\n            parallel_config.distributed_executor_backend != \"external_launcher\"\n            and not get_pp_group().is_last_rank\n        )\n\n        # launch non-blocking send of intermediate tensors\n        self._pp_send_work = get_pp_group().isend_tensor_dict(\n            output.tensors,\n            all_gather_group=get_tp_group(),\n            all_gather_tensors=all_gather_tensors,\n        )\n\n        return None",
+   "elide": [
+    "L1035-L1062 的 sequence parallel（enable_sp）all_gather_tensors 预备块跳过——SP 属进阶组合；use_v2_model_runner 的 pooling 分支跳过。"
+   ]
+  },
+  {
+   "path": "vllm/distributed/parallel_state.py",
+   "lines": "L1019-L1074",
+   "what": "isend_tensor_dict（PP 发送侧真身）：metadata 先经 send_object 走 cpu_group（pickle 序列化天然在 CPU）；每个张量按 is_cpu 选组、torch.distributed.isend 非阻塞发出，CUDA 张量 record_stream 防提前回收；TP 优化——numel 整除 TP world_size 的张量只发本 rank 的 1/tp 切片（L1061-L1064），接收端用 all_gather 重建（见 irecv 侧 L1162-L1186）。",
+   "code": "    def isend_tensor_dict(\n        self,\n        tensor_dict: dict[str, torch.Tensor | Any],\n        dst: int | None = None,\n        all_gather_group: \"GroupCoordinator | None\" = None,\n        all_gather_tensors: dict[str, bool] | None = None,\n    ) -> list[Handle]:\n        if self.world_size <= 1:\n            return []\n\n        if dst is None:\n            dst = (self.rank_in_group + 1) % self.world_size\n        assert dst < self.world_size, f\"Invalid dst rank ({dst})\"\n\n        if self.use_cpu_custom_send_recv:\n            if self.device_communicator is None:\n                raise ValueError(\"No device communicator found\")\n            # custom device communicator path is synchronous\n            self.device_communicator.send_tensor_dict(  # type: ignore\n                tensor_dict, dst\n            )\n            return []\n\n        all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size\n        all_gather_rank = (\n            0 if all_gather_group is None else all_gather_group.rank_in_group\n        )\n\n        group = self.device_group\n        metadata_group = self.cpu_group\n\n        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)\n        self.send_object(metadata_list, dst=dst)\n\n        tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]\n        assert len(tensor_keys) == len(tensor_list)\n\n        handles: list[Handle] = []\n        for key, tensor in zip(tensor_keys, tensor_list):\n            if tensor.numel() == 0:\n                continue\n\n            if self._should_use_all_gather(\n                key, tensor.numel(), all_gather_group, all_gather_tensors\n            ):\n                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]\n\n            comm_group = metadata_group if tensor.is_cpu else group\n            handle = torch.distributed.isend(\n                tensor, dst=self.ranks[dst], group=comm_group\n            )\n            if tensor.is_cuda:\n                tensor.record_stream(torch.cuda.current_stream(tensor.device))\n            handles.append(handle)\n\n        return handles",
+   "elide": [
+    "use_cpu_custom_send_recv 的同步旁路（L1033-L1040）跳过；接收侧 irecv_tensor_dict（L1114-L1198）与发送侧镜像对称，正文对读即可，不重复内嵌。"
+   ]
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L1306-L1318",
+   "what": "引擎出生分叉（run_engine_core 尾段）：MoE 且 DP>1 → DPEngineCoreProc（wave 锁步忙循环，构造处 assert is_moe）；非 MoE → 注释原话 'Non-MoE DP ranks are completely independent, so treat like DP=1'——data_parallel_size 就地改回 1，引擎完全独立。这一行注释是 DP 两种形态的分水岭。",
+   "code": "            parallel_config.data_parallel_index = dp_rank\n            if data_parallel and vllm_config.model_config.is_moe:\n                # Set data parallel rank for this engine process.\n                parallel_config.data_parallel_rank = dp_rank\n                engine_core = DPEngineCoreProc(*args, **kwargs)\n            else:\n                # Non-MoE DP ranks are completely independent, so treat like DP=1.\n                # Note that parallel_config.data_parallel_index will still reflect\n                # the original DP rank.\n                parallel_config.data_parallel_size = 1\n                parallel_config.data_parallel_size_local = 1\n                parallel_config.data_parallel_rank = 0\n                engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L2124-L2188",
+   "what": "DPEngineCoreProc.run_busy_loop 的 DP 尾段：正常 step 后——本引擎无活且全局未 running 则 dummy batch 维持步进对齐（L2133-L2137，MoE all2all 要求全员在场）；每拍调 _has_global_unfinished_reqs 做 all-reduce 共识；共识『全体无活』时 dp rank 0 发 wave_complete（client_index=-1 走 coordinator）、current_wave+=1、step_counter 清零。",
+   "code": "            executed = self._process_engine_step()\n            self._maybe_publish_request_counts()\n\n            local_unfinished_reqs = self.scheduler.has_unfinished_requests()\n            if not executed:\n                if not local_unfinished_reqs and not self.engines_running:\n                    # All engines are idle.\n                    continue\n\n                # Execute a dummy pass when no ready requests ran, unless the\n                # engine is sleeping.\n                elif not self.model_executor.is_sleeping:\n                    with self.capture_iteration_details(None) as iteration_details:\n                        self.execute_dummy_batch()\n                    if iteration_details is not None and not self.has_coordinator:\n                        stats = self._make_iteration_details_stats(iteration_details)\n                        self.output_queue.put_nowait(\n                            (0, EngineCoreOutputs(scheduler_stats=stats))\n                        )\n\n            # 3) All-reduce operation to determine global unfinished reqs.\n            self.engines_running = self._has_global_unfinished_reqs(\n                local_unfinished_reqs\n            )\n\n            if not self.engines_running:\n                if self.dp_rank == 0 or not self.has_coordinator:\n                    # Notify client that we are pausing the loop.\n                    logger.debug(\n                        \"Wave %d finished, pausing engine loop.\", self.current_wave\n                    )\n                    # In the coordinator case, dp rank 0 sends updates to the\n                    # coordinator. Otherwise (offline spmd case), each rank\n                    # sends the update to its colocated front-end process.\n                    client_index = -1 if self.has_coordinator else 0\n                    self.output_queue.put_nowait(\n                        (\n                            client_index,\n                            EngineCoreOutputs(wave_complete=self.current_wave),\n                        )\n                    )\n                # Increment wave count and reset step counter.\n                self.current_wave += 1\n                self.step_counter = 0\n\n        raise SystemExit\n\n    def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:\n        # Optimization - only perform finish-sync all-reduce every 32 steps.\n        self.step_counter += 1\n        if self.step_counter % 32 != 0:\n            return True\n\n        has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(\n            self.dp_group,\n            has_unfinished=local_unfinished,\n            pending_pause=self.pending_pause,\n        )\n\n        if pause_consensus:\n            self.ignore_start_dp_wave = True\n            self.pending_pause = False\n            logger.debug(\"DP pause consensus reached, ignoring START_DP_WAVE.\")\n\n        return has_unfinished",
+   "elide": [
+    "L2112-L2122 的 elastic EP 状态机推进段跳过（弹性扩缩容归 ch39）；L2138-L2142 的 iteration_details 统计分支跳过。"
+   ]
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L2075-L2090",
+   "what": "DPEngineCoreProc._maybe_publish_request_counts：counts 有变才发——SchedulerStats 携带 waiting/running/kv_cache_usage + lockstep 的 step_counter/current_wave，put (-1, EngineCoreOutputs(scheduler_stats=stats))——client_index=-1 哨兵把统计路由给 coordinator 而非任何前端（输出线程分流在 core.py:L1788-L1793，ch5 已立）。",
+   "code": "    def _maybe_publish_request_counts(self):\n        if not self.publish_dp_lb_stats:\n            return\n\n        # Publish our request counts (if they've changed), stamped with the\n        # lockstep-synchronized step counter and wave number.\n        counts = self.scheduler.get_request_counts()\n        if counts != self.last_counts:\n            self.last_counts = counts\n            stats = SchedulerStats(\n                *counts,\n                kv_cache_usage=self.scheduler.get_kv_cache_usage(),\n                step_counter=self.step_counter,\n                current_wave=self.current_wave,\n            )\n            self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/engine/core_client.py",
+   "lines": "L116-L139",
+   "what": "前端家族分发 make_async_mp_client：DP=1 → AsyncMPClient；DP>1 外部 LB → DPAsyncMPClient（'client per DP rank'，外部均衡器分流）；DP>1 内部 LB → DPLBAsyncMPClient（client 给全部引擎做均衡）。三分支共享 AsyncMPClient 主体，差异全压在『谁来选引擎』。",
+   "code": "    def make_async_mp_client(\n        vllm_config: VllmConfig,\n        executor_class: type[Executor],\n        log_stats: bool,\n        client_addresses: dict[str, Any] | None = None,\n        client_count: int = 1,\n        client_index: int = 0,\n    ) -> \"AsyncMPClient\":\n        parallel_config = vllm_config.parallel_config\n        client_args = (\n            vllm_config,\n            executor_class,\n            log_stats,\n            client_addresses,\n            client_count,\n            client_index,\n        )\n        if parallel_config.data_parallel_size > 1:\n            if parallel_config.data_parallel_external_lb:\n                # External load balancer - client per DP rank.\n                return DPAsyncMPClient(*client_args)\n            # Internal load balancer - client balances to all DP ranks.\n            return DPLBAsyncMPClient(*client_args)\n        return AsyncMPClient(*client_args)",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/engine/core_client.py",
+   "lines": "L1410-L1425",
+   "what": "DPAsyncMPClient.add_request_async：request.current_wave + request.client_index 双盖章 → get_core_engine_for_request 选引擎 → _send_input(ADD, request, chosen_engine)（ROUTER 按引擎 identity 定向——F4 兑现处）；engines 暂停时另经 first_req_send_socket（PAIR）发 FIRST_REQ 抢先唤醒全体，不等 ADD 走完。",
+   "code": "    async def add_request_async(self, request: EngineCoreRequest) -> None:\n        self._ensure_stats_update_task()\n\n        request.current_wave = self.current_wave\n        request.client_index = self.client_index\n\n        chosen_engine = self.get_core_engine_for_request(request)\n        to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)\n        if not self.engines_running:\n            # Notify coordinator that we're sending a request\n            req_msg = msgspec.msgpack.encode((\"FIRST_REQ\", chosen_engine))\n            await self.first_req_send_socket.send(req_msg)\n\n        await to_await\n\n        self._ensure_output_queue_task()",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/engine/core_client.py",
+   "lines": "L1468-L1519",
+   "what": "内部 LB 的打分选路 get_core_engine_for_request：score = max(client_count×inflight, waiting+running)——inflight 地板是本地精确在飞计数（注释自述 'exact and can't be erased by a snapshot rebind'，兜 100ms 快照的 race）；waiting 按 KV 压力斜坡加权（>50% 才开始罚、满载 3 倍，注释给了理由：KV-bound 引擎的队列泄得慢）；起点轮转消平局偏置；选中即 reqs_in_flight 登记（abort 找回路）+ engine_inflight 自增。",
+   "code": "    def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:\n        # Engines are in rank order.\n        if (eng_index := request.data_parallel_rank) is None and (\n            eng_index := get_late_interaction_engine_index(\n                request.pooling_params, len(self.core_engines)\n            )\n        ) is None:\n            current_counts = self.lb_engines\n            # TODO use P2C alg for larger DP sizes\n            num_engines = len(current_counts)\n            min_score: float = sys.maxsize\n            eng_index = 0\n            for i in range(num_engines):\n                # Start from client_index to help with balancing when engines\n                # are empty.\n                idx = (self.eng_start_index + i) % num_engines\n                waiting, running, kv_cache_usage = current_counts[idx]\n                # Estimate engine load as the greater of the coordinator's\n                # latest (waiting + running) snapshot and this client's own\n                # in-flight count (scaled by the number of clients). The\n                # in-flight floor is exact and can't be erased by a snapshot\n                # rebind, so a burst spreads round-robin even when snapshots\n                # race with routing decisions; the snapshot raises the score\n                # when other clients or stale requests load the engine.\n                inflight = self.engine_inflight[self.core_engines[idx]]\n                score: float = max(self.client_count * inflight, waiting + running)\n                if waiting:\n                    # Waiting requests are penalized in proportion to KV cache\n                    # pressure: a queue on a KV-bound engine drains slowly, so\n                    # new requests should strongly prefer other engines. With\n                    # low KV usage the queue is transient (e.g. mid-burst) and\n                    # the penalty stays off, preserving exact round-robin.\n                    # Ramps from 0 at <=50% usage to 3x waiting at 100%.\n                    score += waiting * 6.0 * max(0.0, kv_cache_usage - 0.5)\n                if score < min_score:\n                    min_score = score\n                    eng_index = idx\n            # Increment local waiting count for better balancing between stats\n            # updates from the coordinator (which happen every 100ms).\n            current_counts[eng_index][0] += self.client_count\n            # Rotate the scan start so that ties (equal scores, e.g. right\n            # after a coordinator stats reset when engines look equally loaded)\n            # don't systematically favor the same engine. This removes the\n            # fixed tie-break bias without affecting load-aware decisions when\n            # scores actually differ.\n            self.eng_start_index = (self.eng_start_index + 1) % num_engines\n\n        chosen_engine = self.core_engines[eng_index]\n        # Record which engine is chosen for this request, to handle aborts.\n        self.reqs_in_flight[request.request_id] = chosen_engine\n        self.engine_inflight[chosen_engine] += 1\n        return chosen_engine",
+   "elide": [
+    "L1470-L1474 的 late-interaction pooling 引擎选择分支跳过；注意 v2 时代公式是 waiting*4+running——v0.27.1 已重写，禁迁移旧叙述。"
+   ]
+  },
+  {
+   "path": "vllm/config/parallel.py",
+   "lines": "L727-L762",
+   "what": "两个静态共识原语：has_unfinished_dp（单元素 MAX all-reduce ≡ 逻辑 OR）与 sync_dp_state（单次 2 元素 SUM all-reduce 同时回答两问——[0] SUM>0 即任一引擎有活；[1] SUM==dp_size 即全体同意暂停；docstring 明言 pause 计数非整除时 has_unfinished_global 也为真，防半数暂停导致 all-to-all 错配）。一次集合通信买两个共识。",
+   "code": "    def has_unfinished_dp(dp_group: ProcessGroup, has_unfinished: bool) -> bool:\n        tensor = torch.tensor([has_unfinished], dtype=torch.int32, device=\"cpu\")\n        # dp rank 0: has_unfinished_seqs=True\n        # dp rank 1: has_unfinished_seqs=False\n        # aggregated: has_unfinished_seqs=True\n        # so this is an OR operation, i.e. MAX in integers\n        torch.distributed.all_reduce(tensor, op=ReduceOp.MAX, group=dp_group)\n        aggregated_has_unfinished = bool(tensor.item())\n        return aggregated_has_unfinished\n\n    @staticmethod\n    def sync_dp_state(\n        dp_group: ProcessGroup, has_unfinished: bool, pending_pause: bool\n    ) -> tuple[bool, bool]:\n        \"\"\"Combined all-reduce for DP state synchronization.\n\n        Uses a single SUM all-reduce on a 2-element tensor:\n          [0] = 1 if this rank has unfinished work, else 0.\n                SUM > 0 ≡ logical OR across ranks → any rank has work.\n          [1] = 1 if this rank has a pending pause request, else 0.\n                SUM == dp_size ≡ all ranks reached pause consensus.\n\n        has_unfinished_global is true if any rank has unfinished work,\n        or if some ranks are waiting for a pause consensus.\n\n        Returns:\n            (has_unfinished_global, pause_consensus)\n        \"\"\"\n        tensor = torch.tensor(\n            [int(has_unfinished), int(pending_pause)], dtype=torch.int32, device=\"cpu\"\n        )\n        torch.distributed.all_reduce(tensor, op=ReduceOp.SUM, group=dp_group)\n        dp_size = dp_group.size()\n        pause_count = tensor[1].item()\n        has_unfinished_global = tensor[0].item() > 0 or pause_count % dp_size != 0\n        return has_unfinished_global, pause_count == dp_size",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/engine/coordinator.py",
+   "lines": "L252-L283",
+   "what": "DPCoordinatorProc 主循环的发布节拍：poller 同时盯三个 socket（front XPUB / back XPUB / output PULL）；无事件时按 stats_update_interval_ms=100ms（stats 有变）或 5s（心跳）把 (每引擎 counts, current_wave, engines_running) msgpack 发布给全部前端；MoE lockstep 下先等 ≥50ms 收齐同拍统计再发。",
+   "code": "            poller = zmq.Poller()\n            poller.register(publish_front, zmq.POLLIN)\n            poller.register(publish_back, zmq.POLLIN)\n            poller.register(output_back, zmq.POLLIN)\n            last_publish_time = 0\n            while True:\n                elapsed = int(time.time() * 1000) - last_publish_time\n                # Send at stats_update_interval_ms interval if the stats have\n                # changed, or otherwise every 5 seconds.\n                wait_for = self.stats_update_interval_ms if stats_changed else 5000\n\n                # Wait at least 50ms to ensure we've received all stats for\n                # the current step. Only applicable to lockstep (MoE) DP;\n                # non-lockstep engines have no synchronized step boundaries.\n                if self.enable_wave_coordination and last_step_counts is None:\n                    min_timeout = 50\n                else:\n                    min_timeout = 0\n\n                events = poller.poll(timeout=max(min_timeout, wait_for - elapsed))\n                if not events:\n                    # Poller timeout - publish current stats to front-ends.\n                    if last_step_counts is not None:\n                        engine_req_counts_list = last_step_counts\n                        last_step_counts = None\n                    else:\n                        engine_req_counts_list = self._get_engine_counts()\n                        stats_changed = False\n\n                    to_publish = (engine_req_counts_list, current_wave, engines_running)\n                    publish_front.send(msgspec.msgpack.encode(to_publish))\n                    last_publish_time = int(time.time() * 1000)",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/engine/coordinator.py",
+   "lines": "L457-L467",
+   "what": "_send_start_wave：把 (wave, exclude_engine_index) 编码成 START_DP_WAVE 帧、从 back XPUB 广播给全部引擎——exclude 是已收到该 wave 请求的引擎（不用再叫醒）。类 docstring（L23-L57）是 wave 语义的权威表述：wave 编号 = 全体 running→paused 的次数。",
+   "code": "    @staticmethod\n    def _send_start_wave(\n        socket: zmq.Socket, wave: int, exclude_engine_index: int | None\n    ):\n        \"\"\"Broadcast the START_DP_WAVE message to all the engines.\n        It includes the current wave number and index of engine which\n        has already received a request with this wave number and so doesn't\n        require additional notification.\n        \"\"\"\n        wave_encoded = msgspec.msgpack.encode((wave, exclude_engine_index))\n        socket.send_multipart((EngineCoreRequestType.START_DP_WAVE.value, wave_encoded))",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/dp_utils.py",
+   "lines": "L36-L54",
+   "what": "_run_ar：每 rank 把 (原始 tokens, padded tokens, ubatch 意愿, cudagraph 档位) 填进 4×dp_size int32 张量的自己那列，一次 all-reduce 换全员互见——populate 在 CPU、传输走 device_group（disable_nccl_for_dp_synchronization 可退 gloo，防 D2H 同步点伤异步调度）。",
+   "code": "def _run_ar(\n    should_ubatch: bool,\n    orig_num_tokens_per_ubatch: int,\n    padded_num_tokens_per_ubatch: int,\n    cudagraph_mode: int,\n    parallel_config: ParallelConfig,\n) -> torch.Tensor:\n    dp_size = parallel_config.data_parallel_size\n    dp_rank = parallel_config.data_parallel_rank\n    device, group = _get_device_and_group(parallel_config)\n    # Populate this rank's contribution on CPU to reduce GPU syncs.\n    tensor_cpu = torch.zeros(4, dp_size, dtype=torch.int32)\n    tensor_cpu[0][dp_rank] = orig_num_tokens_per_ubatch\n    tensor_cpu[1][dp_rank] = padded_num_tokens_per_ubatch\n    tensor_cpu[2][dp_rank] = 1 if should_ubatch else 0\n    tensor_cpu[3][dp_rank] = cudagraph_mode\n    tensor = tensor_cpu.to(device, non_blocking=True)\n    dist.all_reduce(tensor, group=group)\n    return tensor",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/dp_utils.py",
+   "lines": "L77-L89",
+   "what": "_post_process_dp_padding：should_dp_pad 时全员 padding 到 max——cudagraph 启用或 ubatch 开启才需要（形状查表与集合通信都要求全员同形）；否则各跑各的真实 token 数，num_tokens_across_dp 照实下发（MoE dispatch 的 sizes 就吃它）。",
+   "code": "def _post_process_dp_padding(tensor: torch.Tensor, should_dp_pad: bool) -> torch.Tensor:\n    num_tokens_across_dp = tensor[1, :]\n    if should_dp_pad:\n        # If DP padding is enabled, ensure that each rank is processing the same number\n        # of tokens\n        max_num_tokens = int(num_tokens_across_dp.max().item())\n        return torch.tensor(\n            [max_num_tokens] * len(num_tokens_across_dp),\n            device=\"cpu\",\n            dtype=torch.int32,\n        )\n    else:\n        return num_tokens_across_dp.cpu()",
+   "elide": []
+  },
+  {
+   "path": "vllm/distributed/device_communicators/all2all.py",
+   "lines": "L44-L67",
+   "what": "AgRsAll2AllManager 类头：默认 all-to-all 后端 'allgather_reducescatter'——docstring 自述 'based on all-gather (dispatch) and reduce-scatter (combine)'。_get_comm_group 三选一：序列并行→EP 组；dp>1→DP 组；否则 PCP 组。_get_sizes：dp>1 时从 forward_context 的 DPMetadata 拿各 rank chunk sizes（谁长谁短全网互见）。",
+   "code": "class AgRsAll2AllManager(All2AllManagerBase):\n    \"\"\"\n    An implementation of all2all communication based on\n    all-gather (dispatch) and reduce-scatter (combine).\n    \"\"\"\n\n    def __init__(self, cpu_group, tcp_store_group=None):\n        super().__init__(cpu_group, tcp_store_group)\n\n    def _get_comm_group(self, is_sequence_parallel: bool) -> Any:\n        if is_sequence_parallel:\n            return get_ep_group()\n        if self.dp_world_size > 1:\n            return get_dp_group()\n        return get_pcp_group()\n\n    def _get_sizes(self, num_local_tokens: int, comm_group: Any) -> list[int]:\n        if self.dp_world_size == 1:\n            return [num_local_tokens] * comm_group.world_size\n\n        dp_metadata = get_forward_context().dp_metadata\n        assert dp_metadata is not None\n        sizes = dp_metadata.get_chunk_sizes_across_dp_rank()\n        assert sizes is not None",
+   "elide": []
+  },
+  {
+   "path": "vllm/distributed/device_communicators/all2all.py",
+   "lines": "L101-L150",
+   "what": "AgRs 的 dispatch/combine 真身：dispatch = 把 (hidden_states, topk_weights, topk_ids[, extras]) all_gatherv 到 dim=0 拼接——每 rank 拿到全网 token 的路由结果，本地专家只算命中自己的那部分；combine = reduce_scatterv 按原 sizes 归位求和。数学上等价于 all-to-all（每 token 到达它的专家所在 rank），实现上是两次规整的集合通信——这是『没有自研 A2A 内核时』的正确性基线；真 A2A 后端（DeepEP HT/LL、MoRI、nixl、flashinfer NVLink）替换的是这两个方法，接口不变。",
+   "code": "    def dispatch(\n        self,\n        hidden_states: torch.Tensor,\n        topk_weights: torch.Tensor,\n        topk_ids: torch.Tensor,\n        is_sequence_parallel: bool = False,\n        extra_tensors: list[torch.Tensor] | None = None,\n    ) -> (\n        tuple[torch.Tensor, torch.Tensor, torch.Tensor]\n        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]\n    ):\n        \"\"\"\n        Gather hidden_states and router_logits from all dp ranks.\n        \"\"\"\n        dist_group = self._get_comm_group(is_sequence_parallel)\n        sizes = self._get_sizes(hidden_states.shape[0], dist_group)\n        assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]\n\n        tensors_to_gather = [hidden_states, topk_weights, topk_ids]\n        if extra_tensors is not None:\n            tensors_to_gather.extend(extra_tensors)\n\n        gathered_tensors = dist_group.all_gatherv(\n            tensors_to_gather,\n            dim=0,\n            sizes=sizes,\n        )\n\n        hidden_states = gathered_tensors[0]\n        topk_weights = gathered_tensors[1]\n        topk_ids = gathered_tensors[2]\n\n        if extra_tensors is None:\n            return hidden_states, topk_weights, topk_ids\n\n        return hidden_states, topk_weights, topk_ids, gathered_tensors[3:]\n\n    def combine(\n        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False\n    ) -> torch.Tensor:\n        \"\"\"\n        Reduce-scatter hidden_states across all dp ranks.\n        \"\"\"\n        dist_group = self._get_comm_group(is_sequence_parallel)\n        sizes = self._get_sizes(\n            hidden_states.shape[0] // dist_group.world_size,\n            dist_group,\n        )\n        hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)\n        return hidden_states",
+   "elide": [
+    "extra_tensors（量化 scale/LoRA 映射随行）的 gathered_extras[3:] 拼接细节跳过；dispatch_router_logits 单双版本差异一句带过。"
+   ]
+  },
+  {
+   "path": "vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py",
+   "lines": "L158-L164",
+   "what": "EP 的消费现场（MoE prepare 尾段）：get_ep_group().dispatch(a1q, topk_weights, topk_ids, is_sequence_parallel=...)——MoE 层在量化完成后、专家 kernel 之前把 token 全网重排；类 docstring 自述 'Uses Torch AR/RS or AR for dispatch/combine operations'。",
+   "code": "        res = get_ep_group().dispatch(\n            a1q,\n            topk_weights,\n            topk_ids,\n            is_sequence_parallel=self.is_sequence_parallel,\n            extra_tensors=extra_tensors,\n        )",
+   "elide": []
+  },
+  {
+   "path": "vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py",
+   "lines": "L187-L209",
+   "what": "EP 的回收现场（finalize 尾段）：本地专家算完、topk 加权归约后，get_ep_group().combine(...) 把结果送回 token 原主，output.copy_ 覆写进 MoE 层输出张量——dispatch/combine 之间夹着的就是『各 rank 只算本地专家』。",
+   "code": "    def finalize(\n        self,\n        output: torch.Tensor,\n        fused_expert_output: torch.Tensor,\n        topk_weights: torch.Tensor,\n        topk_ids: torch.Tensor,\n        apply_router_weight_on_input: bool,\n        weight_and_reduce_impl: mk.TopKWeightAndReduce,\n    ) -> None:\n        if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):\n            weight_and_reduce_impl = TopKWeightAndReduceContiguous()\n\n        out = weight_and_reduce_impl.apply(\n            output=None,\n            fused_expert_output=fused_expert_output,\n            topk_weights=topk_weights,\n            topk_ids=topk_ids,\n            apply_router_weight_on_input=apply_router_weight_on_input,\n        )\n\n        output.copy_(\n            get_ep_group().combine(out, is_sequence_parallel=self.is_sequence_parallel)\n        )",
+   "elide": []
+  },
+  {
+   "path": "vllm/v1/worker/gpu_model_runner.py",
+   "lines": "L4842-L4869",
+   "what": "PP 采样 token 回传（异步调度版）：末段把 sampled_token_ids[num_reqs,1] 从 GPU 直接 broadcast 回首段（src=pp.rank，走 pp.device_group——不过 CPU 不过调度器）；首段 _pp_receive 写进 input_batch.prev_sampled_token_ids，供下一拍 _prepare_input_ids 直接 scatter 进 input_ids.gpu（ch12 已立 GPU 回填），并顺手把 -1 占位 token 记进本地账（L4880-L4886）。同步版对照：new_token_ids 随 SchedulerOutput 差量字段过线（ch18）。",
+   "code": "    def _pp_broadcast_prev_sampled_token_ids(\n        self, sampled_token_ids: torch.Tensor\n    ) -> None:\n        \"\"\"Broadcast sampled token ids (GPU) from last PP stage\"\"\"\n        pp = get_pp_group()\n        assert pp.is_last_rank\n        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].\n        assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (\n            \"PP+async expects sampled_token_ids to have shape [num_reqs, 1]\"\n        )\n        # Skip for chunked prefill: sampled tokens are dummy\n        # and will be discarded, no need to broadcast.\n        if not self._is_all_reqs_chunked_prefill():\n            torch.distributed.broadcast(\n                sampled_token_ids, src=pp.rank, group=pp.device_group\n            )\n\n    def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:\n        \"\"\"Receive sampled token ids broadcast from last PP stage\"\"\"\n        pp = get_pp_group()\n        assert not pp.is_last_rank\n        num_reqs = self.input_batch.num_reqs\n        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].\n        recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)\n        # skip for chunked prefill.\n        if not self._is_all_reqs_chunked_prefill():\n            torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)\n        self.input_batch.prev_sampled_token_ids = recv",
+   "elide": [
+    "chunked prefill 的 skip 分支（L4854/L4867）一句带过：dummy token 反正会被丢弃。"
+   ]
+  },
+  {
+   "path": "vllm/sequence.py",
+   "lines": "L12-L37",
+   "what": "IntermediateTensors 本体：非末 PP 段 forward 的返回载体（hidden_states+residual 的张量字典）。__init__ 手写而非 dataclass 自动生成——注释原话 'so that Dynamo knows IntermediateTensors() comes from this file'，否则 dataclass 按字符串求值生成构造器、Dynamo 丢失源文件信息。PP 的载荷形状由模型层契约决定（ch23 已立两方法契约），本章只管运输。",
+   "code": "class IntermediateTensors:\n    \"\"\"For all pipeline stages except the last, we need to return the hidden\n    states and residuals to be sent to the next stage. This data structure\n    contains the hidden states and residuals for a request.\n    \"\"\"\n\n    tensors: dict[str, torch.Tensor]\n\n    def __init__(\n        self,\n        tensors: dict[str, torch.Tensor],\n    ) -> None:\n        # manually define this function, so that\n        # Dynamo knows `IntermediateTensors()` comes from this file.\n        # Otherwise, dataclass will generate this function by evaluating\n        # a string, and we will lose the information about the source file.\n        self.tensors = tensors\n\n    def __getitem__(self, key: str | slice):\n        if isinstance(key, str):\n            return self.tensors[key]\n        elif isinstance(key, slice):\n            return self.__class__({k: v[key] for k, v in self.tensors.items()})\n\n    def __setitem__(self, key: str, value: torch.Tensor):\n        self.tensors[key] = value",
+   "elide": []
+  }
+ ],
+ "theory": [
+  {
+   "topic": "四种并行各切什么、各付什么（通信税对账表的理论基础）",
+   "content": "TP 切一层之内的权重（列切/行切）：每层前向要一次 all_reduce（ring 量级 2(p-1)/p·N·b/rank）换显存 ÷p——通信在层内、每拍都付；PP 切层序：段间只传激活（每 token hidden_size 一份，isend/irecv 点对点），通信量小但引入流水气泡（各段步调耦合，v1 是全员同批推进的简式 PP，无 1F1B 交错）；DP 复制整个引擎：引擎间零集合通信（非 MoE 时完全独立），代价是权重复制 M 份、KV cache 各算各的；EP 切专家：权重去重（num_experts 摊到各 rank），但每个 MoE 层要 dispatch+combine 全网重排（AgRs 形态=一次 all_gather + 一次 reduce_scatter，比真 A2A 多传『不归我管的 token』）。一张 2×2 表：省的是显存还是单卡算力 vs 付的是层内集合/段间点对点/权重复制/层间重排。"
+  },
+  {
+   "topic": "ring all-reduce 通信量与『AR=RS+AG』的分解",
+   "content": "设组大小 p、张量 N 元素、字节宽 b：ring all_reduce 每 rank 搬 2(p-1)/p·N·b（reduce-scatter 阶段 (p-1)/p·N·b + all-gather 阶段 (p-1)/p·N·b）；all_gather 与 reduce_scatter 各 (p-1)/p·N·b。三个 shape 直觉：all_reduce 输出不变、all_gather 沿 dim ×p、reduce_scatter 沿 dim ÷p（fake 实现的 shape 公式就是它，parallel_state.py:L174-L197）。序列并行（SP）用 RS+AG 在不同算子边界摊销同一笔通信——AgRs 后端名里的 RS/AG 正是这两块积木。"
+  },
+  {
+   "topic": "rank / local_rank / rank_in_group 三套坐标",
+   "content": "rank=torch.distributed 全局 rank（跨引擎唯一标识进程，DP>1 时=dp_rank*world_size+rank_in_engine）；local_rank=节点内序号（决定绑哪块卡，DP 下要修正为 dp_local_rank*tp*pp+tp_local_rank，gpu_worker.py:L309-L326）；rank_in_group=组内序号（集合原语的 src/dst 都用它，经 self.ranks[i] 翻回全局）。GroupCoordinator 类顶 4-rank/2-node 表（L394-L400）是理解三者的钥匙：跨节点时同一 PP 组两进程 local_rank 相同、rank 不同。"
+  },
+  {
+   "topic": "MoE DP 为什么必须 lockstep（wave 存在的理由）",
+   "content": "EP dispatch/combine 是跨 DP 引擎的集合通信：一台引擎停下不参与，其余引擎的 all_gatherv/reduce_scatterv 永远凑不齐 rank——NCCL 集合通信阻塞至全员到齐，即挂死。所以 MoE DP 引擎要么都在跑、要么都暂停：无活的引擎跑 dummy batch 空转维持步进对齐（core.py:L2133-L2137）；全局去留由每 32 步的 all-reduce 共识裁决；『全体暂停→新请求到来』的唤醒经 coordinator 广播 START_DP_WAVE 一台不落。非 MoE 模型没有跨引擎集合通信（EP 组都不建），引擎完全独立（core.py:L1311-L1318）——lockstep 是 MoE 的税，不是 DP 的税。"
+  },
+  {
+   "topic": "LB 打分的取整经济学（快照 vs 在飞）",
+   "content": "coordinator 统计 100ms 一刷：burst 期间多个请求路由决策共用同一份旧快照——若只按快照打分，同帧内全部请求挤向当时最空的引擎（herd）。inflight 地板是本地精确计数（发出去 +1、finished 回收 -1），快照永远追不上它；score 取 max(地板, 快照和) 保证突发期近似 round-robin、稳态期快照修正长期负载。KV 斜坡的形状：score += waiting×6×max(0, usage-0.5)——低压力时罚 0（保精确轮询），>50% 线性起罚、满载 waiting×3（KV-bound 引擎队列泄得慢，新请求应避开）。"
+  },
+  {
+   "topic": "DP padding 的必要条件（cudagraph 一致性）",
+   "content": "两个硬约束逼出全员同形：① CUDA graph 按形状查表回放（ch19）——各 DP rank 各自捕获的图形状集合一致才有意义，一个 rank 落到未捕获形状就回退 eager、性能突降；② 集合通信（EP dispatch 的 all_gatherv、wave 的 all-reduce）要求全员带着同形的张量到达。coordinate_batch_across_dp 用一次 4×dp all-reduce 互见 (orig,padded,ubatch,cg_mode)，cg_mode 取 min（一人 NONE 全体 NONE——宁可不捕也不冒泡）、启用时全员 pad 到 max（decode 白算几行很便宜，ch19 已立此账）。"
+  }
+ ],
+ "mechanisms": [
+  {
+   "id": "m1",
+   "name": "GroupCoordinator 双群组分工：cpu_group(gloo) 走元数据/对象/barrier，device_group(NCCL) 走张量集合",
+   "kind": "layout",
+   "source_anchors": [
+    "vllm/distributed/parallel_state.py:L409-L527",
+    "vllm/distributed/parallel_state.py:L455-L470",
+    "vllm/distributed/parallel_state.py:L1200-L1207"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "一个并行维度 = 一个实例；类顶 4-rank/2-node 注释表是三套坐标的钥匙。图：解剖图（双群组+device_communicator+mq_broadcaster，右列虚框示意 TP/PP/DP/EP 各一份同构实例）。"
+  },
+  {
+   "id": "m2",
+   "name": "5 维 rank 张量统一切分：(ExternalDP, DP, PP, PCP, TP) 一次 reshape，任一维度 transpose→reshape→unbind 机械导出 group_ranks",
+   "kind": "algorithm",
+   "source_anchors": [
+    "vllm/distributed/parallel_state.py:L1812-L1827",
+    "vllm/distributed/parallel_state.py:L1829-L1916"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "difficulty": "core",
+   "note": "worked example 必做：8 GPU、TP=2/PP=2/DP=2——手推 TP 组 [0,1][2,3][4,5][6,7]、PP 组 transpose(2,4)、DP 组 transpose(1,4)=[0,4][1,5]...，标出各组的 NCCL 通信域。v2 ch20 图 03 可重绘。"
+  },
+  {
+   "id": "m3",
+   "name": "EP 群组合并与 MoE 门槛：EP=同一 PP 段内 DP×PCP×TP 全合并（transpose(1,2)）；dense 模型不建；use_all2all=dp>1 或 SP-MoE 或 (EP∧PCP>1)；EPLB 另建同 rank 隔离组防死锁",
+   "kind": "config",
+   "source_anchors": [
+    "vllm/distributed/parallel_state.py:L1919-L1950",
+    "vllm/config/parallel.py:L690-L696"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "与 m2 同一张 worked example 顺带推出 EP 组；点明 EP 组是『哪些 rank 一起分专家』的答案。"
+  },
+  {
+   "id": "m4",
+   "name": "集合原语 custom-op 注册：all_reduce/reduce_scatter/all_gather 注册成 torch.ops.vllm.*，接口只收 group_name 字符串，各配 fake 实现供编译期形状推断",
+   "kind": "protocol",
+   "source_anchors": [
+    "vllm/distributed/parallel_state.py:L152-L197",
+    "vllm/distributed/parallel_state.py:L352-L368"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "与 ch19 piecewise 编译直接衔接：集合通信作为不透明节点进图不打断。docstring 两个约束（Dynamo 不收对象 / custom op 不许原地）是理解迂回设计的钥匙。"
+  },
+  {
+   "id": "m5",
+   "name": "all_reduce 用户面双路径：world_size==1 短路返回；use_custom_op_call 时走 torch.ops.vllm.all_reduce(group_name)、否则直接 _all_reduce_out_place",
+   "kind": "protocol",
+   "source_anchors": [
+    "vllm/distributed/parallel_state.py:L662-L748"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "两条路径殊途同归于 device_communicator；图：一张派发路径图（v2 ch20 图 02 可重绘）。"
+  },
+  {
+   "id": "m6",
+   "name": "CudaCommunicator.all_reduce 七级回退链：NCCL symm→quick(ROCm)→flashinfer→aiter→CustomAllreduce→symm_mem→pynccl→torch.distributed 兜底",
+   "kind": "dataflow",
+   "source_anchors": [
+    "vllm/distributed/device_communicators/cuda_communicator.py:L275-L341",
+    "vllm/distributed/device_communicators/base_device_communicator.py:L220-L222"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting",
+   "note": "点明『一条优先级回退链、对调用方透明』即可；CustomAllreduce 是 vLLM 自研低延迟小张量 AR（TP 小 batch 的延迟关键）。"
+  },
+  {
+   "id": "m7",
+   "name": "TP 前向调用面：RowParallel 部分和→tensor_model_parallel_all_reduce；ColumnParallel 切片→tensor_model_parallel_all_gather；bias 只在 rank0 融进 GEMM",
+   "kind": "dataflow",
+   "source_anchors": [
+    "vllm/model_executor/layers/linear.py:L1748-L1774",
+    "vllm/model_executor/layers/linear.py:L591-L615",
+    "vllm/distributed/communication_op.py:L12-L43"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "回指 ch23 切头数学（列切权重行切输出）；communication_op 是模型层与分布式层的接缝——模型代码不认识 GroupCoordinator。"
+  },
+  {
+   "id": "m8",
+   "name": "PP 中间张量字典 P2P：metadata 先 send_object 走 cpu_group、张量按 is_cpu 选组 isend/irecv；IntermediateTensors 是非末段 forward 的返回载体（手写 __init__ 保 Dynamo 溯源）",
+   "kind": "dataflow",
+   "source_anchors": [
+    "vllm/distributed/parallel_state.py:L1019-L1074",
+    "vllm/distributed/parallel_state.py:L1114-L1198",
+    "vllm/sequence.py:L12-L37"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "双群组分工在 P2P 上的体现（与 m1 呼应）；模型层两方法契约归 ch23，这里只管运输。"
+  },
+  {
+   "id": "m9",
+   "name": "AsyncIntermediateTensors 懒同步：irecv 句柄存着，__getattribute__ 钩子保证谁先碰 .tensors 谁负责 wait_for_comm——接收等待与 KV 取址/元数据构建重叠",
+   "kind": "algorithm",
+   "source_anchors": [
+    "vllm/v1/worker/gpu_worker.py:L96-L125",
+    "vllm/v1/worker/gpu_worker.py:L1064-L1076"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "difficulty": "core",
+   "note": "worked example：一段 PP 拍的时间线（irecv 发出→本地准备→触碰 .tensors 才 wait）；ch17 站 9 点过名、本章展开。"
+  },
+  {
+   "id": "m10",
+   "name": "PP isend 延迟一拍收割：非末段 isend_tensor_dict 句柄存 _pp_send_work，下一轮 execute_model 开头统一 wait",
+   "kind": "protocol",
+   "source_anchors": [
+    "vllm/v1/worker/gpu_worker.py:L1023-L1026",
+    "vllm/v1/worker/gpu_worker.py:L1101-L1105",
+    "vllm/v1/worker/gpu_worker.py:L176-L176"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting",
+   "note": "发送方发完即走、完成检查推迟一整轮；CUDA 张量 record_stream 防提前回收。"
+  },
+  {
+   "id": "m11",
+   "name": "PP×TP 切片优化：numel 整除 TP world_size 的张量只发本 rank 1/tp 切片，接收端 irecv 切片后 all_gather 重建全张量",
+   "kind": "algorithm",
+   "source_anchors": [
+    "vllm/distributed/parallel_state.py:L1061-L1064",
+    "vllm/distributed/parallel_state.py:L1162-L1186",
+    "vllm/distributed/parallel_state.py:L967-L979"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "difficulty": "supporting",
+   "note": "PP 段间张量在 TP 组内本就 replicated——p 份重复发送是浪费；all_gather_tensors 字典可逐张量覆写开关。"
+  },
+  {
+   "id": "m12",
+   "name": "PP 采样 token 回传两版：async=末段 GPU broadcast 直回首段（不过 CPU/调度器）；sync=new_token_ids 随 SchedulerOutput 差量过线（ch18）",
+   "kind": "dataflow",
+   "source_anchors": [
+    "vllm/v1/worker/gpu_model_runner.py:L4842-L4869"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting",
+   "note": "首段下拍的 input_ids 依赖上拍采样结果——这个环形依赖在 PP 下跨了段；首段顺手给本地账记 -1 占位 token（L4880-L4886）。"
+  },
+  {
+   "id": "m13",
+   "name": "DP 引擎出生分叉：MoE∧DP>1→DPEngineCoreProc（wave 锁步+引擎级 gloo dp_group）；非 MoE→'treat like DP=1' 就地改配置、完全独立",
+   "kind": "config",
+   "source_anchors": [
+    "vllm/v1/engine/core.py:L1306-L1318",
+    "vllm/v1/engine/core.py:L1918-L1983"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "读者分清两种 DP 形态的分水岭；引擎级 dp_group 是 stateless gloo（引擎进程无 CUDA，config/parallel.py:L618-L657）。"
+  },
+  {
+   "id": "m14",
+   "name": "前端家族三分支：make_async_mp_client——DP=1→AsyncMPClient；外部 LB→DPAsyncMPClient（绑引擎+XSUB 订阅统计+PAIR first_req 转投）；内部 LB→DPLBAsyncMPClient（全权选路）",
+   "kind": "config",
+   "source_anchors": [
+    "vllm/v1/engine/core_client.py:L116-L139",
+    "vllm/v1/engine/core_client.py:L1249-L1291"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "类树五层（MPClient→AsyncMP→DPAsync→DPLB）是 ipc-stage 卡点过的维护成本，正文点到即止。"
+  },
+  {
+   "id": "m15",
+   "name": "内部 LB 打分（v0.27.1 重写版）：score=max(client_count×inflight, waiting+running)+waiting×6×max(0,kv-0.5)；起点轮转消平局；选中即 reqs_in_flight/engine_inflight 记账",
+   "kind": "algorithm",
+   "source_anchors": [
+    "vllm/v1/engine/core_client.py:L1468-L1519",
+    "vllm/v1/engine/core_client.py:L1532-L1539"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "difficulty": "core",
+   "note": "worked example 必做：给 4 引擎一组 counts/inflight 算出谁胜出（含 KV 压力分支与平局轮转）；⚠ v2 公式 waiting*4+running 已废，禁迁移。"
+  },
+  {
+   "id": "m16",
+   "name": "abort 按引擎路由：reqs_in_flight[request_id]=engine 登记表 + finished_requests 回收 engine_inflight——多引擎下 abort 要找到正确的引擎",
+   "kind": "protocol",
+   "source_anchors": [
+    "vllm/v1/engine/core_client.py:L1446-L1450",
+    "vllm/v1/engine/core_client.py:L1587-L1602"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting",
+   "note": "与 ch7 断连 abort 链衔接：断连反向 abort 在 DP 下多了一跳『选对引擎』。"
+  },
+  {
+   "id": "m17",
+   "name": "client_index/current_wave 双盖章过线：client_index 是多前端回程键（F3 回收）、current_wave 防 wave 竞态（请求先于 wave 完成通知到达）；client_index=-1 哨兵走 coordinator stats 通道",
+   "kind": "protocol",
+   "source_anchors": [
+    "vllm/v1/engine/core_client.py:L1410-L1423",
+    "vllm/v1/engine/__init__.py:L120-L127",
+    "vllm/v1/engine/core.py:L1788-L1793"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "F3 回收主现场；-1 哨兵路由 ch5 站 9 标过「→ ch34」，此处兑现。"
+  },
+  {
+   "id": "m18",
+   "name": "DPCoordinator 三 socket 与发布节拍：front XPUB(聚合统计→前端)/back XPUB(控制→引擎)/output PULL(引擎统计)；100ms 变化刷/5s 心跳；MoE lockstep 先等 ≥50ms 收齐同拍",
+   "kind": "layout",
+   "source_anchors": [
+    "vllm/v1/engine/coordinator.py:L208-L256",
+    "vllm/v1/engine/coordinator.py:L252-L283",
+    "vllm/v1/engine/core.py:L1669-L1698"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "图：DP 集群全景（N 前端×M 引擎×coordinator 三 socket，数据面实线/控制面虚线）——本章头图候选。"
+  },
+  {
+   "id": "m19",
+   "name": "wave 共识状态机：每 32 步 2 元素 SUM all-reduce（[0]>0=OR 继续跑、[1]==dp_size=全体同意暂停）；无活引擎 dummy batch 维持锁步；wave_complete 由 dp_rank0 上报、current_wave+=1",
+   "kind": "protocol",
+   "source_anchors": [
+    "vllm/v1/engine/core.py:L2124-L2188",
+    "vllm/config/parallel.py:L727-L762"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "图：wave 时间线（running↔paused 状态迁移 + 各消息时序，UML 时序图规约——WRITING-CONTRACT §8 多步时序机制优先时序图）。"
+  },
+  {
+   "id": "m20",
+   "name": "唤醒与竞态闭环：FIRST_REQ 经 PAIR 抢先通知 coordinator 广播 START_DP_WAVE(exclude 已收请求引擎)；stale wave 请求触发引擎上报 start_wave；暂停共识后 ignore_start_dp_wave 丢弃在途唤醒",
+   "kind": "protocol",
+   "source_anchors": [
+    "vllm/v1/engine/core_client.py:L1369-L1378",
+    "vllm/v1/engine/core.py:L2008-L2022",
+    "vllm/v1/engine/core.py:L2058-L2071",
+    "vllm/v1/engine/coordinator.py:L436-L467"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting",
+   "note": "三处代码合力闭环（抢先通知/stale 上报/共识后丢弃）——本章最精细的协议，正文值得一小节专讲。"
+  },
+  {
+   "id": "m21",
+   "name": "DP 批对齐：coordinate_batch_across_dp 一次 4×dp all-reduce 互见 (orig,padded,ubatch,cg_mode)——cg_mode 取 min（一人 NONE 全体 NONE）、启用时全员 pad 到 max；num_tokens_across_dp 进 DPMetadata",
+   "kind": "protocol",
+   "source_anchors": [
+    "vllm/v1/worker/dp_utils.py:L36-L91",
+    "vllm/v1/worker/dp_utils.py:L164-L225",
+    "vllm/v1/worker/gpu_model_runner.py:L4004-L4027",
+    "vllm/forward_context.py:L72-L128"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "core",
+   "note": "cudagraph 一致性（ch19）与集合通信同形约束在 DP 下的合流；DPMetadata 的 chunk sizes 是 MoE dispatch 的 sizes 来源。"
+  },
+  {
+   "id": "m22",
+   "name": "EP dispatch/combine：MoE prepare 调 get_ep_group().dispatch 全网重排（默认 AgRs=all_gatherv）/finalize combine（reduce_scatterv）归位；各 rank 只算命中本地专家的 token；真 A2A 后端替换同接口",
+   "kind": "algorithm",
+   "source_anchors": [
+    "vllm/distributed/device_communicators/all2all.py:L44-L150",
+    "vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py:L158-L164",
+    "vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py:L187-L209",
+    "vllm/config/parallel.py:L188-L199"
+   ],
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "difficulty": "core",
+   "note": "worked example 必做：2 rank 各 3 token、topk 命中跨 rank 专家——手推 dispatch 后每 rank 拿到的 token 集、本地算哪些、combine 归位求和。图：token 全网重排示意。all2all_backend 旋钮列家族（DeepEP/MoRI/nixl/flashinfer）一段带过（ch26 已见 DeepSeek MoE 层）。"
+  },
+  {
+   "id": "m23",
+   "name": "sequence-parallel MoE 动机与 DPMetadata sizes：o_proj 后 all_reduce 使 token 在 TP 组内 replicated——EP 下重复 token=重复算+重复传；SP-MoE 先 reduce_scatter 摊薄再 dispatch；sp_local_sizes 上下文供 chunk sizes",
+   "kind": "config",
+   "source_anchors": [
+    "vllm/config/parallel.py:L664-L683",
+    "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:L628-L640",
+    "vllm/forward_context.py:L101-L128"
+   ],
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "difficulty": "supporting",
+   "note": "use_sequence_parallel_moe 的注释（parallel.py:L660-L668）把动机写得很白——直接引用；sp_size=1 时 local_sizes=全量（纯 DP 也走同一条路）。"
+  }
+ ],
+ "subtraction_plan": {
+  "delete": [
+   {
+    "what": "parallel_state.py：patched_fused_scaled_matmul_reduce_scatter(+fake+注册, L200-L249/L320-L349/L370-L377)；VLLM_DISTRIBUTED_USE_SPLIT_GROUP 全家（_create_subgroups_split_group L282-L317、_init_process_group_for_split_group L1492-L1525、_validate_default_pg_for_split_group L1527-L1551 及 L434-L445/L1661-L1678/L1700-L1701 分支）；make_sibling_device_group L535-L555；create_single_reader_mq_broadcasters L571-L582；use_cpu_custom_send_recv 旁路（L529-L533 与 isend/irecv_tensor_dict 内 L1033-L1040/L1131-L1138）；DCP 维度（L1846-L1862 与 _DCP/L1398-L1403）；EPLB 组（L1952-L1973 与 _EPLB 访问器 L1434-L1443）；elastic EP 全家（_init_stateless_group L1339-L1363、_init_elastic_ep_world L1553-L1585、initialize_model_parallel 内 enable_elastic_ep 各分支、_replace_active_groups L1366-L1387）；send_object/recv_object 以外的对象通信变体（broadcast_object_list L805-L821 保留一句、send_object/recv_object L822-L883 保留——isend/irecv metadata 依赖）",
+    "why_safe": "fp8 融合算子绕 pytorch bug（TODO 自认待删）；split_group 是默认关的实验门；sibling/单读者 MQ 是 RL/弹性场景专用；CPU 自定义收发是 CPU 后端旁路；DCP/EPLB/弹性 EP 是进阶维度与 ch39 话题——主线 TP/PP/DP/EP 四维 + 非弹性路径的建组、集合原语、P2P、广播分桶行为完整不受影响。"
+   },
+   {
+    "what": "cuda_communicator.py：_log_all_reduce_backend_selection（L206-L273）与 all2all manager 选型中本章不展开的后端分支（mori/deepep_v2/nixl/flashinfer 的 import 分支 L160-L206 只留 AgRs 与一个『其余后端』注释）；custom_all_gather/custom_reduce_scatter（L343-L356）；symm-mem 的 _all_gather_symm_mem 路径注为省略",
+    "why_safe": "日志拼装不影响行为；后端家族正文一段带过、AgRs 主线（base 类 + all_gatherv/reduce_scatterv）不依赖被删分支；custom gather/scatter 是 CustomAllreduce 的可选加速，回退语义仍在。"
+   },
+   {
+    "what": "all2all.py：AgRsAll2AllManager 之外的整个家族（DeepEPAll2AllManagerBase/DeepEPHT/DeepEPLL/DeepEPV2/NixlEP/MoRI/FlashInfer* 全类）；AgRs 内 extra_tensors/LoRA 映射随行的 gathered_extras 拼接细节",
+    "why_safe": "本章 EP 主线=AgRs 后端（默认）；真 A2A 后端替换同一 dispatch/combine 接口，正文以『替换实现』一句带过即可成立。"
+   },
+   {
+    "what": "dp_utils.py：_post_process_ubatch/_post_process_cudagraph_mode 的 DBO 细节可并作注释行（ubatch 归 ch12/ch19 已立的 DBO 话题）；disable_nccl_for_dp_synchronization 的 gloo 回退分支",
+    "why_safe": "坐标对齐主线（_run_ar 4×dp all-reduce + cg_mode min + pad to max）不依赖 DBO 细节；gloo 回退是调参逃生舱。"
+   },
+   {
+    "what": "core_client.py DP 类中的 elastic EP 面：eep_scaling_cache/_ensure_stats_update_task 里 SCALE_ELASTIC_EP 分支（L1332-L1367）、_prepared_elastic_ep/commit_elastic_ep/prepare_elastic_ep、eep_process_engine_core_notification（L1541-L1585）；get_core_engine_for_request 的 late-interaction pooling 分支（L1470-L1474）",
+    "why_safe": "弹性扩缩容归 ch39；pooling 分支是专用功能——LB 打分主线（score 主式+记账）删后行为完整。"
+   },
+   {
+    "what": "core.py DPEngineCoreProc 中的 elastic EP 面（eep_scaling_state 推进 L2112-L2122、reinitialize_distributed L2190 起）、_should_throttle_prefills（L2092-L2099）、iteration_details 统计分支（L2138-L2142）；非 MoE 引擎的 _maybe_publish_request_counts（L1391-L1402）与 DPEngineCoreProc 版二选一保留后者",
+    "why_safe": "弹性与细粒度统计归后续章；publish 主线（counts 变化才发+step/wave 盖章+-1 哨兵）在 DPE 版完整表达。"
+   },
+   {
+    "what": "coordinator.py：SCALE_ELASTIC_EP 处理块（L311-L345）、新引擎订阅的 READY 重发分支注释保留主干（L289-L299 简化）、_wait_for_zmq_addrs 的超时细节可简",
+    "why_safe": "控制面主线（三 socket + 100ms/5s 发布 + wave 状态机 + START_DP_WAVE）不依赖弹性分支。"
+   },
+   {
+    "what": "gpu_worker.py：execute_model 中 enable_sp 序列并行预备块（L1035-L1062）与 use_v2_model_runner pooling 分支（L1082-L1087）；init_device 的 assigned_physical_gpu_ids/patch 注释块（L328-L357）",
+    "why_safe": "SP 属进阶组合（m23 一句带过）；PP 接力主线（收割上拍 isend→irecv→转调→isend）完整。"
+   },
+   {
+    "what": "naive_dp_ep.py：MoEPrepareAndFinalizeNaiveDPEPMonolithic 整类（L212 起）；_quantize_and_setup_dispatch/_unwrap_scale 的量化细节压成两行注释",
+    "why_safe": "Monolithic 是 router 内置变体；dispatch/combine 调用现场（Modular 版）不受影响；量化细节归 ch27。"
+   }
+  ],
+  "must_keep": [
+   {
+    "symbol": "GroupCoordinator",
+    "why": "本章核心抽象——TP/PP/DP/EP 统一入口。"
+   },
+   {
+    "symbol": "cpu_group",
+    "why": "双群组之一（gloo）：元数据/对象/barrier。"
+   },
+   {
+    "symbol": "device_group",
+    "why": "双群组之二（NCCL）：张量集合与 P2P。"
+   },
+   {
+    "symbol": "device_communicator",
+    "why": "device 后端选择的下沉点，all_reduce 最终落在它。"
+   },
+   {
+    "symbol": "use_custom_op_call",
+    "why": "集合算子走 torch.ops.vllm.* 与否的开关——编译故事的开关。"
+   },
+   {
+    "symbol": "use_all2all",
+    "why": "EP 组是否启用 all2all manager 的开关（dp>1 或 SP-MoE 或 EP∧PCP>1）。"
+   },
+   {
+    "symbol": "all_reduce",
+    "why": "三大集合原语之一，TP 聚合核心。"
+   },
+   {
+    "symbol": "all_gather",
+    "why": "三大集合原语之二（ColumnParallel/SP）。"
+   },
+   {
+    "symbol": "reduce_scatter",
+    "why": "三大集合原语之三（AgRs combine 的积木）。"
+   },
+   {
+    "symbol": "all_reduce_fake",
+    "why": "fake/meta 实现——编译期形状推断的关键。"
+   },
+   {
+    "symbol": "direct_register_custom_op",
+    "why": "集合算子注册成 vLLM 自定义算子的机制。"
+   },
+   {
+    "symbol": "_all_reduce_out_place",
+    "why": "两条路径的汇合点，out-of-place 约束体现。"
+   },
+   {
+    "symbol": "barrier",
+    "why": "刻意走 cpu_group 的同步（NCCL barrier 陷阱）。"
+   },
+   {
+    "symbol": "send",
+    "why": "PP P2P 发送原语。"
+   },
+   {
+    "symbol": "recv",
+    "why": "PP P2P 接收原语。"
+   },
+   {
+    "symbol": "isend_tensor_dict",
+    "why": "PP 发送侧真身（metadata 走 cpu_group + TP 切片优化）。"
+   },
+   {
+    "symbol": "irecv_tensor_dict",
+    "why": "PP 接收侧真身（与 isend 镜像）。"
+   },
+   {
+    "symbol": "get_tp_group",
+    "why": "TP 单例访问器，模型 forward 的入口。"
+   },
+   {
+    "symbol": "get_pp_group",
+    "why": "PP 单例访问器，P2P/is_last_rank 的入口。"
+   },
+   {
+    "symbol": "get_dp_group",
+    "why": "DP 单例访问器（批对齐/EP comm group 用）。"
+   },
+   {
+    "symbol": "get_ep_group",
+    "why": "EP 单例访问器，dispatch/combine 的入口。"
+   },
+   {
+    "symbol": "initialize_model_parallel",
+    "why": "5 维张量切四刀的总装函数。"
+   },
+   {
+    "symbol": "init_model_parallel_group",
+    "why": "构造单维度 GroupCoordinator 的工厂。"
+   },
+   {
+    "symbol": "init_distributed_environment",
+    "why": "建全局 world（DP rank 偏移在此发生）。"
+   },
+   {
+    "symbol": "tensor_model_parallel_all_reduce",
+    "why": "模型层调用的公共 API——两域接缝。"
+   },
+   {
+    "symbol": "CudaCommunicator",
+    "why": "回退链宿主（CustomAllreduce/pynccl...）。"
+   },
+   {
+    "symbol": "AsyncIntermediateTensors",
+    "why": "PP 懒同步包装（introduces 清单）。"
+   },
+   {
+    "symbol": "IntermediateTensors",
+    "why": "PP 段间载荷本体。"
+   },
+   {
+    "symbol": "_pp_send_work",
+    "why": "isend 句柄延迟一拍收割的存放处。"
+   },
+   {
+    "symbol": "_pp_broadcast_prev_sampled_token_ids",
+    "why": "async PP token 回传（末段 GPU broadcast）。"
+   },
+   {
+    "symbol": "make_async_mp_client",
+    "why": "前端三分支工厂。"
+   },
+   {
+    "symbol": "DPAsyncMPClient",
+    "why": "外部 LB 客户端（绑引擎+订阅统计）。"
+   },
+   {
+    "symbol": "DPLBAsyncMPClient",
+    "why": "内部 LB 客户端（score 选路）。"
+   },
+   {
+    "symbol": "get_core_engine_for_request",
+    "why": "LB 打分选引擎的算法本体。"
+   },
+   {
+    "symbol": "add_request_async",
+    "why": "盖章+定向+F3/F4 回收现场。"
+   },
+   {
+    "symbol": "current_wave",
+    "why": "wave 竞态防护的随请求印章。"
+   },
+   {
+    "symbol": "client_index",
+    "why": "F3 伏笔本体——多前端回程路由键。"
+   },
+   {
+    "symbol": "reqs_in_flight",
+    "why": "abort 按引擎路由的登记表。"
+   },
+   {
+    "symbol": "engine_inflight",
+    "why": "本地精确在飞计数（score 地板）。"
+   },
+   {
+    "symbol": "DPCoordinator",
+    "why": "控制面独立进程（前端侧包装）。"
+   },
+   {
+    "symbol": "DPCoordinatorProc",
+    "why": "控制面真身（三 socket 循环）。"
+   },
+   {
+    "symbol": "_send_start_wave",
+    "why": "START_DP_WAVE 广播原语。"
+   },
+   {
+    "symbol": "START_DP_WAVE",
+    "why": "唤醒信令（EngineCoreRequestType 成员）。"
+   },
+   {
+    "symbol": "DPEngineCoreProc",
+    "why": "MoE DP 引擎（wave 锁步忙循环）。"
+   },
+   {
+    "symbol": "_has_global_unfinished_reqs",
+    "why": "32 步共识的裁决点。"
+   },
+   {
+    "symbol": "sync_dp_state",
+    "why": "2 元素 SUM 双共识原语。"
+   },
+   {
+    "symbol": "has_unfinished_dp",
+    "why": "MAX=OR 单元素共识（resume 路径用）。"
+   },
+   {
+    "symbol": "ignore_start_dp_wave",
+    "why": "两阶段暂停的在途唤醒丢弃开关。"
+   },
+   {
+    "symbol": "pending_pause",
+    "why": "两阶段暂停的阶段 1 标志。"
+   },
+   {
+    "symbol": "_maybe_publish_request_counts",
+    "why": "stats 发布（-1 哨兵路由）。"
+   },
+   {
+    "symbol": "coordinate_batch_across_dp",
+    "why": "DP 批对齐入口。"
+   },
+   {
+    "symbol": "num_tokens_across_dp",
+    "why": "对齐结果，DPMetadata 的载荷。"
+   },
+   {
+    "symbol": "DPMetadata",
+    "why": "MoE dispatch sizes 的载体。"
+   },
+   {
+    "symbol": "AgRsAll2AllManager",
+    "why": "默认 EP 后端（AG+RS 凑 A2A）。"
+   },
+   {
+    "symbol": "MoEPrepareAndFinalizeNaiveDPEPModular",
+    "why": "MoE 层消费 dispatch/combine 的现场。"
+   },
+   {
+    "symbol": "use_sequence_parallel_moe",
+    "why": "SP-MoE 动机的配置面。"
+   },
+   {
+    "symbol": "stateless_init_dp_group",
+    "why": "引擎级 gloo DP 组的构造（wave all-reduce 的通道）。"
+   }
+  ]
+ },
+ "foreshadow_due": {
+  "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，不跑）",
+  "should_plant": [],
+  "should_payoff": [
+   {
+    "id": "F3",
+    "text": "client_index 随请求过线",
+    "planted_here": 4,
+    "paid_at": 34,
+    "how": "ch4 第 9 站埋『盖 client_index 过线』时只当多前端回程键讲了一半——本章兑现全景：DPLB/DPAsync 客户端盖章（core_client.py:L1413-L1414）→ EngineCoreRequest 字段（__init__.py:L120-L122 'used to ensure outputs are sent back to the same client'）→ scheduler.update_from_output 按 request.client_index 分桶（scheduler.py:L1924, L2015-L2016）→ 输出线程 sockets[client_index] 选 PUSH 回发起方（core.py:L1785-L1805）；DPLB 还按 engine_ranks_managed 把 coordinator 的全局 counts 切成本 client 管的切片（core_client.py:L1398-L1401）。回指句式建议：『第 4 章盖进请求的那枚章，在 M 台引擎的集群里长成了回程坐标系』。"
+   },
+   {
+    "id": "F4",
+    "text": "ROUTER 寻址能力",
+    "planted_here": 5,
+    "paid_at": 34,
+    "how": "ch5 埋的问题是『这条带信封的路，什么时候才真的需要寻址？』——本章回答：DP>1 时 _send_input(ADD, request, chosen_engine) 的 chosen_engine identity 就是信封首帧（core_client.py:L1410-L1423），N 前端 × M 引擎的 many-to-many 全靠 ROUTER 按 identity 精确投递；内部 LB（client 全权选路）与外部 LB（DPAsyncMPClient 每 client 绑定一个引擎，L1427-L1428 get_core_engine_for_request 原样返回）是同一寻址能力的两种用法；ch5 讲过的『DP=1 也在付信封帧开销』在此兑现成收益。回指句式建议：『第 5 章信封上还空着的那个地址栏，M 台引擎时才真正写了名字』。"
+   }
+  ]
+ },
+ "l2_spec": "book/cartography/l2-specs/ch34.json（同批产出；stations 与本档 stations 同一份账本）"
+}
