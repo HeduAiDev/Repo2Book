@@ -408,7 +408,11 @@ def _check_enough_kv_cache_memory(
 
 ## 一份账喂两侧（站 7）
 
-定账的产物是 `KVCacheConfig`（num_blocks + 分组 + 张量布局），它要去两个世界：调度器进程拿它建账本，worker 进程拿它真分配显存。开读前先交代一条改名链，免得三个名字读成三笔钱。这笔数的出生地在站 3：各 worker 用一行减法量出 `available_kv_cache_memory_bytes`。汇到 EngineCore，入参名换成 `available_gpu_memory`（多卡时是一张逐 worker 的清单）；再传进定账总控 `get_kv_cache_configs`，形参又写成 `available_memory`。一路下来三个名字、一个数，行文统称 available_kv。先看总编排：
+定账的产物是 `KVCacheConfig`（num_blocks + 分组 + 张量布局），它要去两个世界：调度器进程拿它建账本，worker 进程拿它真分配显存。开读前先交代一条改名链，免得三个名字读成三笔钱。这笔数的出生地在站 3：各 worker 用一行减法量出 `available_kv_cache_memory_bytes`。汇到 EngineCore，入参名换成 `available_gpu_memory`（多卡时是一张逐 worker 的清单）；再传进定账总控 `get_kv_cache_configs`，形参又写成 `available_memory`。一路下来三个名字、一个数，行文统称 available_kv。先看总览图，再进总编排：
+
+![站 7 调用全景：一笔账从站 3、站 4 汇入 get_kv_cache_configs 单点定账，再分两版喂调度器与 worker](../diagrams/ch14-fig-init-call-panorama.png)
+
+> *图注：L0 图「调度 · 显存账本」列启动带的放大，站 7 的调用关系一图看全：账从哪来（站 3 一行减法量出的可用字节、站 4 各层自报形状）→ 单点定账在哪（get_kv_cache_configs，护栏四道上一节已拆，这一景 40 MiB 算到 320 块）→ 喂到哪两侧（拍平版给调度器建账本，布局版给 worker 在 CuMem 显存池真分配）。先在图上认全这三段再进下面的代码块，正文按讲解需要逐段展开。*
 
 ```python
 # vllm/v1/engine/core.py:L301-L330 · EngineCore._initialize_kv_caches
