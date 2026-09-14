@@ -1,0 +1,393 @@
+{
+  "figures": [
+    {
+      "figure_id": "L2-ch26",
+      "svg": "L2-ch26.svg",
+      "png": "L2-ch26.png",
+      "claim": "MLA 压缩 KV 只省显存——注意力仍要读完全部历史，O(L²) 一步没省。DeepSeek 在 MLA 前挂『闪电索引器』：64 头×128 维小头给每个历史 token 打分、只挑 top-2048 真算。打分自己不也是 O(L²)？凭什么便宜小头知道该看哪里？挑中的索引记在哪？NSA 三支路到 V4 怎么回来？",
+      "numbers": [
+        {
+          "n": 1,
+          "where": "vllm/model_executor/models/deepseek_v2.py:L1376-L1389",
+          "what": "模型装配：is_v32=hasattr(config, 'index_topk') 探测 DSA 架构；分配全模型共享 topk_indices_buffer [max_num_batched_tokens, index_topk] int32——所有层的 indexer 写、稀疏 MLA 读同一块裸 buffer（无所有权封装；V4 同款在 vllm/models/deepseek_v4/nvidia/model.py:L1043-L1047）"
+        },
+        {
+          "n": 2,
+          "where": "vllm/model_executor/models/deepseek_v2.py:L1091-L1121",
+          "what": "IndexCache 跨层复用账本（装配期）：『IndexCache config』注释直引 arXiv:2603.12201；index_topk_freq/index_topk_pattern/index_skip_topk_offset 算出本层 _skip_topk——'S' 层不建 indexer、直接复用别层写进共享 buffer 的选块省重复打分；MTP/nextn 层恒建全量 indexer（draft step 0 算一次、运行时 set_skip_topk 切换，冻结 True 会让 draft 读永不写入的 buffer）"
+        },
+        {
+          "n": 3,
+          "where": "vllm/model_executor/models/deepseek_v2.py:L645-L726",
+          "what": "独立小头装配：topk_tokens/n_head=64/head_dim=128/rope_dim=64 全来自 config.index_* 前缀（与主注意力头数无关）；wq_b 从 q_lora_rank=1536 上投 64×128 且复制不切 TP；wk_weights_proj 一枪 GEMM 出 key(128)+逐头权重(64)；k_norm=LayerNorm(eps=1e-6)；softmax_scale=head_dim**-0.5；indexer_op=SparseAttnIndexer"
+        },
+        {
+          "n": 4,
+          "where": "vllm/model_executor/models/deepseek_v2.py:L616-L642",
+          "what": "IndexCache 落地：DeepseekV32IndexerCache 注册 static_forward_context、自报 MLAAttentionSpec(num_kv_heads=1, head_size=128+128//128*4=132)——『只有一根向量、无 K+V 之分』，与主 KV cache 分开分配的第二本账（KV 账本分组归 ch14/ch25 站 6）；backend=DeepseekV32IndexerBackend（block_size 64、头维 {32,64,128}）"
+        },
+        {
+          "n": 5,
+          "where": "vllm/v1/attention/backends/mla/indexer.py:L764-L978",
+          "what": "每拍 metadata（builder 侧）：按 decode_threshold=1+num_speculative_tokens 分流 decode/prefill；prefill 侧 split_indexer_prefill_chunks 双预算切块（N≤max_model_len×40 workspace；M·N·4≤VLLM_SPARSE_INDEXER_MAX_LOGITS_MB）；decode 侧 flatten/native 两路展开 per-token 上下文长；compress_ratio>1 时 slot_mapping/seq_lens 全部换算进压缩坐标（get_compressed_slot_mapping、seq_lens//compress_ratio）"
+        },
+        {
+          "n": 6,
+          "where": "vllm/model_executor/layers/mla.py:L189-L206",
+          "what": "前向接线（每拍）：MLA 外层算完 q_c/kv_c/k_pe、q 投影与 RoPE 之后、交 mla_attn 之前——if indexer and is_sparse and not skip_topk: indexer(hidden_states, q_c, positions, indexer_rope_emb)。返回值无人接收：纯写 topk_indices_buffer 的副作用；skip_topk 层跳过此调用、复用 buffer 旧值"
+        },
+        {
+          "n": 7,
+          "where": "vllm/model_executor/models/deepseek_v2.py:L728-L836",
+          "what": "打分前置（Indexer.forward）：wq_b(qr) 低秩上投 64 头×128 维 q（qr=ch25 站 9 的 q_c，indexer query 与主 query 共享低秩瓶颈）；wk_weights_proj(hidden) 一枪出 k 与逐头权重 w；k_norm+interleave RoPE 只打 rope 段（专属 RoPE，is_neox 取反）；q per-token-group FP8 量化（128 一组、ue8m0）；q_scale·softmax_scale·n_head**-0.5 折进 weights（标量归一化搬出核）→ indexer_op(hidden, q_fp8, k, weights)"
+        },
+        {
+          "n": 8,
+          "where": "vllm/model_executor/layers/sparse_attn_indexer.py:L295-L432",
+          "what": "op 入口：从 ForwardContext 按层名（k_cache.prefix）取 DeepseekV32IndexerMetadata——metadata 不走参数、隐式契约（ch19/ch25 已立）；profiling 假跑预留 K-gather workspace+logits 峰值账（VLLM_SPARSE_INDEXER_MAX_LOGITS_MB）；k 量化与缓存插入一步融合 indexer_k_quant_and_cache（V4 skip_k_cache_insert=True 交给 compressor）；topk_indices_buffer 预清 -1 哨兵"
+        },
+        {
+          "n": 9,
+          "where": "vllm/model_executor/layers/sparse_attn_indexer.py:L449-L528",
+          "what": "prefill 打分+选块：逐 chunk cp_gather_indexer_k_quant_cache 从分页 IndexCache 收历史量化 key 进共享 workspace → fp8_fp4_mqa_logits 算 I_{t,:}=Σ_j w_j·ReLU(q_j·k_s)（逐头点积+ReLU+加权在核内，O(L²) 本尊）→ top_k_per_row_prefill 按 cu_seqlen_ks/ke 因果边界选 top-k 写 buffer 行；chunk 尾 DCP 合并单卡 no-op（归 ch34）"
+        },
+        {
+          "n": 10,
+          "where": "vllm/model_executor/layers/sparse_attn_indexer.py:L530-L688",
+          "what": "decode 打分+选块：fp8_fp4_paged_mqa_logits 不经 gather、直接对分页 IndexCache 打分（block_table+DeepGEMM schedule_metadata 寻址）——『每轮只对新增 token 算 index』的 decode 形态：query=本拍 token（含 spec 窗口 2D seq_lens），key=全历史缓存；top-k 三核分派：cooperative_topk（小批）/persistent_topk（topk∈{512,1024,2048} 专用核）/top_k_per_row_decode 兜底；spec 解 pad 回写"
+        },
+        {
+          "n": 11,
+          "where": "vllm/model_executor/layers/sparse_attn_indexer.py:L470-L472",
+          "what": "落账：topk_indices = topk_indices_buffer[token_start:token_end, :topk_tokens]——buffer 行=本拍 query token（每轮只对新增 token 算 index 的机制保证：历史 token 的行上一拍已消费、本拍整块重写），无效位 -1 哨兵（越短上下文/DCP 边界）"
+        },
+        {
+          "n": 12,
+          "where": "vllm/v1/attention/backends/mla/flashmla_sparse.py:L838-L874",
+          "what": "V3.2 消费：SparseMLACommonImpl 装配期接管 buffer（indexer.topk_indices_buffer 或显式传参——skip 层没 indexer 也能读）；每拍 FlashMLASparseImpl.forward_mqa 取前 num_actual_toks 行，局部逻辑位经 triton_convert_req_index_to_global_index（sparse_utils.py:L120）按块表换算成物理 slot → flash_mla_sparse_fwd 在 576 维潜向量上只对选中条目真算（O(Lk)）"
+        },
+        {
+          "n": 13,
+          "where": "vllm/models/deepseek_v4/attention.py:L718-L892",
+          "what": "V4/CSA 打分（第三代的差异全在压缩）：DeepseekCompressor 先把 K 压成 K^IComp 写进 indexer k_cache（skip_k_cache_insert=True；缓存以压缩块为单位）；indexer 活在 //compress_ratio 坐标系（max_model_len//4）；短上下文（candidates≤topk）直接 _fill_short_context_topk_indices 全选、跳过打分但仍建缓存；wq_b+量化 与 compressor 双流并行（maybe_execute_in_parallel），join 保证 K 写先于打分"
+        },
+        {
+          "n": 14,
+          "where": "vllm/models/deepseek_v4/nvidia/flashmla.py:L163-L244",
+          "what": "V4 消费=NSA 支路回归：C4A 把 buffer 局部压缩 index 经 compute_global_topk_indices_and_lens 换算全局 slot（C128A 无 indexer——压缩后 candidates≤topk，metadata 期直算全选）；decode 侧 flash_mla_with_kvcache 一核双源：k_cache=SWA 滑窗缓存（indices=滑窗位）+ extra_k_cache=压缩 KV 池（extra_indices_in_kvcache=top-k 位）；prefill 侧 gather 后 combine_topk_swa_indices 并集成连续 KV（L331-L363）"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "2026-09-14 ch26 开篇「你在这里」图 = L2 章图。权威产出点 = cartography gen_L2.py（dossier 产 spec l2-specs/ch26.json 渲染，本角色只拷贝不改造）。本轮=盲审压框两连回修后复验：①渲染干净（no overflow warnings，canvas 2200x1560，PNG 4400x3120 sharp 2x，cairosvg 不用）；②lint_diagram_geometry （cartography 路径 strict）✓ 无问题；③像素级复验两处修复——「第8-11站」徽标四条边框连续无缺口（顶/底/左直边段零间隙、右边框直段 780-792 行零缺失；此前被 ⑤→topk 标签白色 halo 啃掉的上边框已复原），IndexCache 青色右边框 y338-550 直段连续（此前被 IndexCache→⑤ 标签拦腰斩断处已复原）；④两标签新位经视觉复核（fable 读图）+盲审下轮复核：⑤→topk「写本拍 query token 行·-1 哨兵（L470-L472）」改 end 锚贴线左、落车道 304/352 间净空档（band 334.5-347.0，距下侧橙色车道线 5px）；IndexCache→⑤「prefill chunk gather（L456）/ decode paged 直读（L603）」落车道 288/304 间净空档（band 309-321.5，距下侧车道 304 线 5px；上方 x 相触的最近车道 352 线距 30px）——两处均被对向直落竖线穿过、由渲染末道白 halo 断口兜底（既有 pattern）；topk→⑥/IndexCache→⑥/⑥→出 等邻位标签零变动（pixel 级核对）；⑤回归=全 27 张存量 L2 SVG 对 04:02 渲染器逐字节不变（本轮避让硬化走 spec 流级 opt-in slot:true，仅 ch26 三条流加旗——IndexCache→⑤、⑤→topk、topk→⑥，沿 hdr_gap 同款 opt-in 先例）。claim=spec.hook、numbers=spec.stations 逐字核对一致。blind_review 留 PENDING 待独立盲审回填。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "盲审=只看 PNG(round2 收口,修图后重审): 与 ch26-fig-indexer-head 同源的三处旧「interleave RoPE」标签已改净——②装配·小头+IndexCache 卡「k_norm + 专属 RoPE(默认 NeoX 半分式)」、④线+打分前置卡「k_norm+专属 RoPE(默认 NeoX 半分式)·只打 rope 段」、左栏第7站「…k_norm+专属 RoPE 只打 rope 段(默认 NeoX 半分式, is_neox 取反)」;①-⑥站带、第 1-14 站栏、why 行、V4 压缩案/三类层、FP4/MXFP4 变体与 DCP 边界注逐区扫过,无残留「interleave」措辞;布局/站号/配色/站内数字未变,无新矛盾。"
+      }
+    },
+    {
+      "figure_id": "ch26-fig-indexer-head",
+      "gen": "gen_ch26-fig-indexer-head.py",
+      "svg": "ch26-fig-indexer-head.svg",
+      "png": "ch26-fig-indexer-head.png",
+      "claim": "indexer 是一套与主注意力完全独立的打分头：头表全来自 config.index_*（64 头×128 维，与主 128 头无关）、wq_b 从 1536 维潜向量上投且复制不切 TP、wk_weights_proj 一枪 GEMM 出 128 维 key 与 64 个逐头权重、key 经 LayerNorm(eps=1e-6) 与专属 interleave RoPE 后以 132B 量化条目进 IndexCache——主 MLA 一个头都没动用。",
+      "numbers": [
+        {
+          "value": "wq_b [8192, 1536]——q_lora_rank 1536 上投 64×128，ReplicatedLinear『no tensor parallel, just replicated』",
+          "provenance": "traces/m01.json dsv32_shapes.wq_b_weight_shape"
+        },
+        {
+          "value": "wk_weights_proj [192, 7168]，output_sizes [128, 64]——一枪 GEMM 出 key + 逐头权重两片",
+          "provenance": "traces/m01.json dsv32_shapes"
+        },
+        {
+          "value": "indexer 64 头 vs 主注意力 128 头——两套头表互不相干（字面证据=字段前缀 index_*）",
+          "provenance": "traces/m01.json independent_head_evidence + deepseek_v2.py:L655-L660"
+        },
+        {
+          "value": "k_norm eps=1e-6；softmax_scale=0.0884（128^-0.5）；n_head_scale=0.125（64^-0.5）——三标量折进 weights",
+          "provenance": "traces/m01.json dsv32_shapes / forward_run"
+        },
+        {
+          "value": "k_cache 132B/条；workspace 6553600 条（163840×40）",
+          "provenance": "traces/m01.json dsv32_shapes.k_cache_head_dim 与 max_total_seq_len"
+        },
+        {
+          "value": "FP8 wk + BF16 weights_proj 融合加载（两段缓冲、到齐反量化bf16）——单独训练的 checkpoint 形态痕迹",
+          "provenance": "traces/m01.json fp8_wk_load + deepseek_v2.py:L822-L871"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "Read PNG 亲眼看(盲审 FAIL 修复轮):连线全画完后再发标注,y=150 两条横线(实/灰虚)穿字形的三处标注(wq_b(qr) 上投 64×128、fused_qkv_a_proj(ch25)、同族的 q_b_proj)启用白 halo(paint-order:stroke,gen_L2 同款)——连线在字形处断开,4x/整图复核无墨迹相交;其余与上轮一致:五维对照+≠,10 秒可复述『indexer 与主 MLA 五件事互不相干』;逐数核对 spec.numbers 全命中(wq_b [8192,1536] 逐字原文、wk_weights_proj [192,7168]、64 vs 128 头·index_* 前缀、eps=1e-6·0.0884·0.125、132B=128+4、workspace 6553600、FP8 wk+BF16 两段缓冲、字节条真实比例 11.46%);无相撞/越界/悬空(lint_diagram_geometry ✓)、中文正常、读序清晰。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "盲审=只看 PNG+issue 清单(round2 收口,修图后重审): RoPE 行两格放大逐字核对——左「GPT-J 交错式·打 q/k 的 rope 段(末 64 维)」/「(is_neox_style=False,相邻维两两成对)」,右「专属 RoPE·默认 NeoX 半分式(is_neox 取反)」/「只打前 64 维——与主 RoPE 相反」——与 issue 事实方向一致(主链=GPT-J 交错式打末 64 维,indexer 默认=NeoX 半分式打前 64 维),原左右互换已消除,图面无残留「interleave」字样;归一化行左「q_a / kv_a RMSNorm(字段名 layernorm 名不副实)」在位;头表/权重/缓存三行与底部「折进 weights」面板未动,全图无新矛盾。"
+      }
+    },
+    {
+      "figure_id": "ch26-fig-index-cache-ledger",
+      "gen": "gen_ch26-fig-index-cache-ledger.py",
+      "svg": "ch26-fig-index-cache-ledger.svg",
+      "png": "ch26-fig-index-cache-ledger.png",
+      "claim": "IndexCache 每条 132 字节 = 128B fp8 值 + 4B fp32 scale（ue8m0 幂次），spec 自报 num_kv_heads=1 的 MLAAttentionSpec——『只有一根向量、无 K+V 之分』，与主 KV cache（bf16 576 元素 = 1152B/token）分开分配、分开分组的第二本账：缓存的是打分原料（量化索引键），不是分数。",
+      "numbers": [
+        {
+          "value": "132 = 128 + 4：前 128B fp8 值 + 尾 4B fp32 scale；量化+缓存插入一步融合（indexer_k_quant_and_cache）",
+          "provenance": "traces/m02.json layout_roundtrip（回环 dequant 偏差与 ue8m0 参考一致）"
+        },
+        {
+          "value": "spec：MLAAttentionSpec(num_kv_heads=1, head_size=132, dtype=uint8)；后端 V3.2 块 64 / V4 块 256；stride_order 恒等=不支持跨层布局",
+          "provenance": "traces/m02.json spec_self_report"
+        },
+        {
+          "value": "workspace 魔数账：40×163840 = 6553600 条 ×132B = 865075200 B = 825 MB——(576×2//132)×5=40 对齐 flashmla_sparse 的 5×max_model_len workspace",
+          "provenance": "traces/m02.json workspace_account + indexer.py:L442-L452 注释原文"
+        },
+        {
+          "value": "第二本账字节对比：132B vs 主 KV bf16 1152B/token/layer = 11.46%；满长 163840 单层 21626880 B vs 188743680 B",
+          "provenance": "traces/m02.json second_ledger_bytes"
+        },
+        {
+          "value": "『每 token 只算一次』：历史 token 的索引键跨拍只读——decode 打分直接对它 paged 读（m06）",
+          "provenance": "dossier ch26-m02 note + 站 10（sparse_attn_indexer.py:L530-L688）"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "Read PNG 亲眼看(盲审 FAIL 修复轮):11.46% 量规改为双端卡尺只跨条②条宽(52..132=80px,同一比例尺下 132B 宽),上移到条①底边与标签行之间的净空带 y=193——不再横穿『② IndexCache…』『uint8 · 132 B/token/layer』两标签,且刻度长=条②实宽,消除『刻度长=占比补数』误读;文字改 11.46% (132B/1152B, 即条②宽),4x 复核卡尺/文字/标签行互不相扰;其余与上轮一致:两本账对照 10 秒可复述,逐数核对 spec.numbers 全命中(132=128+4、MLAAttentionSpec(1,132,uint8)·块 64/256·stride_order 恒等、(576×2//132)×5=40→6553600 条×132B=825MB、满长 21626880 vs 188743680 B,像素实测按真实比例);无相撞/越界/悬空(lint_diagram_geometry ✓)、中文正常、读序清晰。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "盲审=只读 PNG+figure_spec。①复述=claim 对得上:两本账逐条对照——① 主 KV cache(MLA 潜向量,bf16·576 元素 = 1152 B/token/layer)vs ② IndexCache(indexer 专属 K 池,uint8·132 B/token/layer),132B 条目放大图剖开 128B fp8 值 + 尾 4B fp32 scale(ue8m0、融合 indexer_k_quant_and_cache),右栏 spec 自报与 workspace 魔数账,底部同一比例尺满长对比 + 记账纪律三条(缓存的是打分原料不是分数/每 token 只算一次/与主 KV 分开分配分开分组);②数字逐个核真全命中:132=128+4、MLAAttentionSpec(num_kv_heads=1, head_size=132, dtype=uint8) 与『Only has one vector instead of K + V』、后端块 64(V3.2)/256(V4)、stride_order 恒等=不支持跨层布局、K-cache 形状 [10,64,132]/[10,256,132]、(576×2//132)×5=40(复算 1152//132=8、8×5=40)、40×163840=6553600 条 ×132B=865075200 B=825 MB(复算全对)、11.46%=132B/1152B、满长 21626880 vs 188743680 B/层;像素级独立复核:红色卡尺两端 103..264px 与条② 严格同宽(不构成『刻度长=占比补数』误读)、满长两条 265 vs 2322 px=11.41% 与 11.46% 相符(同一比例尺成立)、条目放大图橙段 4B 占比与 4/132 相符;③无裁切、无悬空箭头(放大引线/卡尺/进核线落位)、读序清晰(①→②→放大→spec/workspace→满长对比→纪律)。观感注(不影响判读):① 条与② 条之间及 ② 标签行附近留白较大;11.46% 卡尺横排在 ① 条与 ② 标题之间,未压任何字形。"
+      }
+    },
+    {
+      "figure_id": "ch26-fig-buffer-protocol",
+      "gen": "gen_ch26-fig-buffer-protocol.py",
+      "svg": "ch26-fig-buffer-protocol.svg",
+      "png": "ch26-fig-buffer-protocol.png",
+      "claim": "一块 [max_num_batched_tokens, index_topk] int32 裸 buffer 是 indexer 与稀疏 MLA 的唯一接口：每层的 indexer 先于 mla_attn 被调用、纯副作用写本拍 query token 的行（返回值无人接收），稀疏后端取前 num_actual_toks 行读——无所有权封装的共享让 skip 层『不写只读旧值』的跨层复用成为可能。",
+      "numbers": [
+        {
+          "value": "形状 [512, 2048] int32 = 4194304 B（4 MiB）；例 8192 token 档 = 67108864 B（64 MiB）",
+          "provenance": "traces/m03.json allocation"
+        },
+        {
+          "value": "两层共用同一对象（layer0/layer1 的 topk_indices_buffer is buf = true）；非 v32 模型 buffer=None",
+          "provenance": "traces/m03.json allocation"
+        },
+        {
+          "value": "-1 哨兵两例：decode 因果自界 rowEnd=1 时行 [0, -1]（越界高分 9 不得入选）；空上下文 prefill 整行 -1（op 预清）",
+          "provenance": "traces/m03.json sentinel_case_decode_bound / sentinel_case_empty_context"
+        },
+        {
+          "value": "行=本拍 query token：同一行拍 1 写 [7, 1]、拍 2 整块重写 [2, 5]——历史行旧值不残留",
+          "provenance": "traces/m03.json row_rewrite_across_steps"
+        },
+        {
+          "value": "接线位：if indexer and is_sparse and not skip_topk: indexer(...)——返回值无人接收（mutates_args 声明写者身份）",
+          "provenance": "vllm/model_executor/layers/mla.py:L205-L206（dossier embed_excerpts[5]）"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "Read PNG 亲眼看:UML 时序图法(名牌生命线+激活条+消息水平直线,零折线,跨线直穿);两拍底纹带+带界虚线+共享时间轴标比例注;四类消息——拍1:①写本拍行(-1 预清→top-k 覆写)→②同层读→skip 虚线只读(不写,读别层写的同一行)→③取前 num_actual_toks 行;拍2:④整块重写高亮([7,1]→[2,5] 旧值不残留);buffer 画成 GPU 绿竖条带行刻度;右侧行放大:-1 两例(decode 因果自界 rowEnd=1,logits=[9,9,1,9] 窗外高分 9 不得入选;空上下文 prefill 整行 -1 op 预清)+跨拍重写 cells([7,1]/[2,5] 配 1.519/0.438→1.121/0.531);分配卡:[512,2048] int32=4194304 B(4 MiB)、8192 档 67108864 B(64 MiB)、两层同一对象、非 v32 → None(L1376-L1389);底部接线位 mla.py:L205-L206 原文+mutates_args=[topk_indices_buffer];lint_diagram_geometry ✓。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "盲审=只读 PNG+figure_spec。①复述=claim 对得上：UML 时序图法（泳道=层、时间轴=拍），[max_num_batched_tokens, index_topk] int32 裸 buffer 是 indexer 与稀疏 MLA 的唯一接口；拍 1 ①写本拍行（-1 预清→top-k 覆写）→②同层读→skip 层虚线只读不写（读别层写的同一行）→③取前 num_actual_toks 行，拍 2 ④整块重写高亮，全程零折线；②数字逐个核真全命中：[512,2048] int32=4194304B（4 MiB）、8192 token 档=67108864B（64 MiB）、两层同一对象（is buf=True）、非 v32→None、-1 哨兵两例（decode 因果自界 rowEnd=1 行 [0,-1]、窗外高分 9 不入选；空上下文 prefill 整行 -1）、跨拍整块重写 [7,1]→[2,5]（配 1.519/0.438→1.121/0.531）、接线位 mla.py:L205-L206 原文+mutates_args 声明写者身份；③无裁切、无悬空箭头、读序清晰。小观感（不影响判读）：①/②/skip 三处消息标签贴在各直线上方 3-5px、与线相切但不压字形。"
+      }
+    },
+    {
+      "figure_id": "ch26-fig-prefill-scoring",
+      "gen": "gen_ch26-fig-prefill-scoring.py",
+      "svg": "ch26-fig-prefill-scoring.svg",
+      "png": "ch26-fig-prefill-scoring.png",
+      "claim": "prefill 打分三段流水：cp_gather 把分页 IndexCache 按块表收成请求序连续 workspace（物理块 2/3 的碎片回到逻辑序）→ fp8_fp4_mqa_logits 对 (q_fp8, weights)×(k_quant, k_scale) 算 I_{t,:}=Σ_j w_j·ReLU(q_j·k_s)（ReLU 与逐头加权在核内，O(L²) 本尊）→ top_k_per_row_prefill 按 cu_seqlen_ks/ke 因果边界选 top-k 写 buffer 行（不足 -1 哨兵）。",
+      "numbers": [
+        {
+          "value": "块表 [[2,3],[4,0]]：req0 逻辑 pos 63→slot 191、pos 64→192、pos 65→193（跨块边界）；req1 pos 0→256",
+          "provenance": "traces/m05.json paged_gather_slots"
+        },
+        {
+          "value": "因果边界：cu_seqlen_ks=[0×6, 70×4]，cu_seqlen_ke=[65,66,67,68,69,70, 73,74,75,76]——req0 首行窗 [0,65)、req1 首行窗 [70,73)",
+          "provenance": "traces/m05.json chunk_metadata"
+        },
+        {
+          "value": "workspace 76 条×132B（请求序铺放）；logits [10, 76] fp32",
+          "provenance": "traces/m05.json chunk_metadata.local_total_seq_lens 与 logits_matrix_rounded3"
+        },
+        {
+          "value": "选块对账：全部 10 行与暴力参考相等=true；req1 首行窗长 3 → 选中 [1,2,0,-1,-1,-1]（3 个 -1 哨兵）",
+          "provenance": "traces/m05.json per_row_account（r6）"
+        },
+        {
+          "value": "打分核消费位：q_scale 已折 weights 的契约（核内只剩点积+ReLU+加权和）",
+          "provenance": "sparse_attn_indexer.py:L500-L507 + traces/m01.json forward_run.fold_formula"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "Read PNG 亲眼看(盲审 FAIL 修复轮):② 段标签改在三条收卷连线之后发射并启用白 halo(基线 320→322),第三条横线 y=316 在字形处断开,halo 上缘距第二条横线(y=310)约 2.4px、下缘距 workspace 条顶约 4.4px,4x/8x 复核三根竖落线(x=300/630/688)过标签带处走字隙或被 halo 断开、字形墨迹完好;其余与上轮一致:三段流水 10 秒可复述,逐数核对 spec.numbers 全命中(块表 [[2,3],[4,0]]、pos63→191/pos64→192/pos65→193/req1 pos0→256、cu_seqlen_ks=[0×6,70×4] 与 ke 十值、workspace 76×132B、logits [10,76] fp32、10 行==暴力参考=true、r6→[1,2,0,-1,-1,-1]),logits 矩阵 10×76 因果阶梯/块界/请求界正确;无相撞/越界/悬空(lint_diagram_geometry ✓)、中文正常、读序清晰。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "盲审=只读 PNG+figure_spec。①复述=claim 对得上:三段流水四段编号——① 分页 IndexCache 三张物理块卡(块 2/3/4,条高示碎片)② 收卷 cp_gather_indexer_k_quant_cache 按块表收成请求序 workspace[76,132](req0 70 条 + req1 6 条)③ 打分核 fp8_fp4_mqa_logits 出 logits 矩阵 [10,76]④ top_k_per_row_prefill 按因果窗选 top-6 写 buffer 行;②数字逐个核真全命中:block_table=[[2,3],[4,0]] 与物理块从 2 起、块 slots 128-191/192-255/256-319、pos63→slot191(块2)/pos64→192(块3)/pos65→193 与 req1 pos0→slot256(块4)、cu_seqlen_ks=[0×6, 70×4] 与 cu_seqlen_ke=[65,66,67,68,69,70, 73,74,75,76] 逐字、workspace 76 条×132B 与 logits [10,76] fp32(3040 B,复算 10×76×4=3040 对)、buffer 行 r0[4,9,13,16,22,24]/r6[1,2,0,-1,-1,-1]/r9[1,3,4,2,5,0]、全部 10 行==暴力参考=true 与 req1 首行窗长 3→尾部 3 个 -1、r1 top3 分值 57.951/50.560/45.411 与选中位 [9,51,13,48,60,61]、q_scale 已折 weights 的核契约(核内只剩点积+ReLU+加权和)、几何 seq=[70,6]/qry=[6,4]/topk=6/block_size=64;logits 矩阵因果阶梯、块界(63|64)与请求界(69|70)位置与语义相符;③无裁切、无悬空箭头(三条收卷线落到 workspace 顶、logits 回指矩阵右缘、workspace 右端进核线闭环)、读序清晰(①→②→③→④ 编号与箭头成环)。观感注(不影响判读):块 3/4 碎片条高比 6/64 的理论比例略高(26px vs 块 2 的 148px,≈1.9×;文字标签已写明 6/64,属示意条非比例条);② 标签行被两处竖线穿过、以白 halo 断开,字形完好;x 轴 63|64 刻度与理论列界差约半格、不影响判读。"
+      }
+    },
+    {
+      "figure_id": "ch26-fig-v4-layer-types",
+      "gen": "gen_ch26-fig-v4-layer-types.py",
+      "svg": "ch26-fig-v4-layer-types.svg",
+      "png": "ch26-fig-v4-layer-types.png",
+      "claim": "compress_ratios 逐层表把 V4 的每一层定型为三类之一：SWAonly(1) 只滑窗、C4A(4) 带 indexer 做 4 压 1 的块级 top-k、C128A(128) 压缩后 1280 个候选在 metadata 期无条件全选（不比较 topk）——只有 C4A 建 indexer，MTP 层恒回 1。",
+      "numbers": [
+        {
+          "value": "三实例 ratios [1,4,128] → indexer 建/不建 [False, True, False]；类型映射 1→swaonly、4→c4a、128→c128a",
+          "provenance": "traces/m10.json layer_types"
+        },
+        {
+          "value": "『Only C4A uses sparse attention and hence has indexer』（attention.py:L277-L278 注释原话）",
+          "provenance": "vllm/models/deepseek_v4/attention.py:L276-L297（dossier embed_excerpts[11]）"
+        },
+        {
+          "value": "C4A 数字账：163840//4=40960 候选块远超官方 top-k 512/1024（论文 §4.2.1）→ 真打分；C128A：压缩后 163840//128=1280 候选 metadata 期无条件全选、这条路径不比较 topk（不建 indexer）；C4A 全选边界=上下文 4×topk（官方两档 2048/4096）",
+          "provenance": "官方 V4 论文 arXiv:2606.19348 §4.2.1（top-k 512 Flash · 1024 Pro，明说比 V3.2 训练时的 2048 选得更小；ch25/ch26 research/concepts.json 一手核实）；C128A 无条件全选：vllm/models/deepseek_v4/sparse_mla.py:L264-L283、L353-L419（_build_c128a_topk_metadata 枚举 (pos+1)//128 全部候选、无 topk_tokens 参与）；C4A 全选边界：attention.py:L845（max_seq_len//compress_ratio ≤ topk_tokens）"
+        },
+        {
+          "value": "MTP 护栏：layer_id 5 ≥ num_hidden_layers 3 → compress_ratio=1（逐字 L207-L213：MTP 层不在表内）",
+          "provenance": "traces/m10.json layer_types.mtp_compress_ratio"
+        },
+        {
+          "value": "SWA 与 C4A 压缩块共享物理张量页：SWA 块宽 64 与 C4A KV 块 [256//4, head_dim] 同页宽；三类层各有 FlashMLASchedMeta 不共享 planner",
+          "provenance": "traces/m10.json layer_types.swa_note + flashmla.py:L210-L226"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "Read PNG 亲眼看:61 格层带三色(青系深浅)+类型分界 tick+C4A 格内嵌 4→1 小图标+MTP 尾格(虚线橙,恒 compress_ratio=1);带下明注『61 格、着色与分界均为示意,Pattern 随 checkpoint 发布(vLLM 不设默认值)』;三卡逐数命中:SWAonly(1,无 indexer)/C4A(4:163840//4=40960 候选块远超官方 top-k 512/1024 真打分;全选边界 4×topk=官方两档 2048/4096;skip_k_cache_insert=True)/C128A(128:压缩后 163840//128=1280 候选 metadata 期无条件全选、这条路径不比较 topk);实例行 ratios [1,4,128]→indexer [False,True,False]+类型映射;引语『Only C4A uses sparse attention and hence has indexer.』逐字含句点(L277-L278);MTP 护栏(layer_id 5≥num_hidden_layers 3→1,L207-L213 逐字引)+同页注(SWA 块宽 64 与 C4A 块 [256//4,head_dim] 同页宽 sparse_swa.py:L81-L83;三类层各有 FlashMLASchedMeta 不共享 flashmla.py:L210-L226);无相撞悬空(lint ✓,本图无箭头)。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "【2026-09-14 前的旧口径判词，原样保留供审计——其中的 topk 数字已被本轮 top-k 口径同步修取代，见本条末尾注】盲审=只读 PNG+figure_spec。①复述=claim 对得上：61 格层带按 compress_ratios 定型三类——SWAonly(1) 只滑窗、C4A(4) 带 indexer 做 4 压 1 块级 top-k、C128A(128) 压缩后 candidates≤topk 在 metadata 期直算全选；只有 C4A 格画 indexer 图标，MTP 尾格恒 1；②数字逐个核真全命中：实例 ratios [1,4,128]→indexer 建/不建 [False,True,False] 与类型映射 1→swaonly/4→c4a/128→c128a、引语『Only C4A uses sparse attention and hence has indexer.』逐字（attention.py:L277-L278）、C128A 163840//128=1280≤2048 直算 vs C4A 163840//4=40960>2048 真打分、边界上下文 4×2048=8192、MTP 护栏 layer_id 5≥num_hidden_layers 3→compress_ratio=1（L207-L213）、同页注（SWA 块宽 64 与 C4A 块 [256//4,head_dim] 同页宽、三类层各有 FlashMLASchedMeta 不共享 planner）；③无裁切、图中无箭头（无悬空风险）、读序清晰。观感注：层带着色与类型分界为示意且图上已明写『Pattern 随 checkpoint 发布（vLLM 不设默认值）』——不构成杜撰。｜2026-09-14 top-k 口径同步修待重盲审（图面四处文字已按官方 V4 论文 §4.2.1 的 top-k 512/1024 与 sparse_mla.py:L353-L419 的无条件全选改正） ｜2026-09-14 重盲审：top-k 口径同步修验证 PASS——四处新口径在 PNG 上逐字核到（C4A 卡「163840//4 = 40960 候选块远超 top-k（官方 512/1024）→ 真打分」「上下文 ≤ 4×topk 时整批判全选（官方两档 2048/4096）」、C128A 卡「1280 候选无条件全选（不比较 topk）」、副标题「C128A(128) 压缩后 1280 候选 metadata 期无条件全选（不比较 topk）」）；旧口径「≤ topk 2048」/「≤ 2048」/「= 8192」/「全选即最优」在图面与 SVG 文本层均零命中；新文字 2-3× 放大复核无相撞/越界/裁切/中文豆腐；与正文口径一致（§915：top-k 512 Flash·1024 Pro、C4A 全选边界 4×topk=2048/4096、C128A 1280「metadata 期被无条件全选，这条路径根本不比较 topk」）；另回源核真：attention.py:L843-L847 的 max_seq_len//compress_ratio ≤ topk_tokens 与注释「candidates num smaller than topk, every candidate is selected」对上「≤ 4×topk 整批判全选」，sparse_mla.py:L240 `_build_c128a_metadata` 系真符号（非杜撰字面量）。"
+      }
+    },
+    {
+      "figure_id": "ch26-fig-compressor-window",
+      "gen": "gen_ch26-fig-compressor-window.py",
+      "svg": "ch26-fig-compressor-window.svg",
+      "png": "ch26-fig-compressor-window.png",
+      "claim": "DeepseekCompressor 在 (pos+1)%4==0 的边界 token 上把 8-token 窗（前半读状态头0、后半读头1——overlap）softmax 门控压成 1 个块：Σ kv·score → RMSNorm → GPT-J RoPE（位置=压缩位 (pos//4)*4）→ FP8 132B 一步融合写进压缩坐标系的 IndexCache—— indexer 活在 //4 坐标系里（max_model_len//4、seq_lens//4、slot=(pos+1)%4==0）。",
+      "numbers": [
+        {
+          "value": "窗 8 项门控权重 [0.0259, 0.0704, 0.1913, 0.5200, 0.0259, 0.0259, 0.0704, 0.0704]（score [1,2,3,4,1,1,2,2] 的 softmax，和 1.0000）",
+          "provenance": "traces/m11.json compress_window.window_items"
+        },
+        {
+          "value": "头切换：t_i<4 读头0（pos 0-3）、t_i≥4 读头1（pos 4-7）——overlap 窗比 ratio 宽一倍",
+          "provenance": "traces/m11.json compress_window.head_switch_note + compressor.py:L68-L84（HOST SEAM 逐式）"
+        },
+        {
+          "value": "RMSNorm rrms=19.878185（eps=1e-6、weight=1）；RoPE 只打末 64 维、压缩位 4=(7//4)*4；FP8 scale=0.03125 写 slot 7",
+          "provenance": "traces/m11.json compress_window"
+        },
+        {
+          "value": "压缩坐标：seq_lens [16,8]→[4,2]；slot 15→3、7→17（storage_block=16=block//4 分页）；16 token→4 块：top-k 在 [0..3] 选",
+          "provenance": "traces/m11.json compressed_coordinates"
+        },
+        {
+          "value": "skip_k_cache_insert=True：K^IComp 插入归 compressor（indexer_op 不插）；省打分不省建缓存（m12）",
+          "provenance": "traces/m10.json layer_types.c4a_skip_k_cache_insert + attention.py:L820"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "Read PNG 亲眼看:8 行窗位状态表(窗位/pos/头切片/score/权重比例条,比例条按 0.5200 满幅),权重和 1.0000 注记,t=3 行高亮(score=4 独占 52%);头切换虚线分隔+表脚两行(softmax 账/前半读头0·后半读头1——overlap 窗 8=2×ratio 4);输出链四步框逐数命中:compressed[0:8]=[0.0259,0.0704,0.1913,0.5200,…]、rrms=19.878185(eps=1e-6,weight=1)/normed 首维 0.514586、GPT-J RoPE 只打末 64 维·压缩位 4=(7//4)*4、FP8 scale=0.03125(2 的幂)·值首维 16.000000·写 slot 7→132B 条(128B 值+4B scale 橙段);右栏坐标轴 16 token 格按块分 4 组色、竖线收拢成 4 压缩块,top-k 在 [0..3] 选;seq_lens [16,8]→[4,2]、实尺 163840→40960、slot 映射例 pos15→3/pos7→17(storage_block=16=block//4 分页);skip_k_cache_insert=True 注(attention.py:L820);无相撞悬空(lint ✓)。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "盲审=只读 PNG+figure_spec。①复述=claim 对得上：8 行窗位状态表（窗位/pos/头切片/score/权重比例条）+输出链（Σ kv·门控→RMSNorm→GPT-J RoPE→FP8 132B 写 slot），右缘 token 位 0-15→压缩块 0-3 的坐标轴=indexer 活在 //4 坐标系的字面图解；②数字逐个核真全命中：窗权重 [0.0259,0.0704,0.1913,0.5200,0.0259,0.0259,0.0704,0.0704]（score [1,2,3,4,1,1,2,2] 的 softmax、和 1.0000）、头切换 t<4 读头0/t≥4 读头1（overlap 窗 8=2×ratio 4）、rrms=19.878185（eps=1e-6、weight=1）、normed 首维 0.514586、GPT-J RoPE 只打末 64 维·压缩位 4=(7//4)*4、FP8 scale=0.03125（2 的幂）、值首维 16.000000、写 slot 7→132B 条（128B 值+4B scale）、seq_lens [16,8]→[4,2]、实尺 max_model_len//4=163840→40960、slot 映射例 pos15→3/pos7→17（storage_block=16=block//4 分页）、16 token→4 块·top-k 在 [0..3] 选、skip_k_cache_insert=True（attention.py:L820）；③无裁切、无悬空箭头、读序清晰（表→输出链→右缘坐标轴）。"
+      }
+    },
+    {
+      "figure_id": "ch26-fig-dual-source",
+      "gen": "gen_ch26-fig-dual-source.py",
+      "svg": "ch26-fig-dual-source.svg",
+      "png": "ch26-fig-dual-source.png",
+      "claim": "V4 decode 消费是一次 flash_mla_with_kvcache 调用吃两本 KV：k_cache=SWA 滑窗缓存（indices=滑窗位）+ extra_k_cache=压缩 KV 池（extra_indices_in_kvcache=indexer 选的 top-k 位）——输出严格等于 union 上的 softmax（trace max diff 0.000000），NSA 的滑窗/压缩/选择三支路在这一次调用里结构性回归。",
+      "numbers": [
+        {
+          "value": "例 pos 15、滑窗 8：SWA 位 [8..15] 共 8 条 + top-k 有效 2 条 → union 10 vs 全上下文 16；输出==union softmax（max diff 0.000000）",
+          "provenance": "traces/m13.json decode_dual_source"
+        },
+        {
+          "value": "C4A 换算：buffer 行 [3,1,-1]（请求内压缩坐标）→ 全局物理 slot [323, 321]（block_table 块 5：5*64+3/5*64+1）",
+          "provenance": "traces/m13.json decode_dual_source.compressed_physical_slots"
+        },
+        {
+          "value": "NSA 三支路映射：滑窗=k_cache+indices、压缩=extra_k_cache、选择=extra_indices_in_kvcache（indexer 选）",
+          "provenance": "traces/m13.json decode_dual_source.nsa_mapping + flashmla.py:L228-L244 调用面"
+        },
+        {
+          "value": "prefill 并集：token0 len=2+4=6（top-k 段 [3,-1] + SWA 段 4）、token2 len=1+4=5——combine_topk_swa_indices 段拼接",
+          "provenance": "traces/m13.json prefill_union + flashmla.py:L331-L363"
+        },
+        {
+          "value": "C128A 无 indexer：压缩后 1280 候选 metadata 期无条件全选（不比较 topk）——同一消费面吃直选表",
+          "provenance": "vllm/models/deepseek_v4/sparse_mla.py:L353-L419（_build_c128a_topk_metadata 枚举 (pos+1)//128 全部候选、无 topk_tokens 参与）；消费面 flashmla.py:L185-L187（C128A 用 metadata 期预算好的直选表）"
+        }
+      ],
+      "selfcheck": {
+        "claim_readable_10s": true,
+        "numbers_match_spec": true,
+        "no_overlap": true,
+        "arrows_attached": true,
+        "cjk_rendered": true,
+        "reading_order_clear": true
+      },
+      "selfcheck_note": "Read PNG 亲眼看:中央 flash_mla_with_kvcache 核(GPU 绿,L228-L244),左上 SWA 滑窗源(浅青=支路③:indices=滑窗位 [8..15] 共 8 条)、左下压缩 KV 池源(深青=支路①②:extra_indices_in_kvcache=top-k,buffer 行 [3,1,-1]),两箭头斜入核、支路号短标签居中;C4A 换算框 [3,1,-1]→物理 slot [323,321](块 5:5×64+3 / 5×64+1,compute_global_topk_indices_and_lens)上行箭头回接压缩池;union 账卡 10 格(8 浅+2 深)=8+2=10 条 vs 全上下文 16 条+max diff 0.000000(host 实测对账)→attn_out(输出==union softmax,只对 union 真算);NSA 谱系卡:三支路映射逐字对上(arXiv:2502.11089→DSA 砍一支→V4 回归,vLLM 无 NSA 独立落地注);prefill 并集卡 token0 len=2+4=6(top-k 段 [3,-1]+SWA 段 4)/token2 len=1+4=5(combine_topk_swa_indices L331-L363);C128A 卡 压缩后 1280 候选无条件全选、不比较 topk 直选表(L185-L187);无相撞悬空(lint ✓)。",
+      "blind_review": {
+        "verdict": "PASS",
+        "notes": "【2026-09-14 前的旧口径判词，原样保留供审计——其中的 topk 数字已被本轮 top-k 口径同步修取代，见本条末尾注】盲审=只读 PNG+figure_spec。①复述=claim 对得上：中央 flash_mla_with_kvcache 一核双源（k_cache=SWA 滑窗缓存+indices=滑窗位、extra_k_cache=压缩 KV 池+extra_indices_in_kvcache=indexer 选的 top-k 位），两源斜入、出口 attn_out，输出==union 上的 softmax，NSA 三支路在这一次调用里结构性回归；②数字逐个核真全命中：例 pos 15/滑窗 8→SWA 位 [8..15] 共 8 条+top-k 有效 2 条=union 10 vs 全上下文 16、max diff 0.000000、buffer 行 [3,1,-1]→全局物理 slot [323,321]（block_table 块 5：5*64+3 / 5*64+1）、prefill 并集 token0 len=2+4=6（top-k 段 [3,-1]+SWA 段 4）/token2 len=1+4=5（combine_topk_swa_indices L331-L363）、C128A 无 indexer·metadata 期直选表 1280≤2048（L185-L187）；NSA 谱系卡的三支路编号与两个源框的支路标签逐字核对一致（③ 滑窗 / ① 压缩 / ② 选择——高倍放大复核，排除编号自相矛盾）；③无裁切、无悬空箭头、读序清晰。观感注（不影响判读）：图角 NSA 谱系卡文字折行处出现单字换行（『落地』被拆行）。｜2026-09-14 top-k 口径同步修待重盲审（C128A 卡一行已改为「压缩后 1280 候选无条件全选（不比较 topk）」——依据 sparse_mla.py:L353-L419 枚举全部候选、无 topk_tokens 参与） ｜2026-09-14 重盲审：top-k 口径同步修验证 PASS——C128A 卡三行在 PNG 上逐字核到（「压缩后 1280 候选无条件全选（不比较 topk）」「metadata 期直算全选表(不作选择)」「同一个核吃直选表(flashmla.py:L185-L187)」），与本章 layer-types 图副标题/卡同口径；旧口径「≤ topk 2048」/「≤ 2048」/「= 8192」/「全选即最优」在本图 SVG 文本层零命中（全图已无 2048 字样）；3× 放大复核新文字无相撞/越界/裁切/中文豆腐，箭头（两源→核、核→union、union→attn_out、C4A 换算→压缩池）落点实测均贴框无悬空；与正文图注口径一致（「C128A 走 metadata 期的直选表（不比较 topk、无条件全选）」）。观感注（沿用旧判词、不影响判读）：右下 NSA 谱系卡脚注「vLLM v0.27.1 无 NSA 独立落地」折行处「落地」被拆成两行。"
+      }
+    }
+  ]
+}

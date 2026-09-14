@@ -1,0 +1,916 @@
+{
+  "chapter_id": "ch26",
+  "part": "VI",
+  "title": "DeepSeek 索引器 NSA→DSA",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "chapter_kind": "code",
+  "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。依赖 ch24 primer（MHA/GQA/MQA 与 MLA 低秩压缩数学已立——本章直接消费『576 维潜向量』与『吸收』概念，不重推）。本章把 L0 的『模型层 indexer 框』打开：MLA 解决的是每 token KV 的总量（40960→576），但注意力仍要读完全部历史——O(L²) 一步没省；DeepSeek 的答案是 MLA 前面再挂一个『闪电索引器』：一组独立小头（64 头×128 维，可 FP8/FP4）给每个历史 token 打分、只挑 top-k 个真算注意力。谱系三跳：NSA（arXiv:2502.11089，三支路可训练稀疏，vLLM v0.27.1 无直接落地）→ DSA（arXiv:2512.02556，V3.2 lightning indexer，token 级 top-k）→ CSA（arXiv:2606.19348，V4：每 4 token 压 1 块、块级 top-k + SWA 滑窗，三支路结构回归）。落地双布局并存：V3.2 走 model_executor/models/deepseek_v2.py 扁平布局（registry L94：DeepseekV32ForCausalLM→DeepseekV3ForCausalLM；vllm/models/deepseek_v32/ 新布局是硬件隔离特化层），DSV4 走 vllm/models/deepseek_v4/ 新布局——两代共享同一个 SparseAttnIndexer CustomOp 与 DeepseekV32IndexerBackend→DeepseekV4IndexerBackend 后端族。边界：MLA 两种展开归 ch25（本章站 6 的 q_c 就是它算的）；量化数学归 ch27（FP8/FP4 只讲布局不讲数学）；三类层的 MoE/拼装归 ch28；DCP 分布式深讲归 ch34。",
+  "hook_suggestion": "「ch25 把每 token KV 压到 576 维，显存账平了——可注意力还是得读完全部历史才算得动，O(L²) 一步没省。DeepSeek 的答案是在 MLA 前面塞一个『闪电索引器』：一组 64 头×128 维的独立小头给每个历史 token 打个分，只挑分数最高的 2048 个真算注意力。可打分自己不也要扫全部历史、不也是 O(L²)？凭什么一个头数减半、还能压到 FP8 的小头，就知道该看哪里？挑中的索引记在哪——为什么全模型 60 层共用一块裸 buffer？历史 token 的打分原料每步重算吗，还是有自己的缓存？NSA 论文里的三支路（压缩/选择/滑窗）到 V4 又怎么在代码里回来了？」（从 Part VI hook『Attention 是插座不是实现』+ 本章 introduces『NSA 三支路/DSA 打分器/IndexCache』+ deepread/model-sample why_chains[10] DSV4 段 + notes『每轮只对新增 token 算 index』提炼）",
+  "one_line": "稀疏注意力的工程形态：决定看哪里（indexer 打分，O(L²) 但便宜：少头+FP8/FP4+无反向）与看完怎么算（稀疏 MLA，O(Lk)）解耦成两个模块，靠一块全模型共享的 topk_indices_buffer [max_num_batched_tokens, index_topk] int32（-1 哨兵）传递——indexer 纯副作用写、稀疏后端读，无返回值消费。打分函数 I_{t,s}=Σ_j w_{t,j}·ReLU(q_{t,j}·k_s)（Eq.(1)）：wq_b 从 q_c 低秩上投 64 头×128 维 q、wk_weights_proj 一枪 GEMM 出 key+逐头权重、q FP8 量化且 scale 折进 weights；打分原料 k 每 token 只算一次、量化后存进 IndexCache（132B/条=128B fp8 值+4B fp32 scale，num_kv_heads=1 的 MLAAttentionSpec，与主 KV cache 完全独立的第二本账）——『每轮只对新增 token 算 index』：decode 每步只对本拍 query token 打分，历史 key 全从 IndexCache paged 直读（fp8_fp4_paged_mqa_logits）；prefill 则逐 chunk gather 后 fp8_fp4_mqa_logits，chunk 由双预算（workspace N≤max_model_len×40、logits M·N·4≤预算 MB）切开压峰值显存。可信度是训练期买的：indexer 输入 detach、单独 KL 损失对齐主注意力分布（Eq.(3)-(4)）——推理侧字面证据=独立 config.index_* 头表+专门 FP8 权重加载路径。跨层复用（index_topk_freq/pattern，arXiv:2603.12201）让部分层直接 skip_topk 复用别层选块。V4/CSA 第三代：compress_ratio 逐层表把层分成 SWAonly(1)/C4A(4)/C128A(128) 三类，只有 C4A 建 indexer；DeepseekCompressor 把每 4 token 压成 1 个压缩块（K^IComp 与主压缩 KV 并行产出），indexer 活在 //4 压缩坐标系（max_model_len//4、短上下文 candidates≤topk 直接全选）；消费侧 flash_mla_with_kvcache 一核双源（SWA 滑窗+extra_k_cache 压缩 top-k）——NSA 三支路在 V4 代码里的结构性回归。",
+  "code_spine": [
+    "vllm/model_executor/models/deepseek_v2.py:L1376-L1389  模型入口：is_v32 探测（hasattr index_topk）+ 全模型共享 topk_indices_buffer 分配 [max_num_batched_tokens, index_topk] int32（V4 同款 vllm/models/deepseek_v4/nvidia/model.py:L1043-L1047）",
+    "vllm/model_executor/models/deepseek_v2.py:L1091-L1137  MLA 层内 IndexCache 复用配置（index_topk_freq/pattern/offset → skip_topk，arXiv:2603.12201）+ Indexer 装配与否（skip 层不建）",
+    "vllm/model_executor/models/deepseek_v2.py:L616-L642    DeepseekV32IndexerCache：spec 自报 MLAAttentionSpec(num_kv_heads=1, head_size=132) + DeepseekV32IndexerBackend",
+    "vllm/model_executor/models/deepseek_v2.py:L645-L726    Indexer.__init__：独立小头（wq_b 复制不切 TP / wk_weights_proj 融合 GEMM / k_norm / 132B k_cache / SparseAttnIndexer op）",
+    "vllm/model_executor/layers/mla.py:L189-L206            MLA 前向接线：算完 q_c/q/k_pe 后、交 mla_attn 前先调 indexer 写 topk_indices_buffer（纯副作用）",
+    "vllm/model_executor/models/deepseek_v2.py:L728-L836    Indexer.forward：低秩上投 q、fused wk+weights、k_norm+interleave RoPE、q FP8 量化、scale 折进 weights → indexer_op",
+    "vllm/model_executor/layers/sparse_attn_indexer.py:L295-L432  sparse_attn_indexer op：ForwardContext 按层名取 metadata → K 量化+缓存插入融合（indexer_k_quant_and_cache）→ buffer 预清 -1",
+    "vllm/model_executor/layers/sparse_attn_indexer.py:L449-L528  prefill 打分：chunk gather → fp8_fp4_mqa_logits（I_{t,:}，O(L²) 本尊）→ top_k_per_row_prefill 选块",
+    "vllm/model_executor/layers/sparse_attn_indexer.py:L530-L688  decode 打分：fp8_fp4_paged_mqa_logits 直接对分页 IndexCache 打分 → cooperative/persistent/top_k_per_row_decode 三核选块",
+    "vllm/v1/attention/backends/mla/indexer.py:L455-L978   DeepseekV32IndexerMetadataBuilder：prefill 双预算切块（split_indexer_prefill_chunks）+ decode 展开（flatten/native）+ compress_ratio 压缩坐标换算",
+    "vllm/v1/attention/backends/mla/sparse_utils.py:L120-L238  index 空间换算：请求内逻辑位 → 分页物理 slot（block_table 换算 Triton 核）",
+    "vllm/v1/attention/backends/mla/flashmla_sparse.py:L838-L874  V3.2 消费：FlashMLASparseImpl.forward_mqa 取 buffer 前 num_actual_toks 行 → flash_mla_sparse_fwd（O(Lk)）",
+    "vllm/models/deepseek_v4/attention.py:L206-L297        V4 装配：compress_ratios 逐层表（SWAonly/C4A/C128A 三类层）+ compress_ratio==4 才建 DeepseekV4Indexer + SWA cache/compressor 并存",
+    "vllm/models/deepseek_v4/attention.py:L718-L892         DeepseekV4Indexer：压缩坐标系（max_model_len//compress_ratio）+ FP4(68B)/FP8(132B) 布局 + compressor 建缓存（skip_k_cache_insert=True）+ 短上下文全选快路径 + 双流并行",
+    "vllm/models/deepseek_v4/compressor.py:L211-L478        DeepseekCompressor：fused_wkv_wgate 出 KV+score → save_partial_states → compress→norm→RoPE→量化写缓存",
+    "vllm/models/deepseek_v4/nvidia/flashmla.py:L151-L244 与 L331-L363  V4 消费：C4A 局部 index→全局 slot 换算 / C128A 直选；decode 一核双源（SWA+extra_k_cache 压缩 top-k）；prefill combine_topk_swa_indices 并集"
+  ],
+  "stations": [
+    {
+      "n": 1,
+      "where": "vllm/model_executor/models/deepseek_v2.py:L1376-L1389",
+      "what": "模型装配：is_v32=hasattr(config, 'index_topk') 探测 DSA 架构；分配全模型共享 topk_indices_buffer [max_num_batched_tokens, index_topk] int32——所有层的 indexer 写、稀疏 MLA 读同一块裸 buffer（无所有权封装；V4 同款在 vllm/models/deepseek_v4/nvidia/model.py:L1043-L1047）"
+    },
+    {
+      "n": 2,
+      "where": "vllm/model_executor/models/deepseek_v2.py:L1091-L1121",
+      "what": "IndexCache 跨层复用账本（装配期）：『IndexCache config』注释直引 arXiv:2603.12201；index_topk_freq/index_topk_pattern/index_skip_topk_offset 算出本层 _skip_topk——'S' 层不建 indexer、直接复用别层写进共享 buffer 的选块省重复打分；MTP/nextn 层恒建全量 indexer（draft step 0 算一次、运行时 set_skip_topk 切换，冻结 True 会让 draft 读永不写入的 buffer）"
+    },
+    {
+      "n": 3,
+      "where": "vllm/model_executor/models/deepseek_v2.py:L645-L726",
+      "what": "独立小头装配：topk_tokens/n_head=64/head_dim=128/rope_dim=64 全来自 config.index_* 前缀（与主注意力头数无关）；wq_b 从 q_lora_rank=1536 上投 64×128 且复制不切 TP；wk_weights_proj 一枪 GEMM 出 key(128)+逐头权重(64)；k_norm=LayerNorm(eps=1e-6)；softmax_scale=head_dim**-0.5；indexer_op=SparseAttnIndexer"
+    },
+    {
+      "n": 4,
+      "where": "vllm/model_executor/models/deepseek_v2.py:L616-L642",
+      "what": "IndexCache 落地：DeepseekV32IndexerCache 注册 static_forward_context、自报 MLAAttentionSpec(num_kv_heads=1, head_size=128+128//128*4=132)——『只有一根向量、无 K+V 之分』，与主 KV cache 分开分配的第二本账（KV 账本分组归 ch14/ch25 站 6）；backend=DeepseekV32IndexerBackend（block_size 64、头维 {32,64,128}）"
+    },
+    {
+      "n": 5,
+      "where": "vllm/v1/attention/backends/mla/indexer.py:L764-L978",
+      "what": "每拍 metadata（builder 侧）：按 decode_threshold=1+num_speculative_tokens 分流 decode/prefill；prefill 侧 split_indexer_prefill_chunks 双预算切块（N≤max_model_len×40 workspace；M·N·4≤VLLM_SPARSE_INDEXER_MAX_LOGITS_MB）；decode 侧 flatten/native 两路展开 per-token 上下文长；compress_ratio>1 时 slot_mapping/seq_lens 全部换算进压缩坐标（get_compressed_slot_mapping、seq_lens//compress_ratio）"
+    },
+    {
+      "n": 6,
+      "where": "vllm/model_executor/layers/mla.py:L189-L206",
+      "what": "前向接线（每拍）：MLA 外层算完 q_c/kv_c/k_pe、q 投影与 RoPE 之后、交 mla_attn 之前——if indexer and is_sparse and not skip_topk: indexer(hidden_states, q_c, positions, indexer_rope_emb)。返回值无人接收：纯写 topk_indices_buffer 的副作用；skip_topk 层跳过此调用、复用 buffer 旧值"
+    },
+    {
+      "n": 7,
+      "where": "vllm/model_executor/models/deepseek_v2.py:L728-L836",
+      "what": "打分前置（Indexer.forward）：wq_b(qr) 低秩上投 64 头×128 维 q（qr=ch25 站 9 的 q_c，indexer query 与主 query 共享低秩瓶颈）；wk_weights_proj(hidden) 一枪出 k 与逐头权重 w；k_norm+interleave RoPE 只打 rope 段（专属 RoPE，is_neox 取反）；q per-token-group FP8 量化（128 一组、ue8m0）；q_scale·softmax_scale·n_head**-0.5 折进 weights（标量归一化搬出核）→ indexer_op(hidden, q_fp8, k, weights)"
+    },
+    {
+      "n": 8,
+      "where": "vllm/model_executor/layers/sparse_attn_indexer.py:L295-L432",
+      "what": "op 入口：从 ForwardContext 按层名（k_cache.prefix）取 DeepseekV32IndexerMetadata——metadata 不走参数、隐式契约（ch19/ch25 已立）；profiling 假跑预留 K-gather workspace+logits 峰值账（VLLM_SPARSE_INDEXER_MAX_LOGITS_MB）；k 量化与缓存插入一步融合 indexer_k_quant_and_cache（V4 skip_k_cache_insert=True 交给 compressor）；topk_indices_buffer 预清 -1 哨兵"
+    },
+    {
+      "n": 9,
+      "where": "vllm/model_executor/layers/sparse_attn_indexer.py:L449-L528",
+      "what": "prefill 打分+选块：逐 chunk cp_gather_indexer_k_quant_cache 从分页 IndexCache 收历史量化 key 进共享 workspace → fp8_fp4_mqa_logits 算 I_{t,:}=Σ_j w_j·ReLU(q_j·k_s)（逐头点积+ReLU+加权在核内，O(L²) 本尊）→ top_k_per_row_prefill 按 cu_seqlen_ks/ke 因果边界选 top-k 写 buffer 行；chunk 尾 DCP 合并单卡 no-op（归 ch34）"
+    },
+    {
+      "n": 10,
+      "where": "vllm/model_executor/layers/sparse_attn_indexer.py:L530-L688",
+      "what": "decode 打分+选块：fp8_fp4_paged_mqa_logits 不经 gather、直接对分页 IndexCache 打分（block_table+DeepGEMM schedule_metadata 寻址）——『每轮只对新增 token 算 index』的 decode 形态：query=本拍 token（含 spec 窗口 2D seq_lens），key=全历史缓存；top-k 三核分派：cooperative_topk（小批）/persistent_topk（topk∈{512,1024,2048} 专用核）/top_k_per_row_decode 兜底；spec 解 pad 回写"
+    },
+    {
+      "n": 11,
+      "where": "vllm/model_executor/layers/sparse_attn_indexer.py:L470-L472",
+      "what": "落账：topk_indices = topk_indices_buffer[token_start:token_end, :topk_tokens]——buffer 行=本拍 query token（每轮只对新增 token 算 index 的机制保证：历史 token 的行上一拍已消费、本拍整块重写），无效位 -1 哨兵（越短上下文/DCP 边界）"
+    },
+    {
+      "n": 12,
+      "where": "vllm/v1/attention/backends/mla/flashmla_sparse.py:L838-L874",
+      "what": "V3.2 消费：SparseMLACommonImpl 装配期接管 buffer（indexer.topk_indices_buffer 或显式传参——skip 层没 indexer 也能读）；每拍 FlashMLASparseImpl.forward_mqa 取前 num_actual_toks 行，局部逻辑位经 triton_convert_req_index_to_global_index（sparse_utils.py:L120）按块表换算成物理 slot → flash_mla_sparse_fwd 在 576 维潜向量上只对选中条目真算（O(Lk)）"
+    },
+    {
+      "n": 13,
+      "where": "vllm/models/deepseek_v4/attention.py:L718-L892",
+      "what": "V4/CSA 打分（第三代的差异全在压缩）：DeepseekCompressor 先把 K 压成 K^IComp 写进 indexer k_cache（skip_k_cache_insert=True；缓存以压缩块为单位）；indexer 活在 //compress_ratio 坐标系（max_model_len//4）；短上下文（candidates≤topk）直接 _fill_short_context_topk_indices 全选、跳过打分但仍建缓存；wq_b+量化 与 compressor 双流并行（maybe_execute_in_parallel），join 保证 K 写先于打分"
+    },
+    {
+      "n": 14,
+      "where": "vllm/models/deepseek_v4/nvidia/flashmla.py:L163-L244",
+      "what": "V4 消费=NSA 支路回归：C4A 把 buffer 局部压缩 index 经 compute_global_topk_indices_and_lens 换算全局 slot（C128A 无 indexer——压缩后 candidates≤topk，metadata 期直算全选）；decode 侧 flash_mla_with_kvcache 一核双源：k_cache=SWA 滑窗缓存（indices=滑窗位）+ extra_k_cache=压缩 KV 池（extra_indices_in_kvcache=top-k 位）；prefill 侧 gather 后 combine_topk_swa_indices 并集成连续 KV（L331-L363）"
+    }
+  ],
+  "stations_note": "站号 = indexer 生命周期流经顺序：第 1-4 站装配幕（buffer 分配→skip 层模式→独立小头→IndexCache spec 自报；一生一次）；第 5 站每拍 metadata 幕（builder 侧切块/展开/压缩坐标）；第 6-11 站一拍之内（接线→打分前置→op 入口→prefill/decode 打分选块→落 buffer）；第 12-14 站消费幕（V3.2 稀疏 MLA / V4 双源注意力）。正文建议编排：先立谱系与打分数学（NSA 三支路→DSA 一支独走→V4 支路回归；Eq.(1)-(2) 配 worked example），再走装配幕（1-4，『独立小头』与『第二本账』两个硬证据），沿一拍走 5-11（prefill/decode 两路打分对照讲），收在消费幕（12-14：buffer 的 -1 哨兵/换算/双源）。与前后章衔接：ch24 primer 已立 MLA 低秩数学、ch25 站 9 的 indexer 调用位即本章站 6 入口（q_c 从那来）；ch22 的 block_table 是站 12 换算的底座（F7 已回收、本章直接用）；ch27 消费 FP8/FP4 布局讲量化数学；ch28 capstone 把三类层装回整机；ch34 深讲 DCP 合并。",
+  "key_classes": [
+    {
+      "name": "Indexer",
+      "file": "vllm/model_executor/models/deepseek_v2.py:L645",
+      "responsibility": "V3.2 lightning indexer（compress_ratio=1，无压缩）：低秩上投 indexer query、fused wk+weights_proj、k_norm+专属 interleave RoPE、FP8 量化、scale 折进 weights，交 SparseAttnIndexer。落地 Eq.(1)-(2)。DSA 打分器的主形态（registry L94 路由 DeepseekV32ForCausalLM 走这里）。"
+    },
+    {
+      "name": "DeepseekV32IndexerCache",
+      "file": "vllm/model_executor/models/deepseek_v2.py:L616",
+      "responsibility": "IndexCache 本体（V3.2）：MLAAttentionSpec(num_kv_heads=1, head_size=132) 的 indexer 专属 K 缓存——打分原料（量化索引键）的账本，不是分数缓存；与主 KV cache 分开分配、分开分组。"
+    },
+    {
+      "name": "SparseAttnIndexer",
+      "file": "vllm/model_executor/layers/sparse_attn_indexer.py:L728",
+      "responsibility": "CustomOp（@CustomOp.register('sparse_attn_indexer')）：把 q_fp8/k/weights 变成写进 topk_indices_buffer 的 top-k 索引。封装重核 fp8_fp4_mqa_logits/fp8_fp4_paged_mqa_logits/top_k_per_row_{prefill,decode}/cooperative/persistent；V3.2 与 V4 共用（V4 多传 skip_k_cache_insert=True/use_fp4_cache）。"
+    },
+    {
+      "name": "sparse_attn_indexer（op 函数）",
+      "file": "vllm/model_executor/layers/sparse_attn_indexer.py:L296",
+      "responsibility": "@eager_break_during_capture 的自定义算子本体（direct_register_custom_op，mutates_args=['topk_indices_buffer']）：metadata 查 ForwardContext、K 插入、buffer 清 -1、prefill/decode 两路打分+选块、DCP 合并——本章一拍之内的主舞台。"
+    },
+    {
+      "name": "DeepseekV32IndexerMetadataBuilder",
+      "file": "vllm/v1/attention/backends/mla/indexer.py:L455",
+      "responsibility": "indexer 后端 metadata builder：decode_threshold 分流、split_indexer_prefill_chunks 双预算切块、decode flatten/native 展开、compress_ratio>1 时 slot/seq 换算压缩坐标；DCP/PCP 单卡不触发。"
+    },
+    {
+      "name": "DeepseekV32IndexerBackend / DeepseekV4IndexerBackend",
+      "file": "vllm/v1/attention/backends/mla/indexer.py:L126/L170",
+      "responsibility": "indexer KV cache 后端：get_kv_cache_shape=(num_blocks, block_size, head_size)、num_kv_heads==1 断言、头维 {32,64,128}；V3.2 块 64、V4 子类块 256；不支持跨层 KV 布局（stride_order 恒等排列即『不兼容』信号）。"
+    },
+    {
+      "name": "DeepseekV4Indexer",
+      "file": "vllm/models/deepseek_v4/attention.py:L718",
+      "responsibility": "V4/CSA lightning indexer（compress_ratio>1）：活在 //compress_ratio 压缩坐标系；FP4(68B)/FP8(132B) 双布局；自带 DeepseekCompressor 建压缩索引键（skip_k_cache_insert=True）；短上下文全选快路径；打分与压缩双流并行。落地 Eq.(13)-(17)。"
+    },
+    {
+      "name": "DeepseekV4IndexerCache",
+      "file": "vllm/models/deepseek_v4/attention.py:L677",
+      "responsibility": "V4 indexer 缓存：与 V3.2 同字节布局但带 compress_ratio（缓存按压缩块增长）与 576B/512B 页对齐（FlashMLA 打包/FlashInfer sparse #44577）。"
+    },
+    {
+      "name": "DeepseekCompressor",
+      "file": "vllm/models/deepseek_v4/compressor.py:L211",
+      "responsibility": "V4 KV/索引键压缩机：fused_wkv_wgate 一枪出 KV+门控 score；save_partial_states 存未满窗的部分状态；compress→RMSNorm→RoPE→量化写缓存一步融合（cutedsl/triton 分派）。同时服务主压缩 KV 池与 indexer K^IComp（两实例、各自缓存）。"
+    },
+    {
+      "name": "CompressorStateCache",
+      "file": "vllm/models/deepseek_v4/compressor.py:L155",
+      "responsibility": "压缩机的 fp32 部分状态缓存（kv_state 前半+score_state 后半，SlidingWindowMLASpec）：压缩窗跨页边界的『等满 4 个再压』状态，与 KV 块共享物理张量。"
+    },
+    {
+      "name": "MultiHeadLatentAttentionWrapper",
+      "file": "vllm/model_executor/layers/mla.py:L36",
+      "responsibility": "MLA 外层（ch25 主角）：本章只取 L205-L206 的 indexer 接线位与 L96-L100 的 skip_topk 语义——先 indexer 后稀疏 MLA 的『切分点』画在这。"
+    },
+    {
+      "name": "SparseMLACommonImpl",
+      "file": "vllm/model_executor/layers/attention/sparse_mla_attention.py:L441",
+      "responsibility": "稀疏 MLA 消费侧公共基类：装配期接管 topk_indices_buffer（indexer.topk_indices_buffer 或显式传参——skip 层无 indexer 也能读）；prefill 期把 topk 转 mask/_run_masked_mha，chunked context 用 _remap_topk_to_ranges+merge_attn_states 精确合并。"
+    },
+    {
+      "name": "FlashMLASparseImpl",
+      "file": "vllm/v1/attention/backends/mla/flashmla_sparse.py:L514",
+      "responsibility": "V3.2 消费后端：forward_mqa 取 buffer 前 num_actual_toks 行交 flash_mla_sparse_fwd；bf16/fp8 混批/纯 fp8 三条 KV 路径。"
+    },
+    {
+      "name": "DeepseekV4FlashMLAAttention",
+      "file": "vllm/models/deepseek_v4/nvidia/flashmla.py:L34",
+      "responsibility": "V4 消费（平台子类实现 forward_mqa）：C4A 换算 buffer 局部 index→全局 slot、C128A 用 metadata 期直算的全选表；decode 一核双源（SWA+extra_k_cache）、prefill combine_topk_swa_indices 并集。"
+    },
+    {
+      "name": "DeepseekV4SWACache",
+      "file": "vllm/v1/attention/backends/mla/sparse_swa.py:L56",
+      "responsibility": "V4 滑窗支路的 KV 缓存（SlidingWindowMLASpec，window=sliding_window）：NSA 三支路中『滑窗』在 V4 的字面载体；与压缩块共享物理张量页。"
+    },
+    {
+      "name": "DeepseekV32Indexer / DeepseekV32Attention",
+      "file": "vllm/models/deepseek_v32/attention.py:L38/L157",
+      "responsibility": "新布局的 DSV3.2 落地（vllm/models/deepseek_v32/ 硬件隔离特化层）：打分数学与扁平 Indexer 同构，差异在全融合路径——fused_norm_rope 一核做 MLA+indexer 的 norm/RoPE/KV 插入/buffer 清 -1（故 op 调用带 skip_topk_buffer_clear=True）、fused_q 一核做 q RoPE+量化+吸收；registry 目前仍路由扁平版，新布局经全限定模块路径启用。"
+    },
+    {
+      "name": "MLAAttentionSpec",
+      "file": "vllm/v1/kv_cache_interface.py:L389",
+      "responsibility": "特形 KV spec：cache_dtype_str/alignment/compress_ratio/model_version 字段是 IndexCache/压缩层与主 KV 分组定池的原料（storage_block_size=block_size//compress_ratio）。"
+    }
+  ],
+  "data_flow": "本章不做独立 data_flow 重挖——沿 deepread/model-sample.json 的 data_flow 步骤 2（模型前向段）下钻：该步骤里『LlamaAttention（qkv_proj→split→rotary_emb→attn 插座→o_proj）』在 DeepSeek 侧替换为 MLA 层（ch25 站 9 已走），本章在『attn 插座』之前插进 indexer 一环。一拍之内（decode 步、单卡）：① runner set_forward_context 挂全层 metadata（含 indexer 的 DeepseekV32IndexerMetadata，站 5 的 builder 产物）→ ② MLA 外层 forward 算 q_c/q/k_pe（ch25）→ ③ 站 6：indexer(hidden, q_c, ...) 先于 mla_attn 调用 → ④ 站 7：q FP8 量化+weights 折 scale → ⑤ 站 8：k 量化+IndexCache 插入（新 token 的索引键每 token 只算这一次）→ ⑥ 站 10：fp8_fp4_paged_mqa_logits 对全历史缓存打分（prefill 换站 9 的 gather 路径）→ ⑦ top-k 三核选块写 topk_indices_buffer 行（-1 哨兵）→ ⑧ 站 12/14：稀疏 MLA 消费——V3.2 flash_mla_sparse_fwd 只算选中 latent 条目；V4 一核双源（SWA+压缩 top-k）→ ⑨ 输出回 MLA 外层 o_proj，回到 ch25 站 9 之后的主线。（跨拍视角即『每轮只对新增 token 算 index』：buffer 行=本拍 query token 整块重写；IndexCache 里的历史索引键跨拍只读。spec decode 时 decode_lens 为 2D (B,next_n)、逐 token 上下文长由 builder 展开——细节归站 5/10。）",
+  "why_chains": [
+    {
+      "source_card": "deepread/model-sample.json why_chains[10]（MLA 三代演化）——本章主链（DSV4 第三代段）",
+      "decision": "MLA 三代演化：KV cache 只存压缩潜向量；prefill/decode 两种相反的展开策略（MHA 展开 vs MQA 吸收）；DSV4 再上上下文压缩+fp8_ds_mla 自定义布局",
+      "old_design": "MHA/GQA：每 token 缓存 K、V 各 num_kv_heads×head_dim。DSV3 若 128 头 MHA，每 token 每 layer 需 128×(192+128)=40960 元素；Llama-70B GQA（8 KV 头×128 维）也要 2048。KV cache 总量是长上下文并发的第一瓶颈——PagedAttention（分页）只解决碎片与共享，不降低每 token 总量。",
+      "pain": "长上下文批量并发的显存天花板：KV cache 装不下 → 要么砍 batch 要么砍上下文。DSV2 论文（arXiv:2405.04434，mla_attention.py:L24 引用）把 KV 低秩压缩进潜空间。",
+      "solution": "DSV2/V3 世代（vllm/model_executor/layers/attention/mla_attention.py）：cache 只存 kv_lora_rank(512)+qk_rope_head_dim(64)=576 元素/token/layer；prefill/decode 双路径展开（归 ch25）。DSV4 第三代（vllm/models/deepseek_v4/attention.py）：统一 head_dim=512 语义、fp8_ds_mla UE8M0 块缩放 uint8 布局 584B/token（448 NoPE+128 RoPE+8 scale，vllm/v1/kv_cache_interface.py:L409-L413）、compress_ratio=4 上下文压缩（仅 C4A 层带 indexer 选 top-k，attention.py:L207-L213、L277-L297）、输出侧 o_lora_rank/o_groups 低秩（L200-L262）、alignment 576B 页对齐（L663-L674）；DSV3.2 稀疏 MLA 656B 布局（kv_cache_interface.py:L414-L416）；IndexCache 缓存 indexer 打分原料跨轮复用（attention.py:L677+ DeepseekV4IndexerCache）。",
+      "cost": "① prefill 上投影要物化 [Skv, N, P+V] 大张量 → chunked prefill workspace 分块 + LSE merge（determine_chunked_prefill_workspace_size，mla_attention.py:L1803；git df71917cf 实证这块代价真实存在且有专人优化，vllm/models/deepseek_v4/eager_scratch.py 即其产物）；② 同层两条数值路径，正确性靠 merge_attn_states 对齐；③ 特形 KV 与所有通用后端不兼容 → MLA 需要独立 backend 家族（MLAAttentionSpec 的 cache_dtype_str/alignment/compress_ratio 字段就是给 KV 账本分组的）；④ 记法漂移的税由框架侧吃（get_mla_dims 双格式兼容）；⑤ compress_ratio>1 的层读写都要经过压缩器（DeepseekCompressor），cache 命中/共享语义与普通层不同——⑤即本章主战场。"
+    },
+    {
+      "source_card": "deepread/model-sample.json why_chains[9]（模型定义层拼装+v0.27 新政）——本章取其『新旧双布局并存』段（DSA 双落地的事实底座）",
+      "decision": "模型定义层 = 平台无关层的纯拼装（模型文件只做层组装 + 权重名映射，attention 是插座不是实现）+ v0.27 新政：旗舰架构走 vllm/models/<name>/ 硬件隔离布局",
+      "old_design": "HF modeling_*.py 每个模型自带注意力实现与 KV 管理；vLLM 旧世代 model_executor/models/ 扁平目录，一个 .py 塞全部平台分支（DSV4 迁移动机：git 287471b99 '[Model Refactoring] Migrate DeepSeek V4 to vllm/models/ [1/N]' #43004，2026-05）。",
+      "pain": "新架构 = 重写一遍 attention+TP+量化胶水；同一 FlashAttention kernel 要为几十个模型各改一遍；平台分支（CUDA/ROCm/XPU）混在同一文件越长越不可维护——DSV4 这种深度依赖平台 kernel（FlashMLA/FlashInfer sparse/MegaMoE）的模型在扁平布局里已经没法读。",
+      "solution": "模型文件只拼层，attention 是插座（细节归 ch23）；v0.27 新政：新旗舰走 vllm/models/<name>/{common,nvidia,amd,xpu}/——registry._resolve_module_name 支持全限定模块路径（vllm/model_executor/models/registry.py:L1437-L1443）。本章相关落点：DSV4（含 DeepseekV4Indexer）走 vllm/models/deepseek_v4/（registry L95）；DSV3.2 的 DeepseekV32ForCausalLM 仍路由扁平 deepseek_v2.DeepseekV3ForCausalLM（registry L94），但 vllm/models/deepseek_v32/ 已备好硬件隔离版（__init__.py 按 current_platform 分发，服务一切 DSA checkpoint 含 GLM-5.2 glm_moe_dsa）。",
+      "cost": "接入税重：平台子类让『一层到底谁实现』要跨目录追；新旧两套布局并存，读者要能分辨——本章 indexer 双落地（Indexer 扁平版 / DeepseekV32Indexer 新布局版 / DeepseekV4Indexer 旗舰版）正是这套进行时的活标本。"
+    }
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/model_executor/models/deepseek_v2.py",
+      "lines": "L645-L726",
+      "what": "Indexer.__init__（V3.2 lightning indexer 装配）：独立小头的字面证据——topk_tokens/n_head(64)/head_dim(128)/rope_dim(64) 全来自 config.index_* 前缀，与主注意力头数无关；wq_b 复制不切 TP（『no tensor parallel, just replicated』）；wk_weights_proj 一枪 GEMM 同时出 indexer key 与逐头权重 w；k_norm 是 LayerNorm(eps=1e-6)；k_cache=DeepseekV32IndexerCache(head_dim=128+128//128*4=132B)；indexer_op=SparseAttnIndexer CustomOp。",
+      "code": "class Indexer(nn.Module):\n    def __init__(\n        self,\n        vllm_config: VllmConfig,\n        config: DeepseekV2Config | DeepseekV3Config,\n        hidden_size: int,\n        q_lora_rank: int,\n        quant_config: QuantizationConfig | None,\n        cache_config: CacheConfig | None,\n        topk_indices_buffer: torch.Tensor | None,\n        prefix: str = \"\",\n        is_inplace_rope: bool = False,\n    ):\n        super().__init__()\n        self.vllm_config = vllm_config\n        self.config = config\n        self.quant_config = quant_config\n        # self.indexer_cfg = config.attn_module_list_cfg[0][\"attn_index\"]\n        self.topk_tokens = config.index_topk\n        self.n_head = config.index_n_heads  # 64\n        self.head_dim = config.index_head_dim  # 128\n        self.rope_dim = config.qk_rope_head_dim  # 64\n        self.q_lora_rank = q_lora_rank  # 1536\n        # no tensor parallel, just replicated\n        self.wq_b = ReplicatedLinear(\n            self.q_lora_rank,\n            self.head_dim * self.n_head,\n            bias=False,\n            quant_config=quant_config,\n            prefix=f\"{prefix}.wq_b\",\n        )\n        # Fused wk + weights_proj: single GEMM producing [head_dim + n_head].\n        # FP8 wk weights are upcasted to BF16 during loading to maintain fusion.\n        self.wk_weights_proj = MergedColumnParallelLinear(\n            hidden_size,\n            [self.head_dim, self.n_head],\n            bias=False,\n            quant_config=None,\n            disable_tp=True,\n            prefix=f\"{prefix}.wk_weights_proj\",\n        )\n        self.k_norm = LayerNorm(self.head_dim, eps=1e-6)\n        self.softmax_scale = self.head_dim**-0.5\n\n        self.scale_fmt = \"ue8m0\"\n        self.quant_block_size = 128  # TODO: get from config\n        self.topk_indices_buffer = topk_indices_buffer\n\n        # NOTE: (zyongye) we use fp8 naive cache,\n        #       where we store value in fp8 and scale in fp32\n        #       per self.quant_block_size element\n        self.k_cache = DeepseekV32IndexerCache(\n            head_dim=self.head_dim + self.head_dim // self.quant_block_size * 4,\n            dtype=torch.uint8,\n            prefix=f\"{prefix}.k_cache\",\n            cache_config=cache_config,\n        )\n        self.max_model_len = vllm_config.model_config.max_model_len\n        self.prefix = prefix\n        from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size\n\n        self.max_total_seq_len = get_max_prefill_buffer_size(vllm_config)\n        self.indexer_op = SparseAttnIndexer(\n            self.k_cache,\n            self.quant_block_size,\n            self.scale_fmt,\n            self.topk_tokens,\n            self.head_dim,\n            self.max_model_len,\n            self.max_total_seq_len,\n            self.topk_indices_buffer,\n        )\n\n        self.is_inplace_rope = is_inplace_rope\n        self.n_head_scale = self.n_head**-0.5\n        self.use_fused_indexer_q = (\n            current_platform.is_cuda()\n            and self.quant_block_size == self.head_dim\n            and self.head_dim == 128\n            and self.rope_dim == 64\n            and self.scale_fmt is not None\n        )",
+      "elide": [
+        "L646-L652 形参与 docstring 头；L722-L726 的 is_inplace_rope/n_head_scale/use_fused_indexer_q 标量为下游分支开关，正文按需引用"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/models/deepseek_v2.py",
+      "lines": "L780-L836",
+      "what": "Indexer.forward 的可读分支（else 分支+共享尾，Eq.(1) 的落地前置）：q 切 rope/nope 两段；wk_weights_proj(hidden) 一枪出 k 与逐头权重 w；k_norm 后同样切两段；interleave RoPE 只打 rope 段；q/k 各自 cat 回 128 维；随后 q per-token-group FP8 量化（128 一组、ue8m0 scale），q_scale·softmax_scale·n_head**-0.5 全部折进 weights——标量归一化搬出打分核。最后 indexer_op(hidden_states, q_fp8, k, weights)。",
+      "code": "        else:\n            q_pe, q_nope = torch.split(\n                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1\n            )\n            # Fused wk + weights_proj: one GEMM, then split\n            kw, _ = self.wk_weights_proj(hidden_states)\n            k = kw[:, : self.head_dim]\n            weights = kw[:, self.head_dim :]\n\n            k = self.k_norm(k)\n            k_pe, k_nope = torch.split(\n                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1\n            )\n\n            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))\n            # Note: RoPE (NeoX) can introduce extra leading dimensions during\n            # compilation so we need to reshape back to token-flattened shapes\n            q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)\n            k_pe = k_pe.reshape(-1, self.rope_dim)\n\n            # `rotary_emb` is shape-preserving; `q_pe` is already\n            # [num_tokens, n_head, rope_dim].\n            q = torch.cat([q_pe, q_nope], dim=-1)\n            # `k_pe` is [num_tokens, rope_dim] (MQA).\n            k = torch.cat([k_pe, k_nope], dim=-1)\n\n        # we only quant q here since k quant is fused with cache insertion\n        q = q.view(-1, self.head_dim)\n        q_fp8, q_scale = per_token_group_quant_fp8(\n            q,\n            self.quant_block_size,\n            column_major_scales=False,\n            use_ue8m0=self.scale_fmt is not None,\n        )\n        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)\n        q_scale = q_scale.view(-1, self.n_head)\n\n        weights = weights * q_scale * self.softmax_scale * self.n_head_scale\n\n        return self.indexer_op(hidden_states, q_fp8, k, weights)\n\n\ndef _try_load_fp8_indexer_wk(\n    name, tensor, buf, params_dict, loaded_params, pp_missing_layer_names\n):\n    \"\"\"\n    We fuse the WK and weights_proj projections, but in some checkpoints WK is stored\n    in FP8 with a separate weight_scale_inv, while weights_proj is stored in BF16.\n    Upcasting to BF16 during loading enables the fusion. This function loads the FP8 WK\n    weights and scale, and when both are available, dequantizes to BF16 and stores into\n    the fused wk_weights_proj.weight parameter.\n    \"\"\"\n    if \"indexer.wk.\" not in name or \"wk_weights\" in name:\n        return False  # Weight is not an isolated WK weight for the indexer, ignore.\n    is_weight = name.endswith(\".weight\") and tensor.dtype == torch.float8_e4m3fn\n    is_scale = \"weight_scale\" in name\n    if not is_weight and not is_scale:",
+      "elide": [
+        "L734-L752 ROCm inplace-RoPE 分支与 L753-L779 CUDA fused 分支（fused_indexer_q_rope_quant 一个 Triton 核做 RoPE+量化+scale 折叠，数学与本分支等价）省略——三条分支殊途同归"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/models/deepseek_v2.py",
+      "lines": "L616-L642",
+      "what": "DeepseekV32IndexerCache（IndexCache 本体）：注册进 static_forward_context 的 AttentionLayerBase；get_kv_cache_spec 自报 MLAAttentionSpec(num_kv_heads=1, head_size=132)——『只有一根向量、没有 K+V 之分』，与主 KV cache 完全独立分配；get_attn_backend 返回 DeepseekV32IndexerBackend。",
+      "code": "class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):\n    def __init__(\n        self, head_dim: int, dtype: torch.dtype, prefix: str, cache_config: CacheConfig\n    ):\n        super().__init__()\n        self.kv_cache = torch.tensor([])\n        self.head_dim = head_dim\n        self.prefix = prefix\n        self.cache_config = cache_config\n        self.dtype = dtype\n        compilation_config = get_current_vllm_config().compilation_config\n        if prefix in compilation_config.static_forward_context:\n            raise ValueError(f\"Duplicate layer name: {prefix}\")\n        compilation_config.static_forward_context[prefix] = self\n\n    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:\n        return MLAAttentionSpec(\n            block_size=self.cache_config.block_size,\n            num_kv_heads=1,\n            head_size=self.head_dim,\n            dtype=self.dtype,\n        )  # Only has one vector instead of K + V\n\n    def forward(self): ...\n\n    def get_attn_backend(self) -> AttentionBackend:\n        return DeepseekV32IndexerBackend",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/models/deepseek_v2.py",
+      "lines": "L1376-L1389",
+      "what": "模型入口（DeepseekV2Model.__init__）：is_v32=hasattr(config, 'index_topk') 探测 DSA 架构；是则分配全模型共享的 topk_indices_buffer [max_num_batched_tokens, index_topk] int32——所有层的 indexer 写、稀疏 MLA 读，同一块裸 buffer 无任何所有权封装（V4 同款在 vllm/models/deepseek_v4/nvidia/model.py:L1043-L1047）。",
+      "code": "        self.device = current_platform.device_type\n        self.hidden_size = config.hidden_size\n        self.vocab_size = config.vocab_size\n        self.is_v32 = hasattr(config, \"index_topk\")\n        if self.is_v32:\n            topk_tokens = config.index_topk\n            topk_indices_buffer = torch.empty(\n                vllm_config.scheduler_config.max_num_batched_tokens,\n                topk_tokens,\n                dtype=torch.int32,\n                device=self.device,\n            )\n        else:\n            topk_indices_buffer = None",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/models/deepseek_v2.py",
+      "lines": "L1091-L1137",
+      "what": "MLA 层装配（DeepseekV2MLAAttention.__init__ 尾段）：『IndexCache config』注释直引 arXiv:2603.12201；index_topk_freq/index_topk_pattern/index_skip_topk_offset 三旋钮算出本层 _skip_topk——skip 层不建 indexer、直接复用别层写进共享 buffer 的选块；MTP/nextn 层恒建全量 indexer（draft step 0 算一次，运行时 set_skip_topk 切换）；indexer 用专属 RoPE（is_neox_style 取反=indexer_rope_interleave）。",
+      "code": "        self.is_v32 = hasattr(config, \"index_topk\")\n\n        # IndexCache config\n        # Refer: https://arxiv.org/abs/2603.12201 for more details.\n        _skip_topk = False\n        is_mtp_layer = False\n        if self.is_v32:\n            _index_topk_freq = getattr(config, \"index_topk_freq\", 1)\n            _index_topk_pattern = getattr(config, \"index_topk_pattern\", None)\n            _index_skip_topk_offset = getattr(config, \"index_skip_topk_offset\", 2)\n            layer_id = extract_layer_index(prefix)\n\n            if _index_topk_pattern is None:\n                _skip_topk = (\n                    max(layer_id - _index_skip_topk_offset + 1, 0) % _index_topk_freq\n                    != 0\n                )\n            elif 0 <= layer_id < len(_index_topk_pattern):\n                _skip_topk = _index_topk_pattern[layer_id] == \"S\"\n\n            # The skip pattern only governs backbone layers. MTP/nextn\n            # layers (layer_id >= num_hidden_layers) always build a full\n            # indexer: they compute indices at draft step 0 and toggle\n            # at runtime via set_skip_topk\n            # (index_share_for_mtp_iteration).\n            _num_hidden_layers = getattr(config, \"num_hidden_layers\", None)\n            is_mtp_layer = (\n                _num_hidden_layers is not None and layer_id >= _num_hidden_layers\n            )\n\n        if self.is_v32 and (not _skip_topk or is_mtp_layer):\n            self.indexer_rope_emb = get_rope(\n                qk_rope_head_dim,\n                max_position=max_position_embeddings,\n                rope_parameters=config.rope_parameters,\n                is_neox_style=not getattr(config, \"indexer_rope_interleave\", False),\n            )\n            self.indexer = Indexer(\n                vllm_config,\n                config,\n                hidden_size,\n                q_lora_rank,\n                quant_config,\n                cache_config,\n                topk_indices_buffer,\n                f\"{prefix}.indexer\",\n                is_inplace_rope=self.indexer_rope_emb.enabled(),",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/mla.py",
+      "lines": "L189-L206",
+      "what": "接线关键（MultiHeadLatentAttentionWrapper.forward 中段）：MLA 外层算完 q_c/kv_c/k_pe、q 投影与 RoPE 之后、交内层 mla_attn 之前——if self.indexer and self.is_sparse and not self.skip_topk: self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)。indexer 的返回值无人接收：纯写 topk_indices_buffer 的副作用，随后稀疏 MLA 后端从同一 buffer 取索引做数值计算。",
+      "code": "        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)\n        kv_c_normed = self.kv_a_layernorm(kv_c)\n        # Add head dim of 1 to k_pe\n        k_pe = k_pe.unsqueeze(1)\n\n        q = q_proj_layer(q_proj_input)[0]\n        heads = self.num_heads\n        if self.dcp_q_replicate:\n            heads *= q_proj_layer.group_size\n        q = q.view(-1, heads, self.qk_head_dim)\n\n        if self.rotary_emb is not None:\n            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(\n                positions, q[..., self.qk_nope_head_dim :], k_pe\n            )\n\n        if self.indexer and self.is_sparse and not self.skip_topk:\n            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)",
+      "elide": []
+    },
+    {
+      "path": "vllm/model_executor/layers/sparse_attn_indexer.py",
+      "lines": "L449-L528",
+      "what": "prefill 打分+选块（sparse_attn_indexer op 主循环，O(L²) 本尊）：逐 chunk 先 cp_gather_indexer_k_quant_cache 从分页 IndexCache 收集历史量化 key 进 workspace；fp8_fp4_mqa_logits 对 (q_fp8, weights)×(k_quant, k_scale) 算出每 query 对全部历史 token 的 index 分数 I_{t,:}（Eq.(1)/(16)，ReLU 与逐头加权在核内）；top_k_per_row_prefill 按 cu_seqlen_ks/ke 因果边界选 top-k 写 buffer 行；chunk 尾 _merge_dcp_topk_global 单卡 no-op。",
+      "code": "        for chunk in prefill_metadata.chunks:\n            cu_seqlen_ks = chunk.cu_seqlen_ks\n            cu_seqlen_ke = chunk.cu_seqlen_ke\n            assert chunk.local_cu_seq_lens is not None\n            k_quant = k_quant_full[: chunk.max_local_total_seq_lens]\n            k_scale = k_scale_full[: chunk.max_local_total_seq_lens]\n            if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:\n                ops.cp_gather_indexer_k_quant_cache(\n                    kv_cache,\n                    k_quant,\n                    k_scale,\n                    chunk.block_table,\n                    chunk.local_cu_seq_lens,\n                )\n\n            q_slice = q_quant[chunk.token_start : chunk.token_end]\n            q_scale_slice = (\n                q_scale[chunk.token_start : chunk.token_end]\n                if q_scale is not None\n                else None\n            )\n            topk_indices = topk_indices_buffer[\n                chunk.token_start : chunk.token_end, :topk_tokens\n            ]\n\n            if chunk.local_total_seq_lens == 0:\n                logits = q_slice.new_empty((q_slice.shape[0], 0), dtype=torch.float32)\n                topk_indices.fill_(-1)\n            else:\n                # DeepGEMM scalar-type tags (zero-copy): MXFP4 values → int8\n                # (kPackedFP4), scales → int32 squeezed to 1-D kv_sf / 2-D q_sf.\n                if use_fp4_cache:\n                    q_slice_cast = q_slice.view(torch.int8)\n                    k_quant_cast = k_quant.view(torch.int8)\n                    k_scale_cast = k_scale.view(torch.int32).squeeze(-1)\n                else:\n                    q_slice_cast = q_slice\n                    k_quant_cast = k_quant\n                    k_scale_cast = k_scale.view(torch.float32).squeeze(-1)\n                if current_platform.is_xpu():\n                    if q_scale_slice is not None:\n                        raise RuntimeError(\"XPU fp8_mqa_logits does not support FP4 Q\")\n                    logits = torch.ops.vllm.xpu_fp8_mqa_logits(\n                        q_slice_cast,\n                        k_quant_cast,\n                        k_scale_cast,\n                        weights[chunk.token_start : chunk.token_end],\n                        cu_seqlen_ks,\n                        cu_seqlen_ke,\n                    )\n                else:\n                    logits = fp8_fp4_mqa_logits(\n                        (q_slice_cast, q_scale_slice),\n                        (k_quant_cast, k_scale_cast),\n                        weights[chunk.token_start : chunk.token_end],\n                        cu_seqlen_ks,\n                        cu_seqlen_ke,\n                        clean_logits=False,\n                    )\n                num_rows = logits.shape[0]\n                ops.top_k_per_row_prefill(\n                    logits,\n                    cu_seqlen_ks,\n                    cu_seqlen_ke,\n                    topk_indices,\n                    num_rows,\n                    logits.stride(0),\n                    logits.stride(1),\n                    topk_tokens,\n                )\n\n            _merge_dcp_topk_global(\n                logits,\n                topk_indices,\n                topk_tokens,\n                dcp_rank,\n                dcp_world_size,\n                cp_kv_cache_interleave_size,\n                row_starts=chunk.cu_seqlen_ks,\n            )",
+      "elide": [
+        "L480-L487 FP4 路径的 DeepGEMM 标量类型 cast（int8/int32 零拷贝视图）与 L488-L498 XPU 分支省略；L520-L528 DCP 合并调用正文单卡当 no-op 讲"
+      ]
+    },
+    {
+      "path": "vllm/model_executor/layers/sparse_attn_indexer.py",
+      "lines": "L603-L665",
+      "what": "decode 打分+选块：fp8_fp4_paged_mqa_logits 不经 gather、直接对分页 IndexCache 打分（block_table+schedule_metadata 寻址）；top-k 三核分派——cooperative_topk（≤32 行+sm90/非 sm120+TMA 对齐）/persistent_topk（topk∈{512,1024,2048} 专用核）/top_k_per_row_decode 兜底；结果写 buffer 前 num_padded_tokens 行。",
+      "code": "            logits = fp8_fp4_paged_mqa_logits(\n                (padded_q_quant_cast, padded_q_scale),\n                kv_cache,\n                weights[:num_padded_tokens],\n                seq_lens,\n                decode_metadata.block_table,\n                decode_metadata.schedule_metadata,\n                max_model_len=max_model_len,\n                clean_logits=False,\n            )\n        num_rows = logits.shape[0]\n        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]\n\n        use_cooperative_topk = (\n            current_platform.is_cuda()\n            and topk_tokens in (512, 1024, 2048)\n            and num_rows <= 32\n            and logits.stride(0) % 4 == 0  # TMA 16-byte alignment\n            and current_platform.has_device_capability(90)\n            and not current_platform.is_device_capability_family(120)\n        )\n        use_persistent_topk = current_platform.is_cuda() and topk_tokens in (\n            512,\n            1024,\n            2048,\n        )\n        if use_cooperative_topk:\n            workspace_manager = current_workspace_manager()\n            (topk_workspace,) = workspace_manager.get_simultaneous(\n                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),\n            )\n            torch.ops._C.cooperative_topk(\n                logits,\n                seq_lens,\n                topk_indices,\n                topk_workspace,\n                topk_tokens,\n                attn_metadata_narrowed.max_seq_len,\n            )\n        elif use_persistent_topk:\n            workspace_manager = current_workspace_manager()\n            (topk_workspace,) = workspace_manager.get_simultaneous(\n                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),\n            )\n            torch.ops._C.persistent_topk(\n                logits,\n                seq_lens,\n                topk_indices,\n                topk_workspace,\n                topk_tokens,\n                logits.shape[1],\n            )\n        else:\n            ops.top_k_per_row_decode(\n                logits,\n                next_n,\n                seq_lens,\n                topk_indices,\n                num_rows,\n                logits.stride(0),\n                logits.stride(1),\n                topk_tokens,\n            )",
+      "elide": [
+        "L616-L628 use_cooperative/use_persistent 的平台判定条件展开保留（这是真分派逻辑）；L667-L686 的 DCP 合并与解 pack 回写在省略注——正文按需引用"
+      ]
+    },
+    {
+      "path": "vllm/v1/attention/backends/mla/indexer.py",
+      "lines": "L77-L123",
+      "what": "prefill 双预算切块（split_indexer_prefill_chunks）：N 约束（chunk 内总历史长 ≤ workspace=max_model_len×40）+ logits 约束（M·N·4 字节 ≤ VLLM_SPARSE_INDEXER_MAX_LOGITS_MB）；单请求超预算时再按 query 维 M 子切——O(L²) 打分的峰值显存就是这里被压住的。",
+      "code": "def split_indexer_prefill_chunks(\n    seq_lens_cpu: torch.Tensor,\n    query_lens_cpu: torch.Tensor,\n    workspace_size: int,\n    max_logits_bytes: int,\n    request_offset: int = 0,\n) -> list[tuple[slice, slice]]:\n    \"\"\"\n    Split prefill requests into chunks for the sparse indexer, respecting:\n    - N constraint: total_seq_lens <= workspace_size (existing O(N) workspace)\n    - Logits constraint: M * N * 4 <= max_logits_bytes\n\n    When a single request-level chunk still exceeds the logits budget,\n    sub-chunks on the query dimension (M) to bound peak memory.\n\n    Returns list of (req_slice, query_slice) tuples.\n    \"\"\"\n    chunks: list[tuple[slice, slice]] = []\n    n = len(seq_lens_cpu)\n    max_logits_elems = max_logits_bytes // 4\n    end = 0\n\n    while end < n:\n        start, chunk_m, chunk_n = end, 0, 0\n\n        while end < n:\n            q, s = query_lens_cpu[end].item(), seq_lens_cpu[end].item()\n            new_m, new_n = chunk_m + q, chunk_n + s\n            if new_n <= workspace_size and new_m * new_n <= max_logits_elems:\n                chunk_m, chunk_n = new_m, new_n\n                end += 1\n            else:\n                break\n\n        # A single request can exceed the budget, requiring sub-chunking\n        # on the query dimension.\n        if end == start:\n            chunk_m, chunk_n = query_lens_cpu[end].item(), seq_lens_cpu[end].item()\n            end += 1\n\n        req_slice = slice(start + request_offset, end + request_offset)\n        max_q = max(1, max_logits_elems // chunk_n) if chunk_n > 0 else max(1, chunk_m)\n        for q_off in range(0, chunk_m, max_q):\n            sub_m = min(max_q, chunk_m - q_off)\n            chunks.append((req_slice, slice(q_off, q_off + sub_m)))\n\n    return chunks",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/attention/backends/mla/sparse_utils.py",
+      "lines": "L120-L135",
+      "what": "index 空间换算的契约（triton_convert_req_index_to_global_index docstring）：out = block_table[req, idx//BLOCK]*BLOCK + idx%BLOCK——indexer 输出的是『请求内第几个 token』的逻辑位，主注意力要的是分页 cache 的物理 slot；-1 直通 -1。这一步是 F7（block_table 间接寻址）在稀疏路径的再现。",
+      "code": "def triton_convert_req_index_to_global_index(\n    req_id: torch.Tensor,  # int32 [num_tokens]\n    block_table: torch.Tensor,  # int32 [num_requests, max_num_blocks_per_req]\n    token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]\n    BLOCK_SIZE: int = 64,\n    NUM_TOPK_TOKENS: int = 2048,\n    BLOCK_N: int = 128,  # tile width along columns\n    HAS_PREFILL_WORKSPACE: bool = False,\n    prefill_workspace_request_ids: torch.Tensor | None = None,\n    prefill_workspace_starts: torch.Tensor | None = None,\n    return_valid_counts: bool = False,\n) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"\n    out[token_id, indice_id] =\n        block_table[req_id[token_id],\n            token_indices[token_id, indice_id] // BLOCK_SIZE] * BLOCK_SIZE",
+      "elide": []
+    },
+    {
+      "path": "vllm/models/deepseek_v4/attention.py",
+      "lines": "L276-L297",
+      "what": "V4 装配（DeepseekV4Attention.__init__ 中段）：compress_ratio==4（C4A 层）才建 DeepseekV4Indexer——『Only C4A uses sparse attention and hence has indexer』；同层并存 DeepseekV4SWACache（滑窗支路）与 DeepseekCompressor（压缩支路）；indexer 的 wq_b+量化 与 compressor 走 aux 流重叠。",
+      "code": "        self.indexer = None\n        if self.compress_ratio == 4:\n            # Only C4A uses sparse attention and hence has indexer.\n            # aux_stream_list[2] is free here (outer GEMMs joined) for the inner\n            # overlap of wq_b+fused_indexer_q_rope_quant vs compressor. None on\n            # ROCm, where aux_stream_list is None.\n            indexer_aux_stream = (\n                aux_stream_list[2] if aux_stream_list is not None else None\n            )\n            self.indexer = DeepseekV4Indexer(\n                vllm_config,\n                config=config,\n                hidden_size=self.hidden_size,\n                q_lora_rank=self.q_lora_rank,\n                quant_config=quant_config,\n                cache_config=cache_config,\n                topk_indices_buffer=topk_indices_buffer,\n                compress_ratio=self.compress_ratio,\n                prefix=f\"{prefix}.indexer\",\n                aux_stream=indexer_aux_stream,\n                eager_scratch_pool=eager_scratch_pool,\n            )",
+      "elide": []
+    },
+    {
+      "path": "vllm/models/deepseek_v4/attention.py",
+      "lines": "L770-L822",
+      "what": "V4 索引缓存布局与压缩机接线（DeepseekV4Indexer.__init__ 尾段）：max_model_len/max_total_seq_len 全部 //compress_ratio——indexer 活在压缩坐标系；FP4 时 head_dim=64 打包值+4 ue8m0=68B/条、FP8 时 128+4=132B/条（与 V3.2 同布局）；自己的 DeepseekCompressor 负责 K 压缩；SparseAttnIndexer(skip_k_cache_insert=True)——插入由 compressor 完成。",
+      "code": "        self.topk_indices_buffer = topk_indices_buffer\n\n        self.max_model_len = (\n            vllm_config.model_config.max_model_len // self.compress_ratio\n        )\n        self.prefix = prefix\n\n        self.max_total_seq_len = (\n            get_max_prefill_buffer_size(vllm_config) // self.compress_ratio\n        )\n\n        assert cache_config is not None, \"Deepseek V4 indexer requires cache_config\"\n        if self.use_fp4_kv:\n            # MXFP4 stores two values per byte plus one UE8M0 byte per 32 values.\n            # head_dim bytes = 64 packed values + 4 UE8M0 scales = 68.\n            k_cache_head_dim = self.head_dim // 2 + self.head_dim // MXFP4_BLOCK_SIZE\n        else:\n            # NOTE(yifan): FP8 indexer cache uses the same layout as V3.2:\n            # head_dim bytes = 128 fp8 + 4 fp32 scale = 132.\n            k_cache_head_dim = (\n                self.head_dim + self.head_dim // self.quant_block_size * 4\n            )\n        self.k_cache = DeepseekV4IndexerCache(\n            head_dim=k_cache_head_dim,\n            dtype=torch.uint8,\n            prefix=f\"{prefix}.k_cache\",\n            cache_config=cache_config,\n            compress_ratio=self.compress_ratio,\n        )\n        self.compressor = DeepseekCompressor(\n            vllm_config=vllm_config,\n            compress_ratio=self.compress_ratio,\n            hidden_size=hidden_size,\n            head_dim=self.head_dim,\n            rotate=True,\n            prefix=f\"{prefix}.compressor\",\n            k_cache_prefix=self.k_cache.prefix,\n            use_fp4_cache=self.use_fp4_kv,\n            eager_scratch_pool=eager_scratch_pool,\n        )\n\n        self.indexer_op = SparseAttnIndexer(\n            self.k_cache,\n            self.quant_block_size,\n            self.scale_fmt,\n            self.topk_tokens,\n            self.head_dim,\n            self.max_model_len,\n            self.max_total_seq_len,\n            self.topk_indices_buffer,\n            skip_k_cache_insert=True,\n            use_fp4_cache=self.use_fp4_kv,\n        )",
+      "elide": []
+    },
+    {
+      "path": "vllm/models/deepseek_v4/attention.py",
+      "lines": "L831-L892",
+      "what": "V4 forward（DeepseekV4Indexer.forward）：短上下文快路径——压缩后 candidates ≤ topk 时全选（_fill_short_context_topk_indices 直填 0..n-1，跳过打分但仍建缓存）；正常路径 wq_b+量化 与 compressor 双流并行（maybe_execute_in_parallel），join 保证 K 写缓存先于 indexer_op；indexer_op(hidden, q_quant, k, weights)。",
+      "code": "    def forward(\n        self,\n        hidden_states: torch.Tensor,\n        qr: torch.Tensor,\n        compressed_kv_score: torch.Tensor,\n        indexer_weights: torch.Tensor,\n        positions: torch.Tensor,\n        rotary_emb: nn.Module,\n    ) -> torch.Tensor:\n        compressor = self.compressor\n\n        attn_metadata = get_forward_context().attn_metadata\n        if isinstance(attn_metadata, dict):\n            indexer_metadata = cast(Any, attn_metadata[self.k_cache.prefix])\n            if indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens:\n                # candidates num smaller than topk, every candidate is selected\n                # but we still need to build k cache\n                compressor(compressed_kv_score, positions, rotary_emb)\n                assert self.topk_indices_buffer is not None\n                num_tokens = (\n                    indexer_metadata.num_decode_tokens\n                    + indexer_metadata.num_prefill_tokens\n                )\n                if num_tokens > 0:\n                    _fill_short_context_topk_indices[(num_tokens,)](\n                        self.topk_indices_buffer,\n                        positions,\n                        TOP_K=self.topk_tokens,\n                        COMPRESS_RATIO=self.compress_ratio,\n                        PADDED_TOP_K=triton.next_power_of_2(self.topk_tokens),\n                        num_warps=8,\n                    )\n                return self.topk_indices_buffer\n\n        def wq_b_and_q_quant():\n            # ReplicatedLinear returns (output, bias); bias is None.\n            q, _ = self.wq_b(qr)\n            q = q.view(-1, self.n_head, self.head_dim)\n            outputs = None\n            if self.eager_scratch_pool is not None and self.use_fp4_kv:\n                outputs = self.eager_scratch_pool.indexer_q_outputs(q.shape[0])\n            return fused_indexer_q_rope_quant(\n                positions,\n                q,\n                rotary_emb.cos_sin_cache,\n                indexer_weights,\n                self.softmax_scale,\n                self.n_head**-0.5,\n                use_fp4=self.use_fp4_kv,\n                output_buffers=outputs,\n            )\n\n        # compressor returns None and writes K to the indexer KV cache; the\n        # join orders that write before indexer_op (skip_k_cache_insert=True).\n        (q_quant, weights), k = maybe_execute_in_parallel(\n            wq_b_and_q_quant,\n            lambda: compressor(compressed_kv_score, positions, rotary_emb),\n            self.ln_events[0],\n            self.ln_events[1],\n            self.aux_stream,\n        )\n        return self.indexer_op(hidden_states, q_quant, k, weights)",
+      "elide": []
+    },
+    {
+      "path": "vllm/models/deepseek_v4/compressor.py",
+      "lines": "L284-L300",
+      "what": "DeepseekCompressor 装配：fused_wkv_wgate 一枪 GEMM 出 [coff·head_dim] 的 KV 与同宽门控 score 两半；RMSNorm；CompressorStateCache(state_dim=2·coff·head_dim)——kv_state 前半、score_state 后半，compress_ratio∈{4,128} 时窗宽 coff·compress_ratio。",
+      "code": "        self.fused_wkv_wgate = MergedColumnParallelLinear(\n            self.hidden_size,\n            [self.coff * self.head_dim, self.coff * self.head_dim],\n            bias=False,\n            return_bias=False,\n            quant_config=None,\n            disable_tp=True,\n            prefix=f\"{prefix}.fused_wkv_wgate\",\n        )\n        self.norm = RMSNorm(self.head_dim, self.rms_norm_eps)\n\n        self.state_cache = CompressorStateCache(\n            state_dim=2 * self.coff * self.head_dim,  # kv_state + score_state\n            dtype=state_dtype,\n            compress_ratio=compress_ratio,\n            prefix=f\"{prefix}.state_cache\",\n        )",
+      "elide": []
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/flashmla.py",
+      "lines": "L163-L244",
+      "what": "V4 decode 消费=NSA 支路回归（_forward_decode）：C4A 把 buffer 里的局部压缩 index 经 compute_global_topk_indices_and_lens 换算成全局物理 slot；C128A 不经 indexer、metadata 期直算全选；flash_mla_with_kvcache 一核双源——k_cache=SWA 滑窗缓存 + indices=滑窗位，extra_k_cache=压缩 KV 池 + extra_indices_in_kvcache=top-k 位——滑窗与选中压缩块在同一次注意力里合算。",
+      "code": "        topk_indices = None\n        topk_lens = None\n        if not swa_only:\n            assert attn_metadata is not None\n            assert swa_metadata.is_valid_token is not None\n            block_size = attn_metadata.block_size // self.compress_ratio\n            is_valid = swa_metadata.is_valid_token[:num_decode_tokens]\n            if self.compress_ratio == 4:\n                # C4A: local indices differ per layer (filled by Indexer).\n                assert self.topk_indices_buffer is not None\n                global_indices, topk_lens = compute_global_topk_indices_and_lens(\n                    self.topk_indices_buffer[:num_decode_tokens],\n                    swa_metadata.token_to_req_indices,\n                    attn_metadata.block_table[:num_decodes],\n                    block_size,\n                    is_valid,\n                    output_buffers=self._global_topk_output_buffers(\n                        self.topk_indices_buffer[:num_decode_tokens]\n                    ),\n                )\n                topk_indices = global_indices.view(num_decode_tokens, 1, -1)\n            else:\n                # C128A: pre-computed during metadata build.\n                topk_indices = attn_metadata.c128a_global_decode_topk_indices\n                topk_lens = attn_metadata.c128a_decode_topk_lens\n\n        swa_indices = swa_metadata.decode_swa_indices\n        swa_lens = swa_metadata.decode_swa_lens\n\n        # We treat queries in the same seq as different queries\n        # and later we only attend by generated indices.\n        # q arrives pre-padded to self.padded_heads by the outer wrapper.\n        q = q.unsqueeze(1)\n\n        # Prepare SWA cache (num_blocks, swa_block_size, 1, head_bytes)\n        # Use unsqueeze to preserve strides (handles padded blocks correctly)\n        swa_cache = self.swa_cache_layer.kv_cache.unsqueeze(-2)\n        # Reshape KV cache to (num_blocks, block_size, 1, head_bytes)\n        if kv_cache is not None:\n            kv_cache = kv_cache.unsqueeze(-2)\n\n        # One FlashMLASchedMeta per layer type, shared across all same-type\n        # layers within this decode step. The first forward call per type\n        # triggers the in-kernel planner (allocating tile_scheduler_metadata\n        # and num_splits via PyTorch's graph-aware allocator so CUDA graph\n        # capture reuses the same addresses on replay); subsequent same-type\n        # layers see have_initialized=True and skip the planner.\n        if self.compress_ratio <= 1:\n            tile_metadata = swa_metadata.tile_sched_swaonly\n        elif self.compress_ratio == 4:\n            tile_metadata = swa_metadata.tile_sched_c4a\n        elif self.compress_ratio == 128:\n            tile_metadata = swa_metadata.tile_sched_c128a\n        else:\n            raise ValueError(\n                f\"Unsupported compress_ratio={self.compress_ratio}; \"\n                \"expected 1, 4, or 128.\"\n            )\n        assert tile_metadata is not None, (\n            \"swa_metadata missing tile_sched entry for \"\n            f\"compress_ratio={self.compress_ratio}; \"\n            \"DeepseekSparseSWAMetadataBuilder.build_tile_scheduler did not \"\n            \"allocate one for this layer type.\"\n        )\n\n        out, _ = flash_mla_with_kvcache(\n            q=q,\n            k_cache=swa_cache,\n            block_table=None,\n            head_dim_v=512,\n            tile_scheduler_metadata=tile_metadata,\n            cache_seqlens=None,\n            is_fp8_kvcache=True,\n            indices=swa_indices,\n            topk_length=swa_lens,\n            softmax_scale=self.scale,\n            attn_sink=self.attn_sink,\n            extra_k_cache=kv_cache if not swa_only else None,\n            extra_indices_in_kvcache=topk_indices,\n            extra_topk_length=topk_lens,\n            out=output.unsqueeze(1),\n        )",
+      "elide": [
+        "L196-L226 tile_scheduler 元数据选择（swaonly/c4a/c128a 三类层各自的 FlashMLASchedMeta）保留——三类层分型就在这几行"
+      ]
+    },
+    {
+      "path": "vllm/v1/attention/backends/mla/flashmla_sparse.py",
+      "lines": "L838-L875",
+      "what": "V3.2 消费（FlashMLASparseImpl.forward_mqa）：topk_indices = self.topk_indices_buffer[:num_actual_toks]——impl 从层手里接过共享 buffer 的前 num_actual_toks 行，交给 flash_mla_sparse_fwd（在 576 维潜向量上只对选中条目真算，O(Lk)）。",
+      "code": "    def forward_mqa(\n        self,\n        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],\n        kv_c_and_k_pe_cache: torch.Tensor,\n        attn_metadata: FlashMLASparseMetadata,\n        layer: AttentionLayer,\n    ) -> tuple[torch.Tensor, torch.Tensor | None]:\n        # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use\n        # MQA 576/512 approach for both prefill and decode\n\n        # Concatenate q if it's a tuple (ql_nope, q_pe)\n        if isinstance(q, tuple):\n            ql_nope, q_pe = q\n            q = self.q_concat_buffer[: ql_nope.shape[0]]\n            ops.concat_mla_q(ql_nope, q_pe, q)\n\n        num_actual_toks = q.shape[0]\n\n        # Get topk indices\n        assert self.topk_indices_buffer is not None\n        topk_indices = self.topk_indices_buffer[:num_actual_toks]\n\n        use_fp8_cache = self.kv_cache_dtype == \"fp8_ds_mla\"\n\n        if not use_fp8_cache:\n            attn_out = self._forward_bf16_kv(\n                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata\n            )\n        elif attn_metadata.fp8_use_mixed_batch:\n            attn_out = self._forward_fp8_kv_mixed_batch(\n                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata\n            )\n        else:\n            attn_out = self._forward_fp8_kv_separate_prefill_decode(\n                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata\n            )\n\n        return attn_out, None",
+      "elide": []
+    },
+    {
+      "path": "vllm/config/attention.py",
+      "lines": "L68-L73",
+      "what": "FP4 变体总开关：use_fp4_indexer_cache（默认 False）+ indexer_kv_dtype——量化缓存格式（fp8/mxfp4/nvfp4）要求后端核支持；builder 侧断言仅 Blackwell 数据中心 GPU（sm_10x，B200/GB200）。",
+      "code": "    use_fp4_indexer_cache: bool = False\n    \"\"\"If set, use fp4 indexer cache for dsv32 family model (not support yet)\"\"\"\n\n    indexer_kv_dtype: IndexerKVDType = \"bf16\"\n    \"\"\"Data type for the sparse-attention indexer K cache. Quantized formats\n    (fp8, mxfp4, nvfp4) require indexer kernel support in the backend.\"\"\"",
+      "elide": []
+    }
+  ],
+  "theory": [
+    "谱系第一跳 NSA（arXiv:2502.11089）：三支路可训练稀疏——compressed（对 m-token 压缩块做粗注意力）/ selected（对 top-k token 做细注意力）/ sliding window（局部窗口），三支门控加权相加、端到端可训。vLLM v0.27.1 无 NSA 直接落地（word-boundary 搜索零命中）——它是概念前身；其三支路在 DSV4 代码里结构性回归（SWA 缓存+压缩 KV 池+块级 top-k，站 14 一核双源）。",
+    "谱系第二跳 DSA 打分函数（arXiv:2512.02556 Eq.(1)）：I_{t,s}=Σ_{j=1}^{H^I} w_{t,j}·ReLU(q_{t,j}·k_s)——逐头点积→ReLU（吞吐考虑，非 softmax）→逐头标量权重 w 加权求和。w_{t,j} 由 h_t 线性投影（weights_proj 融合在 wk_weights_proj 里），使不同头的贡献可学习地加权。H^I=64 头、head_dim=128、可 FP8——『打分便宜到能扫全部历史』的数量级根据。",
+    "top-k 选择（Eq.(2)）：u_t = Attn(h_t, {c_s | I_{t,s} ∈ Top-k(I_{t,:})})——主注意力只在分数最大的 k 个 latent KV 条目上算，其余丢弃；k<<L（DSV3.2 index_topk=2048）。-1 哨兵=『这一位没选中任何 token』。",
+    "可信度来源：训练期分离优化（Eq.(3)-(4)）——indexer 输入 detach、单独 KL 损失 L^I=Σ_t D_KL(p_t‖Softmax(I_t)) 逼近主注意力各头分数和的 L1 归一化分布（warm-up 全序列→sparse 阶段只在选中集上）。推理侧字面证据：独立 config.index_* 头表、专门 FP8 权重加载 _try_load_fp8_indexer_wk（deepseek_v2.py:L822-L871，FP8 wk 权重+BF16 weights_proj 的融合加载正是『单独训练、独立 checkpoint 形态』的工程痕迹）。",
+    "复杂度诚实账（§2.3）：主注意力 O(L²)→O(Lk)；indexer 自身仍 O(L²)——没被消灭、被换成便宜项（少头一半、FP8/FP4、无反向）。worked example：L≈128k、k≈2048，主注意力省 ~L/k≈64× 核算量；indexer 的 O(L²) 打分因低精度+少头远低于原 MLA 的 O(L²)。这是 IndexCache 必须存在的根本原因：打分要扫全历史 → 历史索引键只算一次、量化缓存、跨拍复用。",
+    "prefill 峰值显存的解析解：logits 张量 M×N×4 字节（M=query 数、N=历史长、fp32 分数）。split_indexer_prefill_chunks 的双预算（N≤max_model_len×40 workspace；M·N·4≤VLLM_SPARSE_INDEXER_MAX_LOGITS_MB）就是把这个解析式直接写成切块条件——单请求超预算再按 M 子切。get_max_prefill_buffer_size 的魔数 40 = (576×2)//132×5（对齐 flashmla_sparse workspace 的最大利用，indexer.py:L442-L452 注释原账）。",
+    "谱系第三跳 V4/CSA 压缩（arXiv:2606.19348 Eq.(9)-(17)）：每 m=4 个 KV 条目按 softmax 门控权重压成 1 个压缩块；K^IComp∈R^{n/m×c^I} 用同样压缩操作与主压缩 KV 并行产出、各自缓存；indexer query 与主注意力 query 共享同一个低秩 c_t^Q（Eq.(18)，落地=wq_b 吃 qr=q_c）。indexer 在压缩键上打分——序列长度实际压到 1/m，top-k 是在 n/m 个压缩块里选；candidates≤topk 时数学上全选即最优 → _fill_short_context_topk_indices 快路径（省掉打分但保留建缓存）。",
+    "FP4 收益账（§5.2.1）：indexer QK 路径全 FP4（MXFP4：2 值/字节+ue8m0 per-32 scale → 68B/条 vs FP8 132B/条）、index 分数 FP32→BF16——top-k 选择器 2x 加速、KV 条目召回 99.7%（QAT 保精度）。仅 Blackwell 数据中心 GPU（sm_10x）。",
+    "DCP top-k 合并的精确性论证（sparse_attn_indexer.py:L83-L94 docstring）：全局 top-K 中的任一 token 必在其所属 rank 的本地 top-K 内（全局至多 topk-1 个 token 排在它前面，本地更少）→ 各 rank 只交换 topk 个候选即可精确还原全局 top-K，等价于 all-gather 全量分数矩阵、却只传 world_size×topk 个候选。"
+  ],
+  "mechanisms": [
+    {
+      "id": "ch26-m01",
+      "name": "DSA 打分器：独立小头 + I_{t,s}=Σ w·ReLU(q·k) 的前置装配",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/model_executor/models/deepseek_v2.py:L645-L726",
+        "vllm/model_executor/models/deepseek_v2.py:L728-L836",
+        "vllm/model_executor/layers/sparse_attn_indexer.py:L500-L507"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2512.02556",
+        "sections": [
+          "§2.1",
+          "Eq.(1)",
+          "Eq.(2)"
+        ]
+      },
+      "note": "worked example：2 头小 vocab 手算一个 I_{t,s}（q·k 点积→ReLU→加权求和）再乘 weights 折叠的 scale；图：独立小头与主 MLA 的解剖对照（indexer 头表/权重/缓存全独立）。"
+    },
+    {
+      "id": "ch26-m02",
+      "name": "IndexCache：indexer 专属 K 缓存（132B/条）与第二本账",
+      "kind": "layout",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/model_executor/models/deepseek_v2.py:L616-L642",
+        "vllm/model_executor/models/deepseek_v2.py:L686-L712",
+        "vllm/v1/attention/backends/mla/indexer.py:L442-L452"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2512.02556",
+        "sections": [
+          "§2.1",
+          "Instantiate DSA Under MLA"
+        ]
+      },
+      "note": "128B fp8 值+4B fp32 scale=132B/条；num_kv_heads=1 的 MLAAttentionSpec——『打分原料的账本』与主 KV cache 分开分配分组；魔数 40 的 workspace 账（825MB@163k）在这里。注意精确表述：缓存的是量化索引键（打分原料），不是分数。"
+    },
+    {
+      "id": "ch26-m03",
+      "name": "topk_indices_buffer：全模型共享的副作用缓冲（-1 哨兵）",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/model_executor/models/deepseek_v2.py:L1376-L1389",
+        "vllm/model_executor/layers/mla.py:L189-L206",
+        "vllm/model_executor/layers/sparse_attn_indexer.py:L426-L432"
+      ],
+      "note": "indexer 与稀疏 MLA 的唯一接口：写者=indexer（mutates_args 声明）、读者=稀疏后端，无返回值消费；跨层共享让 skip 层复用成为可能；『每轮只对新增 token 算 index』的载体（行=本拍 query token）。"
+    },
+    {
+      "id": "ch26-m04",
+      "name": "prefill 双预算切块（workspace N + logits M·N·4）",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/attention/backends/mla/indexer.py:L77-L123",
+        "vllm/model_executor/layers/sparse_attn_indexer.py:L449-L476"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2512.02556",
+        "sections": [
+          "§2.3",
+          "Inference Costs"
+        ]
+      },
+      "note": "worked example：给 M/N/预算代数字算 chunk 数；单请求超预算按 M 子切的边界例。"
+    },
+    {
+      "id": "ch26-m05",
+      "name": "prefill 打分核链：gather → mqa_logits → top_k_per_row",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/model_executor/layers/sparse_attn_indexer.py:L449-L528"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2512.02556",
+        "sections": [
+          "§2.3.4",
+          "Efficiency Discussion"
+        ]
+      },
+      "note": "cp_gather_indexer_k_quant_cache 收历史量化 key → fp8_fp4_mqa_logits（O(L²) 本尊，ReLU/加权在核内，weights 已折 scale）→ top_k_per_row_prefill 因果边界选块。与 m06 对照讲。"
+    },
+    {
+      "id": "ch26-m06",
+      "name": "decode paged 打分 + top-k 三核分派",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/model_executor/layers/sparse_attn_indexer.py:L530-L688"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2512.02556",
+        "sections": [
+          "§2.3",
+          "Inference Costs"
+        ]
+      },
+      "note": "fp8_fp4_paged_mqa_logits 免 gather 直接 paged 读（block_table+DeepGEMM scheduler metadata）；cooperative（≤32 行）/persistent（topk∈{512,1024,2048}）/per_row 兜底；2D seq_lens 支持 spec 窗口。worked example：一行 logits 手挑 top-k + -1 填充。"
+    },
+    {
+      "id": "ch26-m07",
+      "name": "index 空间换算：请求内逻辑位 → 分页物理 slot",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/attention/backends/mla/sparse_utils.py:L120-L238",
+        "vllm/models/deepseek_v4/nvidia/flashmla.py:L163-L187"
+      ],
+      "note": "out=block_table[req, idx//BLOCK]*BLOCK+idx%BLOCK；-1 直通；F7（block_table 间接寻址，已回收）在稀疏路径的再现——writer 应回指 ch22。"
+    },
+    {
+      "id": "ch26-m08",
+      "name": "IndexCache 跨层复用：skip_topk 模式（freq/pattern/offset）",
+      "kind": "config",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/model_executor/models/deepseek_v2.py:L1091-L1137",
+        "vllm/model_executor/layers/mla.py:L96-L100",
+        "vllm/model_executor/models/deepseek_v2.py:L1572-L1576"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2603.12201",
+        "sections": [
+          "IndexCache"
+        ]
+      },
+      "note": "『S' 层不建 indexer 复用共享 buffer；MTP 层恒建（draft step 0 算、set_skip_topk 运行时切换——冻结 True 会让 draft 读永不写入的 buffer）；deepseek_v2.py:L1572-L1573 注释明示 freq>1 时只有部分层建 indexer（其后半句只讲 checkpoint 仍为全层发 indexer 权重、加载侧按 prefix 跳过——不涉 buffer 尺寸）。"
+    },
+    {
+      "id": "ch26-m09",
+      "name": "复杂度诚实账：O(L²)→O(Lk)，indexer 自身仍 O(L²)",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/model_executor/layers/sparse_attn_indexer.py:L449-L528",
+        "vllm/v1/attention/backends/mla/indexer.py:L442-L452"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2512.02556",
+        "sections": [
+          "§2.3",
+          "Inference Costs"
+        ]
+      },
+      "note": "worked example：L=128k/k=2048 代入——主注意力省 64×、indexer 开销的数量级对比；『没消灭、换成便宜项』是本章的哲学句。"
+    },
+    {
+      "id": "ch26-m10",
+      "name": "V4 三类层：SWAonly(1)/C4A(4)/C128A(128) 与 compress_ratios 逐层表",
+      "kind": "layout",
+      "difficulty": "supporting",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/attention.py:L206-L297",
+        "vllm/v1/attention/backends/mla/sparse_swa.py:L38-L53",
+        "vllm/models/deepseek_v4/sparse_mla.py:L218-L238"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2606.19348",
+        "sections": [
+          "§2.3",
+          "Compressed Sparse Attention"
+        ]
+      },
+      "note": "只有 C4A 建 indexer（L278 注释原话）；C128A 压缩后 candidates≤topk → metadata 期直算全选（_build_c128a_topk_metadata_kernel）；三类层各有 FlashMLASchedMeta 不共享 planner。"
+    },
+    {
+      "id": "ch26-m11",
+      "name": "V4 压缩索引 K^IComp：compressor 建缓存 + 压缩坐标系",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/attention.py:L718-L822",
+        "vllm/models/deepseek_v4/compressor.py:L211-L478",
+        "vllm/models/deepseek_v4/compressor.py:L284-L300"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2606.19348",
+        "sections": [
+          "§2.3.1",
+          "Eq.(9)-(17)"
+        ]
+      },
+      "note": "skip_k_cache_insert=True（插入归 compressor）；max_model_len//compress_ratio 一处换算、全链路跟着换（slot/seq_len/scale 都在压缩坐标）；worked example：4 个 token 压成 1 块后 index 的编号变化。"
+    },
+    {
+      "id": "ch26-m12",
+      "name": "V4 短上下文全选快路径（_fill_short_context_topk_indices）",
+      "kind": "algorithm",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/attention.py:L72-L87",
+        "vllm/models/deepseek_v4/attention.py:L843-L863"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2606.19348",
+        "sections": [
+          "§2.3.4",
+          "Efficiency Discussion"
+        ]
+      },
+      "note": "candidates=(pos+1)//compress_ratio ≤ topk 时直填 0..n-1——数学上全选即最优，省打分不省建缓存（后续步还要用）。"
+    },
+    {
+      "id": "ch26-m13",
+      "name": "V4 消费：topk ∪ SWA 一核双源——NSA 三支路的结构回归",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/models/deepseek_v4/nvidia/flashmla.py:L163-L244",
+        "vllm/models/deepseek_v4/nvidia/flashmla.py:L331-L363",
+        "vllm/v1/attention/backends/mla/sparse_swa.py:L56-L108"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2606.19348",
+        "sections": [
+          "§2.3",
+          "Compressed Sparse Attention"
+        ]
+      },
+      "note": "decode：flash_mla_with_kvcache(k_cache=SWA, extra_k_cache=压缩池, extra_indices_in_kvcache=top-k)；prefill：combine_topk_swa_indices 并集成连续 gather。NSA 的滑窗+压缩+选择三支在 V4 一次前向里合流——谱系闭环的图证。"
+    },
+    {
+      "id": "ch26-m14",
+      "name": "V3.2 消费：FlashMLASparseImpl 取 buffer 行做稀疏 MLA（O(Lk)）",
+      "kind": "protocol",
+      "difficulty": "core",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/attention/backends/mla/flashmla_sparse.py:L838-L875",
+        "vllm/model_executor/layers/attention/sparse_mla_attention.py:L441-L490"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2512.02556",
+        "sections": [
+          "§2.1",
+          "Instantiate DSA Under MLA"
+        ]
+      },
+      "note": "装配期接管 buffer（skip 层无 indexer 也能读——显式传参兜底）；prefill 侧 topk→mask/_run_masked_mha 与 chunked context 的 _remap_topk_to_ranges+merge_attn_states（sparse_mla_attention.py:L740-L829）作 supporting 展开。"
+    },
+    {
+      "id": "ch26-m15",
+      "name": "FP4/MXFP4 indexer 缓存变体（68B/条，Blackwell 限定）",
+      "kind": "config",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/model_executor/layers/sparse_attn_indexer.py:L44-L45",
+        "vllm/model_executor/layers/sparse_attn_indexer.py:L254-L292",
+        "vllm/models/deepseek_v4/attention.py:L782-L798",
+        "vllm/config/attention.py:L68-L73",
+        "vllm/v1/attention/backends/mla/indexer.py:L494-L505"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2606.19348",
+        "sections": [
+          "§5.2.1",
+          "FP4 Quantization-Aware Training"
+        ]
+      },
+      "note": "2 值/字节+ue8m0 per-32 scale；FP4 时 q_scale 不折 weights 而是单独传核；仅 sm_10x（B200/GB200）断言。量化数学归 ch27，本章只讲布局与开关。"
+    },
+    {
+      "id": "ch26-m16",
+      "name": "K 量化与缓存插入融合（q 单独量化）",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/model_executor/layers/sparse_attn_indexer.py:L389-L406",
+        "vllm/model_executor/models/deepseek_v2.py:L813-L819"
+      ],
+      "note": "『we only quant q here since k quant is fused with cache insertion』——k 的量化+插入一步（indexer_k_quant_and_cache），q 的量化在 Python 侧（或 fused_indexer_q_rope_quant 一核三合一）；V4 新布局 fused_norm_rope 连 buffer 清 -1 都融进去（skip_topk_buffer_clear=True）。"
+    },
+    {
+      "id": "ch26-m17",
+      "name": "DCP top-k 合并：本地候选交换=精确全局 top-K（边界注）",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/model_executor/layers/sparse_attn_indexer.py:L74-L124",
+        "vllm/model_executor/layers/sparse_attn_indexer.py:L520-L528"
+      ],
+      "note": "全局 top-K 必含于各 rank 本地 top-K（docstring 论证）；单卡 no-op。深讲归 ch34（分布式 Part VIII）——本章一段带过，registry/精简版按 delete 清单裁掉。"
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "sparse_attn_indexer.py 全部 DCP 路径：_assert_cutedsl_dcp_merge_supported + _merge_dcp_topk_global（L48-L124）、两处调用（L520-L528、L667-L675）及 dcp_rank/dcp_world_size/cp_kv_cache_interleave 形参（L315-L317，均带默认 0/1/1）；indexer.py 侧只删五小块——① _dcp_localize_decode_seq_lens 方法（L596-L614）、② build 里 build_prefill_chunk_metadata 调用的 dcp 形参透传（L855-L857，函数形参自带默认 0/1/1）、③ global_seq_lens_for_decode 守卫块（L883-L885）连同其 None-直通下游（L893-L901 的 _prepare_global_decode_seq_lens 调用 + L963 的 global_seq_lens= 传参——必须一起删否则 NameError；dataclass 字段 indexer.py:L420 默认 None；_prepare_global_decode_seq_lens 方法本体 L736-L762 随之成死代码，可留可删）、④ _dcp_localize 调用块（L922-L928）、⑤ build_prefill_chunk_metadata 的 DCP 段（L1013-L1027，守卫 dcp_world_size>1 单卡恒假）。L777 的 dcp_local_seq_lens 赋值删后仅成无害未用变量，可留。⚠ 绝不可整段删 L886-L921：seq_lens/block_table 切片、_prepare_decode_tensors、seq_lens_is_buffer_view 是 decode 主路径",
+        "why_safe": "dcp_world_size=1 时 _merge_dcp_topk_global 首行直接 return（L95-96）、get_dcp_local_seq_lens 不被调用、_prepare_global_decode_seq_lens 对 None 输入原样返回 None（indexer.py:L746-L747）——单卡语义逐字不变；分布式深讲归 ch34"
+      },
+      {
+        "what": "sparse_attn_indexer.py 的 XPU 分支（L488-L498、L587-L601）与 SparseAttnIndexer.forward_hip/rocm_aiter 分支（L842-L873）",
+        "why_safe": "CUDA-only 精简版；forward_native 的平台分派保留 def 分支即可"
+      },
+      {
+        "what": "use_fp4_cache 全部分支：_gather_workspace_shapes 的 fp4 形状（L264-L268）、kv_cache_as_quant_view 的 fp4 视图（L282-L291）、q_scale 断言（L372-L377）、prefill 的 fp4 cast（L480-L487）、decode 的 fp4 cast（L552-L558、L582-L586）、DeepseekV4Indexer 的 use_fp4_kv 分支（L782-L785）与 fused 输出缓冲（L870-L871）",
+        "why_safe": "attention_config.use_fp4_indexer_cache 默认 False 且 builder 断言仅 Blackwell——FP8 路径完整自洽；FP4 讲解用真实源码 excerpt，不依赖精简版"
+      },
+      {
+        "what": "sparse_attn_indexer.py 的 PCP 路径：use_pcp 形参、maybe_gather_indexer_k 调用（L383-L396）与 num_tokens 的 pcp 折半",
+        "why_safe": "prefill_context_parallel_size=1 时 use_pcp=False 恒不触发"
+      },
+      {
+        "what": "dense-MHA 跳过优化：sparse_attn_indexer 的 L408-L424（use_dense_mha 检查提前返回）与 mla.py 的 dense_mha_metadata_layer_name 绑定（L128-L147）",
+        "why_safe": "纯优化性跳过——不跳只多算一次打分、buffer 多写一次，结果不变（注释原话 'clearing it would be unnecessary work'）"
+      },
+      {
+        "what": "sparse_attn_indexer.py 的 profiling 假跑分支（L327-L364，if not isinstance(attn_metadata, dict): 整块连 return sparse_attn_indexer_fake；⚠ L321-L325 的 forward_context/attn_metadata/fp8_dtype/k_cache_prefix 取值是真实路径必需——fp8_dtype 在 prefill 真路径 L443 复用、attn_metadata/k_cache_prefix 在 L365 复用，不得并入删除）",
+        "why_safe": "仅 vLLM runner dummy run 用（预留 workspace+峰值 logits 账）；独立精简版不跑 dummy run"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "Indexer",
+        "why": "V3.2 DSA 打分器主类——装配+forward 全在这"
+      },
+      {
+        "symbol": "DeepseekV32IndexerCache",
+        "why": "IndexCache 本体（132B/条布局+spec 自报）"
+      },
+      {
+        "symbol": "SparseAttnIndexer",
+        "why": "CustomOp 层——打分到 top-k 的封装"
+      },
+      {
+        "symbol": "sparse_attn_indexer",
+        "why": "op 本体（prefill/decode 两路打分+选块主舞台）"
+      },
+      {
+        "symbol": "topk_indices_buffer",
+        "why": "全模型共享副作用缓冲——本章数据流主轴"
+      },
+      {
+        "symbol": "wq_b",
+        "why": "indexer query 低秩上投（独立小头证据①）"
+      },
+      {
+        "symbol": "wk_weights_proj",
+        "why": "k+逐头权重一枪融合 GEMM（独立小头证据②）"
+      },
+      {
+        "symbol": "k_norm",
+        "why": "indexer key 的 LayerNorm(eps=1e-6)"
+      },
+      {
+        "symbol": "softmax_scale",
+        "why": "head_dim**-0.5 折进 weights 的归一化"
+      },
+      {
+        "symbol": "n_head_scale",
+        "why": "n_head**-0.5——多头加权和的尺度补偿"
+      },
+      {
+        "symbol": "indexer_k_quant_and_cache",
+        "why": "K 量化+缓存插入融合核（m16）"
+      },
+      {
+        "symbol": "fp8_fp4_mqa_logits",
+        "why": "prefill 打分核（I_{t,:} O(L²) 本尊）"
+      },
+      {
+        "symbol": "fp8_fp4_paged_mqa_logits",
+        "why": "decode paged 打分核"
+      },
+      {
+        "symbol": "top_k_per_row_prefill",
+        "why": "prefill top-k 选择核"
+      },
+      {
+        "symbol": "top_k_per_row_decode",
+        "why": "decode top-k 兜底核"
+      },
+      {
+        "symbol": "persistent_topk",
+        "why": "topk∈{512,1024,2048} 专用核（三核分派之一）"
+      },
+      {
+        "symbol": "cooperative_topk",
+        "why": "小批合作式核（三核分派之二）"
+      },
+      {
+        "symbol": "per_token_group_quant_fp8",
+        "why": "q 的 128 组 FP8 量化（ue8m0）"
+      },
+      {
+        "symbol": "cu_seqlen_ks",
+        "why": "因果下界（每 query 行的 K 起点账）"
+      },
+      {
+        "symbol": "cu_seqlen_ke",
+        "why": "因果上界——top_k_per_row 的因果边界对"
+      },
+      {
+        "symbol": "split_indexer_prefill_chunks",
+        "why": "双预算切块算法（m04）"
+      },
+      {
+        "symbol": "DeepseekV32IndexerMetadataBuilder",
+        "why": "每拍 metadata 侧（分流/切块/展开/压缩坐标）"
+      },
+      {
+        "symbol": "DeepseekV32IndexerBackend",
+        "why": "indexer cache 后端（V3.2，块 64）"
+      },
+      {
+        "symbol": "DeepseekV4IndexerBackend",
+        "why": "V4 子类（块 256）——两代共享后端族证据"
+      },
+      {
+        "symbol": "get_max_prefill_buffer_size",
+        "why": "workspace=max_model_len×40 的魔数账"
+      },
+      {
+        "symbol": "DeepseekV4Indexer",
+        "why": "V4/CSA 打分器（压缩坐标系+FP4 开关）"
+      },
+      {
+        "symbol": "DeepseekV4IndexerCache",
+        "why": "V4 indexer 缓存（compress_ratio+页对齐）"
+      },
+      {
+        "symbol": "DeepseekCompressor",
+        "why": "K^IComp 压缩机（skip_k_cache_insert 的对价）"
+      },
+      {
+        "symbol": "CompressorStateCache",
+        "why": "压缩机 fp32 部分状态（跨页等满窗）"
+      },
+      {
+        "symbol": "fused_wkv_wgate",
+        "why": "压缩机一枪出 KV+score 的融合 GEMM"
+      },
+      {
+        "symbol": "save_partial_states",
+        "why": "部分状态存入 state_cache 的核"
+      },
+      {
+        "symbol": "compress_ratio",
+        "why": "三代分型的主旋钮（1/4/128）"
+      },
+      {
+        "symbol": "topk_tokens",
+        "why": "k——O(Lk) 的 k"
+      },
+      {
+        "symbol": "skip_topk",
+        "why": "跨层复用开关（m08）"
+      },
+      {
+        "symbol": "index_topk_freq",
+        "why": "skip 模式三旋钮之一（arXiv:2603.12201）"
+      },
+      {
+        "symbol": "is_v32",
+        "why": "DSA 架构探测（hasattr index_topk）"
+      },
+      {
+        "symbol": "_fill_short_context_topk_indices",
+        "why": "短上下文全选快路径（m12）"
+      },
+      {
+        "symbol": "triton_convert_req_index_to_global_index",
+        "why": "index 空间换算（m07）"
+      },
+      {
+        "symbol": "compute_global_topk_indices_and_lens",
+        "why": "V4 C4A 的换算+计数核"
+      },
+      {
+        "symbol": "combine_topk_swa_indices",
+        "why": "V4 prefill 的 topk∪SWA 并集核（m13）"
+      },
+      {
+        "symbol": "flash_mla_with_kvcache",
+        "why": "V4 decode 一核双源调用（extra_k_cache）"
+      },
+      {
+        "symbol": "extra_k_cache",
+        "why": "双源的『第二本 KV』形参——NSA 回归字面证据"
+      },
+      {
+        "symbol": "DeepseekV4SWACache",
+        "why": "滑窗支路缓存（三支路之一）"
+      },
+      {
+        "symbol": "FlashMLASparseImpl",
+        "why": "V3.2 消费后端"
+      },
+      {
+        "symbol": "SparseMLACommonImpl",
+        "why": "消费侧公共基类（buffer 接管+mask 路径）"
+      },
+      {
+        "symbol": "forward_mqa",
+        "why": "消费侧统一入口（V3.2/V4 同名方法）"
+      },
+      {
+        "symbol": "MXFP4_BLOCK_SIZE",
+        "why": "FP4 布局常量（per-32 scale）——布局讲解锚"
+      },
+      {
+        "symbol": "RADIX_TOPK_WORKSPACE_SIZE",
+        "why": "cooperative/persistent 核的共享 workspace"
+      },
+      {
+        "symbol": "indexer_rope_emb",
+        "why": "indexer 专属 RoPE（interleave 与主 RoPE 相反）"
+      },
+      {
+        "symbol": "_try_load_fp8_indexer_wk",
+        "why": "FP8 wk 权重加载专门路径——『单独训练』的工程痕迹（m01 可信度）"
+      },
+      {
+        "symbol": "indexer_op",
+        "why": "Indexer→SparseAttnIndexer 的调用句柄（三代都在）"
+      },
+      {
+        "symbol": "maybe_execute_in_parallel",
+        "why": "站 13 双流并行：wq_b+量化 与 compressor 重叠执行，join 保证 K 写缓存先于打分（V4 forward）"
+      }
+    ]
+  },
+  "foreshadow_due": {
+    "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，不跑）",
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "pedagogy-plan.foreshadows 十条无一 planted=26 或 paid=26——本章不埋不收。途经伏笔（不回收、只回指）：F7（block_table 间接寻址，13→22 已收）在站 12/14 的 index 空间换算是活的——正文可一句『F7 的同一套间接寻址在稀疏路径再现』；F10（量化与 kernel 的耦合，19→27）在 FP8/FP4 indexer 缓存布局处是活的——一句『数学归 ch27』。与前后章衔接：ch25 站 9 的 indexer 调用位与 hybrid 组化注即本章入口（L2 图已互相回指）；ch28 capstone 消费本章三类层与 compress_ratios 表；ch34 深讲 DCP 合并（m17 边界注）。收尾回指段按 WRITING-CONTRACT §7 埋下一章种子：MoE 拼装。"
+  },
+  "l2_spec": "book/cartography/l2-specs/ch26.json（同批产出；stations 与本档 stations 同一份账本）"
+}

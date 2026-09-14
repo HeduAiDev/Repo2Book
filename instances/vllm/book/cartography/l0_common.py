@@ -81,13 +81,25 @@ def rect_svg(x, y, w, h, fill, stroke, rx, sw, dash):
             f'fill="{fill}" stroke="{stroke}" stroke-width="{sw}"{d}/>')
 
 
-def text(x, y, s, fs=11, fill=C_TXT, anchor='middle', bold=False, maxw=None, tag=''):
+def text(x, y, s, fs=11, fill=C_TXT, anchor='middle', bold=False, maxw=None, tag='', halo=False):
     if maxw:
         fit(s, fs, maxw, tag or s[:16], bold)
     w = tw(s, fs, bold)
     x0 = x - w / 2 if anchor == 'middle' else (x - w if anchor == 'end' else x)
-    ELEMS.append(((x0 - 2, y - 0.85 * fs - 1.5, x0 + w + 2, y + 0.25 * fs + 1.5),
-                  text_svg(x, y, s, fs, fill, anchor, bold)))
+    bbox = (x0 - 2, y - 0.85 * fs - 1.5, x0 + w + 2, y + 0.25 * fs + 1.5)
+    body = text_svg(x, y, s, fs, fill, anchor, bold)
+    if halo:
+        # 白 halo 叠层（gen_L2 2026-08-27 同款）：白描边同字先铺、彩字原样后绘，
+        # 穿过文字的连线在字形处视觉断开；两层均带 data-halo="1"（geometry linter
+        # 对 halo 孪生不收集，防 text-text 自撞）。调用方须把 halo 文字在**连线之后**
+        # 发射（SVG 文档序=绘制序，先线后字才有遮盖）。
+        b = ' font-weight="bold"' if bold else ''
+        sw_ = max(2.6, 0.34 * fs)
+        h = (f'<text x="{x:.1f}" y="{y:.1f}" font-family="{FONT}" font-size="{fs}" '
+             f'fill="#ffffff" stroke="#ffffff" stroke-width="{sw_:.1f}" stroke-linejoin="round" '
+             f'paint-order="stroke" text-anchor="{anchor}" data-halo="1"{b}>{esc(s)}</text>')
+        body = h + body.replace('>', ' data-halo="1">', 1)
+    ELEMS.append((bbox, body))
 
 
 def rect(x, y, w, h, fill, stroke, rx=8, sw=1.6, dash=False):
