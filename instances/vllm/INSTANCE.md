@@ -24,6 +24,10 @@
 - **🔄 Phase 2 图系三层缩放**（已完成：L0+L1×8 minimap 模式+L2 渲染器样板）：L0 唯一 → L1 Part 图（L0 局部放大）→ L2 章图；
   同一数据源分层渲染；改造 v2 arch-model 渲染器。
 - Phase 3 逐章重写：pipeline 复用 + 新写作契约（hook 开篇/先地图后细节/阶梯展开）。
+- **⏸ 生产暂停（2026-09-15，用户指示「先不开新章节」）**：已定稿 **31/40**（ch01-28 + ch29 + ch30 + ch34），全部已提交推送（分支 `vllm-book-v3-rewrite`）。
+  - 待写 9 章：**ch36**（P/D 分离，断点停在 dossier 对抗自核修复后的重验，`wf_89b2562d-1c9` 可 resume——注意 resume 前确认 dossier-verify 的 rev16 注记在位）；就绪待发 ch31/ch32/ch35/ch38/ch39；依赖链尾 ch33（等 ch32）/ch37（等 ch36）/ch40 终章。
+  - ch14 四轮读者反馈 + 一轮独立验收已全数闭环（断链重排/密度阶梯/雅词清剿/DeepSeek 嵌入去生硬，验收报告 `artifacts-v3/ch14-memory-ledger/reviews/reader-acceptance-round4.md`）；契约 §7.5 已固化「断链出口≠断点」诊断纪律。
+  - ch28 定稿后遗留的 negotiable 小项与 ch14 的 census claim 元数据口径（「六类缓存自报四族 spec」→「四类缓存/六种形态」）留批次收尾处理。
 - v3 方法论/大纲：`docs/superpowers/specs/2026-08-15-v3-pedagogy-rewrite.md` +
   `book/cartography/outline-v3-draft.md`（**38 章 8 Part、4 primer 混合制**，用户多轮裁决已吸收：
   容量修正/KV 池化/DSpark/IndexCache/先原理后代码）。
