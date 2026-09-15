@@ -916,7 +916,7 @@ if self.compress_ratio == 4:  # L277
 
 ![V4 三类层：compress_ratios 逐层表定型](../diagrams/ch26-fig-v4-layer-types.png)
 
-> *图注：61 格层带按 compress_ratios 表染成三色：SWAonly(1) 只滑窗、C4A(4) 带 indexer 做 4 压 1 块级 top-k、C128A(128) 压缩后 1280 个候选在 metadata 期直算全选（不比较 topk、不建 indexer）。只有 C4A 格画 indexer 小图标；MTP 尾格钉死 compress_ratio=1。着色与分界均为示意。具体逐层 Pattern 随 checkpoint 发布，vLLM 不设默认值。三类层各有独立的 FlashMLA 调度元数据（tile_scheduler 不共享，因为三者的 topk 与页宽配置不同）；SWA 块与 C4A 压缩块共享物理张量页（同 64-token 页宽）。消费侧一核双源见后图。*
+> *图注：61 格层带按 compress_ratios 表染成三色：SWAonly(1) 只滑窗、C4A(4) 带 indexer 做 4 压 1 块级 top-k、C128A(128) 压缩后 1280 个候选在 metadata 期直算全选（不比较 topk、不建 indexer）。只有 C4A 格画 indexer 小图标；MTP 尾格钉死 compress_ratio=1。着色与分界均为示意。具体逐层 Pattern 随 checkpoint 发布，vLLM 不设默认值。三类层各有独立的 FlashMLA 调度元数据（图上写作 planner：源码注释里指每个层类型首次前向时生成那份 tile_scheduler 元数据的那一步；三类层之间不共享，因为 topk 与页宽配置不同）；SWA 块与 C4A 压缩块共享物理张量页（同 64-token 页宽）。消费侧一核双源见后图。*
 
 C4A 的索引键不再由打分算子插入，改由**压缩机**生产。`DeepseekCompressor` 是 V4 新部件：把 KV 按 softmax 门控压成块的核（[第 25 章](../../ch25-mla-two-expansions/narrative/chapter.md)提过它同时服务主压缩 KV 池；这里看它的索引侧输出）。装配的核心两件：
 
