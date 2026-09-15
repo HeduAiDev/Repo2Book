@@ -29,7 +29,7 @@ PHY_S = '#475569'                       # 物理张量 = 石板灰
 # ---------------- 标题区 ----------------
 lc.text(MX, 34, '通用张量布局：账本说 10 块、物理只有 2 张张量——每池由每组各出一层合租',
         16.5, lc.C_TXT, 'start', True, maxw=990, tag='title')
-lc.text(MX, 58, 'num_blocks = available // page // group_size = 1310720 // 65536 // 2 = 10——三组三张私有块表各记各的门牌，房间（物理页）合租',
+lc.text(MX, 58, 'num_blocks = available // page // group_size = 1310720 // 65536 // 2 = 10——三组三张私有块表各记各的块号，房间（物理页）合租',
         10.5, lc.C_MUTE, 'start', maxw=1030, tag='subtitle')
 _ch = 'L0 放大 · KV 账本列 → GPU 列接缝 · L2 拍片④'
 _cw = lc.chip_w(_ch)
@@ -95,18 +95,22 @@ TB = TY + STH
 # ---------------- 矩阵左下方：三张私有块表（调度器侧账本） ----------------
 BT_X, BT_W = GX, RH_LBL
 BT_Y = GB + 36
+BT_ROW_X = BT_X + 40        # 十格块表条起点（行标签后留 10px，末标落在面板内）
+BT_PG_W, BT_PG_GAP = 7.4, 1.2
+BT_ROW_W = 10 * (BT_PG_W + BT_PG_GAP)
 lc.rect(BT_X, BT_Y, BT_W, TB - BT_Y, lc.C_KV_F, lc.C_KV_S, rx=7, sw=1.3)
-lc.text(BT_X + 12, BT_Y + 19, '三张私有块表', 9.5, lc.C_KV_S, 'middle', True,
+lc.text(BT_X + 12, BT_Y + 19, '三张私有块表', 9.5, lc.C_KV_S, 'start', True,
         maxw=BT_W - 24, tag='bt:t')
-lc.text(BT_X + 12, BT_Y + 36, '每组一张 · append-only', 8.2, '#475569', 'middle',
+lc.text(BT_X + 12, BT_Y + 36, '每组一张 · append-only', 8.2, '#475569', 'start',
         maxw=BT_W - 24, tag='bt:s')
 for r, (label, _, _) in enumerate(ROWS):
     ry = BT_Y + 50 + r * 24
     lc.text(BT_X + 12, ry + 10, label.split(' · ')[0], 8.4, lc.C_TXT, 'start', True,
             maxw=44, tag='bt:r%d' % r)
     for p in range(10):
-        lc.rect(BT_X + 58 + p * 8.6, ry, 7.4, 14, '#ffffff', lc.C_KV_S, rx=1.5, sw=0.7)
-    lc.text(BT_X + 58 + 10 * 8.6 + 4, ry + 10, '0-9', 8, lc.C_MUTE, 'start', maxw=30,
+        lc.rect(BT_ROW_X + p * (BT_PG_W + BT_PG_GAP), ry, BT_PG_W, 14, '#ffffff',
+                lc.C_KV_S, rx=1.5, sw=0.7)
+    lc.text(BT_ROW_X + BT_ROW_W + 4, ry + 10, '0-9', 8, lc.C_MUTE, 'start', maxw=30,
             tag='bt:e%d' % r)
 
 # ---------------- 右：对照 · 单组异宽（不合租） ----------------

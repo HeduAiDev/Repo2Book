@@ -30,7 +30,7 @@ HL_S, HL_F = lc.C_ENG_S, lc.C_ENG_F        # 本图主角路径（四路分发�
 AMBER = '#b45309'                          # 同页 37440 的设计证据标注（虚线连线）
 
 # ---------------- 标题区 ----------------
-lc.text(MX, 34, 'DeepSeek V4 的账本户口：六种形态自报四种页宽——第三路径「MLA 元组打包 + 滑窗分桶」收编成 5 组',
+lc.text(MX, 34, 'DeepSeek V4 的账本清单：六种形态自报四种页宽——第三路径「MLA 元组打包 + 滑窗分桶」收编成 5 组',
         16.5, lc.C_TXT, 'start', True, maxw=1010, tag='title')
 lc.text(MX, 58, '等页组化六条假设的第 3 条（每 token 每层字节相同）当场破——vLLM 为 V4 单开第三条分组路径：'
                 'MLA 全家打包成 [C4I,C4A,C128] 元组、滑窗族按 (block_size, window) 分桶',
@@ -190,7 +190,7 @@ lc.rect(MX, BB_Y, BXR - MX, 52, '#ffffff', lc.C_MUTE, rx=6, sw=1.1, dash=True)
 lc.text(MX + 16, BB_Y + 17, '深讲边界（均为预告）：584 B 槽特形与 compress_ratio 数学 → 第 24 章（原理章）· '
         '索引器/压缩器/滑窗缓存三件套与打包张量布局 → 第 25/26 章 · MTP 草稿层混进滑窗组（is_eagle_group）→ 第 28 章',
         8.8, lc.C_MUTE, 'start', maxw=BXR - MX - 32, tag='bb:1')
-lc.text(MX + 16, BB_Y + 36, '等页组化（④ 两位前辈 Gemma3 / gpt-oss 走的路）到 V4 为止——元组打包的正片归后续专章展开',
+lc.text(MX + 16, BB_Y + 36, '等页组化（④ 两位前辈 Gemma3 / gpt-oss 走的路）到 V4 为止——元组打包的完整拆解归后续专章展开',
         8.4, lc.C_MUTE, 'start', maxw=BXR - MX - 32, tag='bb:2')
 lc.text(MX, BB_Y + 72, '逐字锚 vllm/v1/kv_cache_interface.py（六种形态的 spec 直跑 census）· '
         'vllm/v1/core/kv_cache_utils.py:L1592-L1754（分组走查·host 转写非直跑）· '
