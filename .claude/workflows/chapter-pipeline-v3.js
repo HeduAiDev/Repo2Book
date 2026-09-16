@@ -299,6 +299,7 @@ const expl = await agent(
     : '+ ' + CH + '/implementation/：**只补 deepread 卡没有的数**——优先写驱动脚本跑精简版取 trace（trace_source="run"），表格每个数字必须能在 trace 或 deepread 卡里找到出处。\n') +
   '对每个 needs_worked_example 机制产出教学素材，Write 到 ' + CH + '/explainer/explainer.json；trace 原始输出与驱动脚本存 ' + CH + '/explainer/traces/。\n' +
   '每个 needs_figure 机制至少 1 个 figure-spec（claim 一句话、numbers 全带 provenance、caption_draft 给结论）。**新图须能回答「它是 L0 哪一块的放大」**（FIGURE-SYSTEM §0 一张图原则），答不出的别提 figure-spec。\n' +
+  (PRIMER ? '**本章强制「密集小图」风格（用户 2026-09-16 定，规范 STYLE-dense-mini-figures.md，样板 refs/shou-si-v4-3-hca.md）**：按六个模块的**步骤**出步进小图——每模块 3-6 张、每张一个论点、删掉该图论证就断；figure-spec 的 claim 写成「该步的一句话结论」，numbers 给该步的极小数值例（L=11/r=4 级）。不是只出几张全景大图。\n' : '') +
   '完成后自跑 `python3 ' + REPO + '/scripts/lint_explainer.py ' + CH + '` 确保无 BLOCKING。返回 status/note。' + ESC,
   mo({ schema: STATUS_SCHEMA, label: 'explain', phase: 'Explain', agentType: 'general-purpose' }, 'explain', false)
 )
@@ -408,6 +409,7 @@ const CONTRACT_V3 = [
   '- 图注三要素（缺一 reviewer 打回）：①这块在 L0 全局图的哪里（认得感——「它就是第 1 章那张图里的 XX 块」）；',
   '  ②本章打开什么、接在哪几块已读结构上；③站号 = 请求流经代码的顺序，正文按讲解需要编排、不必照站号读。',
   '- 正文任何时刻进入新组件，先一句「现在走到 L0 图的哪一段」再展开细节。',
+  '- **密集小图算法讲解（2026-09-16 用户指定）**：讲算法的节按步骤逐张配小图（≈每 2000 字一图、每模块 3-6 张），每张必须「删掉论证就断」（装饰/重复图禁）；图贴该步旁、图注给该步结论；每个机制配极小数值例；实现走 sec1 基础→sec2+机制→完整 的伪码阶梯。规范正本 `STYLE-dense-mini-figures.md`；**primer 章强制**。',
   '',
   '## 3. 阶梯不跳级（概念首现门禁）',
   '',
