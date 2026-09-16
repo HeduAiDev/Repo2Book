@@ -367,6 +367,7 @@ for (let b = 1; b <= 3; b++) {
   const ill = await agent(
     head('illustrator') +
     '任务：按 ' + CH + '/explainer/explainer.json 的全部 figure_specs 绘**机制图**到 ' + CH + '/diagrams/（gen_<figure_id>.py + svg + png + figure-manifest.json 登记；manifest 里已有的开篇图条目别动）。每张图强制流程：渲染 → 用 Read 打开 PNG **亲眼看** → 六项自查全真才登记 manifest（blind_review 初写 PENDING）。\n' +
+    '（rev2 注记：explainer.json 可能刚按「密集小图」规范重产过 spec——**必须以当前盘上 explainer.json 的最新 figure_specs 全量绘制**，不沿用上轮已画的清单；小图=聚焦单一步骤的小画布、一图一论点。规范 ' + CART + '/STYLE-dense-mini-figures.md。）（rev3：同前。）\n' +
     'v3 图系铁律（FIGURE-SYSTEM §3）：机制图允许存在，但**架构性内容必须回指 L0/L1/L2**（用文字/局部指北，不许另立第二种架构画法）；图上禁止杜撰类名/方法名/站号；数字须可溯源 explainer。开篇图已由上一步产出，**不要生成 arch-model/roadmap/chapter-map**（已退役）。\n' +
     (blindLedger.length ? '上一轮盲审 FAIL，必须修复后重渲重看：\n' + blindLedger.join('\n') + '\n' : '') +
     '完成后自跑 `python3 ' + REPO + '/scripts/lint_diagram_geometry.py ' + CH + '/diagrams/*.svg` 与 `python3 ' + REPO + '/scripts/lint_diagram_scaffolding.py ' + CH + '` 确保无问题。返回 status/note。' + ESC,
