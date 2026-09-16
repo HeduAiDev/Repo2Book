@@ -535,8 +535,9 @@ def build_l0():
     #   右界让开 ② 拍号徽标（badge 左缘 = BX+COL_W-27-8）
     _b1lbl = 'Part V 打开 · ch17-22'
     part_chip(BX + COL_W - 35 - 10 - chip_w(_b1lbl), B1Y + 8, _b1lbl, PART_COLOR['V'])
-    # 模型层 → Part VI（ch23-28，l0_part_map #7）
-    _b3lbl = 'Part VI 打开 · ch23-28'
+    # 模型层 → Part VI（ch23-29，l0_part_map #7；重编号后）
+    # ⚠️ Part 区间与 pedagogy-plan.parts 同步（2026-09-16 重编号：VI=ch23-29）
+    _b3lbl = 'Part VI 打开 · ch23-29'
     part_chip(BX + COL_W - 12 - chip_w(_b3lbl), B3Y + 8, _b3lbl, PART_COLOR['VI'])
 
     # ---- C 列（品红） ----
@@ -567,8 +568,9 @@ def build_l0():
     alabel(CCX + 7, C2Y - 4, 'logits [采样位, vocab]', 9, C_SAM_S)
     seg(CCX, C3Y, CCX, C2Y + c2h, C_SAM_S, 1.6, 'std')
     alabel(CCX + 7, C3Y - 4, 'bitmask H2D → -inf', 9, C_SAM_S)
-    # 「第几 Part 打开」行程表：采样出口列 → Part VII（ch29-33，l0_part_map #8）
-    _c1lbl = 'Part VII 打开 · ch29-33'
+    # 「第几 Part 打开」行程表：采样出口列 → Part VII（ch30-34，l0_part_map #8；重编号后）
+    # ⚠️ 与 pedagogy-plan.parts 同步（重编号：VII=ch30-34）
+    _c1lbl = 'Part VII 打开 · ch30-34'
     part_chip(CX + COL_W - 12 - chip_w(_c1lbl), C1Y + 8, _c1lbl, PART_COLOR['VII'])
 
     # ---- 跨列箭头 ----
@@ -628,7 +630,8 @@ def build_l0():
     rect(MI_X, VY, MI_W, VH, '#ffffff', C_MUTE, rx=8, sw=1.2, dash=True)
     text(MI_X + 16, VY + 24, '多实例视角：DP / P-D 分离 / 弹性扩缩', 11.5, C_TXT, 'start', True,
          maxw=MI_W - 200, tag='multi:t')
-    _ml = 'Part VIII 打开 · ch34-40'
+    # ⚠️ 与 pedagogy-plan.parts 同步（重编号：VIII=ch35-41）
+    _ml = 'Part VIII 打开 · ch35-41'
     part_chip(MI_X + MI_W - 12 - chip_w(_ml), VY + 7, _ml, PART_COLOR['VIII'])
     text(MI_X + 16, VY + 46, '· 数据并行（DP）、P/D 分离（生成与消化拆到不同机器）、弹性扩缩自愈',
          9, '#334155', 'start', maxw=MI_W - 32, tag='multi:l1')

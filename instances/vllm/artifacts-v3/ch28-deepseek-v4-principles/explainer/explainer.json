@@ -1,0 +1,869 @@
+{
+ "chapter_id": "ch28",
+ "chapter_title": "【primer】DeepSeek-V4 原理：七件套怎么还两本账",
+ "pin": "vLLM v0.27.1 (6e448d0ea)；论文包 book/papers/ch28-deepseek-v4-principles/（主料 arXiv:2606.19348 + V3.2 arXiv:2512.02556 / V3 arXiv:2412.19437 / HC arXiv:2409.19606 / mHC arXiv:2512.24880 / DeepSeekMoE arXiv:2401.06066 / Hash Layers arXiv:2106.04426 六篇谱系锚 + V4-Flash config 数字表）",
+ "kind": "primer",
+ "trace_environment": "本章为 primer 原理章：implementation/ 是论文忠实的小型 NumPy 参考实现（非 vLLM 源码减法，`python -m pytest tests/` 100 passed，见 tests/test-report.json），7 个驱动脚本全部 host python（Miniconda CPython 3.11.11、numpy 1.26.4）纯 CPU 实跑，trace_source=run，脚本与原始输出在 explainer/traces/（无 vLLM 包、无 CUDA、无容器）。与 pin 真实运行环境的结构性差异（均就近标注，writer 需挑明）：①数值取自 numpy float64——真实 GPU 路径是 fp8/bf16 混合精度，ulp 级数值行为不在本章取证范围；『权重和为 1』『逐位等价』这类断言是 float64 实测，其数学依据是式子的恒等变形而非浮点巧合。②vLLM 侧数字（584B/条、132B/条 IndexCache、656B(V3.2)、4096B(GQA8 基线)、滑窗行宽 576B、层分布 43 层）全部来自 pin 源码注释与 config 的**同式算术镜像**（纯乘除/整除，锚点行号已对 v0.27.1 工作树核真），本机不 import vllm、不依赖 CUDA、无需容器。③config 数字（43 层 / compress_ratios / sliding_window=128 / index_topk=512 / hc_mult=4 / 256 挑 6 + 1 共享 / moe_intermediate_size=2048 / num_hash_layers=3）取自本包 §八 的 V4-Flash config 直抓记录，正文引用时必须写『config 口径』。④**官方参考实现（DeepSeek-V4-Pro inference/model.py）是只读蓝本**：本机不执行它（host 无 tilelang/GPU 路径），公式↔代码对照里的 `model.py:Lxxx` 均为源码阅读证据；m03/m04 的『两半区标签相反』对账是在**本章译自官方代码的同构实现**（compressor.csa_compress_reference_layout）上做的逐位核对，不是官方代码实跑——引用时不要写成『跑了官方代码』。⑤本包未取到 V4 的 num_attention_heads（主注意力头数），凡涉及『合计乘加数』的比较一律降级为**每头**口径并在 trace 里写明（run_m08_hca.py 的 8.561644 倍即此口径）。",
+ "figure_policy": "dossier needs_figure=true 的 16 个机制 m01/m02/m03/m04/m05/m07/m08/m09/m12/m13/m14/m15/m16/m18/m19/m20 各配 1 张 figure_spec。本章 primer：无 L2 章图、无站号徽标（FIGURE-SYSTEM §2『primer 章主体改为推导链图』；dossier stations_note 同），开篇『你在这里』用 L1-partVI.png。每张 spec 的 l0_zoom 字段显式回答『它是 L0 哪一块的放大』：机制侧统一锚点 = L0 中列『GPU 执行臂』（gpu_column，绿 C_GPU_S）的『模型层 forward + 编译』块——本图打开这个块内部的七件套；缓存账侧（m01/m20）锚点 = L0『调度 · 显存账本』带的 KV 池块（kv_column，青 C_KV_S）。推导链动线按『两本账 → CSA 压缩 → 重叠与边界 → 选择 → 共享 KV → HCA → 滑窗 → mHC 三张 → MoE/hash → MTP → 坐标系』排。机制图一律用 l0_common 配色常量（GPU 执行臂恒绿、KV 池恒青、引擎恒橙），不引入第二种架构画法；与 ch29（同一批机制的代码装配/权重流入视角）的分工：本章画**公式口径**（符号 + 算式 + 玩具数值），ch29 画代码口径（类/字段/tilelang 核）。",
+ "symbol_table": [
+  {"symbol": "H", "meaning": "一串输入隐状态（n 个 token × d 维）——注意力层的输入矩阵，vLLM 里就是 hidden_states。", "first_use": "§二 首个公式 Eq.(9) 前定义", "source": "arXiv:2606.19348 §2.3.1"},
+  {"symbol": "n", "meaning": "序列长度（token 个数）——一切『压到几分之一』的分母。", "first_use": "Eq.(9) 前定义", "source": "arXiv:2606.19348 §2.3.1"},
+  {"symbol": "d", "meaning": "模型隐维度（config 口径 4096）；也是四组压缩投影的输入宽度。", "first_use": "Eq.(9) 前定义", "source": "arXiv:2606.19348 §2.3.1 / §八 config"},
+  {"symbol": "c", "meaning": "主注意力头维（config 口径 512）——一条压缩条目就是一条 c 维向量，它同时当 K 和 V。", "first_use": "Eq.(9) 后定义（head dimension）", "source": "arXiv:2606.19348 §2.3.1"},
+  {"symbol": "m", "meaning": "CSA 的压缩率：每 m 个 token 压成 1 条（config 口径 4）；它同时决定窗宽 2m。", "first_use": "§2.3 引言", "source": "arXiv:2606.19348 §2.3 / §八 config"},
+  {"symbol": "C^a, C^b", "meaning": "两组 KV 原料序列：第 i 条压缩条目的『当前窗』取自 C^a、『前一个窗』取自 C^b（两半区靠重叠共享一半输入）。", "first_use": "Eq.(9)", "source": "arXiv:2606.19348 Eq.(9)"},
+  {"symbol": "Z^a, Z^b", "meaning": "对应的两组『权重原料』——它们加位置偏置、过 softmax 之后就是每个位置的加权份额（这一层决定谁的信息进得来）。", "first_use": "Eq.(10)", "source": "arXiv:2606.19348 Eq.(10)"},
+  {"symbol": "B^a, B^b", "meaning": "可学习位置偏置（m×c）：让『窗内第几个位置』也参与权重——权重不只是内容相关，还带位置先验。代码里就是 ape。", "first_use": "Eq.(11) 前的 prose", "source": "arXiv:2606.19348 §2.3.1 / Eq.(11)"},
+  {"symbol": "Softmax_row", "meaning": "沿行方向做 softmax，但归一范围是 Z^a 与 Z^b 拼起来的 **2m 个元素**——两半区合起来才是一份完整权重。", "first_use": "Eq.(11)", "source": "arXiv:2606.19348 Eq.(11)"},
+  {"symbol": "C^Comp_i", "meaning": "第 i 条压缩条目（c 维）：2m 个向量按 softmax 权重逐元素加权求和的结果——不是摘要出来的，是算出来的。", "first_use": "Eq.(12)", "source": "arXiv:2606.19348 Eq.(12)"},
+  {"symbol": "S^a_j, S^b_j", "meaning": "第 j 个位置在 a 半区／b 半区的权重向量（逐元素权重，所以用 ⊙ 而非常数乘）。", "first_use": "Eq.(12)", "source": "arXiv:2606.19348 Eq.(12)"},
+  {"symbol": "⊙", "meaning": "逐元素相乘（Hadamard）——权重是 c 维向量，对 C 的每一维分别加权。", "first_use": "Eq.(12) 后符号说明", "source": "arXiv:2606.19348 Eq.(12)"},
+  {"symbol": "K^IComp", "meaning": "索引器自己的压缩键（n/m 条 × c^I 维）：打分对象从『每个 token 的 k』换成了『每个压缩块』——这是 V4 相对 V3.2 索引器唯一改的对象。", "first_use": "§2.2 选择段首句", "source": "arXiv:2606.19348 §2.3.1"},
+  {"symbol": "c^I", "meaning": "索引器头维（config 口径 128，与主注意力 512 无关）——索引器小头之所以便宜就便宜在这里。", "first_use": "§2.2 选择段", "source": "arXiv:2606.19348 §2.3.1 / §八 config"},
+  {"symbol": "n_h^I", "meaning": "索引器头数（config 口径 64）：每个索引头投一票，票的权重是学出来的标量。", "first_use": "Eq.(14) 后定义", "source": "arXiv:2606.19348 §2.3.1 / §八 config"},
+  {"symbol": "n_h", "meaning": "主注意力 query 头数——压缩条目在头之间共享，所以头数只加在 query 侧。", "first_use": "Eq.(18) 后定义", "source": "arXiv:2606.19348 §2.3.1"},
+  {"symbol": "c^Q_t", "meaning": "query 的低秩潜向量（d_c 维）：它往左接索引器 q、往右接主注意力 q——一次降维两处用，是本章的隐藏主线。", "first_use": "Eq.(13)", "source": "arXiv:2606.19348 Eq.(13)"},
+  {"symbol": "W^{DQ}", "meaning": "query 的降维矩阵（d → d_c）：把 hidden 压到低秩潜空间，两个 q 都从它出发。", "first_use": "Eq.(13)", "source": "arXiv:2606.19348 Eq.(13)"},
+  {"symbol": "W^{IUQ}", "meaning": "索引器 q 的升维矩阵（d_c → c^I·n_h^I）：把潜向量铺成 64 个头 ×128 维。", "first_use": "Eq.(14)", "source": "arXiv:2606.19348 Eq.(14)"},
+  {"symbol": "W^{UQ}", "meaning": "主注意力 q 的升维矩阵（d_c → c·n_h）：同一份潜向量铺成主注意力的多头 q。", "first_use": "Eq.(18)", "source": "arXiv:2606.19348 Eq.(18)"},
+  {"symbol": "q^I_{t,h}", "meaning": "第 t 个 query 的第 h 个索引头的查询向量（c^I 维）。", "first_use": "Eq.(14)", "source": "arXiv:2606.19348 Eq.(14)"},
+  {"symbol": "w^I_{t,h}", "meaning": "第 h 个索引头这一票的权重（标量，由 W^w 从 hidden 直接算出）——打分器里被学得最直接的一件东西。", "first_use": "Eq.(15)", "source": "arXiv:2606.19348 Eq.(15)"},
+  {"symbol": "I_{t,s}", "meaning": "query token t 对第 s 个压缩块的索引分：多头 ReLU 内积的加权和——分高者进 top-k。", "first_use": "Eq.(16)", "source": "arXiv:2606.19348 Eq.(16)"},
+  {"symbol": "ReLU(·)", "meaning": "负相关直接归零：让每个块只被『正相关』推动，避免多个头一起投反对票累积成负分。", "first_use": "Eq.(16)", "source": "arXiv:2606.19348 Eq.(16) / arXiv:2512.02556 Eq.(1)"},
+  {"symbol": "C^SprsComp_t", "meaning": "第 t 个 query 实际会看的稀疏压缩条目集合（top-k 选出来的那一小把）。", "first_use": "Eq.(17)", "source": "arXiv:2606.19348 Eq.(17)"},
+  {"symbol": "k", "meaning": "每个 query 保留的压缩条目数（config 口径 index_topk=512）——FLOPs 账的封顶值。", "first_use": "§2.3 引言", "source": "arXiv:2606.19348 §2.3 / §八 config"},
+  {"symbol": "s < Floor(t/m)", "meaning": "因果条件：query 只能选**严格在自己所在块之前**的完整块——块内先后在块级表达不出来，所以只能整块地看。（代码口径是 (t+1)//m，块尾 token 允许多看自己那块一格。）", "first_use": "Eq.(16) 后定义", "source": "arXiv:2606.19348 §2.3.1 / §2.3.3"},
+  {"symbol": "CoreAttn", "meaning": "核心注意力：query 多头、key/value 是同一份压缩条目（共享 KV 的 MQA）。", "first_use": "Eq.(19)", "source": "arXiv:2606.19348 Eq.(19)"},
+  {"symbol": "o_{t,i}", "meaning": "第 t 个 token 第 i 个头的注意力输出；输出侧还要按位置 −i 反向旋转、再走分组输出投影。", "first_use": "Eq.(19)", "source": "arXiv:2606.19348 Eq.(19)"},
+  {"symbol": "m′", "meaning": "HCA 的重压缩率（config 口径 128 ≫ m=4）：窗宽就是 m′ 本身，没有重叠、没有 a/b 两半。", "first_use": "§2.3 引言", "source": "arXiv:2606.19348 §2.3 / Eq.(20)-(23)"},
+  {"symbol": "n_win", "meaning": "滑窗保留的**未压缩** KV 条数（config 口径 128）：论文不给数值，数字全在 config；这一项是加账。", "first_use": "§四 滑窗段", "source": "arXiv:2606.19348 §2.3.3 / §八 config"},
+  {"symbol": "z′_h", "meaning": "第 h 个头的可学习 sink logit：Exp(z′_h) 只加到 softmax 的**分母**上（分子里没有对应的 value）——于是每个头的注意力总质量可以小于 1、甚至接近 0。", "first_use": "§四 sink 句", "source": "arXiv:2606.19348 §2.3.3"},
+  {"symbol": "X_l", "meaning": "第 l 个半层的残差状态，形状 n_hc × d——残差流从 1 条扩成 4 条（config: hc_mult=4）。", "first_use": "Eq.(1)", "source": "arXiv:2606.19348 §2.2"},
+  {"symbol": "A_l", "meaning": "读入映射：把 n_hc 条流聚成子层的一路输入（A_l = σ(Ã_l)，值域 (0,1)）。", "first_use": "Eq.(1)/Eq.(6)", "source": "arXiv:2606.19348 §2.2"},
+  {"symbol": "B_l", "meaning": "流间混合矩阵（残差自带的那一项），被关进 Birkhoff 多面体（双随机）——多流不塌的关键。", "first_use": "Eq.(1)/Eq.(2)", "source": "arXiv:2606.19348 §2.2 Eq.(1)(2)"},
+  {"symbol": "C_l", "meaning": "写回映射：把子层输出散回 n_hc 条流（C_l = 2σ(C̃_l)，值域 (0,2)）。", "first_use": "Eq.(1)/Eq.(7)", "source": "arXiv:2606.19348 §2.2"},
+  {"symbol": "F_l(·)", "meaning": "被夹在中间的子层（注意力或 FFN）——mHC 只关心它怎么被读入和写回，不关心它内部是什么。", "first_use": "Eq.(1)", "source": "arXiv:2606.19348 §2.2"},
+  {"symbol": "Ã_l, B̃_l, C̃_l", "meaning": "三张映射的 raw 参数（还没过 σ/Sinkhorn），由展平后的 RMSNorm 态一次 GEMM 生成：动态项（输入相关）+ 静态偏置。", "first_use": "Eq.(3)(4)(5)", "source": "arXiv:2606.19348 §2.2"},
+  {"symbol": "α_l^pre/res/post", "meaning": "三条支路的可学习门控（初始化很小）：决定『输入相关的动态项』占多少。", "first_use": "Eq.(3)(4)(5) 符号说明", "source": "arXiv:2606.19348 §2.2"},
+  {"symbol": "S_l^pre/res/post", "meaning": "对应的静态偏置（输入无关）——门控为 0 时映射退化成它。代码里是 hc_base。", "first_use": "Eq.(3)(4)(5) 符号说明", "source": "arXiv:2606.19348 §2.2"},
+  {"symbol": "σ(·)", "meaning": "sigmoid：把 raw 参数压进 (0,1)（A）或 (0,2)（C=2σ）——给门控一个正值下界。", "first_use": "Eq.(6)(7)", "source": "arXiv:2606.19348 §2.2"},
+  {"symbol": "M^(t)", "meaning": "Sinkhorn-Knopp 迭代到第 t 步的矩阵（起点 M^(0)=exp(B̃_l)），迭代行/列交替归一；t_max=20 之后它就是 B_l。", "first_use": "Eq.(8)", "source": "arXiv:2606.19348 §2.2 / arXiv:2512.24880 Eq.(9)"},
+  {"symbol": "T_r, T_c", "meaning": "行归一化算子与列归一化算子——交替作用就是 Sinkhorn-Knopp 迭代。", "first_use": "Eq.(8)", "source": "arXiv:2606.19348 §2.2 / arXiv:2512.24880 Eq.(9)"},
+  {"symbol": "t_max", "meaning": "迭代上限（=20，config: hc_sinkhorn_iters=20）：论文原话 as a practical value——精度与开销的折中，不是精确投影。", "first_use": "Eq.(8) 后原句", "source": "arXiv:2606.19348 §2.2 / arXiv:2512.24880 §4.2"},
+  {"symbol": "H_l^pre, H_l^res, H_l^post", "meaning": "mHC 原论文对同一组三映射的写法（读入/流间混合/写回）——V4 报告改叫 A_l/B_l/C_l，符号不同、角色相同。", "first_use": "mHC Eq.(3)/Eq.(5)", "source": "arXiv:2512.24880 Eq.(3)(5)(8)"},
+  {"symbol": "Birkhoff 多面体", "meaning": "全体双随机矩阵（非负、行和=1、列和=1）——B_l 被投影到的流形；置换矩阵是它的顶点（含恒等映射）。", "first_use": "Eq.(2) 定义", "source": "arXiv:2606.19348 Eq.(2) / arXiv:2512.24880 Eq.(6)"},
+  {"symbol": "u_t^l", "meaning": "第 l 层第 t 个 token 进 MoE 的输入向量（FFN 的输入）。", "first_use": "Eq.(3)", "source": "arXiv:2401.06066 Eq.(3)"},
+  {"symbol": "e_i^l", "meaning": "第 i 个专家的中心向量：门控分 = 输入与它的内积过 softmax（Eq.5）。", "first_use": "Eq.(5)", "source": "arXiv:2401.06066 Eq.(5)"},
+  {"symbol": "s_{i,t}", "meaning": "token t 对专家 i 的（归一化）门控分——V4 把它的激活从 Sigmoid 换成 Sqrt(Softplus)。", "first_use": "Eq.(5)", "source": "arXiv:2401.06066 Eq.(5) / arXiv:2606.19348 §2.1"},
+  {"symbol": "g_{i,t}", "meaning": "稀疏门控：只有 top-k 内的专家拿到自己的分值，其余置 0（Eq.4）——注意它**不重新归一**。", "first_use": "Eq.(4)", "source": "arXiv:2401.06066 Eq.(4)"},
+  {"symbol": "N, K", "meaning": "专家总数与每 token 激活数（标准 MoE 口径）；板斧一之后变成 mN 与 mK。", "first_use": "Eq.(3)(4)", "source": "arXiv:2401.06066 Eq.(3)(4)(6)(7)"},
+  {"symbol": "K_s", "meaning": "共享专家个数（config 口径 1）：前 K_s 个专家**无条件计算**（Eq.9 第一项没有 gate），路由只在它们之后挑 mK−K_s 个。", "first_use": "Eq.(9)(10)", "source": "arXiv:2401.06066 §3.2"},
+  {"symbol": "m（MoE 侧）", "meaning": "板斧一的切分倍数：每个专家 FFN 中间维砍到 1/m、专家数与激活数各乘 m——算力不变、可选组合变多。与 CSA 的压缩率 m 同名不同物，读公式时看上下文。", "first_use": "Eq.(6)(7)(8)", "source": "arXiv:2401.06066 Eq.(6)(7)(8)"},
+  {"symbol": "L_ExpBal / L_DevBal", "meaning": "DeepSeekMoE 的专家级/设备级均衡损失（Eq.12-17）：V4 不再拿它当主力（改用 auxiliary-loss-free），此处是谱系背景。", "first_use": "Eq.(12)/Eq.(15)", "source": "arXiv:2401.06066 §3.3"},
+  {"symbol": "auxiliary-loss-free", "meaning": "均衡不走损失函数，而是给每个专家一个修正偏置进**选择**、不进权重（代码: e_score_correction_bias 只进 scores_for_choice）——避免把权重分布压平。", "first_use": "§六 V4 口径", "source": "arXiv:2606.19348 §2.1"},
+  {"symbol": "hash(x_t)", "meaning": "按**原始输入 token**（不是隐状态）查表定专家：无路由参数、无均衡损失项。V4 的落地形态就是一张 [vocab, topk] 的整数表，选谁定死、权重仍现算。", "first_use": "§六 hash 路由式", "source": "arXiv:2106.04426 摘要 / arXiv:2606.19348 §2.1"},
+  {"symbol": "h′^k_i", "meaning": "MTP 第 k 档在第 i 个位置拼出来的中间量：上一档隐状态与第 i+k 个 token 的 embedding 各自 RMSNorm 后拼接过投影。", "first_use": "Eq.(21)", "source": "arXiv:2412.19437 Eq.(21)"},
+  {"symbol": "M_k", "meaning": "第 k 档的拼接投影（2d → d）；embedding 层与输出头都与主模型共享。", "first_use": "Eq.(21)", "source": "arXiv:2412.19437 Eq.(21) / §2.2"},
+  {"symbol": "TRM_k", "meaning": "第 k 档的 Transformer 块——**保持完整因果链**（顺序版与并行独立头的分水岭）。", "first_use": "Eq.(22)", "source": "arXiv:2412.19437 Eq.(22)"},
+  {"symbol": "P^k_{i+k+1}", "meaning": "第 k 档对位置 i+k+1 的预测 logits（由共享输出头 OutHead 给出）。注意下标错位 k+1：输入错位 k 格、输出错位 k+1 格。", "first_use": "Eq.(23)", "source": "arXiv:2412.19437 Eq.(23)"},
+  {"symbol": "D", "meaning": "MTP 的预测深度（D=1 是 V3/V4 的超参默认值）——D 个模块**顺序**堆，不是并行独立头。", "first_use": "Eq.(25) 后的超参句", "source": "arXiv:2412.19437 §2.2 / §八 config"},
+  {"symbol": "λ", "meaning": "MTP 损失权重（=0.3）：总损失 = (λ/D)·Σ_k 各档交叉熵。", "first_use": "Eq.(25)", "source": "arXiv:2412.19437 Eq.(25) / §2.2"},
+  {"symbol": "L^k_MTP", "meaning": "第 k 档的交叉熵损失（只对本档有目标的位置取平均——Eq.(24) 的区间比 Eq.(22) 短一格）。", "first_use": "Eq.(24)", "source": "arXiv:2412.19437 Eq.(24)"}
+ ],
+ "mechanisms": [
+  {
+   "mechanism_id": "ch28-m01",
+   "name": "两本账：1M 上下文的 FLOPs 账与 KV 账（三个数字三个分母 + 自算方法）",
+   "paper_anchor": "arXiv:2606.19348 摘要 + §2.3.4（原文摘录）",
+   "intuition": "一家人搬进小房子要算两个数：每走一步搬多少东西（FLOPs），家里要囤多少东西（KV）。V4 说它这两样分别只有 V3.2 的 27% 与 10%——但这里最要紧的不是百分比，而是**分母**：这两个数的分母是『同样住 1M 场景的 V3.2』；论文另外那个『约 2%』的分母却是『BF16 GQA8、head_dim=128 这一常见规格的标准房』。分母不说清，百分比就是没有意义的口号。",
+   "worked_example": {
+    "params": {"层数": "43 层主干（config.num_hidden_layers）", "层型": "compress_ratios 前两项 0、中段 4/128 严格交替、末项 0（= MTP 槽）", "上下文": "1000000（1M）", "n_win": "128（config.sliding_window）", "字节口径": "一条压缩条目 584B（448 NoPE fp8 + 128 RoPE bf16 + 8 scale）、IndexCache 132B/条（128 fp8 + 4 fp32）、V3.2 对照 656B/token、GQA8 基线 4096B/token", "滑窗行宽": "576B（pin 的 SlidingWindowMLASpec(alignment=576)）"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m01_m02_ledger.json",
+    "table": {
+     "columns": ["账目行", "算式", "数值（自算）", "判定/口径"],
+     "rows": [
+      ["层型分布", "classify_layers(43 项)", "swaonly 2 / c4a 21 / c128a 20", "0 归一成 1（max(1,·)）；MTP 层不在 43 里"],
+      ["CSA 层每 token 摊销", "(584 + 132) / 4", "179.0 B/token/层", "含 IndexCache（只有 ratio==4 的层建索引器）"],
+      ["同层不计 IndexCache", "584 / 4", "146.0 B/token/层", "口径敏感性的一档"],
+      ["HCA 层每 token 摊销", "584 / 128", "4.5625 B/token/层", "没有索引器对象"],
+      ["整机压缩账", "(2×0 + 21×179.0 + 20×4.5625) / 43", "89.540698 B/token/层", "ratio ≤ 1 的层压缩账为 0"],
+      ["分母一：BF16 GQA8", "2 × 8 × 128 × 2", "4096 B/token", "论文 §2.3.4 的 baseline（~2% 的分母）"],
+      ["比值一", "89.540698 / 4096", "2.1861 %", "与论文『approximately 2%』同量级"],
+      ["分母二：V3.2", "—", "656 B/token", "摘要 10% 的分母（同为 1M）"],
+      ["比值二", "89.540698 / 656", "13.6495 %", "比论文的 10% 略高——口径不同（见下行）"],
+      ["滑窗是加账", "43 × 128 × 576.0", "3170304 B 的常数窗", "1M 下摊薄 3.1703 B/token；与上下文长度无关"],
+      ["计滑窗总账", "89.540698 + 3.1703", "92.711002 B/token", "对 GQA8 2.2635%、对 V3.2 14.1328%"],
+      ["口径敏感性", "不计 IndexCache 与滑窗", "73.424419 B/token", "对 GQA8 1.7926%、对 V3.2 11.1927%"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "逐层项 = 条目字节 / m：压缩率在分母上，所以『每 token 每层摊销字节』是 m 的单调减函数——三个比例之间的漂移只来自常数项（滑窗、IndexCache）与分母选择，不来自机制本身。",
+    "argument": "骨架是算术归纳：Eq.(11)(12) 已证每条条目覆盖 m 个新增 token（本 trace 的 m04 段：12 个 token → 3 条），故 ratio=m 的层每 token 摊销 = 条目字节/m（per_type 的 c4a 179.0 = 584/4 + 132/4、c128a 4.5625 = 584/128 两条轨迹可直接核）；整机值 = Σ_层 类型字节 × 层数 / 总层数，是逐层项的凸组合 ⇒ 落在 min(4.5625) 与 max(179.0) 之间（实测 89.540698 ✓）。口径变化（计不计 IndexCache、计不计滑窗、分母取 4096 还是 656）只改常数与分母：89.540698−73.424419 = 16.116279 恰等于 21 × (132/4) / 43（21 个 CSA 层各多 33B 再除以 43），滑窗项 3.1703 = 3170304/1000000 与 m 无关——所以『m 越大账越小』这条单调性在任何口径下都成立。",
+    "monotone_quantity": "逐层摊销字节随 m 单调递减（584/m + 索引器项/m）"
+   },
+   "quantified": "1M 上下文、43 层：压缩账 89.540698 B/token/层、计滑窗 92.711002；两个分母下 2.1861% 与 13.6495%。滑窗常数窗 3170304 B（1M 下摊薄 3.1703 B/token，占压缩账 0.035406；换成 1K 上下文这一项按 1/context 放大到 3170.304 B/token ⇒ 短上下文里滑窗反而最贵）。FLOPs 侧同一 trace：1M 下一 query 实看条目 CSA 512（top-k 封顶）、HCA 7812、纯滑窗层恒 128（常数窗，与上下文无关）；短到 1K 时 CSA 候选只有 250 条 < 512 ⇒ 全选快路径接管。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-two-accounts",
+     "template": "before-after",
+     "l0_zoom": "放大 L0 中列『调度 · 显存账本』带（kv_column，青 C_KV_S）的 KV 池块 + 右列『GPU 执行臂』模型层的注意力计算块：左半是每 token 要算多少（FLOPs），右半是每 token 要囤多少（KV 字节），两侧各标自己的分母。",
+     "claim": "三个数字三个分母——27% FLOPs / 10% KV 的分母是 V3.2，『约 2% KV』的分母是 BF16 GQA8（head_dim=128）基线；而这笔省出来的账里滑窗是**加账**：43 层 × 128 条 × 576B 的常数窗永远留着。",
+     "numbers": [
+      {"value": "压缩账 89.540698 B/token/层；计滑窗总账 92.711002 B/token", "provenance": "traces/run_m01_m02_ledger.json（raw_stdout『[KV 账·整机]』与『[KV 账·计滑窗总账]』）"},
+      {"value": "分母一 4096 B/token（2×8×128×2）→ 2.1861%；分母二 656 B/token（V3.2）→ 13.6495%", "provenance": "traces/run_m01_m02_ledger.json（『分母一/分母二/比值一/比值二』）"},
+      {"value": "逐层摊销：CSA 179.0 B（含 IndexCache 132B/4）、不计则 146.0 B；HCA 4.5625 B", "provenance": "traces/run_m01_m02_ledger.json（『KV 账·逐层摊销』三行）"},
+      {"value": "层型分布 swaonly 2 / c4a 21 / c128a 20（43 层）", "provenance": "traces/run_m01_m02_ledger.json（『[层型分类]』）"},
+      {"value": "滑窗常数窗 3170304 B = 43×128×576.0；1M 下摊薄 3.1703 B/token", "provenance": "traces/run_m01_m02_ledger.json（『[KV 账·滑窗是加账]』）"},
+      {"value": "口径敏感性：不计 IndexCache 73.424419 B/token → 1.7926% / 11.1927%", "provenance": "traces/run_m01_m02_ledger.json（『[口径敏感性]』）"}
+     ],
+     "caption_draft": "两本账并排结算：左边 FLOPs 账——每 query 实看条目数在 1M 下是 纯滑窗 128 / CSA 512（top-k 封顶）/ HCA 7812 三档，压缩与稀疏各砍一刀；右边 KV 账——一条压缩条目 584B（448 fp8 NoPE + 128 bf16 RoPE + 8 scale）除以压缩率就是每 token 的摊销，CSA 层 179.0B、HCA 层 4.5625B，43 层加权后 89.540698 B/token/层。同样的账对着两个分母给出 2.1861%（BF16 GQA8 4096B/token）与 13.6495%（V3.2 656B/token）——这正是论文『约 2%』与摘要『10%』两个数字各自的来处。最下一行单独摆出滑窗：43×128×576 = 3170304B 的常数窗，1M 下摊薄到 3.1703B/token，短上下文里它会反过来成为最贵的一项——七件套里唯一『加账』的那件。",
+     "illustrator_notes": "before-after 模板左右分栏：左栏 FLOPs（条数轴，三档柱子 128/512/7812 + 顶部标『top-k 512 封顶』）、右栏 KV 字节（B/token 轴，逐层条 179.0 / 4.5625 / 0 与整机加权线 89.540698）。两栏各自在轴上标分母（4096 / 656），不要只标百分比。滑窗项单独画在最下方一条常数色带（青 C_KV_S），标注『与上下文长度无关』。配色走 l0_common，不出现内部路径与内部产物名。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch28-m02",
+   "name": "三类层与 4/128 交替排布：一张 compress_ratios 表决定谁付哪笔账",
+   "paper_anchor": "arXiv:2606.19348 §2.3（interleaved hybrid configuration）+ Figure 3/4；数字口径 = V4-Flash config",
+   "intuition": "43 层楼，每层门口挂一块牌子：0（这层没有压缩机，全靠最近 128 个 token 的原样缓存）、4（每 4 个 token 压成 1 条，再看 512 条）、128（每 128 个 token 才留 1 条，而且一条不挑全看）。牌子不是随手挂的：4 与 128 严格交替——一层保住分辨率但要挑着看，下一层丢掉分辨率换来『看得全』。论文只说它们 interleaved，**没说为什么**；『两档各管一段尺度』是本书的结构性解释，别写成论文原话。",
+   "quantified": "43 层主干：swaonly 2 层（前两层）、c4a 21 层、c128a 20 层；compress_ratios 全长 44 项（末项 0 是 MTP 槽，max(1,·) 归一后也归三类：swaonly 3 / c4a 21 / c128a 20）。同一条 trace 的每 query 实看条目：1M 下纯滑窗层恒 128（常数窗）、c4a 512、c128a 7812（=1000000//128）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-layer-ladder",
+     "template": "layout",
+     "l0_zoom": "放大 L0 右列『GPU 执行臂』（gpu_column，绿 C_GPU_S）的『模型层 forward + 编译』块：把 43 层主干竖排成一部电梯，每层挂一张 compress_ratios 的牌子——本章其余所有图都是这梯子上某一层的内部放大。",
+     "claim": "一张 compress_ratios 表决定每层付哪笔账：0/4/128 三类、中段严格交替（21 层 c4a 与 20 层 c128a），而每档的『每 query 实看条目数』（128 / 512 / 7812）就是 FLOPs 账的分档来源。",
+     "numbers": [
+      {"value": "44 项 compress_ratios（前两项 0、中段 4/128 交替、末项 0）→ 主干 43 层分类 {swaonly 2, c4a 21, c128a 20}", "provenance": "traces/run_m01_m02_ledger.json（raw_stdout『[层型分类]』两行）"},
+      {"value": "每档每 query 实看条目数：纯滑窗 128（常数窗）、c4a 512（top-k）、c128a 7812（=1000000//128）", "provenance": "traces/run_m01_m02_ledger.json（『[FLOPs 账·三档并置]』）"},
+      {"value": "短上下文倒挂：1K 上下文时 c4a 候选 250 < topk 512 ⇒ 全选（250 条），c128a 只有 7 条", "provenance": "traces/run_m01_m02_ledger.json（『[FLOPs 账·短上下文倒挂]』）"}
+     ],
+     "caption_draft": "一台电梯看全书：43 层里 21 层挂 4、20 层挂 128、最前两层挂 0（纯滑窗），两块牌子交替出现。右边的三档刻度盘把『一层实际要掏多少』标在同一根轴上——每 query 实看条目数：滑窗层 128 条（与上下文长度无关）、CSA 层 512 条（被 top-k 封住）、HCA 层 7812 条（1M 除以 128）。而 KV 侧反过来：条目越少、每条摊销越便宜（179.0 B vs 4.5625 B）。一张表、两种账、三个数字——这就是『交替排布』的可读形态（论文只说 interleaved，为什么交替本书不替它解释）。",
+     "illustrator_notes": "layout 模板：左侧竖排 43 层电梯（层号只标首尾与三类切换处，避免文字过密），每层右侧挂小牌 0/4/128（三种牌三种色阶，同一色系内做深浅）；右侧放一根横轴刻度盘，把 128/512/7812 三个实看条目数与 179.0/4.5625 两个字节数并置（单位写在轴端）。配色走 l0_common（GPU 绿为主），不出现源码路径。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch28-m03",
+   "name": "CSA 软池化压缩：2m 个元素一次 softmax 加权求和成 1 条（Eq.9-12）",
+   "paper_anchor": "arXiv:2606.19348 §2.3.1 Eq.(9)(10)(11)(12)",
+   "intuition": "CNN 的最大池化是在 2×2 里挑一个最大的；这里换成了『加权平均版池化』——每个位置先由一个可学习投影算一个分数（再加一个可学习的『窗内第几格』偏置），softmax 把这 8 个分数变成加起来等于 1 的份额，然后按份额把 8 个向量逐元素加权求和成 1 条。注意它**不是摘要**：没有生成、没有语言模型，是纯线性混合——但混合的比例是学出来的，所以它能挑人。",
+   "worked_example": {
+    "params": {"m": 4, "c": 2, "n": 12, "条目数": 3, "窗宽": "2m = 8", "手账版": "第 i=1 条、第 0 列：8 个 (Z+B) 值 = [2.0, 1.0, 0.0, -1.0, -2.0, 0.0, 0.0, 0.0]，对应 8 个 C 值 = [1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0]"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m03_m04_csa.json",
+    "table": {
+     "columns": ["轮次/步骤", "动作", "关键数值", "判定"],
+     "rows": [
+      ["手账-输入", "摆出 2m 个 (Z+B) 值（a 半区 4 个 + b 半区 4 个）", "[2.0, 1.0, 0.0, -1.0, -2.0, 0.0, 0.0, 0.0]", "没有一个是给定的『重要性』，全是投影出来的"],
+      ["手账-归一", "Softmax_row 跨 8 个元素", "权重 S = [0.505734, 0.186049, 0.068444, 0.025179, 0.009263, 0.068444, 0.068444, 0.068444]", "权重和 = 1.000000（跨 2m 归一）"],
+      ["手账-加权", "Σ S·C（C = 1.0…15.0）", "加权和 4.335023 vs 直接平均 8.000000，差 3.664977", "最大权重 0.505734 拿走 50.6% 份额——权重真的在挑人"],
+      ["完整链-投影", "四组投影 C^a/C^b/Z^a/Z^b（Eq.9 与 Eq.10）", "C^Comp 形状 (3, 2)：12 个 token → 3 条", "n/m = 3（不是 n/2m）"],
+      ["完整链-产出", "逐条 softmax 加权和（Eq.11-12）", "i=0 [0.576481, 0.469171]｜i=1 [0.548559, 0.297268]｜i=2 [0.779006, 0.400221]", "每条权重逐列和 = [1.0, 1.0]"],
+      ["边界 i=0", "Z^b 填 −inf、C^b 填 0", "b 半区权重全 0（slot 4..7 = [0.0, 0.0]×4）", "exp(−inf)=0 ⇒ 第一个窗只看自己（a 半区权重逐列和 [1.0, 1.0]）"],
+      ["对照 i=1", "同一条目在 i=1 的 b 半区", "b 半区权重非 0：[0.054212, 0.098538]…[0.034567, 0.281588]", "有前窗可看——i=0 的特例是唯一的"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "每条条目的权重沿『跨 2m 个元素的列方向』和为 1，且 i=0 时 b 半区权重恒为 0——前者保证压缩是凸组合（产出落在输入凸包内、不发散），后者保证『第一个窗只看自己』。",
+    "argument": "softmax_row 沿堆叠轴逐列归一 ⇒ Σ_{j=1}^{2m} S_j = 1（trace 三条条目的『权重逐列和 = [1.0, 1.0]』逐条实证）；C^Comp_i = Σ S ⊙ C 是凸组合 ⇒ ‖C^Comp‖ 被 max‖C_j‖ 界住（无放大）。i=0 的基例：Z^b 填 −inf ⇒ exp(−inf)=0 ⇒ 那 m 个权重恰为 0（trace『b 半区权重 = [[0.0,0.0]×4]』），归一自动落到 a 半区（『a 半区权重逐列和 = [1.0, 1.0]』）；归纳步：i≥1 时 b 半区取第 i−1 窗、非退化，且 Σ 仍为 1。",
+    "monotone_quantity": "每条条目的权重和恒 = 1（列方向），与 m、i 无关"
+   },
+   "quantified": "玩具 m=4、c=2：12 个 token → 3 条条目、每条跨 8 个元素归一；换成 config 口径 m=4、c=512：1M 个 token → 250000 条，每条仍是『8 个元素的 softmax + 一次逐元素加权和』——计算量随 n/m 线性，权重表 (n/m, 2m, c) 就是压缩核要 materialize 的规模。手账版的数字差 3.664977（= 8.000000−4.335023）说明『软池化 ≠ 平均池化』：均匀权重下和是 8.000000，学出来的权重把它拉到 4.335023。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-soft-pooling",
+     "template": "tensor-flow",
+     "l0_zoom": "放大 L0 右列 GPU 执行臂（绿）模型层块内的 CSA 压缩段：一张图从 2m 个隐状态走到 1 条 c 维条目——本章其余 CSA 图（重叠窗、索引器、共享 KV）都是它下游或侧旁的放大。",
+     "claim": "软池化＝2m 个位置一次 softmax 加权求和成 1 条：权重来自可学习投影 + 可学习位置偏置（不是摘要生成），列方向和恒为 1，i=0 时 b 半区权重恒 0。",
+     "numbers": [
+      {"value": "玩具 m=4、c=2：8 个 (Z+B) 值 [2.0, 1.0, 0.0, -1.0, -2.0, 0.0, 0.0, 0.0] → 权重 [0.505734, 0.186049, 0.068444, 0.025179, 0.009263, 0.068444, 0.068444, 0.068444]（和 1.000000）", "provenance": "traces/run_m03_m04_csa.json（手账版 A 段）"},
+      {"value": "加权和 4.335023 vs 直接平均 8.000000（差 3.664977）", "provenance": "traces/run_m03_m04_csa.json（手账版 A 段）"},
+      {"value": "完整链：C^Comp 形状 (3, 2)；i=0 [0.576481, 0.469171]｜i=1 [0.548559, 0.297268]｜i=2 [0.779006, 0.400221]", "provenance": "traces/run_m03_m04_csa.json（B 段三条『条目 i=k C^Comp』）"},
+      {"value": "i=0 的 b 半区权重全 0（exp(−inf)=0）；a 半区权重逐列和 [1.0, 1.0]", "provenance": "traces/run_m03_m04_csa.json（『i=0 边界』段）"},
+      {"value": "config 口径放大：m=4、c=512 ⇒ 1M 个 token → 250000 条", "provenance": "traces/run_m08_hca.json（『候选压缩块…CSA 层 = 1000000 // 4 = 250000』）"}
+     ],
+     "caption_draft": "把『软池化』摊开看：左边 2m=8 个输入位置（上半 a 半区＝当前窗、下半 b 半区＝前一个窗），中间一列分数经 Softmax_row 变成 8 个加起来等于 1 的份额（0.505734 那格拿走了 50.6%），右边逐元素加权求和成一条 c 维压缩条目。底部给出三个实测产出（0.576481… 等，形状 3×2）与边界：i=0 时 b 半区被 −inf 填掉、权重恰好全 0，于是第一个窗只看自己。整条链没有生成器、没有语言——只有两组投影、一次 softmax、一次加权和；『学出来的』只体现在那两组投影与位置偏置里。",
+     "illustrator_notes": "tensor-flow 模板：左（8 个位置的小方块，两半区用同一色系深浅区分并标 a/b）→ 中（分数条 → softmax 权重条，标注『和 = 1.000000』）→ 右（一条 c 维条目，用 KV 青 C_KV_S）。i=0 的边界画成下方一条小注（b 半区打叉、权重 0）。数字取 numbers.provenance；不出现内部路径/内部产物名；配色 l0_common。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch28-m04",
+   "name": "重叠窗与边界：为什么恰好压到 1/m 而不是 1/(2m)，i=0 怎么处理",
+   "paper_anchor": "arXiv:2606.19348 §2.3.1 Eq.(11)(12)（overlapped 句 + i=0 填充句）",
+   "intuition": "两扇窗户叠着往前推：每扇窗有一半压在上一扇上。12 个 token 不是被『8 个一组』切成 1.5 组，而是按 4 个一组切成 3 组——重叠不改变条目数，只是让每条条目『多带一眼前一个窗』。道理在论文里只有一句：C^b 在第 i 条用到的下标，正好是 C^a 在第 i−1 条用到的下标。",
+   "worked_example": {
+    "params": {"m": 4, "n": 12, "条目数": "3", "对照": "n//2m = 1（如果两半区不共享，12 个 token 只够 1 条）", "pin 口径": "CR=4、OVERLAP=1、HEAD_SIZE=512"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m03_m04_csa.json",
+    "table": {
+     "columns": ["步骤", "动作", "关键数值", "判定"],
+     "rows": [
+      ["归属表", "列出每条条目的两个半区 token 下标", "i=0: [0,1,2,3] + []｜i=1: [4,5,6,7] + [0,1,2,3]｜i=2: [8,9,10,11] + [4,5,6,7]", "每条输入 8 个（2m），新增只有 4 个（m）"],
+      ["条目数核对", "n // m vs n // 2m", "3 条 vs 1 条", "12 // 4 = 3（不是 12 // 8 = 1）——重叠让序列恰好压到 1/m"],
+      ["共享验证", "比较 i=1 的 b 半区与 i=0 的 a 半区", "[0, 1, 2, 3] == [0, 1, 2, 3] → True", "相邻条目共享 m 个输入（论文的 overlapped 句）"],
+      ["pin-窗口起点", "start = position − (1+OVERLAP)·CR + 1（position=3）", "start = 3 − 2*4 + 1 = -4；pos = [-4, -3, -2, -1, 0, 1, 2, 3]", "越界位置由 mask_pos 标记"],
+      ["pin-越界处理", "mask_pos = pos >= 0 → score 取 −inf、kv 取 0", "[False, False, False, False, True, True, True, True]", "与论文 i=0 的 −inf/0 填充同一件事"],
+      ["pin-两半区", "head_offset = (tokens >= CR) × HEAD_SIZE", "[0, 0, 0, 0, 512, 512, 512, 512]", "前半区是前窗、后半区是当前窗（**代码与论文的 a/b 相反**）"],
+      ["标签陷阱", "论文布局 vs 官方参考实现的布局", "max|C_comp − C_ref| = 0.00000000；半区调头后 max|S − S_ref_swapped| = 0.00000000", "同一套数学、两半区命名相反（直接对减 max|S − S_ref| = 0.47154682 非零）"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "条目数恒为 n/m：把 token 按 m 个一组切成窗，第 i 条只**新增** m 个输入（前 m 个已经喂给第 i−1 条），所以每新增一条条目消耗的 token 数是常数 m。",
+    "argument": "基例 i=0：a 半区吃 token [0, m)，b 半区被 −inf/0 填掉（不消耗 token）⇒ 第 0 条消耗 m 个。归纳步 i→i+1：a 半区=[m(i+1), m(i+2)) 是新 token（+m），b 半区=[mi, m(i+1)) 正是上一条的 a 半区（+0，trace 的『共享验证 → True』）⇒ 每条净增 m 个 ⇒ 条目数 = ⌊n/m⌋。这也是『压到 1/m 倍』这句话的算术内容——两半区若互不共享就会是 n/(2m)（本例 1 条），trace 的『12 // 4 = 3（不是 12 // 8 = 1）』把两种读法并排摆在眼前。",
+    "monotone_quantity": "已消耗 token 数 = m × 条目数（严格的线性对账）"
+   },
+   "quantified": "m=4、n=12：3 条条目、每条 8 个输入实例（2m）、净增 4 个（m）；换成 1M 上下文 m=4：250000 条。pin 侧窗口算术一次要给压缩核备 2m 个槽（start = pos − (1+OVERLAP)·CR + 1，CR=4 时一个 8 元素的 gather 窗口），越界位置一律 −inf/0——与论文 i=0 的处理是同一个动作在两处的落法。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-overlap-window",
+     "template": "tiling",
+     "l0_zoom": "放大 L0 右列 GPU 执行臂（绿）CSA 压缩段内部的一处细节：两扇相邻的窗怎么错位——上游是 ch28-fig-soft-pooling 的输入侧，下游是 ch28-fig-indexer-score 的候选块。",
+     "claim": "相邻条目共享 m 个输入 ⇒ 序列恰好压到 1/m（不是 1/2m）；i=0 是唯一特例（b 半区 −inf/0），而实现侧把同一件事写成『窗口起点越界 → score 取 −inf、kv 取 0』。",
+     "numbers": [
+      {"value": "三条条目的输入下标：i=0 [0,1,2,3]+[]；i=1 [4,5,6,7]+[0,1,2,3]；i=2 [8,9,10,11]+[4,5,6,7]", "provenance": "traces/run_m03_m04_csa.json（『csa_entry_input_index_sets』与三条『条目 i=k』行）"},
+      {"value": "条目数 12 // 4 = 3（不是 12 // 8 = 1）；共享验证 True", "provenance": "traces/run_m03_m04_csa.json（『条目数』与『共享验证』两行）"},
+      {"value": "pin 窗口算术（position=3）：start = 3 − 2*4 + 1 = -4；mask_pos = [False, False, False, False, True, True, True, True]", "provenance": "traces/run_m03_m04_csa.json（『pin 侧的窗口算术』段）"},
+      {"value": "head_offset = [0, 0, 0, 0, 512, 512, 512, 512]（前半区=前窗、后半区=当前窗，与论文 a/b 相反）", "provenance": "traces/run_m03_m04_csa.json（同段 head_offset 行）"},
+      {"value": "布局等价：max|C_comp − C_ref| = 0.00000000；调头后 max|S − S_ref_swapped| = 0.00000000；直接对减 0.47154682", "provenance": "traces/run_m03_m04_csa.json（『标签陷阱』段三行）"}
+     ],
+     "caption_draft": "两扇窗叠着推：左侧画出 12 个 token 轴，三条条目各用一根 8 格长的括号把它的两个半区框出来——第 i=1 条的『前窗』那 4 格，正是第 i=0 条的『当前窗』那 4 格（高亮共享区）。于是每加一条只多花 4 个 token：12 个 token 得到 3 条，恰好 1/4，而不是 1/8。右边贴一张『标签对照』小注：论文把当前窗叫 a、前一个窗叫 b，而两侧实现（官方 Compressor 与 pin 的压缩核）把前一个窗放在前半区、当前窗放在后半区——同一个张量的两个半区，命名相反、数学同一套（调头后逐位相同）。",
+     "illustrator_notes": "tiling 模板：横轴 token 0..11，三行括号（每条一行），共享区用同色高亮加虚线连到前一条。下方小注区画『论文 a/b 标签 vs 实现两半区』的对照双行箭头（互为交叉），避免读者把标签当成顺序。i=0 的 b 半区标 −inf/0。配色 l0_common；数字取 numbers.provenance。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch28-m05",
+   "name": "索引器打分：低秩 q + 逐头权重 + 压缩块上的 ReLU 内积（Eq.13-16）",
+   "paper_anchor": "arXiv:2606.19348 §2.3.1 Eq.(13)(14)(15)(16)；谱系锚 arXiv:2512.02556 Eq.(1)",
+   "intuition": "图书馆不让主注意力（贵）把整架子书翻一遍，先派一支便宜的小队做初筛：小队成员各自拿一份『低秩』的查询向量去闻每个压缩块，闻出来的分数乘上自己的信誉权重，加起来就是这一块的得分。ReLU 是纪律：闻不出来（负相关）就当 0，别去拉低别人的分。得分最高的 512 块才上台面。",
+   "worked_example": {
+    "params": {"n_h^I": 2, "c^I": 2, "候选块": 4, "w": "[0.7, 0.3]", "m": 4, "q^I": "[[1.0, 0.0], [0.0, 1.0]]", "K^IComp": "[[2.0, 0.5], [1.0, 0.0], [-0.5, -2.0], [1.5, 0.25]]"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m05_m06_indexer.json",
+    "table": {
+     "columns": ["轮次/步骤", "动作", "关键数值", "判定"],
+     "rows": [
+      ["逐头内积", "q^I_h · K^IComp_s（2 头 × 4 块）", "头 0: [2.0, 1.0, -0.5, 1.5]；头 1: [0.5, 0.0, -2.0, 0.25]", "块 2 两头都是负相关"],
+      ["ReLU", "负相关归零", "头 0: [2.0, 1.0, 0.0, 1.5]；头 1: [0.5, 0.0, 0.0, 0.25]", "块 2 被压成 0（不打负分）"],
+      ["加权求和", "I = Σ_h w_h·ReLU(·)，w = [0.7, 0.3]", "[1.55, 0.7, 0.0, 1.125]", "手算核对：块 0 = 0.7×2.0 + 0.3×0.5 = 1.55"],
+      ["选择", "top-2（Eq.17）", "选中块 [0, 3]", "块 1（0.7）输给块 3（1.125）"],
+      ["对照-去 ReLU", "同一组内积不做 ReLU", "[1.55, 0.7, -0.95, 1.125]", "块 2 会拿到 -0.95——64 头规模下会累积成负分"],
+      ["实现层缩放", "softmax_scale = c^I^-0.5、weights_scaling = n_h^I^-0.5", "0.707107 与 0.707107 ⇒ I 缩到 [0.775, 0.35, 0.0, 0.5625]", "两个都是常数因子 ⇒ top-2 次序不变（True）"],
+      ["短上下文快路径", "候选 ≤ topk 就直接全选", "8//4 = 2 ≤ 512 → True；2048//4 = 512 ≤ 512 → True；4096//4 = 1024 → False", "短上下文里索引器打分是纯开销"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "ReLU 让每个块的得分是**非负**的多头加权和 ⇒ 选择只被正相关推动；而两个实现层缩放都是正标量，不改变 top-k 的次序（选择对正标量缩放不变）。",
+    "argument": "术语：I_{t,s} = Σ_h w_h · ReLU(q_h·k_s)，ReLU(·) ≥ 0。若 w_h > 0 则 I ≥ 0；一般情形下——任何块不可能靠『多个头一起反对』被压到负无穷 ⇒ 候选集的分数下界由单头最差情形决定（trace：去掉 ReLU 时块 2 拿到 -0.95，加上 ReLU 变 0.0，本例排序未翻转，但规模上去后负分会累积，这是论文/实现保留 ReLU 的理由）。次序不变性的论证是一行：把 q 除以正标量 s、同时把 weights 乘上 s（trace 的 softmax_scale 与 weights_scaling 都是正数 0.707107），则 w_h·ReLU(q_h·k) 逐项相等 ⇒ I 整体乘上正常数 ⇒ argsort 不变（trace 的『top-2 次序一致：True』即此）。",
+    "monotone_quantity": "按正标量缩放 I 不改变 top-k 集合"
+   },
+   "quantified": "玩具 2 头 × 4 块：8 个点积 → 一次 ReLU → 加权和 → top-2；config 口径 n_h^I=64、c^I=128、候选 250000 块（1M、m=4）⇒ 每 query 的打分乘加数 = 250000 × 128 = 32000000（每头）/ 2048000000（64 头，见 trace run_m08_hca.json）。索引器自身的缓存是 132B/条（128 fp8 小头 + 4B fp32 scale），行数与主压缩条目同步增长（n/m）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-indexer-score",
+     "template": "flow",
+     "l0_zoom": "放大 L0 右列 GPU 执行臂（绿）模型层块内 CSA 的选择器段：一条低秩潜向量 c^Q 分叉出索引器 q，去给每个压缩块打分——上游是 ch28-fig-soft-pooling 产出的压缩块，下游是 ch28-fig-shared-kv-mqa 的核心注意力。",
+     "claim": "索引器的打分是『低秩 q + 逐头标量权重 + 压缩块上的 ReLU 内积』：一次降维（c^Q）两处用，ReLU 只让正相关推动选择，两个实现层缩放都是正标量因而改不了 top-k 次序。",
+     "numbers": [
+      {"value": "q^I = [[1.0, 0.0], [0.0, 1.0]]、K^IComp = [[2.0, 0.5], [1.0, 0.0], [-0.5, -2.0], [1.5, 0.25]]、w = [0.7, 0.3]", "provenance": "traces/run_m05_m06_indexer.json（A 段输入行）"},
+      {"value": "逐头内积 头0 [2.0, 1.0, -0.5, 1.5] / 头1 [0.5, 0.0, -2.0, 0.25] → ReLU 后 -0.5 与 -2.0 变 0", "provenance": "traces/run_m05_m06_indexer.json（A 段 ReLU 两行）"},
+      {"value": "I = [1.55, 0.7, 0.0, 1.125]；top-2 = 块 [0, 3]", "provenance": "traces/run_m05_m06_indexer.json（A 段 I 行与 Top-2 行）"},
+      {"value": "两个缩放 0.707107（c^I^-0.5 与 n_h^I^-0.5）；缩放后 I = [0.775, 0.35, 0.0, 0.5625]，top-2 次序一致 = True", "provenance": "traces/run_m05_m06_indexer.json（『实现层补充的两个缩放』两行）"},
+      {"value": "短上下文快路径：候选 8//4 = 2、2048//4 = 512、4096//4 = 1024 对 topk 512 的三种判定", "provenance": "traces/run_m05_m06_indexer.json（『短上下文快路径』段）"}
+     ],
+     "caption_draft": "初筛现场：中间一条低秩潜向量 c^Q（向下投影 W^DQ 得来）往上接到主注意力的多头 q（n_h 头 × 512 维）、往右接到索引器自己的 n_h^I 个头（config: 64 头 × 128 维）——同一次降维喂两条路。右下角是打分算式 I = Σ_h w_h·ReLU(q_h·K^IComp_s)：每个索引头闻一遍所有压缩块，分数按各自标量信誉加权；ReLU 把负相关归零（块 2 那两头都是负的，于是它拿 0 而不是 −0.95）。实测那一列给出 4 个块的分数 [1.55, 0.7, 0.0, 1.125] 与 top-2 = {块 0, 块 3}——只有这两块进核心注意力。",
+     "illustrator_notes": "flow 模板：左（c^Q 一分为二的叉）→ 中（每头一行小矩阵的 ReLU 内积）→ 右（4 个候选块的分数条 + top-2 高亮）。ReLU 那一格标『负 → 0』。weights_scaling 与 softmax_scale 画成两个小标量挂在权重边上并标『正标量、不改次序』。数字取 numbers.provenance；配色 l0_common（GPU 绿为主、KV 青标 K^IComp）。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch28-m06",
+   "name": "块级 top-k 与因果约束：候选数 = 已完成的块数（Eq.17）",
+   "paper_anchor": "arXiv:2606.19348 Eq.(17) + §2.3.3（严格因果 + 块内失明）",
+   "intuition": "压缩之后，『因果』不再需要一张掩码表——候选集合本身天生就是因果的：第 t 个 query 能挑的块，只有那些**已经攒满**的块（还没攒满的块里装着未来的 token，压根不存在）。这也带来一个副作用：一个 query 看不进自己所在块的其他 token（块级粒度表达不出块内先后），那一部分只能靠滑窗补。",
+   "worked_example": {
+    "params": {"m": 4, "t": "0..11（三个块）", "两种口径": "论文 s < Floor(t/m) vs 代码 num_compressed = (t+1)//m", "top-k 例": "8 个候选块的分数 I = [0.5, 2.0, 1.0, 0.0, 3.0, 0.2, 0.1, 4.0]"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m05_m06_indexer.json",
+    "table": {
+     "columns": ["轮次/步骤", "动作", "关键数值", "判定"],
+     "rows": [
+      ["t=0..2", "候选 = 已完成的块数", "论文 0 / 0 / 0；代码 0 / 0 / 0 ⇒ 可见块 []", "还没攒满一块：t=2 时一个压缩条目都看不到"],
+      ["t=3（块尾）", "两种口径第一次分叉", "论文 3//4 = 0；代码 (3+1)//4 = 1 ⇒ 可见块 [0]，差一格", "代码允许块尾看自己那块——仍严格因果（不含未来 token）"],
+      ["t=7、t=11（块尾）", "同样的差一格", "论文 1 → 代码 2；论文 2 → 代码 3", "差一格只出现在块尾 token（t = 3, 7, 11）"],
+      ["因果进入 top-k", "越界/未来位置置 −∞ + 候选不足填 −1 哨兵", "threshold=8, topk=2 → 选 [7, 4]；threshold=6 → 选 [4, 1]", "只看已完成的块，排序才算得对"],
+      ["候选不足", "候选 2 个而 topk=5", "缓冲 = [1, 0, -1, -1, -1]", "短上下文里『全选』与『−1 哨兵』是同一件事的两面"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "候选数关于 t 单调不减，且永远 ≤ 已经处理完的 token 数 ⇒ 因果性由候选集合本身保证（不需要额外掩码）。",
+    "argument": "以 m=4 为例逐点核对（trace 表 t=0..11）：num_compressed = (t+1)//m 的取值序列是 [0,0,0,1,1,1,1,2,2,2,2,3]——每次只可能 +0 或 +1，且每当它变成 k 时，前 km 个 token 都已归位（第 k−1 块的最后一步正好在 t = km−1 处闭合）⇒ 任何被选中的块 s < num_compressed 都只含 j ≤ t 的 token ⇒ 不含未来信息。这条单调性也是『为什么压缩能让注意力变便宜』的前提：候选墙随 t 线性长，而 top-k 把它封在常数 k（1M 处 250000 进 512）。论文口径（s < Floor(t/m)）与代码口径（(t+1)//m）在块尾差一格：代码多给的是**当前块**（不含未来），论文措辞是块内失明；正文按论文给公式、按代码讲实现，不要断言两者等价。",
+    "monotone_quantity": "num_compressed = (t+1)//m 关于 t 单调不减（每步 +0 或 +1）"
+   },
+   "quantified": "m=4、n=12：候选数从 0 长到 3；1M 上下文：候选 250000 条，实看被 top-k 封在 512 条（run_m01_m02_ledger.json 的『[FLOPs 账·三档并置]』），压缩比例 250000/512 ≈ 488.28125。短上下文（1K）时候选只有 250 条 < 512 ⇒ 排序无意义、全选快路径接管（run_m05_m06_indexer.json 的短上下文段）。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "ch28-m07",
+   "name": "共享 KV 的 MQA：一条压缩条目同时当 K 和 V，c^Q 与索引器共用（Eq.18-19）",
+   "paper_anchor": "arXiv:2606.19348 §2.3.1 Eq.(18)(19)",
+   "intuition": "一条压缩条目『一人分饰两角』：它既是 key 又是 value（同一个张量传两次），而且所有 query 头共用它。这不是省显存的工程小技巧，而是『只有一条压缩向量』的必然后果——压到最后就剩一条 c 维向量，它想不当 K/V 都难；头数只能加在 query 那一侧。",
+   "worked_example": {
+    "params": {"n_h": 2, "c": 4, "条目数": 3, "玩具": "q (2, 4)、kv (3, 4)", "config 口径": "n_h^I=64 / c^I=128（索引器）、c=512（主注意力）"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m07_m09_attention.json",
+    "table": {
+     "columns": ["轮次/步骤", "动作", "关键数值", "判定"],
+     "rows": [
+      ["打分", "CoreAttn：o = weights @ kv（K 与 V 是同一张量）", "权重（2 头 × 3 条）= [[0.465836, 0.362793, 0.171371], [0.307196, 0.186324, 0.50648]]，每行和 = [1.0, 1.0]", "kv 轴上没有 head 维（(3, 4) 而不是 2×3×4）"],
+      ["输出", "o = weights @ kv", "o = [[0.647232, 1.103042, 0.828629, 0.705536], [0.400358, 1.120872, 0.49352, 1.199285]]", "没有第二份 value 投影"],
+      ["共享性验证", "动一条条目 kv[0] += 1.0", "2 个头**同时**变：o 的变化 = [0.860147, 1.102083, 0.779502, 0.389647, 0.753717, 0.850275, 0.721531, 0.132214]", "没有哪一头能绕过它"],
+      ["c^Q 复用", "同一份低秩潜向量分叉两路 q", "索引器 q：64 × 128；主注意力 q：n_h × 512", "一次降维两处用（Eq.13 与 Eq.18 同一个 c^Q）"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "『共享 KV』把 KV 轴上的头维彻底消掉：注意力输出是『所有头共享的同一份条目』的加权和，任何一条条目的改动对所有头同时生效——省下的不是精度，而是整条 KV 轴的一倍宽度。",
+    "argument": "一行代数：o_i = Σ_s softmax(q_i·k_s) · v_s，而此处 v_s = k_s = C^Comp_s（同一个张量）⇒ 输出权重只由 q_i 决定、被加权的对象对所有 i 相同 ⇒ 条目数 × c 的大小与头数 n_h 无关（trace：kv 形状 (3, 4) 而非 (2, 3, 4)）。可观察后果由扰动实验给出：kv[0] += 1.0 后两个头的输出**同时**改变（trace 的 8 个变化量全非 0）——这正是 MQA 与 MHA 的差别（MHA 里每个头有自己的 K/V，动一份不动另一份）。",
+    "monotone_quantity": "KV 轴尺寸与 n_h 无关（头数只加在 query 侧）"
+   },
+   "quantified": "玩具 2 头 × 3 条 × 4 维：o 的 8 个数一次矩阵乘得出；config 口径 head_dim=512，一条条目同时是 K 和 V ⇒ 每 token 每层省下一整份 value（KV 账里 584B/条 已含这一层省法）。c^Q 复用让『低秩降维』这一次计算服务两个下游（索引器 64×128 与主注意力 512），这是 ch25 的 c^KV 思路在序列维上的第二层应用。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-shared-kv-mqa",
+     "template": "tensor-flow",
+     "l0_zoom": "放大 L0 右列 GPU 执行臂（绿）模型层块内 CSA 的核心注意力段：一条压缩条目怎么同时充当 K 与 V——上游是 ch28-fig-indexer-score 选出的 top-k 条目，下游是输出侧的反旋与分组输出投影。",
+     "claim": "一条压缩条目同时当 K 和 V（同一个张量传两次）、所有 query 头共享它，且它来自与索引器 q 共用的那份低秩潜向量 c^Q。",
+     "numbers": [
+      {"value": "q (2, 4)、kv (3, 4)：KV 轴上没有 head 维（对比 MHA 会是 2×3×4）", "provenance": "traces/run_m07_m09_attention.json（A 段前两行）"},
+      {"value": "权重（2 头 × 3 条）= [[0.465836, 0.362793, 0.171371], [0.307196, 0.186324, 0.50648]]，每行和 [1.0, 1.0]", "provenance": "traces/run_m07_m09_attention.json（A 段注意力权重行）"},
+      {"value": "o = [[0.647232, 1.103042, 0.828629, 0.705536], [0.400358, 1.120872, 0.49352, 1.199285]] 即 weights @ kv，无第二份 value 投影", "provenance": "traces/run_m07_m09_attention.json（A 段输出行）"},
+      {"value": "扰动 kv[0] += 1.0 ⇒ 2 个头同时变（8 个变化量全非 0：0.860147…0.132214）", "provenance": "traces/run_m07_m09_attention.json（A 段『③』行）"},
+      {"value": "c^Q 分叉：索引器 q 64 × 128、主注意力 q n_h × 512", "provenance": "traces/run_m07_m09_attention.json（A 段『c^Q 一次降维两处用』）"}
+     ],
+     "caption_draft": "一条条目，两个身份：中间那条 c 维压缩向量被同时拉给 key 位与 value 位（图上画成同一个方框接两根箭头，不画两份张量），所有 query 头从同一份潜向量 c^Q 升维而来。可观察的后果写在下面的实测里——把这条条目加 1.0，两个头的输出**一起**变（8 个分量无一幸免）：没有哪一头能绕开它，这就是『共享 KV』的算术形态。c^Q 那条虚线往左回到索引器（64 头 × 128 维）：同一份低秩向量，一次降维喂两条路。",
+     "illustrator_notes": "tensor-flow 模板：中央一条 c 维条目（KV 青），向上接两路 q（同一份 c^Q 分叉），标注『K 与 V 同一张量』。右侧小框写权重矩阵的 2×3 形状与每行和为 1。扰动实验画成下方一条小注（一个小箭头 + 8 个数）。配色 l0_common；数字取 numbers.provenance。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch28-m08",
+   "name": "HCA 重压缩与『压完不挑』：同一套机制的另一档（Eq.20-26）",
+   "paper_anchor": "arXiv:2606.19348 §2.3.2 Eq.(20)-(26) + Figure 4",
+   "intuition": "同一台压缩机换一个档位：窗宽从 2m 拉到 m′=128（比 m 大一个量级）、去掉重叠、也去掉选择器。压到 1/128 之后，1M 的上下文只剩七千多条——这时候『一条不挑全看』比『再养一个打分器』更划算：打分器本身要吃 25 万个候选的算力，还要自己一份缓存、还带来盲区。",
+   "worked_example": {
+    "params": {"玩具": "同一组 H/投影跑两档：CSA m=4（窗宽 8、两半区）vs HCA m'=4（窗宽 4、单序列）", "config 口径": "m=4、m'=128、topk=512、1M 上下文、n_h^I=64、c^I=128、c=512", "非平凡性": "i=0 两档**结构性退化**为同一结果（b 半区被 −inf 打掉），真实差别从 i≥1 起"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m08_hca.json",
+    "table": {
+     "columns": ["轮次/步骤", "动作", "关键数值", "判定"],
+     "rows": [
+      ["同构对照-形状", "两档各自的输入个数", "CSA：每条 8 个（2m，当前窗 4 + 前窗 4）；HCA：每条 4 个（m'，无重叠）", "条目数都是 3（n//m = 12//4）"],
+      ["同构对照-归一", "权重逐列和", "CSA [1.0, 1.0]（跨 8 个元素）；HCA [1.0, 1.0]（跨 4 个元素）", "归一范围不同、『和为 1』相同"],
+      ["i≥1 的真实差别", "同一条目的产出", "i=1：CSA [0.548559, 0.297268] vs HCA [0.642875, 0.777963]｜i=2：CSA [0.779006, 0.400221] vs HCA [0.890307, 0.723258]", "逐位相同 = False（两档真的不同）"],
+      ["i=0 的退化", "第一窗的结构性重合", "CSA [0.576481, 0.469171] == HCA [0.576481, 0.469171]（逐位相同 = True）", "i=0 的 b 半区权重全 0 ⇒ CSA 退化成单序列——别拿这一格做对照"],
+      ["成本-候选", "1M 下的候选块数", "CSA 250000（1e6//4）；HCA 7812（1e6//128）", "HCA 的候选少一个量级（250000 对 7812）"],
+      ["成本-实看", "每 query 实看条目", "CSA min(512, 250000) = 512；HCA 7812（全看）", "HCA 的主注意力贵 15.257812 倍"],
+      ["成本-省掉的打分", "索引器打分乘加数 vs HCA 多看的乘加数", "打分 32000000/索引头（64 头合计 2048000000）；HCA 多看 3737600/主头 ⇒ 8.561644 倍", "保守口径（每头并排；把 64 个头合计差距再乘 64）"],
+      ["成本-省掉的缓存", "两档逐层摊销", "CSA (584 + 132) / 4 = 179.000000 B；HCA 584 / 128 = 4.562500 B", "HCA 没有索引器对象"],
+      ["实现形态", "HCA 层的 topk 缓冲 = 所有已完成的块", "pos=255 → 2 条 ⇒ [0, 1, -1, -1, -1, -1, -1, -1]；pos=1000 → 7 条 ⇒ [0, 1, 2, 3, 4, 5, 6, -1]", "一次 seq 填充，没有打分也没有排序"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "『压完不挑』是一笔可以算清的账：HCA 多看的那部分（(n/m′ − k)·c 次乘加）比 CSA 省掉的索引器打分（(n/m)·c^I 次乘加/头）小一个量级——省下的不是注意力算力，而是整个选择器。",
+    "argument": "把两边的量都写成 n、m、m′、k 的函数：CSA 每 query 的打分成本 = (n/m)·c^I（每个索引头）加上排序 (n/m)·log k 与一份 n/m 行的 IndexCache；HCA 的额外注意力成本 = (n/m′ − k)·c（每个主头）。代入 config 的 n=1e6、m=4、m′=128、k=512、c^I=128、c=512，得 32000000 vs 3737600 ⇒ 8.561644 倍（trace 实测）——注意这个比较是**保守的**：索引器有 64 个头而这里只算了一个头，主注意力头数本包未取到。再叠上两条结构性好处：HCA 不需要任何排序（缓冲就是 seq 全填，trace 的 pos 表）与不存在选择盲区（候选少、全看）。代价同样诚实：HCA 层每 query 的条目数确实更多（15.257812 倍），这就是为什么它只占一半层。",
+    "monotone_quantity": "候选数随 m′ 单调递减（由 Eq.11 的 1/m′ 结论给出）"
+   },
+   "quantified": "1M 上下文：HCA 层候选 7812 条、全看；CSA 层候选 250000 条、实看 512 条。KV 侧 HCA 层 4.5625 B/token（无 IndexCache）；CSA 层 179.0 B/token。选择器省的账：每 query 32000000 次乘加/索引头（64 头合计 2048000000）与一份 132B/条 的 IndexCache；相对 HCA『多看』的 3737600 次乘加/主头，比值 8.561644（每头口径）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-csa-vs-hca",
+     "template": "before-after",
+     "l0_zoom": "放大 L0 右列 GPU 执行臂（绿）模型层块内的两条注意力支路：左半是 CSA 层（窗宽 2m + 挑 512），右半是 HCA 层（窗宽 m′ + 全看）——对应 ch28-fig-layer-ladder 电梯上交替挂着的两块牌子。",
+     "claim": "同一套压缩机制的两档：CSA（两组 C/Z、窗宽 2m、有重叠、带索引器只挑 512）与 HCA（一组 C/Z、窗宽 m′、无重叠、一条不挑）；压到 1/128 后全看比养一个打分器更划算（每头口径 8.561644 倍）。",
+     "numbers": [
+      {"value": "同一条目两档产出：i=1 CSA [0.548559, 0.297268] vs HCA [0.642875, 0.777963]；i=2 CSA [0.779006, 0.400221] vs HCA [0.890307, 0.723258]", "provenance": "traces/run_m08_hca.json（A 段『对照』三行）"},
+      {"value": "i=0 两档退化重合 [0.576481, 0.469171]（逐位相同 = True）", "provenance": "traces/run_m08_hca.json（A 段『对照 条目 i=0』行）"},
+      {"value": "候选 250000 vs 7812；实看 512 vs 7812；倍数 15.257812", "provenance": "traces/run_m08_hca.json（B 段前四行）"},
+      {"value": "索引器打分 32000000（每索引头）/ 2048000000（64 头）vs HCA 多看 3737600（每主头）⇒ 8.561644 倍", "provenance": "traces/run_m08_hca.json（B 段乘加数五行）"},
+      {"value": "逐层摊销 CSA (584+132)/4 = 179.000000 B vs HCA 584/128 = 4.562500 B", "provenance": "traces/run_m08_hca.json（B 段『①②』两行）"},
+      {"value": "HCA 的 topk 缓冲＝全填：pos=1000 → 7 条 ⇒ [0, 1, 2, 3, 4, 5, 6, -1]", "provenance": "traces/run_m08_hca.json（C 段 pos 表）"}
+     ],
+     "caption_draft": "两档压缩机并排：左边 CSA——两组 C/Z 投影出一条 8 格宽的窗（当前窗 + 前一个窗，重叠），选出 512 条进核心注意力；右边 HCA——一组 C/Z、一条 4 格（config 128 格）宽的窗，没有重叠、没有选择器，全部条目直接进注意力。下面的对账给出为什么右边敢不挑：候选从 25 万降到 7812，主注意力确实贵 15.257812 倍，但省掉的是每 query 32000000 次乘加的索引器打分（还没算 64 个头、排序和那份 132B/条的缓存）；而 HCA 层每 token 摊销只有 4.562500 B。最后一行是它在实现里的样子——HCA 的『选择』就是把已经完成的块按序全填，一个分数都不比。",
+     "illustrator_notes": "before-after 模板左右分栏：左 CSA（两半区窗 + 512 挑选漏斗）、右 HCA（单序列宽窗 + 全通）。中间竖线标 m vs m′。下方对账小表用 numbers 的两组数字（7812/512 与 8.561644/15.257812），单位与口径写清『每头』。配色 l0_common；不出现源码路径与内部产物名。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch28-m09",
+   "name": "滑窗支路：n_win 条未压缩 KV 与压缩条目的合成（加账的那一项）",
+   "paper_anchor": "arXiv:2606.19348 §2.3.3（n_win 句 + Figure 3 图注）",
+   "intuition": "压完的条目都是大粒度的，可离得最近的那几十个字不行：它们要么还没攒满一块（块级粒度看不见）、要么刚被混进一个混了 128 个 token 的块里。所以永远额外保留最近 n_win 个 token 的原样缓存，跟选出来的压缩条目放进**同一张表**里一起注意。记住这一项是**加账**：多存 128 条未压缩 KV，不省反花。",
+   "worked_example": {
+    "params": {"n_win 玩具": 3, "n_win config": 128, "m": 4, "上下文": "1M（pos=999999）", "合成实验": "pos=8、n_win=3、m=4 ⇒ KV 轴 5 条"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m07_m09_attention.json",
+    "table": {
+     "columns": ["轮次/步骤", "动作", "关键数值", "判定"],
+     "rows": [
+      ["玩具 pos=2", "滑窗 + 压缩条目", "滑窗 [0, 2] 共 3 条｜候选 (2+1)//4 = 0 条 ⇒ KV 轴 = 3 条", "没攒满一块：这一拍只有滑窗看得见那 3 个 token（攒批时间差）"],
+      ["玩具 pos=8", "同上", "滑窗 [6, 8] 共 3 条｜候选 (8+1)//4 = 2 条 ⇒ KV 轴 = 3 + 2 = 5 条", "两路并进同一张表"],
+      ["config pos=127", "同上", "滑窗 [0, 127] 共 128 条｜候选 32 条 ⇒ KV 轴 160 条", "起手不足一窗就从头开始"],
+      ["config pos=1000", "同上", "滑窗 [873, 1000] 共 128 条｜候选 250 条 ⇒ KV 轴 378 条", "滑窗长度只看 n_win 与 pos，与 m 无关"],
+      ["1M·CSA 层", "最贵的一拍（pos=999999）", "滑窗 128 条 + 压缩 512 条 ⇒ KV 轴 640 条；候选 250000", "压缩条目被 top-k 封顶"],
+      ["1M·HCA 层", "同上", "滑窗 128 条 + 压缩 7812 条 ⇒ KV 轴 7940 条", "HCA 全看：7940 条里 7812 条是压缩的、128 条是原样窗"],
+      ["合成真跑", "3 条滑窗 + 2 条压缩条目走一次注意力", "权重（1 头 × 5 条）= [0.230606, 0.179596, 0.179596, 0.230606, 0.179596]，和 = [1.0]", "两路在同一份权重里竞争，不分区"],
+      ["合成输出", "o = Σ weights·kv", "o = [0.55101, 0.589798, 0.564293, 0.179596]", "谁分多由 q·kv 决定"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "滑窗项是**常数窗**：窗口长度 = min(pos+1, n_win)，与压缩率 m 无关、与上下文长度无关 ⇒ 它的 KV 账不随 n 增长（只随层数线性增长），在长上下文里被摊薄、在短上下文里反而最贵。",
+    "argument": "逐点核对（trace）：滑窗起点 swa_start = max(pos − n_win + 1, 0)，条数 n_swa = pos − swa_start + 1 —— pos=8/n_win=3 ⇒ (6, 3)、pos=127/n_win=128 ⇒ (0, 128)、pos=1000/n_win=128 ⇒ (873, 128)、1M 处仍是 128（不是 999872）⇒ 上界被 n_win 钉死。这与压缩条目形成对照：后者的候选数随 pos 线性长（0 → 250000），只有 top-k 封顶。因此总账里滑窗是常数项：43 层 × 128 条 × 576B = 3170304 B，1M 下摊薄 3.1703 B/token，1K 下变成 3170.304 B/token。合成实验再从另一侧给出证据：3+2 两路进同一次 softmax，权重和仍是 [1.0]——滑窗不是外挂的第二套注意力，而是 KV 轴上多出来的 3 行。",
+    "monotone_quantity": "n_swa = min(pos+1, n_win) 关于 pos 单调不减、上界 n_win"
+   },
+   "quantified": "config 口径 n_win=128：1M 处 CSA 层 KV 轴 = 128 + 512 = 640 条、HCA 层 = 128 + 7812 = 7940 条（其中压缩条目占 7812/7940 = 0.983879…，滑窗是那 128 条原样窗）。整机滑窗账 = 43 × 128 × 576 = 3170304 B（常数），1M 摊薄 3.1703 B/token。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-sliding-window",
+     "template": "tiling",
+     "l0_zoom": "放大 L0 右列 GPU 执行臂（绿）模型层块内 KV 轴的组成：压缩条目段 + 最近 n_win 条原样 KV 段——它是 ch28-fig-soft-pooling / csa-vs-hca 的 KV 轴侧放大，也是『一核两源』在公式层的对应物。",
+     "claim": "滑窗把 n_win 条**未压缩** KV 与压缩条目并进同一次注意力：窗口长度是常数（min(pos+1, n_win)），所以它是加账项——长上下文里被摊薄、短上下文里最贵；而且未满一块的新 token 只有它看得见。",
+     "numbers": [
+      {"value": "n_win=3：pos=2 → 滑窗 3 条 + 候选 0 条 = KV 轴 3 条；pos=8 → 3 + 2 = 5 条", "provenance": "traces/run_m07_m09_attention.json（B 段 玩具口径四行）"},
+      {"value": "n_win=128：pos=127 → 滑窗 128 条 + 候选 32 条 = KV 轴 160 条；pos=1000 → 128 + 250 = 378 条", "provenance": "traces/run_m07_m09_attention.json（B 段 config 口径四行）"},
+      {"value": "1M：CSA 层 128 + 512 = 640 条；HCA 层 128 + 7812 = 7940 条", "provenance": "traces/run_m07_m09_attention.json（B 段『③④』两行；compose_csa_1m / compose_hca_1m 的 kv_len）"},
+      {"value": "合成权 [0.230606, 0.179596, 0.179596, 0.230606, 0.179596] 和 = [1.0]；o = [0.55101, 0.589798, 0.564293, 0.179596]", "provenance": "traces/run_m07_m09_attention.json（『合成后真跑一次』两行）"},
+      {"value": "滑窗是加账：43 × 128 × 576 = 3170304 B 常数窗（1M 摊薄 3.1703 B/token）", "provenance": "traces/run_m01_m02_ledger.json（『[KV 账·滑窗是加账]』）"}
+     ],
+     "caption_draft": "KV 轴的组成图：右边一大段是压缩条目（CSA 层 512 条 / HCA 层 7812 条），左边固定一小段永远是最近 128 个 token 的原样 KV——它的长度被 min(pos+1, n_win) 钉死，从 pos=127 到 1M 一直是 128 条（图中给出四个时间点的实测条数：3 / 128 / 128 / 128）。两路并进同一次注意力、在同一份 softmax 权重里竞争（实测 5 条 KV 的权重和仍是 1.0）。最要紧的一点画在角落里：还没攒满一块的最新 token 没有压缩条目，只有这段原样窗看得见它们——而这一段『多存 128 条』是全书唯一只花不省的注意力量。",
+     "illustrator_notes": "tiling 模板：横轴 pos，上排画压缩条目段（长度随 pos 增长、CSA 侧标 512 封顶），下排画滑窗段（恒长 128，右端贴着当前 pos）。四个时间点用竖直虚线对齐。右下角小注画『未攒满的尾巴只有滑窗看得见』。配色 l0_common（KV 青 + 滑窗用同色浅调）。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch28-m10",
+   "name": "位置细节：RoPE 只作用最后 64 维 + 输出侧按 −i 反向旋转",
+   "paper_anchor": "arXiv:2606.19348 §2.3.3（RoPE −i 句）",
+   "intuition": "query 进核心注意力之前，位置信息已经被『转』进向量里了（RoPE）。而压缩条目身上带的是**块级位置**（第 i 条代表整块，位置取 i×m）——跟 query 自己的位置对不上。所以输出侧要做一次反向旋转：把『条目的位置』转回『query 的位置』，这一步只是把两个符号换个方向，乘回去就等于没转。",
+   "worked_example": {
+    "params": {"rope_dim 玩具": 4, "rope_dim 真实": "64（论文：最后 64 维）", "theta": 10000.0, "position": 3, "输入": "x = [9.0, 9.0, 1.0, 2.0, 3.0, 4.0]（前 2 维是 NoPE 段）", "m": 4},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m10_m11_position.json",
+    "table": {
+     "columns": ["轮次/步骤", "动作", "关键数值", "判定"],
+     "rows": [
+      ["频率表", "θ_j = theta^(-2j/rope_dim)，j=0..1", "[1.0, 0.01]", "θ_0 = 1、θ_1 = 0.01（可手算）"],
+      ["正向旋转", "偶数位 x·cos − partner·sin、奇数位 x·cos + partner·sin", "cos = [-0.989992, 0.99955]、sin = [0.14112, 0.029996] ⇒ x' = [9.0, 9.0, -1.272233, -1.838865, 2.878668, 4.088187]", "前 2 维（NoPE 段）纹丝不动"],
+      ["反向旋转", "偶数位 x·cos + partner·sin、奇数位 x·cos − partner·sin", "x'' = [9.0, 9.0, 1.0, 2.0, 3.0, 4.0]", "反旋后逐位回到原值：max|x'' − x| = 0.00000000"],
+      ["一对频率", "位置 2、3 维单看一对", "x = [1.0, 2.0] → 正向 [-1.272233, -1.838865] → 反向 [1.0, 2.0]", "只差 partner 项的符号（−sin/+sin vs +sin/−sin）"],
+      ["为什么必须转回来", "条目带块级位置、query 带自己的位置", "条目位置（m=4、前 3 条）= [0, 4, 8]；query 位置 = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]", "对不齐 ⇒ 输出侧按 −i 反旋把两者换到同一个位置口径"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "反向旋转是正向旋转的逆运算（对同一对频率、同一个角度）：两个方向的公式只差 partner 项的符号，所以『转过去再转回来』逐位复原。",
+    "argument": "一行三角恒等式：正向 (x_e, x_o) → (x_e cosθ − x_o sinθ, x_e sinθ + x_o cosθ) 是旋转矩阵 R(θ)；反向用 (x_e cosθ + x_o sinθ, −x_e sinθ + x_o cosθ) = R(−θ)；R(−θ)R(θ) = I（二维旋转的封闭性 + cos²+sin²=1）。trace 的三段证据：单对数值 [1.0, 2.0] → [-1.272233, -1.838865] → [1.0, 2.0]；整向量 max|x'' − x| = 0.00000000；NoPE 段（前 2 维）两次都原样——只有最后 rope_dim 维参与。为什么需要它：条目携带的是块级位置 [0, 4, 8]，而 query 的位置是 [0…11]，两者不同口径；输出侧按 −i 反旋把条目位置换成 query 位置再进输出投影。",
+    "monotone_quantity": "反旋与正旋互为逆（R(−θ)R(θ) = I）"
+   },
+   "quantified": "config 口径：rope_head_dim=64（只动最后 64 维）、前 448 维是 NoPE；条目位置 = (positions // compress_ratio) × compress_ratio ⇒ m=4 时 [0, 4, 8, …]。玩具里 rope_dim=4、θ=10000 让读者能自己按频率表 [1.0, 0.01] 手算；实数 rope_dim=64 时频率表有 32 对。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "ch28-m11",
+   "name": "attention sink：Exp(z) 进 softmax 分母（让每个头的总质量可调）",
+   "paper_anchor": "arXiv:2606.19348 §2.3.3（Exp(z′_h) 进分母句）",
+   "intuition": "普通 softmax 的权重和永远是 1——每个头必须把全部注意力花掉。sink 是一个可以学的『虚位』：它的指数项只加到分母上，分子里没有对应的 value。于是每个头可以自己决定『这拍我到底想投入多少』：sink 大 ⇒ 总质量趋近 0（几乎不看任何东西），sink 极负 ⇒ 退化成普通 softmax（总质量回 1）。",
+   "worked_example": {
+    "params": {"logits": "[2.0, 1.0]", "sink 取值": "None(-inf) / 1.5 / 0.0 / -2.0 / 10.0 / 20.0 / -20.0", "核内落法": "CoreAttn 带 sink=0.5 与 sink=None 各跑一次"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m10_m11_position.json",
+    "table": {
+     "columns": ["轮次/步骤", "动作", "关键数值", "判定"],
+     "rows": [
+      ["基例 sink=None", "退化成普通 softmax", "权重 = [0.731059, 0.268941]、总质量 = 1.0", "exp(−inf) = 0 ⇒ 无 sink"],
+      ["sink=1.5", "只改分母", "权重 = [0.50648, 0.186324]、总质量 = 0.692804", "相对比例不变、绝对份额整体缩水"],
+      ["sink=0.0", "同上", "权重 = [0.665241, 0.244728]、总质量 = 0.909969", "sink 拿走 0.090031"],
+      ["sink=-2.0", "同上", "总质量 = 0.986787", "sink 越负越接近 1.0"],
+      ["sink=10.0", "同上", "权重 = [0.000335, 0.000123]、总质量 = 0.000459", "这个头这拍几乎不看任何东西"],
+      ["sink=20.0", "同上", "总质量 = 0.00000002、权重 = ['0.00000002', '0.00000001']", "趋向 0 的极限"],
+      ["sink=-20.0", "另一端极限", "总质量 = 1.00000000", "回到普通 softmax"],
+      ["核内落法", "CoreAttn(query, kv, sink=0.5)", "权重 = [0.433651, 0.21382]、o = [0.433651, 0.21382]", "输出方向由比例决定、幅度被总质量缩放"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "sink 只进分母 ⇒ 总质量 = 1/(1 + exp(sink − m′))（m′ 是 logits 的最大值）关于 sink 严格单调递减、取值恒 ≤ 1；相对比例（各 logit 之间的份额）完全不受 sink 影响。",
+    "argument": "写成显式式子：对 logits {z_j} 与 sink z′，权重 w_j = exp(z_j − m)/[Σ_j exp(z_j − m) + exp(z′ − m)]（m 是全体最大值，分母里逐项减去 m 不影响比值）⇒ Σ_j w_j = S/(S + exp(z′−m))，其中 S = Σ exp(z_j−m)。两句据此可证：分子里没有 sink 对应的 value ⇒ 分母多一项、分子不变 ⇒ 权重和 < 1；z′ 增大 ⇒ 分母增大 ⇒ 权重和单调降向 0（trace 的 1.0 → 0.692804 → 0.909969 → 0.000459 序列按 z′ 重排后严格递减）。相对比例不变是因为 sink 不出现在分子：w_j/w_k = exp(z_j − z_k) 与 z′ 无关（trace 里 sink=1.5 与 sink=None 两行的比例 [0.731059, 0.268941] 完全相同）。",
+    "monotone_quantity": "总质量关于 sink 严格单调递减（上界 1.0）"
+   },
+   "quantified": "两个候选 + 一个 sink 的 toy softmax：sink 从 −20 走到 20，总质量从 1.00000000 掉到 0.00000002；sink=1.5 时总质量恰好 0.692804。代码侧：attn_sink 是每层一个 fp32 参数，pin 的初值 −inf（等价『无 sink』），官方参考实现是未初始化参数（装载 checkpoint 后才有意义）⇒ 谈默认行为必须写『取决于检查点权重』，别把『只有 HCA 有 sink』写成代码事实（两侧实现里每层都有这个参数）。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "ch28-m12",
+   "name": "mHC 更新式与双随机约束：多流残差凭什么不塌（Eq.1-2 + Birkhoff 多面体）",
+   "paper_anchor": "arXiv:2606.19348 §2.2 Eq.(1)(2)；arXiv:2512.24880 §4.1 三性质",
+   "intuition": "老式残差是『加回去』：一条流，恒等映射是它的护身符。把流扩成 4 条、连接花样变多，护身符就碎了——多层堆起来数值会飘。mHC 的答法不是放弃多流，而是**把流间混合矩阵关进笼子**：只许用双随机矩阵（行和=1、列和=1、全非负）。笼子里的矩阵永远不放大信号，而且乘来乘去还在笼子里。",
+   "worked_example": {
+    "params": {"n_hc 玩具": "2 与 3（两个双随机矩阵）", "反例": "M = [[0.9, 0.1], [0.2, 0.8]]（行和=1、列和≠1）", "非扩张对照": "X = [[1.0, 2.0], [0.5, -1.0]]，‖X‖_F = 2.5"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m12_m13_m14_mhc.json",
+    "table": {
+     "columns": ["轮次/步骤", "动作", "关键数值", "判定"],
+     "rows": [
+      ["双随机判定", "B2 = [[0.7,0.3],[0.3,0.7]] 的行/列和", "行和 [1.0, 1.0]、列和 [1.0, 1.0]、非负 True", "双随机判定 = True"],
+      ["谱范数", "奇异值（B2 与 B3 各一个双随机矩阵）", "B2 奇异值 [1.0, 0.4] ⇒ 谱范数 1.0；B3 奇异值 [1.0, 0.264575, 0.264575] ⇒ 1.0", "恰好 =1（不是巧合：1 必是特征值，列和再压住上界）"],
+      ["反例", "M = [[0.9,0.1],[0.2,0.8]]（列和 [1.1, 0.9]）", "谱范数 1.009583 > 1", "每次混合都放大 1.009583 倍"],
+      ["反例的复利", "反复自乘后的谱范数", "M^1 1.018627、M^2 1.026639、M^4 1.038734、M^8 1.049989、M^16 1.053848、M^32 1.054092", "深堆叠就是 severe training instability 的算术形态"],
+      ["封闭性", "双随机矩阵相乘还在集合内", "B2@B2 = [[0.58, 0.42], [0.42, 0.58]]（行列和 [1.0,1.0] / [1.0,1.0]，谱范数 1.0）；B3^3 同理", "复合仍在内 ⇒ 深堆叠稳"],
+      ["非扩张", "同一组流、两种混合矩阵", "‖X‖_F = 2.5：双随机 B2 ⇒ 1.537856（比值 0.615142）；反例 M ⇒ 2.076656（比值 0.830662）", "双随机这一档不放大"],
+      ["恒等映射回归", "取双随机集合顶点 B = I", "B = I 时 B X = [[1.0, 2.0], [0.5, -1.0]]（与 X 逐位相同：True）", "多流退化成单流残差的那条『加回去』"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "双随机矩阵的谱范数恒等于 1（既 ≥1 又 ≤1）⇒ 每一次流间混合都是非扩张的；且双随机集合对乘法封闭 ⇒ 连续 L 层复合后仍非扩张——这就是 mHC『恢复恒等映射性质』的数学核心。",
+    "argument": "两句一行：①B·1 = 1（行和为 1）⇒ 1 是 B 的特征值 ⇒ ‖B‖₂ ≥ 1；②Bᵀ·1 = 1（列和为 1）⇒ ‖Bᵀ‖₂ ≥ 1 且 ‖B‖₂ = ‖Bᵀ‖₂，配合 ‖B‖₂ ≤ √(‖B‖₁‖B‖∞) = 1（行/列和都是 1）⇒ ‖B‖₂ ≤ 1；两向夹住 ⇒ ‖B‖₂ = 1（trace 里两个双随机矩阵的谱范数都恰好 1.000000，且第二奇异值 0.4 / 0.264575 才是真在收缩的那部分——它磨掉的是流间差异）。封闭性：若 B₁、B₂ 双随机，则 (B₁B₂)·1 = B₁·1 = 1、1ᵀ(B₁B₂) = 1ᵀB₂ = 1ᵀ、非负性由非负乘非负保 ⇒ B₁B₂ 双随机（trace 的 B2@B2 与 B3^3 两个实例）。反例把必要性钉死：列和不等于 1 时 ‖M‖₂ = 1.009583 > 1，且自乘把放大率复利到 1.054092（32 层）。",
+    "monotone_quantity": "‖B^L‖₂ = 1 对所有层数 L 成立（深堆叠不放大）"
+   },
+   "quantified": "n_hc=2 与 3 的两个玩具矩阵：谱范数 1.0（第二奇异值 0.4 / 0.264575）；反例矩阵 1.009583，32 层后放大到 1.054092（若按 1.009583^64 则 1.841153）。非扩张对照：同一组流经双随机混合后 Frobenius 范数比 0.615142，经反例矩阵是 0.830662。config 口径 hc_mult=4 ⇒ 真实规模的 B_l 是 4×4 双随机矩阵，每个半层一次 GEMM + Sinkhorn 20 轮。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-mhc-manifold",
+     "template": "flow",
+     "l0_zoom": "放大 L0 右列 GPU 执行臂（绿）模型层块内残差流的形态：从 1 条残差扩成 hc_mult=4 条流的读写回路——上游接 ch28-fig-layer-ladder 的层堆叠，下游接 ch28-fig-symbol-exit 的出口。",
+     "claim": "多流残差的稳定性来自一个约束而不是一个技巧：流间混合 B_l 被关进 Birkhoff 多面体（双随机）⇒ 每次混合的谱范数恰为 1（不放大）、复合仍在内（深堆叠稳）、并且保留了恒等映射。",
+     "numbers": [
+      {"value": "双随机 B2 = [[0.7,0.3],[0.3,0.7]]：行和/列和 [1.0, 1.0]，奇异值 [1.0, 0.4]，谱范数 1.0", "provenance": "traces/run_m12_m13_m14_mhc.json（m12 段 B2 三行）"},
+      {"value": "反例 M = [[0.9,0.1],[0.2,0.8]]：列和 [1.1, 0.9]，谱范数 1.009583；M^32 的谱范数 1.054092", "provenance": "traces/run_m12_m13_m14_mhc.json（m12 段反例两行）"},
+      {"value": "封闭性：B2@B2 = [[0.58, 0.42], [0.42, 0.58]]（谱范数 1.0）", "provenance": "traces/run_m12_m13_m14_mhc.json（m12 段封闭性行）"},
+      {"value": "非扩张对照：‖X‖_F = 2.5 → 双随机 1.537856（0.615142）/ 反例 2.076656（0.830662）", "provenance": "traces/run_m12_m13_m14_mhc.json（m12 段非扩张两行）"},
+      {"value": "B = I 时 B X 与 X 逐位相同（True）——恒等映射仍在集合里", "provenance": "traces/run_m12_m13_m14_mhc.json（m12 段『恒等映射的恢复』行）"}
+     ],
+     "caption_draft": "四条残差流的半层回路：残差状态 X_l（n_hc=4 条流）分三路——一条经 A_l 聚合成子层输入、一条原样经 B_l 做流间混合、子层输出经 C_l 散回四条流，然后相加。图上把 B_l 画在一个『笼子』里（Birkhoff 多面体：非负 + 行和 1 + 列和 1）：笼子里的矩阵谱范数恰好为 1（实测 1.0，第二奇异值 0.4 在磨掉流间差异），相乘还在笼子里，连恒等映射也留在里面（B = I 时流原样不动）。旁边一个反例——行和为 1 但列和不是 1 的矩阵：谱范数 1.009583 > 1，32 层自乘把放大率复利到 1.054092，这正是『多流会飘』的算术形态。",
+     "illustrator_notes": "flow 模板：中央一条『半层回路』（A 聚合 → 子层 F_l → C 散回），外圈是 B 的流间混合；B 用『笼子/盒子』的视觉隐喻（框 + 三条件小字：非负、行和 1、列和 1）。右下角放反例小卡（1.009583 / 1.054092）。配色 l0_common（GPU 绿为主）；数字取 numbers.provenance。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch28-m13",
+   "name": "mHC 动态参数化与投影：一次 GEMM 出 A/B/C 的 raw 参数（Eq.3-5 + Eq.6-8）",
+   "paper_anchor": "arXiv:2606.19348 §2.2 Eq.(3)(4)(5)(6)(7)(8)",
+   "intuition": "三张映射（读入 A、流间混合 B、写回 C）不是三张固定的权重表，而是**当场算出来的**：把 4 条流摊平、做一次没有增益的 RMSNorm，再乘一个大矩阵，一口气吐出 8 个数——切三段、各自乘上小小的可学习门控 α、加上静态偏置，σ/2σ/Sinkhorn 一过就成了三张映射。『动态项 + 静态项』是论文原话的分解。",
+   "worked_example": {
+    "params": {"hc_mult": 2, "d": 2, "T": 1, "打包顺序": "参考实现是 (pre, post, res)（论文列举顺序是 pre, res, post）", "α 与 S": "scale[0..2] = [0.5, 0.5, 0.5]；base = [0.1, 0.1, 0.2, 0.2, 0.0, 0.0, 0.0, 0.0]"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m12_m13_m14_mhc.json",
+    "table": {
+     "columns": ["轮次/步骤", "动作", "关键数值", "判定"],
+     "rows": [
+      ["展平与 RMS", "X（1×2×2）→ 展平 x = [1.0, 2.0, 0.5, -1.0] → 无权 RMSNorm", "均方 1.5625 ⇒ x̂ = [0.8, 1.599999, 0.4, -0.8]", "RMSNorm 的缩放折进 GEMM（rsqrt(均方+eps)）"],
+      ["一次 GEMM", "mixes = x̂ · fnᵀ（fn 形状 (8, 4)）", "[0.8, 1.599999, 0.4, -0.8, 2.399999, 1.999999, -0.4, 0.0]", "mix = (2+n_hc)·n_hc = 8 个数一次出齐"],
+      ["切片-读入", "[0:2] = Ã → A = σ(Ã)+eps", "Ã = [0.5, 0.9] ⇒ A = [0.62246, 0.71095]", "值域 (0,1)：读入是『按比例聚合』"],
+      ["切片-写回", "[2:4] = C̃ → C = 2σ(C̃)", "C̃ = [0.4, -0.2] ⇒ C = [1.197375, 0.900332]", "值域 (0,2)：写回可以放大到 2 倍"],
+      ["切片-混合", "[4:8] = B̃ 展平成 2×2 → B = Sinkhorn(B̃)", "B̃ = [[1.2, 1.0], [-0.2, 0.0]] ⇒ B = [[0.549833, 0.450166], [0.450166, 0.549833]]", "行和/列和 [0.999999, 0.999999] ⇒ 双随机 True"],
+      ["α 与 S", "动态项 + 静态偏置", "scale [0.5, 0.5, 0.5]、base [0.1, 0.1, 0.2, 0.2, 0.0, 0.0, 0.0, 0.0]", "α 是可学习门控（初始化很小）、S 是静态偏置"],
+      ["符号顺序坑", "论文列举 vs 参考实现打包", "论文 (pre, res, post)：Ã=[0.5, 0.9]、C̃=[1.2, 1.0]、B̃=[0.4, -0.2]", "同一批数、切片顺序不同——别按论文顺序去读代码切片"],
+      ["更新一拍", "X_1 = B X_0 + C·F(A X_0)（F 取恒等占位）", "A X_0 = [0.977936, 0.53397]；X_1 = [[1.945872, 1.288864], [1.605549, 0.831248]]", "C 把子层输出散回 2 条流、B 让残差在流间混合"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "σ/2σ 给 A、C 一个**正值下界**（A ≥ σ(Ã_min) 时加 eps、C ≥ 0），而 B 的 Sinkhorn 投影给流间混合一个双随机的初值——三张映射都不会退化成 0 映射或放大映射。",
+    "argument": "逐项看值域：σ(·) ∈ (0,1) ⇒ A ∈ (eps, 1+eps)（trace 实测 A = [0.62246, 0.71095] 与下界『σ 后加 eps』一致）；2σ(·) ∈ (0,2) ⇒ C ∈ (0, 2)（实测 [1.197375, 0.900332]）；B 由 Sinkhorn 投影保证非负、行/列和趋 1（实测 [0.999999, 0.999999]）⇒ 谱范数 ≤ 1（见 m12 的论证）。三者的共同点是『有界且不退化』：更新式 X_{l+1} = B X_l + C·F(A X_l) 里每一项都有严格正的下界与有限上界 ⇒ 残差既不会被写没、也不会被写爆。切片顺序的坑是个纯记号问题：论文按 (pre, res, post) 列式、参考实现按 (pre, post, res) 打包，同一批 8 个数换个切法——trace 把两种切法并列打印，正是为了让读代码的人不会照抄论文的行序。",
+    "monotone_quantity": "σ/2σ 的值域下界（A > 0, C > 0）对任意 raw 参数成立"
+   },
+   "quantified": "hc_mult=2、d=2、T=1 的玩具：4 维展平态 → 8 个数（预分配 2 + 2 + 4）→ 3 张映射；一次更新 X_1 的 4 个数由 B（双随机）与 C（∈(0,2)）共同给出。config 口径 hc_mult=4：展平态 4d 维、mixes 数 = (2·4 + 4·4) = 24、B 是 4×4 双随机（Sinkhorn 20 轮、eps=1e-06），三张映射全 fp32。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-mhc-param",
+     "template": "tensor-flow",
+     "l0_zoom": "放大 L0 右列 GPU 执行臂（绿）模型层块内 mHC 的参数生成段：4 条流展平态怎么一次 GEMM 出三张映射——它是 ch28-fig-mhc-manifold 左侧的输入侧放大。",
+     "claim": "A/B/C 三张映射由展平后的无权 RMSNorm 态一次 GEMM 动态生成，再各乘可学习门控 α、加静态偏置 S，最后分别过 σ、2σ、Sinkhorn：一次矩阵乘出全部三张映射的 raw 参数。",
+     "numbers": [
+      {"value": "展平 x = [1.0, 2.0, 0.5, -1.0] ⇒ 均方 1.5625 ⇒ x̂ = [0.8, 1.599999, 0.4, -0.8]", "provenance": "traces/run_m12_m13_m14_mhc.json（m13 段前两行）"},
+      {"value": "mixes（8 个数）= [0.8, 1.599999, 0.4, -0.8, 2.399999, 1.999999, -0.4, 0.0]", "provenance": "traces/run_m12_m13_m14_mhc.json（m13 段 mixes 行）"},
+      {"value": "A = σ(Ã)+eps = [0.62246, 0.71095]（值域 (0,1)）；C = 2σ(C̃) = [1.197375, 0.900332]（值域 (0,2)）", "provenance": "traces/run_m12_m13_m14_mhc.json（m13 段切片两行）"},
+      {"value": "B = Sinkhorn(B̃) = [[0.549833, 0.450166], [0.450166, 0.549833]]（行列和 [0.999999, 0.999999]）", "provenance": "traces/run_m12_m13_m14_mhc.json（m13 段切片-混合行）"},
+      {"value": "α = scale [0.5, 0.5, 0.5]；S = base [0.1, 0.1, 0.2, 0.2, 0.0, 0.0, 0.0, 0.0]", "provenance": "traces/run_m12_m13_m14_mhc.json（m13 段『α 与 S 从哪来』行）"},
+      {"value": "更新一拍：A X_0 = [0.977936, 0.53397]；X_1 = [[1.945872, 1.288864], [1.605549, 0.831248]]", "provenance": "traces/run_m12_m13_m14_mhc.json（m13 段更新一拍两行）"}
+     ],
+     "caption_draft": "参数生成流水线：左边 4 条流摊平成一行（虚线标出 RMSNorm 没有增益、只做缩放），中间一次 GEMM 吐出 8 个数，右边按 (pre, post, res) 切成三段——Ã 过 σ 得读入 A（值域 (0,1)）、C̃ 过 2σ 得写回 C（值域 (0,2)）、B̃ 展成 2×2 再 Sinkhorn 得流间混合 B（双随机）。每个切片旁挂一个 α（很小的可学习门控）与一个 S（静态偏置）：这就是论文说的『动态项 + 静态项』。底部一行提醒记号陷阱：论文列举顺序是 (pre, res, post)，代码打包顺序是 (pre, post, res)——同一批数、换个切法。",
+     "illustrator_notes": "tensor-flow 模板：展平条 → GEMM 方块（标 fn 形状 (8,4)）→ 三色切片 → σ / 2σ / Sinkhorn 三个小变换框 → 三张映射。α 与 S 画成挂在切片边上的小标量。记号顺序陷阱用底部一条小注（两个顺序并列、交叉箭头）。配色 l0_common；数字取 numbers.provenance。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch28-m14",
+   "name": "Sinkhorn-Knopp 迭代与 t_max=20：为什么是 20 次、精度换开销",
+   "paper_anchor": "arXiv:2512.24880 §4.2 Eq.(8)(9) + arXiv:2606.19348 §2.2 Eq.(8)（t_max=20 as a practical value）",
+   "intuition": "想让一个非负矩阵变成双随机，最简单的办法是**交替归一**：先把每行拉到和 1，再把每列拉到和 1，然后再拉行……如此反复。每做一轮都更接近双随机，但永远差一点点（分母每次都加一个 1e-06 的保护项）。20 轮是论文原话里的 practical value——再迭代的收益已经小于每轮核开销，**不是**『20 轮就精确了』。",
+   "worked_example": {
+    "params": {"矩阵": "raw = [[4.0, 1.0], [1.0, 3.0]]（非负）", "起点": "raw（教科书式交替归一）", "eps": "1e-06", "迭代轮数": "20（config: hc_sinkhorn_iters=20）"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m12_m13_m14_mhc.json",
+    "table": {
+     "columns": ["轮次", "动作", "关键数值（行/列偏差）", "判定"],
+     "rows": [
+      ["第 1 轮", "行使和=1 → 列使和=1", "row_dev = 0.02756985、col_dev = 1.05e-06", "列和当轮就归 1（col_dev 恒在 eps 地板）"],
+      ["第 2 轮", "同上", "row_dev = 0.00839717、col_dev = 1.02e-06", "偏差逐轮下降"],
+      ["第 3 轮", "同上", "row_dev = 0.00255908、col_dev = 1e-06", "每轮约缩到前一轮的 1/3"],
+      ["第 4 轮", "同上", "row_dev = 0.00078041、col_dev = 1e-06", "单调降（0.02756985 → 0.00078041）"],
+      ["第 5 轮", "同上", "row_dev = 1e-06、col_dev = 1e-06", "进入 eps 地板"],
+      ["第 20 轮", "停止（t_max）", "row_dev = 1.00e-06、col_dev = 1.00e-06", "最差矩阵 [[4,1],[1,3]] 20 轮后仍有残差 ⇒ 是折中不是精确投影"],
+      ["条件数差的一档", "20 轮 vs 200 轮对照", "[[1,1],[1,1.01]]、[[2,1],[1,1.0001]]、[[1,1e-6],[1e-6,1]] 三档都停在 1.00e-06", "接近 eps 地板，20 与 200 轮结果同档"],
+      ["实现顺序", "row-first vs col-first vs 起点 exp/softmax", "order=row-first 与 col-first 的 M^(20) 互为转置型（0.92408478 等）；start=exp 与 start=softmax 同结果", "论文写 M^(t)=T_r(T_c(·))、两侧实现是 softmax→列→(行→列) 重复 sinkhorn_iters − 1 次——极限相同、定点略差"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "交替归一是一个收缩迭代：每一轮必做一次行归一与一次列归一 ⇒ 列和当轮精确归 1，而下一轮的行归一会把列和破坏一点点 ⇒ 每轮末的最大偏差单调不增，且在有限轮内进入 eps 地板。",
+    "argument": "单调量的骨架：记第 t 轮结束时的最大偏差 d_t = max(|行和−1|, |列和−1|)。列归一在每轮末尾执行 ⇒ 列和恰好 = 1 + O(eps)（trace 的 col_dev 全程停在 1e-06 量级），行归一紧接着在下一轮开头执行 ⇒ d_{t} 的下降由『跨行/列的不平衡被摊薄』保证（trace 的实证序列 0.02756985 → 0.00839717 → 0.00255908 → 0.00078041 → 1e-06 严格递减，比值约 1/3）。终止性：分母每次加 eps=1e-06 ⇒ 偏差不可能到 0，而是进地板（20 轮后 1.00e-06）；所以 t_max 是**精度与开销的折中**而不是『迭代到收敛』——最差的那档矩阵 20 轮仍有 1e-06 残差，200 轮也停在同一个量级的地板（trace 的对照表）。",
+    "monotone_quantity": "每轮末的最大行列偏差 d_t 单调不增，且存在地板（eps=1e-06）"
+   },
+   "quantified": "玩具 2×2：5 轮进地板（row_dev 1e-06）；最差矩阵 [[4,1],[1,3]] 20 轮后残差 1.00e-06（对残差流混合的实际影响约 0.0001% 量级的行/列和不守恒）。config 口径：hc_sinkhorn_iters=20、hc_eps=1e-06 ⇒ 每个半层一次 4×4 的 20 轮交替归一（官方参考实现是 softmax(dim=−1) → 列归一 → 19 轮 (行→列)）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-sinkhorn",
+     "template": "flow",
+     "l0_zoom": "放大 L0 右列 GPU 执行臂（绿）模型层块内 mHC 的投影段：Sinkhorn-Knopp 迭代怎么把 B̃ 变成双随机——它是 ch28-fig-mhc-manifold 右侧『笼子』的入口放大。",
+     "claim": "Sinkhorn-Knopp 是交替归一：列和当轮就归 1，行/列偏差逐轮下降（本轮实测约 1/3 的收缩率），t_max=20 是精度与开销的折中而非精确投影（20 轮后仍有 1.00e-06 的地板残差）。",
+     "numbers": [
+      {"value": "[[4.0, 1.0], [1.0, 3.0]] 逐轮 row_dev：0.02756985 → 0.00839717 → 0.00255908 → 0.00078041 → 1e-06", "provenance": "traces/run_m12_m13_m14_mhc.json（m14 段逐轮表）"},
+      {"value": "col_dev 全程停在 1.05e-06 / 1.02e-06 / 1e-06（eps 地板 1e-06）", "provenance": "traces/run_m12_m13_m14_mhc.json（m14 段各行 col_dev）"},
+      {"value": "第 20 轮末：row_dev = 1.00e-06、col_dev = 1.00e-06", "provenance": "traces/run_m12_m13_m14_mhc.json（m14 段『第 20 轮末』行）"},
+      {"value": "条件数差的矩阵 20 轮 vs 200 轮残差同为 1.00e-06", "provenance": "traces/run_m12_m13_m14_mhc.json（m14 段『20 轮够不够』表）"},
+      {"value": "实现顺序差异：order=row-first / col-first 的 M^(20) 数值（0.92408478、0.07580203、0.07591422…）与 start=exp/softmax 同结果", "provenance": "traces/run_m12_m13_m14_mhc.json（m14 段『两处实现细节』）"}
+     ],
+     "caption_draft": "把『关进笼子』这一步摊开：从 B̃ 出发（列归一 → 行归一 → 列归一……），曲线画每一轮的行和/列和偏差——列和每轮末尾精确归 1（曲线贴在底板上），行和偏差按约 1/3 的速率往下走（0.02756985 → 0.00839717 → 0.00255908 → 0.00078041）。t=20 的位置画一条竖虚线：那里偏差已经在 1e-06 的地板上下不去了（分母每次加 eps 保护），20 与 200 轮不再有区别——论文那句 as a practical value 就是这条曲线上的一个点，不是『收敛点』。",
+     "illustrator_notes": "flow + 收敛曲线的混合版式：左侧画交替归一的机械动作（行归一⇄列归一两个箭头成环），右侧画本轮实测的偏差折线（用 numbers 的五个点，标 t=20 竖线）。轴上注明 eps 地板 1e-06。配色 l0_common；不出现内部路径。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch28-m15",
+   "name": "符号对照与出口：V4 的 A/B/C ↔ mHC 的 H^pre/H^res/H^post，以及 hc_head 压回单流",
+   "paper_anchor": "arXiv:2606.19348 §2.2（A/B/C）vs arXiv:2512.24880 Eq.(3)(5)(8)（H^pre/H^res/H^post）；出口 hc_head 是 V4 自造件",
+   "intuition": "同一件事在三份文档里有三个名字：V4 报告写 A/B/C，mHC 原论文写 H^pre/H^res/H^post，代码里是 hc_mult/hc_scale/hc_base。到了主干出口还要再收一次：4 条流按 sigmoid 门控加权求和压回 1 条（hc_head），然后才做最后归一化与算 logits——mHC 论文里没有这一件，是 V4 自己加的。顺序别讲反：**先**把展平残差拷给 MTP（drafter 用），**再**过 hc_head。",
+   "quantified": "符号三方对照一行一组（读入 A_l=σ(Ã_l) ↔ H^pre=σ(H̃^pre)；混合 B_l（Birkhoff）↔ H^res=Sinkhorn(H̃^res)；写回 C_l=2σ(C̃_l) ↔ H^post=2σ(H̃^post)）；出口顺序：pre-hc_head 残差（hc_mult 条流的展平态）先分叉给 MTP 缓冲，再 hc_head 压回 (T, H)，最后 RMSNorm + compute_logits。首层特判：入参是 2D (T,H) 时用 mhc_pre_broadcast 广播成 4 条流，其余层入参已是残差。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-symbol-exit",
+     "template": "layout",
+     "l0_zoom": "放大 L0 右列 GPU 执行臂（绿）模型层块的**出口**：4 条流怎么收尾、怎么分叉给 MTP——上游是 ch28-fig-mhc-manifold 的多流回路，下游是 ch28-fig-mtp-flow 的 MTP 一档。",
+     "claim": "三份文档一套符号（V4 的 A/B/C ＝ mHC 的 H^pre/H^res/H^post ＝ 代码的 hc_scale/hc_base），而出口 hc_head 是 V4 自造件：先把展平残差拷给 MTP，再用 sigmoid 门控把 4 条流压回 1 条。",
+     "numbers": [
+      {"value": "符号对照三行：A_l=σ(Ã_l) ↔ H^pre=σ(H̃^pre)；B_l ∈ Birkhoff ↔ H^res=Sinkhorn(H̃^res)；C_l=2σ(C̃_l) ↔ H^post=2σ(H̃^post)", "provenance": "论文包 paper.md §5.3 的符号对照表（arXiv:2606.19348 §2.2 / arXiv:2512.24880 Eq.(3)(5)(8)）"},
+      {"value": "config 口径：hc_mult=4（流数）、hc_sinkhorn_iters=20、hc_eps=1e-06 与论文 t_max=20 互证", "provenance": "论文包 paper.md §八 config 表 + dossier m15"},
+      {"value": "出口顺序：pre-hc_head 残差 → _mtp_hidden_buffer（drafter）→ hc_head（sigmoid 门控加权求和）→ RMSNorm + compute_logits", "provenance": "dossier ch28-m15/m19 的 official_anchors（DeepSeek-V4-Pro inference/model.py:L738-L766 与 pin 的 hc_head 落点）"}
+     ],
+     "caption_draft": "一张符号对照卡 + 一条出口动线：左边三行把同一件事的三种写法并排（V4 报告 / mHC 原论文 / 代码字段名），右边画主干出口——4 条流先摊平，一支分叉去 MTP 缓冲（那一档要用的是 hc_head **之前**的残差，多流信息在这里不丢），主路继续过 hc_head 的 sigmoid 门控加权求和压回 1 条，最后才 RMSNorm 并算 logits。图注要写清 hc_head 是 V4 自造件（mHC 论文没有这件），以及『先拷给 MTP、再过 hc_head』这个顺序。",
+     "illustrator_notes": "layout 模板：左半是三行对照表（同一色标三种写法），右半是出口动线（4 条流 → 展平 → 分叉 → hc_head → 单流）。用箭头粗细区分『主路』与『分叉给 drafter』。配色 l0_common（GPU 绿）；不写内部路径，引用官方实现只用标签形态『官方参考实现（DeepSeek-V4-Pro inference/model.py:L738-L766）』。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch28-m16",
+   "name": "MoE 两板斧：细粒度专家切分 + 共享专家无条件计算（Eq.3-11）",
+   "paper_anchor": "arXiv:2401.06066 §3.1-§3.2 Eq.(3)-(11)",
+   "intuition": "板斧一：把每个专家的中间维砍一半、专家数与激活数各乘二——算力一分没多，但『可选的组合』从 6 种变成 70 种（更像『按需拼装』而不是『挑几个大块』）。板斧二：留一个专家永远算，不参与挑选（式子里它那一项根本没有门控）——它负责把公共知识兜住，让别的专家不必重复学。代价很直白：每个 token 都要付这个专家的算力，不管需不需要。",
+   "worked_example": {
+    "params": {"N": 4, "K": 2, "m": 2, "d_ff": 8, "K_s": 1, "config 口径": "256 路由专家挑 6 + 1 个共享；moe_intermediate_size=2048 vs hidden_size=4096"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m16_m18_moe.json",
+    "table": {
+     "columns": ["轮次/步骤", "动作", "关键数值", "判定"],
+     "rows": [
+      ["板斧一-切分前", "N=4、d_ff=8、激活 K=2", "激活算力 = 2 × 8 = 16", "基准"],
+      ["板斧一-切分后", "mN=8、d_ff/m=4、激活 mK=4", "激活算力 = 4 × 4 = 16（与切分前相等）", "算力不变（Eq.6-8 原话）"],
+      ["板斧一-组合数", "C(N,K) → C(mN,mK)", "6 → 70（11.666667 倍）", "更灵活的专家组合"],
+      ["config 口径", "256 挑 6；单专家中间维是 hidden 的一半", "2048 / 4096 = 0.500000；对照常规 FFN 的 4×hidden = 16384 ⇒ 单专家只有它的 8.000000 分之一", "『切得细』的算术形态（后半句是本书自算注解）"],
+      ["板斧二-共享项", "Eq.(9) 第一项没有 gate", "共享项 = [0.5, -0.5]（无论门控怎么变都不动）", "『无条件』的可观察后果"],
+      ["板斧二-对照", "门控整体翻倍 gates_b = 2×gates_a", "h（gates_a）= [2.05, 0.55] → h（gates_b）= [2.6, 1.1]；共享项仍是 [0.5, -0.5]", "只有路由项跟着变"],
+      ["板斧二-不可选", "路由池 start=1（共享位排除）vs start=0", "start=1 ⇒ 门控 [0.0, 0.1]；start=0 ⇒ 门控 [0.9, 0.0]", "共享专家一旦进池子就可能挑不中——那就不叫无条件了"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "『无条件计算』等价于：共享专家的贡献 f_shared 在求导/取值上都不依赖任何门控 ⇒ 它不可能被路由『跳过』；而代价是每 token 恒定多付 K_s 个专家的算力。板斧一则保持总算力不变（mN × d_ff/m = N × d_ff、mK × d_ff/m = K × d_ff）。",
+    "argument": "两处乘法对账：①算力——切分前 K·d_ff = 2×8 = 16，切分后 mK·(d_ff/m) = 4×4 = 16，逐 token 的激活 FLOPs 相等（m 在分子分母上各出现一次，抵消）；②无条件——Eq.(9) 的第一项 Σ_{i≤K_s} FFN_i(u) 里没有 g_{i,t}，因此它关于门控向量是常函数：trace 把门控翻倍后共享项仍为 [0.5, -0.5]（逐位相同 = True），而路由项从 [0.55, 0.55] 变成 [1.1, 1.1]。反证方向同样清楚：若把共享位放回池子（start=0），它就会像普通专家一样竞争（trace 的门控在不同 start 下落到的位置不同）——『挑不中就等于没算』，这正是不共享的那条路。",
+    "monotone_quantity": "共享项对门控的偏导恒为 0（无条件）"
+   },
+   "quantified": "玩具 N=4/K=2/m=2：算力 16 = 16、组合数 6 → 70。config 口径：256 挑 6 + 1 共享、单专家中间维 2048（= hidden 4096 的一半，常规 FFN 的 1/8）⇒ 每 token 的激活参数只占总量的一小部分（V4-Flash 284B 总参 / 13B 激活）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-moe-axes",
+     "template": "before-after",
+     "l0_zoom": "放大 L0 右列 GPU 执行臂（绿）模型层块内 FFN 段：专家池的切分与共享——上游是 ch28-fig-layer-ladder 的层堆叠，下游是 ch28-fig-hash-route 的查表派单。",
+     "claim": "DeepSeekMoE 的两板斧：细粒度切分让组合数从 6 涨到 70 而算力不变（16 = 16），共享专家无条件计算——式子里它那一项没有门控，代价是每 token 恒定多付一份算力。",
+     "numbers": [
+      {"value": "切分前 4 专家 × d_ff 8 挑 2 ⇒ 算力 16；切分后 8 专家 × 4 挑 4 ⇒ 算力 16", "provenance": "traces/run_m16_m18_moe.json（A 段四行）"},
+      {"value": "组合数 C(4,2) = 6 → C(8,4) = 70（11.666667 倍）", "provenance": "traces/run_m16_m18_moe.json（A 段组合数行）"},
+      {"value": "config：256 挑 6；moe_intermediate_size 2048 / hidden_size 4096 = 0.500000；对照 4×hidden 16384 ⇒ 8.000000 分之一", "provenance": "traces/run_m16_m18_moe.json（A 段 config 口径三行）"},
+      {"value": "共享项 [0.5, -0.5] 不随门控变化；门控翻倍后 h 从 [2.05, 0.55] 变 [2.6, 1.1]", "provenance": "traces/run_m16_m18_moe.json（B 段四行）"},
+      {"value": "路由池 start=1 ⇒ 门控 [0.0, 0.1]；start=0 ⇒ 门控 [0.9, 0.0]", "provenance": "traces/run_m16_m18_moe.json（B 段最后两行）"}
+     ],
+     "caption_draft": "两板斧前后对照：左半是切分前的 4 个大专家（中间维 8，挑 2，6 种组合），右半是切分后的 8 个小专家（中间维 4，挑 4，70 种组合）——两根算力条并排都是 16，说明『更灵活』不是靠多花算力买来的。下方画第二个板斧：一个共享专家永远算（没有门控线连到它，标『无条件』），其余 8 挑 4 才走门控；旁边标出它一旦被放回池子就可能挑不中。最下一行给 config 的真实尺度：256 挑 6 + 1 共享，单专家中间维 2048 = hidden 的一半。",
+     "illustrator_notes": "before-after 模板：左右两栏各画专家池 + 门控箭头 + 算力条（16 / 16 对齐）。共享专家画在池外独立一格（无条件标识）。组合数 6 → 70 用小字标在池下。配色 l0_common；数字取 numbers.provenance；不出现内部路径。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch28-m17",
+   "name": "V4 路由口径：Sqrt(Softplus) 亲和分 + bias 只进选择（auxiliary-loss-free）",
+   "paper_anchor": "arXiv:2606.19348 §2.1（Sqrt(Softplus) 句 + auxiliary-loss-free 句）",
+   "intuition": "两处小改动各解决一个具体毛病：①亲和分从 Sigmoid 换成 Sqrt(Softplus)——sigmoid 会把大 logits 一律压到 1 附近（0.999665 与 0.952574 几乎没差别），softplus 不饱和上界、开根号再把分布拉平一点，让专家之间真的分得出高下；②负载均衡不再走损失函数，而是给每个专家一个修正偏置**只参与选择、不参与权重**——权重仍从无偏分数取，否则偏置接近均匀时会把整个权重分布压平。",
+   "worked_example": {
+    "params": {"logits": "[-2.0, 0.5, 3.0, 0.2]", "bias": "[0.0, -0.10, 0.0, 0.30]", "top-k": 2, "对照": "use_biased_weights=True（错误做法）", "大 logits 例": "logit = 8.0"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m16_m18_moe.json",
+    "table": {
+     "columns": ["轮次/步骤", "动作", "关键数值", "判定"],
+     "rows": [
+      ["亲和分-V3", "Sigmoid(·)", "[0.119203, 0.622459, 0.952574, 0.549834]", "大 logits 被压平到 1 附近"],
+      ["亲和分-V4", "Sqrt(Softplus(·))", "[0.35627, 0.986953, 1.74602, 0.893386]", "不饱和上界，仍有区分度"],
+      ["饱和对照", "logit = 8.0 时两种激活", "Sigmoid = [0.999665] vs Sqrt(Softplus) = [2.828486]", "换激活的动机（一条数字对比）"],
+      ["选择-无 bias", "top-2", "专家 [2, 1]；权重（无偏 + renormalize）= [0.638872, 0.361128]", "基准"],
+      ["选择-带 bias", "排序用 scores + bias", "scores + bias = [0.35627, 0.886953, 1.74602, 1.193386] ⇒ top-2 = 专家 [2, 3]", "bias 真的改动了选择（换进来专家 3）"],
+      ["权重取法", "仍从无偏 scores gather", "[0.66152, 0.33848]", "偏置不进权重（auxiliary-loss-free 的落法）"],
+      ["错误做法对照", "use_biased_weights（带偏分数当权重）", "[0.594004, 0.405996]（最大权重从 0.66152 掉到 0.594004）", "分布被压平——pin 注释点破的病（bias ≈ 8.08 时更明显）"],
+      ["非平凡性核对", "两个选中集合对比", "无偏 [1, 2] vs 带偏 [2, 3] ⇒ 不同 = True", "本例确实落在『bias 改变选择』的分支上"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "『bias 只进选择』保证权重分布与『不均衡修正』解耦：选择可以随 bias 改，而权重永远只反映亲合分本身——否则偏置在近均匀时（bias≈8.08）会把所有权重压成一条平线。",
+    "argument": "两段可分别验证：①选择阶段用 s_i + b_i 排序（trace：加 bias 后 top-2 从 [2, 1] 变 [2, 3]，集合确实不同）；②权重阶段从**无偏** s_i 取值再 renormalize（trace：权重 [0.66152, 0.33848] 与『无偏分数之和』一致，与带偏做法 [0.594004, 0.405996] 不同）。为什么这是必要的：偏置被调大时 s_i + b_i 全部趋同，若拿它当权重，renormalize 后会逼近均匀分布（0.594004 已经比 0.66152 更平）——极端情形下权重不再携带任何『这个专家多合适』的信息。Sqrt(Softplus) 那半边同样是可验证的取向：logit = 8.0 时 Sigmoid 给出 0.999665（与 logit=3 的 0.952574 几乎相同，区分度被吃光），而 Sqrt(Softplus) 给出 2.828486（继续增长）。",
+    "monotone_quantity": "Sqrt(Softplus) 严格单调且无上界（Sigmoid 有上界 1）"
+   },
+   "quantified": "4 个专家 + 一个 bias 的玩具：一次选择 + 一次权重 gather；带偏权重最大项 0.594004 对无偏 0.66152（压平幅度 0.067516）。config 口径：n_routed_experts=256、num_experts_per_tok=6、scoring_func=sqrtsoftplus、topk_method=noaux_tc；V4 还保留一点点序列级均衡损失兜极端不均衡（论文原话 augmented by a slight sequence-wise balance loss）。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "ch28-m18",
+   "name": "hash 路由：按 token id 查表派单（无路由参数、无均衡损失）",
+   "paper_anchor": "arXiv:2106.04426（路由式与摘要）+ arXiv:2606.19348 §2.1（V4 的 hash 路由句）",
+   "intuition": "最前面的 3 层不用『挑』——按 token 的 id 直接查表派单。表是一张 [词表, 每 token 选几个] 的整数表，随权重一起装载，运行时只做一次 gather；没有路由参数、也不需要均衡损失（Hash Layers 论文的原话）。但注意：hash 只决定**选谁**，给多少权重仍然从那一层的亲合分现算——所以这几层并不是『没有 gate』，只是 gate 的分数不参与选择。",
+   "worked_example": {
+    "params": {"玩具表": "tid2eid = [[3,1],[0,2],[2,3],[1,0],[3,0],[1,2]]（vocab 6 × topk 2）", "token ids": "[4, 1, 5]", "对照": "同一批 token 若走 gate 打分取 top-2", "config 口径": "num_hash_layers=3、vocab_size=129280、真实 topk=6"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m16_m18_moe.json",
+    "table": {
+     "columns": ["轮次/步骤", "动作", "关键数值", "判定"],
+     "rows": [
+      ["查表 a", "token id = 4 → 表第 4 行", "[3, 0] ⇒ 派给专家 [3, 0]；权重 = [0.818182, 0.181818]", "选谁定死（表说了算）"],
+      ["查表 b", "token id = 1 → 表第 1 行", "[0, 2] ⇒ 派给专家 [0, 2]；权重 = [0.65, 0.35]", "权重从无偏 scores gather"],
+      ["查表 c", "token id = 5 → 表第 5 行", "[1, 2] ⇒ 派给专家 [1, 2]；权重 = [0.25, 0.75]", "同一张表服务所有层（每层一张）"],
+      ["对照-gate 打分", "若这几层走普通路由（取 scores 的 top-2）", "[[1, 3], [0, 2], [2, 3]]", "第 1、3 个 token 的派单与查表结果不同"],
+      ["config 口径", "最前 3 层用 hash、表形状", "num_hash_layers = 3、vocab_size = 129280 ⇒ 表 [129280, 6]", "运行时只是一次 gather"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "hash 路由把『选谁』从可学习量里彻底拿出来：选择的输入是 token id（与 hidden state 无关、无路由参数），所以不需要均衡损失；但权重仍由当层亲合分决定 ⇒ 同一套专家、不同的权重。",
+    "argument": "可观察区分点有两个：①**选择侧**——同一批 token 的派单完全由表决定（trace：token 4 → [3, 0]），而走 gate 打分时得到 [[1, 3], …]（其中第 1、3 个 token 的集合与查表不同）⇒ 两者不是同一个映射，hash 确实不走分数排序；②**权重侧**——权重仍从无偏 scores gather 并 renormalize（trace：[0.818182, 0.181818] 来自 scores 的两个分量之比），说明这几层并没有『没有 gate』，只是分数不参与选择。均衡性来自表的构造方式（Hash Layers 论文：balanced 与 random 指派表现相近，都不需要目标函数里的均衡项），而不是来自运行时机制——这也是它比 routing 方案少一整项损失的算术原因。",
+    "monotone_quantity": "选择结果与 hidden state 无关（仅由 token id 决定）"
+   },
+   "quantified": "玩具 vocab 6 × topk 2：3 个 token 一次 gather 出 6 个专家号 + 6 个权重；config 口径 vocab_size=129280、每 token 挑 6 ⇒ 表 129280 行 × 6 列（约 775680 个整数），运行时每 token 一次 6 元素 gather，最前 num_hash_layers=3 层生效。论文未说明『为什么只有前 3 层』——正文不替它编理由。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-hash-route",
+     "template": "flow",
+     "l0_zoom": "放大 L0 右列 GPU 执行臂（绿）模型层块的**最前三层**：路由不挑、直接查表——与 ch28-fig-moe-axes 的『挑选』并排看，同一层 FFN 的两种派单方式。",
+     "claim": "hash 路由＝按 token id 查一张 [vocab, topk] 的整数表：选择与 hidden state 和 gate 分数完全无关（也不需要均衡损失），但权重仍从当层无偏亲合分 gather。",
+     "numbers": [
+      {"value": "玩具表 tid2eid = [[3,1],[0,2],[2,3],[1,0],[3,0],[1,2]]（vocab 6 × topk 2）", "provenance": "traces/run_m16_m18_moe.json（D 段表行）"},
+      {"value": "token 4 → [3, 0]（权重 [0.818182, 0.181818]）；token 1 → [0, 2]（[0.65, 0.35]）；token 5 → [1, 2]（[0.25, 0.75]）", "provenance": "traces/run_m16_m18_moe.json（D 段三行查表结果）"},
+      {"value": "同一批 token 走 gate 打分的 top-2 = [[1, 3], [0, 2], [2, 3]]（与查表不同）", "provenance": "traces/run_m16_m18_moe.json（D 段『对照』行）"},
+      {"value": "config：num_hash_layers = 3、vocab_size = 129280 ⇒ 表 [129280, 6]", "provenance": "traces/run_m16_m18_moe.json（D 段最后两行）"}
+     ],
+     "caption_draft": "派单台：左边一列 token id（不是 hidden state）直接指向一张整数表，表里两列就是两个专家号——一次 gather 完事，没有打分、没有排序、也没有均衡损失项。右边补上『权限边界』：表只决定选谁，给多少权重仍由这一层的无偏亲合分现算（实测 [0.818182, 0.181818] 这种比值来自分数本身）。最下方一行对照给出门槛感：同一批 token 若走普通 gate 路由，抽出来的是另外两个专家——两条路不是同一件事，最前 num_hash_layers=3 层走的正是左边这条。",
+     "illustrator_notes": "flow 模板：左（token id 列）→ 中（[vocab, topk] 表方块，标 129280×6 的真实尺度）→ 右（专家号 + 权重）。旁注画一个被划掉的门控打分框（标『分数不参与选择』）。配色 l0_common；不出现内部路径与内部字段名以外的脚手架痕迹。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch28-m19",
+   "name": "MTP：顺序多 token 预测的模块与损失（Eq.21-25），以及 V4 的沿用与形态差",
+   "paper_anchor": "arXiv:2412.19437 §2.2 Eq.(21)-(25) + arXiv:2606.19348 §2.1（without modification）",
+   "intuition": "顺手多预测一步：第 k 档模块吃下『上一档的隐状态』和『第 i+k 个 token 的 embedding』，拼起来过一个 Transformer 块，再用**与主模型共享**的输出头吐一个 logits——预测 t_{i+k+1}。关键是『顺序』：第 2 档吃的是第 1 档的输出，一档接一档（论文明确与『并行独立头』区分）。推理期两条路：直接丢掉，或者留下来当投机解码的起草器。",
+   "worked_example": {
+    "params": {"T": 5, "d": 2, "V": 4, "D": 1, "λ": 0.3, "k": 1, "token 序列": "[0, 1, 2, 1, 3]"},
+    "trace_source": "run",
+    "trace_ref": "traces/run_m19_mtp.json",
+    "table": {
+     "columns": ["轮次/步骤", "动作", "关键数值", "判定"],
+     "rows": [
+      ["下标对齐", "mtp_alignment(T=5, k=1)", "隐藏位置 [0, 1, 2, 3]（4 个）；有目标的位置 [(0, 2), (1, 3), (2, 4)]（3 个）", "隐藏位置比目标位置多 1 个（Eq.24 区间短一格）"],
+      ["错位口径", "输入错位 k 格、输出错位 k+1 格", "位置 i=0 吃 (h_0, Emb(t_1)) → 预测 t_2", "『预测下一步』就是输入错位 1 格"],
+      ["Eq.(21) 拼接", "RMS(h) 与 RMS(Emb(t_{i+1})) 拼接后过 M_1", "i=0 的拼接 = [1.26491, 0.632455, 1.414212, 0.0]；h'^1_0 = [0.900367, 0.881912]", "每个位置 4 维 = 2 + 2"],
+      ["Eq.(22) TRM", "因果 Transformer 块", "h^1 各位 = [2.513401, 2.468732, 2.476002, 0.789136, 2.819976, 0.126554, 1.198117, 1.897368]", "输出形状 (4, 2)"],
+      ["Eq.(23) 输出头", "OutHead（与主模型共享）", "logits 形状 (3, 4)；i=0 的预测分布 = [0.072536, 0.069367, 0.856462, 0.001635]", "目标 token = 2（分布最大值恰好落在它上面）"],
+      ["Eq.(24) 损失", "逐深度交叉熵", "L^1_MTP = 3.144246", "只对 3 个有目标的位置取平均"],
+      ["Eq.(25) 加权", "L_MTP = (λ/D)·Σ_k", "(0.3/1) × 3.144246 = 0.943274", "D=1、λ=0.3（论文超参）"],
+      ["因果证据 a", "扰动 Emb(t_4) 看影响面", "受影响的 h'^1 行 = [3]（逐行变化量 [0.0, 0.0, 0.0, 0.468328]）", "t_4 只被它该被用到的那一格用到"],
+      ["因果证据 b", "扰动 h'^1 最后一行", "逐位变化量 = [0.0, 0.0, 0.0, 1.166934]（前面三位纹丝不动）", "改后面的输入动不了前面的输出（np.tril 因果掩码）"],
+      ["顺序 vs 并行", "第 2 档输入取 h^1 vs 取 h'^1", "两种输出逐位相同 = False；扰动 h^1_0 后顺序版变化 [0.001348, 0.001532, 0.000124, 0.000455, 0.000112, 0.000203]、对照版恒 0", "『顺序』= 第 k 档真的吃第 k−1 档的输出"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "每档的因果链是完整的：第 i 个位置预测 t_{i+k+1} 时能看到的 token 上界恰好是它自己喂进去的 t_{i+k}（输入错位 k 格），而 TRM 的因果掩码保证位置 i 看不到 j > i —— 两者合起来，模块不可能偷看要被预测的那个 token。",
+    "argument": "两条独立证据链（都在 trace 里）：①**输入侧错位**——h'^1_i 只吃 Emb(t_{i+1})，所以扰动 Emb(t_4) 只有 i=3 那一行变（逐行变化量 [0.0, 0.0, 0.0, 0.468328]，受影响的 h'^1 行 = [3]）；②**TRM 内部因果**——扰动 h'^1 的最后一行时，位置 0..2 的输出纹丝不动（np.tril 掩码），反向（扰动第 0 行）则所有后面位置都变：因果是『只看前面』而不是『互不影响』。两者相乘 ⇒ 位置 i 的预测只依赖 ≤ i+k 的 token，而目标是 i+k+1 ⇒ 严格不偷看。『顺序』还可再验一次：把第 2 档的输入从 h^1 换成 h'^1（不接第 1 档的 TRM 输出），两种输出逐位相同 = False，且扰动 h^1_0 时顺序版第 2 档输出发生变化（非 0 六个分量）、对照版恒 0 —— 这说明链是真接上的。",
+    "monotone_quantity": "第 i 位的可见 token 上界 = i+k（与 D=1 的档数无关）"
+   },
+   "quantified": "玩具 T=5、k=1：4 个隐藏位置、3 个有目标的位置、一个共享输出头（V=4）；损失 L^1_MTP = 3.144246、总损失 0.943274（λ=0.3、D=1）。config 口径：num_nextn_predict_layers=1（与论文 D=1 一致）、λ=0.3；推理期两条路——官方参考实现有 MTPBlock 但推理脚本不用它（丢弃），pin 把它当 drafter 用（另一条路，接的是主干 hc_head **之前**的展平残差、把单流 unsqueeze 成 hc_mult 条流）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-mtp-flow",
+     "template": "tensor-flow",
+     "l0_zoom": "放大 L0 右列 GPU 执行臂（绿）模型层**尾部**的分叉：主干出口的残差怎么喂给 MTP 一档——与 ch28-fig-symbol-exit 的出口动线接在一起（先拷给 MTP、再过 hc_head）。",
+     "claim": "MTP 一档＝『上一档隐状态 + 第 i+k 个 token 的 embedding』拼接 → 因果 TRM → 共享输出头；输入错位 k 格、目标错位 k+1 格，因此严格不偷看；V4 原样沿用（D=1、λ=0.3）。",
+     "numbers": [
+      {"value": "mtp_alignment(T=5, k=1)：隐藏位置 [0, 1, 2, 3]、目标 [(0, 2), (1, 3), (2, 4)]（隐藏比目标多 1 个）", "provenance": "traces/run_m19_mtp.json（A 段三行）"},
+      {"value": "i=0 的拼接 = [1.26491, 0.632455, 1.414212, 0.0]；h'^1_0 = [0.900367, 0.881912]", "provenance": "traces/run_m19_mtp.json（B 段 Eq.(21) 两行）"},
+      {"value": "i=0 的预测分布 = [0.072536, 0.069367, 0.856462, 0.001635]（目标 token = 2）", "provenance": "traces/run_m19_mtp.json（B 段 Eq.(23) 行）"},
+      {"value": "L^1_MTP = 3.144246 ⇒ L_MTP = (0.3/1) × 3.144246 = 0.943274", "provenance": "traces/run_m19_mtp.json（B 段 Eq.(24)(25) 两行）"},
+      {"value": "扰动 Emb(t_4)：受影响 h'^1 行 = [3]，逐行变化量 [0.0, 0.0, 0.0, 0.468328]", "provenance": "traces/run_m19_mtp.json（C 段前三行）"},
+      {"value": "顺序 vs 对照：逐位相同 = False；扰动 h^1_0 后顺序版变化 [0.001348, 0.001532, 0.000124, 0.000455, 0.000112, 0.000203]、对照版全 0", "provenance": "traces/run_m19_mtp.json（D 段三行）"}
+     ],
+     "caption_draft": "一档 MTP 的数据流：左边从主干尾部取来展平残差（那一份是 hc_head 之前的，4 条流的信息都还在），与第 i+1 个 token 的 embedding 各自归一后拼接、过投影 M_1；中间一个保持完整因果链的 TRM 块；右边用与主模型共享的输出头吐出对 t_{i+2} 的预测。图上用两条错位箭头说清口径：输入错位 1 格（喂 t_{i+1}）、目标错位 2 格（预测 t_{i+2}）。底部两行实测证据：扰动最后一个 token 的 embedding 只影响最后一格（其他三行变化量 0.0），而把第 2 档的输入换成不接第 1 档的写法时输出就变了——『顺序』不是修辞。",
+     "illustrator_notes": "tensor-flow 模板：主干尾部 → 拼接框（两个 RMSNorm 半圆）→ TRM 块 → 共享输出头（标注『与主模型共享』）→ 预测 t_{i+2}。错位用两条错一格的对齐标尺表现。底部小注放两条扰动证据。配色 l0_common（GPU 绿）；不写内部路径。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "ch28-m20",
+   "name": "压缩坐标系与三本账：哪些 token 产出条目、条目落在哪个槽、谁在缓存里",
+   "paper_anchor": "arXiv:2606.19348 §2.3.1（1/m 与产出单位）；实现口径见 pin 的压缩坐标系",
+   "intuition": "三把尺子叠在一起量同一串 token：第一把是原始 token 轴（位置 0…n−1），第二把是压缩块轴（条目号 = 位置 // m），第三把是分页 KV 的槽位轴（块号 + 槽内偏移）。看清谁产出条目（只有块尾 token 干活）、条目落在哪个槽、以及没攒满的那一窗去哪了（留在压缩机的 state 里等下一拍），就知道『压缩不是另存一份，而是把页变小』。",
+   "quantified": "坐标系三句话：①谁产出条目——只有 (position+1) % compress_ratio == 0 的块尾 token 触发（pos 3 只攒出 1 个压缩块，其余位置全早退）；②条目落在哪——同一张分页 KV 里，槽位 = (block_number, pos_after_compress % block_size)，条目号 = 位置 // m；③未完成窗在哪——压缩机的 state（与 KV 页共享物理张量，因此块大小被页尺寸约束成 4 或 8）。三本缓存宽度：主压缩条目 584B、索引器小头 132B、滑窗窗口 128 条未压缩。",
+   "figure_specs": [
+    {
+     "figure_id": "ch28-fig-compress-coords",
+     "template": "layout",
+     "l0_zoom": "放大 L0 青列（kv_column，C_KV_S）KV 池块的**内部坐标系**：原始 token 轴 / 压缩块轴 / 分页槽位轴三把尺子叠在一起——它是 ch28-fig-soft-pooling 的产出去向，也是三本账在缓存层的落点。",
+     "claim": "压缩坐标系把『谁产出条目、条目落在哪个槽、未满的窗在哪』三件事一次说清：条目号 = 位置 // m、只有块尾 token 产出、未满一窗留在压缩机 state 里（与 KV 页共享物理张量）。",
+     "numbers": [
+      {"value": "条目号 = pos // m；产出触发条件 (position+1) % compress_ratio == 0（只有块尾 token 干活）", "provenance": "dossier ch28-m20 与 embed_excerpts（vllm/v1/attention/backends/mla/compressor_utils.py:L33-L50 的 _compressed_slot_mapping_kernel：is_valid=(pos+1)%COMPRESS_RATIO==0、pos_after_compress=pos//block_size）"},
+      {"value": "三本缓存宽度：主压缩条目 584 B、索引器小头 132 B、滑窗 128 条未压缩 KV", "provenance": "traces/run_m01_m02_ledger.json（『一条压缩条目 = 448 fp8 NoPE + 128 bf16 RoPE + 8 fp8 scale = 584 B』『索引器小头一条 = 128 fp8 + 4 fp32 scale = 132 B』与『n_win = 128』）"},
+      {"value": "1M 下条目数：CSA 层 250000 条（1e6//4）、HCA 层 7812 条（1e6//128）", "provenance": "traces/run_m08_hca.json（B 段『候选压缩块』行）"},
+      {"value": "块尾 token 的窗口算术：start = position − (1+OVERLAP)·CR + 1；mask_pos(pos>=0) 决定取 −inf/0", "provenance": "traces/run_m03_m04_csa.json（『pin 侧的窗口算术』段 position=3/7/11 三行）"}
+     ],
+     "caption_draft": "三把尺子叠在一张图上：最上面是原始 token 轴（0…n−1），中间是压缩块轴（条目号 = 位置 // m），最下面是分页 KV 的槽位轴（块号 + 槽内偏移）。三条动线标出：块尾 token 触发产出（(pos+1)%m==0，其余位置早退），条目按 pos_after_compress 落进分页槽位，还没攒满的那一窗留在压缩机 state 里等下一拍。右侧标三本缓存的宽度（584 B / 132 B / 128 条未压缩）——一眼看出压缩不是另存一份，而是把『每个 token 一页』换成『每 m 个 token 一页』。",
+     "illustrator_notes": "layout 模板：三条平行的尺子（token 轴 / 块轴 / 槽位轴）用竖直对齐的刻度虚线连起来；块尾 token 用标记点突出，未满窗用一个虚线小框标『留在 state，等下一拍』。配色 l0_common（KV 青为主）；数字取 numbers.provenance；不出现内部路径与内部产物名（引用 pin 只写语义，不写仓内脚手架路径）。"
+    }
+   ]
+  }
+ ]
+}
