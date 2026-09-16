@@ -824,12 +824,20 @@ def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vse
                 and r['y'] + r['h'] > y - 2 and r['y'] < y + 2]
         if obst:
             obst.sort(key=lambda r: r['x'])
+            # 腿位按**行进方向**的首/末障碍取（exp-2026-09-17 ch38 geometry lint arrow-crossed×2）：
+            # 原 else 分支（右→左流）把 obst[0]/obst[-1] 用反——leg_a 取到「最远障碍与源」的
+            # 中点（中点深陷障碍带），出线横段一路切过近侧 2-3 个拍片再在**框内**折上车道；
+            # leg_b 同反，落腿后横段再穿一个拍片（ch38 ⑨→④/⑨→⑥ 两条 cascade/promotion
+            # 回腿各穿 ⑧⑦⑤ 等 2-4 框，146×205 框被截断）。正确语义：leg_a=源与**行进方向
+            # 首障碍**（右→左=最右障碍 obst[-1]）右缘的缝中点；leg_b=**末障碍**（右→左=最左
+            # 障碍 obst[0]）左缘与目标的缝中点。触发式：左→右分支与无夹框直连逐字节不变
+            # （全 corpus 右→左 hop 仅 ch38 一章，其余章重渲输出不变）。
             if x2 > x1:
                 leg_a = (x1 + obst[0]['x']) / 2
                 leg_b = (obst[-1]['x'] + obst[-1]['w'] + x2) / 2
             else:
-                leg_a = (x1 + obst[0]['x'] + obst[0]['w']) / 2
-                leg_b = (obst[-1]['x'] + x2) / 2
+                leg_a = (x1 + obst[-1]['x'] + obst[-1]['w']) / 2
+                leg_b = (obst[0]['x'] + x2) / 2
             lane_y = min(a['y'], b['y']) - 16
             for k, r in R.items():               # hop 车道不许穿出所在容器顶线
                 if k not in (f['from'], f['to']) and _contains(r, a) and _contains(r, b):
@@ -1266,8 +1274,11 @@ def build(spec_path):
                 _la_ = (_x1_ + _obst_[0]) / 2
                 _lb_ = (_obst_[-1] + cw_each + _x2_) / 2
             else:
-                _la_ = (_x1_ + _obst_[0] + cw_each) / 2
-                _lb_ = (_obst_[-1] + cw_each + _x2_) / 2
+                # 与 draw_flow obst 分支同修（exp-2026-09-17 ch38）：右→左流的腿位按
+                # 行进方向首/末障碍取——_la_ 缝=源与最右障碍右缘、_lb_ 缝=最左障碍左缘
+                # 与目标，镜像同一条判据。
+                _la_ = (_x1_ + _obst_[-1] + cw_each) / 2
+                _lb_ = (_obst_[0] + _x2_) / 2
             if any(min(_la_, _lb_) < _bx1_ and _bx0_ < max(_la_, _lb_)
                    for _bx0_, _bx1_ in _hdr_bx):
                 _fire = True
