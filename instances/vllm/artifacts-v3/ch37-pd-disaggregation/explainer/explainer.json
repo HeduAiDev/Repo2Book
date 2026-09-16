@@ -1,0 +1,415 @@
+{
+ "chapter_id": "ch37-pd-disaggregation",
+ "chapter_title": "P/D 分离",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "kind": "code",
+ "trace_environment": "11 个 trace 全部 host 运行（trace_source=run）：驱动脚本与原始输出在 explainer/traces/（run_m01…m09/m11/m12.py + 同名 json + _driver_common 脚手架；复用 tests/_pd_harness 的「两台引擎」装配件，跑的是 implementation/ 精简版——测试基线 36 passed）。host：Windows conda CPython 3.11.11、torch 2.11.0 CPU float32、无 CUDA/无 RDMA/无 vllm 包安装（精简版自包含）。取证环境与 pin 的差异（writer 须就近挑明，exp-0718-1）：① NIXL 数据面是 impl-notes SEAM 清单的唯一数据面替换——真 RDMA 单边 READ/WRITE 换成进程内 ctypes.memmove，但保留单边语义（只按描述符裸地址取数、不经对端 Python 路径）；替身 transfer() 当场搬完，check_xfer_state 恒 DONE——真 RDMA 下多步轮询会先见 PROC（代码路径逐字保留），本机观察不到 PROC 阶段；② notif 随替身 transfer() 同步送达对端收件箱（真 NIXL 由网卡在传输完成时发出），送达时机提前、内容与消费路径不变；③ host 平台 device_type=cpu → use_host_buffer 恒 False（真 CUDA 平台 kv_buffer_device=cpu 时为 True，见 traces/m12.json 的 host_buffer_flag.pin_behavior_on_cuda）；④ HostAttentionBackend 替身 → _physical_blocks_per_logical_kv_block 恒 1（真 FlashAttention 块尺寸 16 的倍数时可 >1，走减法计划已删的重映射分支）——本章恒走对称正典路径；⑤ side channel 端口为临时分配（每 run 不同），trace 里的端口号/uuid/hash 前缀是本次快照、不是稳定常量；时延类数字（握手整趟 ms、心跳位移 ms）为本机实测、量级供参考。控制面（ZMQ side channel 握手、回执双跳、四账本、租约/心跳/收割、推模式配对）全部为真源码路径真跑。真 RDMA 双机部署（pin 的生产形态）本机不可复现（docker 容器有 GPU 但无 RDMA 网卡/无 NIXL 库、无多节点），故数据面以上述 seam 承载——与 impl-notes 的 SEAM 声明一致。",
+ "figure_policy": "本章 L0 缩放位置 = L0 双实例+KV 边界（pedagogy-plan l0_zoom；l2-specs/ch37.json l0_region=multi）。全部 figure-spec 均可回答「它是 L0 哪一块的放大」：m1=L0 双实例形态本身（两台完整引擎+KV 边界；L2 站 1）；m2=北条 disaggregator 路由器与回执双跳（L2 站 3/5）；m5=下排启动待命→中排⑤握手的 side channel（L2 站 2/7）；m6=中排⑥ READ 直读 P 显存（L2 站 8）；m8=中排⑧ 租约心跳与过期（L2 站 10）；m9=下排推模式对照（L2 站 12）。开篇图走 L2 章图（cartography/l2-specs/ch37.json，gen_L2 渲染），本文件只产正文机制图 spec——按 FIGURE-SYSTEM.md §3：架构性内容回指 L0/L2、不另立架构画法；配色走 l0_common 角色色（API 蓝 C_API_S/ZMQ 紫 C_ZMQ_S/EngineCore 橙 C_ENG_S/GPU 绿 C_GPU_S），图面不出现内部路径。m2 时序图按 WRITING-CONTRACT-v3 §8 + FIGURE-SYSTEM §2 时序图种规约：UML 文法（竖直生命线+共享时间轴+水平消息直线，禁一切折线/肘形）。",
+ "mechanisms": [
+  {
+   "mechanism_id": "m1",
+   "intuition": "P 和 D 不是两种程序，是同一种引擎的两种上岗方式：一台挂着「算完 prefill 把块钉住等人来取」的工牌（kv_producer），一台挂着「prompt 的 KV 在别人那里，我去取」的工牌（kv_consumer）。连代码都是同一份——每个进程里 connector 只活一半：调度器进程活调度器半边、worker 进程活 worker 半边，另一半永远是空的。",
+   "worked_example": {
+    "params": "两台完整引擎（P=kv_role:kv_producer、D=kv_role:kv_consumer），block_size=4、num_kv_heads=2、head_size=8、num_blocks=8、1 层、float32（HND 张量 (8,2,4,16)、每块 512 B）。",
+    "trace_source": "run",
+    "trace_ref": "traces/m01.json",
+    "table": {
+     "columns": ["核对项", "输入", "实测结果", "判定/含义"],
+     "rows": [
+      ["factory 注册名", "NixlConnector / NixlPullConnector / NixlPushConnector", "3 个名字全解析；NixlConnector is NixlPullConnector 为 True（别名 1 对）", "部署命令行里写的 NixlConnector 就是拉模式"],
+      ["kv_role 门", "不填 / 填 kv_watcher", "两者都 ValueError：Please specify kv_role… / Unsupported kv_role…", "角色是部署门——不选角色不许启动"],
+      ["engine_id", "两个实例都走默认", "各 36 位（uuid4），两两不同", "两台引擎天然各有身份（notif 寻址与握手都用它）"],
+      ["facade 半边", "SCHEDULER role 与 WORKER role 各建一份 connector", "4 个 connector 对象里只有 2 个半边非空（scheduler 侧或 worker 侧）", "同一份代码按角色只活一半——分开构建、不共享状态（ch16 的 role-split 在真实后端的形态）"],
+      ["布局门", "非 MLA / MLA", "非 MLA 强制 HND（张量 (8, 2, 4, 16)）；MLA 返回 None 走默认", "HND 把 K/V 打包进内容维——一块的 KV 一个单元过线"],
+      ["kv_both 旧角色", "kv_role=kv_both", "仍能建出 scheduler 半边（打弃用告警）", "P/D 各设一职才是正统，both 是待清退的兼容位"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "任意时刻一个 NIXL 引擎进程里非空的 connector 半边数恰为 2（调度器侧 1 + worker 侧 1），且 kv_role 三态取一、角色互斥。",
+    "argument": "facade __init__ 按 KVConnectorRole 分支构造：SCHEDULER 分支只赋 connector_scheduler（connector_worker 恒 None），WORKER 分支只赋 connector_worker——基例：构造前两者皆 None；归纳步：每个分支只写自己的字段、从不碰另一个，且没有第三条赋值路径。kv_role 三态在 KVTransferConfig 构造期校验（缺省与非法值直接 ValueError，trace 实测两种报错），角色集合是划分而非叠加。trace 实证：4 个 connector 对象非 None 半边恰 2 个。"
+   },
+   "quantified": "部署 2 台引擎 = 2 条 vllm serve（各带一份 --kv-transfer-config）；注册名 3 个（别名 1 对）；每台 2 份 connector、全局 4 个对象、非空半边 2；engine_id 默认 uuid4（36 位）两两不同；非 MLA 强制 HND——本例张量 (8,2,4,16)、每块 512 B（块粒度传输的物理基础，m6 消费）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch37-fig-dual-engine-halves",
+     "template": "layout",
+     "l0_zoom": "L0 双实例+KV 边界（multi 布局块）的直接展开：两个「完整引擎」框 + 中间 KV 边界；对应 L2 章图站 1 的放大。",
+     "claim": "P/D 是同一份 NixlBaseConnector 代码的两种角色上岗：每台引擎内部 scheduler 侧与 worker 侧各建一份 connector、facade 按 role 只建半边（另一半恒 None）——全局 4 个 connector 对象只有 2 个非空半边。",
+     "numbers": [
+      {"value": "注册名 3 个：NixlConnector（=NixlPullConnector 别名）/NixlPullConnector/NixlPushConnector", "provenance": "traces/m01.json factory_resolution（names=3、alias_pairs=1）+ factory.py:L176-L193"},
+      {"value": "每台 2 份 connector（scheduler 侧 + worker 侧）→ 4 个对象、非空半边 2", "provenance": "traces/m01.json facade_halves（total_connector_objects=4、non_none_halves=2）"},
+      {"value": "kv_role 三态部署门：缺省/非法值即 ValueError（Please specify kv_role / Unsupported kv_role）", "provenance": "traces/m01.json kv_role_gate + vllm/config/kv_transfer.py:L41-L72"},
+      {"value": "engine_id 默认 uuid4（36 位）、两实例不同；side channel 端口每引擎独占", "provenance": "traces/m01.json kv_role_gate.default_engine_id_is_uuid4 + engines（distinct_ports=true）"},
+      {"value": "非 MLA 强制 HND：本例张量 (8,2,4,16)、每块 512 B", "provenance": "traces/m01.json required_kvcache_layout + hnd_geometry"},
+      {"value": "kv_both 仍可构建但打弃用告警（P/D 各设一职为正统）", "provenance": "traces/m01.json kv_both_deprecated + nixl/connector.py:L93-L99"}
+     ],
+     "caption_draft": "左右两个完整引擎框（各含 scheduler 半边 + worker 半边，EngineCore 橙/GPU 绿角色色），中间一条 KV 边界；每个 connector 框里只亮一半、另一半画灰并标 None——「同一份代码，按角色只活一半」。上角注三行部署命令行要点：kv_role 二选一、engine_id 默认 uuid4、NixlConnector=拉模式别名。图注结论：P/D 不是两种进程，是同一种引擎的两种工牌。",
+     "illustrator_notes": "架构性内容回指 L2 站 1（不另立画法）；两引擎框用 l0_common 的 EngineCore/GPU 角色色；「另一半 None」用灰色虚框表达；KV 边界本图只画占位（真正的数据面放大归 m6 图）。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m2",
+   "intuition": "回执信封像快递面单：P 把「货在哪、几号货架（块号）、哪家店（engine_id）、门牌（host:port）」写在面单上，随包裹回执一起还给寄件人；disaggregator 这位中转站不做任何分拣判断，只把面单原样贴到下一程的同一个包裹上发去 D。",
+   "worked_example": {
+    "params": "16-token prompt；P 块 [0,1,2,3]；客户端原始请求 max_tokens=7、min_tokens=2、stream=True。跳 1 与跳 2 都跑真 proxy 函数（toy_proxy_server），HTTP 客户端为替身；P 终局回执由真引擎产出。",
+    "trace_source": "run",
+    "trace_ref": "traces/m02.json",
+    "table": {
+     "columns": ["跳", "动作（真函数）", "信封/请求体关键字段", "判定"],
+     "rows": [
+      ["客户端原始请求", "—", "max_tokens=7、min_tokens=2、stream=True", "D 才需要的参数躺在原始请求体里"],
+      ["跳 1：发单 P", "send_request_to_service", "max_tokens=1、stream=False、min_tokens 摘掉（发完放回）；kv_transfer_params 6 键、do_remote_decode=True", "P 只算 prefill 的 1 个 token 就收工交块"],
+      ["P 终局产回执", "request_finished", "回执 10 键：remote_block_ids=[[0,1,2,3]]、remote_num_tokens=16、tp_size=1、remote_engine_id/host/port", "全部传输坐标由 P 侧一次性打包"],
+      ["跳 2：转交 D", "_handle_completions", "D 腿请求体的 kv_transfer_params 与回执逐字相等（== 为 True）；min_tokens=2 放回", "控制面的全部工作=搬运这只信封，不做任何改写"],
+      ["D 挂载", "Request(extra_args)", "挂载 10 键；7 个坐标字段与 P 产出逐一相等；do_remote_prefill=True / do_remote_decode=False", "两条腿各翻一个旗标：P 腿「decode 在远端」、D 腿「prefill 在远端」"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "坐标字段（remote_block_ids/engine_id/request_id/host/port/tp_size/remote_num_tokens）从 P 产出点到 D 挂载点逐字不变——信封在两条腿上只被「整体复制 + 单旗标翻转」，不存在字段级改写点。",
+    "argument": "基例：回执在 request_finished 尾部一次性构造（10 键字典字面量）。归纳步逐过每个搬运点：proxy 腿只做整体赋值 req_data[\"kv_transfer_params\"] = kv_transfer_params（无字段写）；HTTP 层把它放进 extra_args（无字段写）；Request 构造从 extra_args 摘出整只字典挂 self.kv_transfer_params（无字段写）。do_remote_prefill/do_remote_decode 两个旗标的翻转各自发生在腿的入口构造处（P 腿由 proxy 写死、D 腿由入场语义决定），坐标字段没有任何翻转点。trace 实测：7 个坐标字段全部相等、D 腿请求体与回执 == 为 True。"
+   },
+   "quantified": "双跳 = 2 次 HTTP 过境 + 2 次引擎过境；信封 10 键（7 坐标字段 + 2 旗标 + 1 到期时刻占位 None）；P 腿改写恰 3 项（max_tokens 7→1、stream True→False、min_tokens 摘掉再放回）；P 侧 6 键入场参数被换成 10 键回执出场。代价账：proxy 必须有状态才能做多轮（conversation_id→D 回执缓存，disagg_proxy_multiturn.py）；官方口径明确拆分不提升吞吐（disagg_prefill.md「Disaggregated prefill DOES NOT improve throughput」）——买的是 TTFT/ITL 分别调优。",
+   "figure_specs": [
+    {
+     "figure_id": "ch37-fig-envelope-double-hop",
+     "template": "swimlane",
+     "l0_zoom": "L0 双实例+KV 边界的北条 disaggregator 路由器（请求双跳）放大；对应 L2 章图 disaggregator 组件与站 3/5。",
+     "claim": "控制面的全部工作=一只 10 字段回执信封随请求/响应双跳搬运：跳 1 proxy 改写三项（max_tokens=1、stream=False、摘 min_tokens）发单 P，P 只算 prefill；跳 2 从 P 响应掏出 kv_transfer_params 原样附加转交 D——信封字段从产出到挂载逐字不变。",
+     "numbers": [
+      {"value": "跳 1 改写：max_tokens 7→1、stream True→False、min_tokens 2 摘掉（发完放回）；入场 params 6 键", "provenance": "traces/m02.json leg1_proxy_to_p + toy_proxy_server.py:L155-L197"},
+      {"value": "P 终局回执 10 键（remote_block_ids=[[0,1,2,3]]、remote_num_tokens=16、tp_size=1、engine_id/host/port）", "provenance": "traces/m02.json p_terminal_receipt（receipt_keys=10）+ pull_scheduler.py:L280-L291"},
+      {"value": "跳 2：D 腿请求体 kv_transfer_params 与回执 == 为 True", "provenance": "traces/m02.json leg2_proxy_to_d.d_leg_params_identical_to_receipt + toy_proxy_server.py:L219-L237"},
+      {"value": "D 挂载 10 键、7 个坐标字段全部相等", "provenance": "traces/m02.json d_request_mount + vllm/v1/request.py:L100-L122"},
+      {"value": "回执随 P 响应出引擎的真源码出口", "provenance": "vllm/v1/core/sched/scheduler.py:L1901-L1935（EngineCoreOutput.kv_transfer_params）"},
+      {"value": "可选省一次 tokenize：prompt_token_ids 复用", "provenance": "docs/features/disagg_prefill.md「Reusing prefill token ids on decode」+ chat_completion/protocol.py:L465-L472"}
+     ],
+     "caption_draft": "四条竖直生命线（客户端 / disaggregator / P 引擎 / D 引擎）共享时间轴：第一段水平消息是发单 P（标注三项改写 max_tokens=1、stream=False、min_tokens 摘掉），P 线内一个短活动条（prefill 16 token），回程消息上骑着的矩形即回执信封（列出 10 键中的坐标字段）；第二段消息是转交 D（信封原样附加），D 线内活动条（异步拉+decode）。图注结论：disaggregator 不做分拣判断，只搬面单——坐标从 P 的引擎内部流到 D 的引擎内部，一跳都不落地上图之外。",
+     "illustrator_notes": "UML 时序图种规约（WRITING-CONTRACT §8）：竖直生命线+共享时间轴+水平消息直线，禁折线/肘形；信封画成骑在消息线上的小矩形（字段缩写），两条腿各高亮一个旗标翻转（do_remote_decode=True / do_remote_prefill=True）；P/D 生命线内活动条用 EngineCore 橙，proxy 线用 API 蓝。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m3",
+   "intuition": "P 干完活的收尾不是「打扫」，是「移交押金」：只有正常收工（算满额度或命中停止串）才把块押给 connector，押期 30 秒（租约）——押期内 D 不来取，P 自己到期没收押金（放块）；中途被叫停（abort）的活不押，块当场归还。",
+   "worked_example": {
+    "params": "16-token prompt、P 块 [0,1,2,3]（每块 512 B）；三种终局对照 LENGTH_CAPPED / STOPPED / ABORTED；租约默认 30s。P 侧引擎生命周期用真 Scheduler._free_request + _update_from_kv_xfer_finished 驱动。",
+    "trace_source": "run",
+    "trace_ref": "traces/m03.json",
+    "table": {
+     "columns": ["终局场景", "request_finished 返回", "P 侧账本（实测）", "判定"],
+     "rows": [
+      ["LENGTH_CAPPED（disaggregator 发单的 max_tokens=1 触发）", "(True, 10 键回执)", "_reqs_need_send 盖戳：deadline − t0 = 30.0s（租约 30s）；回执 remote_num_tokens=16、块 [0,1,2,3] 共 4 块钉住", "块交给 connector 异步释放——ch16 所有权转移点的真实落地"],
+      ["STOPPED（命中停止串）", "(True, 同款回执)", "同样钉住；本例 remote_num_tokens=12、块 [0,1]", "双条件的另一条：只有这两种正常终局才交接"],
+      ["ABORTED", "(False, None)", "req 进 _reqs_not_processed；不进 _reqs_need_send", "异常终局不交接，块立即释放"],
+      ["引擎侧出口", "Scheduler._free_request 返回回执", "kv_blocks_freed 此刻不含 req-p、请求仍被跟踪；worker 报 finished_sending 后块才放、请求才删", "回执出引擎与块延迟释放是同一个钩子的两半"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "「交接」只发生在（status ∈ {LENGTH_CAPPED, STOPPED}）×（有块可交）的交集上；交接后 _reqs_to_send 的每个键恰有三个消亡来源：D 读完的 notif 计数齐、租约到期收割、（拒绝回执触发的）空 recv notif——不存在无人监督的第四条路径。",
+    "argument": "第一半是显式门：request_finished 对 status 做二元组判定，不在集合内即 _reqs_not_processed + (False, None)（基例：ABORTED 分支实测返回 False/None）。第二半靠枚举删除点：worker 侧 _reqs_to_send 的删除语句只在两处（pull_worker._get_new_notifs 计数齐时 pop、base_worker.get_finished 到期收割时 del）；空 recv 不直接删键，它只是让 D 发出一条 notif、走第一处删除。因此「块被钉住后永不释放」在控制流上不可达——最坏情况被 30s 租约兜底（m8 详述）。"
+   },
+   "quantified": "本例 4 块 × 512 B = 2048 B 钉住 30s；remote_num_tokens = num_computed_tokens（16，块对齐）；ABORTED 对照 0 块交接、无回执。回执出引擎的真源码出口在 scheduler.py:L1901-L1935（精简版收窄为 _free_request 的返回值，锚点见 trace）。F8 回收①：ch16 埋的「request_finished→True 接管异步释放」在本机制落地为租约钉住+回执。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m4",
+   "intuition": "D 收到带面单的请求后第一次「查缓存」就摊牌：整段 prompt 的 KV 都在 P 那里——于是 D 报「全部命中、但请给我异步加载的时间」，先占好落地块（还没写进哈希表的新块），把「要收货」记进账本，然后请求进等待队列等通知。这本账一个请求只记一次，被抢占重排也不会重复下单。",
+   "worked_example": {
+    "params": "D 腿 16-token prompt；P 腿骨架 128-token prompt 对照 remote_num_tokens=32/64/128 三档；kv_recompute_threshold 默认 64。",
+    "trace_source": "run",
+    "trace_ref": "traces/m04.json",
+    "table": {
+     "columns": ["查询/登记", "输入", "返回或账本（实测）", "判定"],
+     "rows": [
+      ["D 腿·零已算", "num_computed_tokens=0", "(16, True)", "整段 prompt 都在远端——全量异步拉"],
+      ["D 腿·部分已算", "num_computed_tokens=12", "(4, True)", "只报增量 N−computed；异步位恒 True"],
+      ["D 腿·全部已算", "num_computed_tokens=16", "(0, False)", "没有可拉的，不进等待路径"],
+      ["P 腿骨架·低于阈值", "remote_num_tokens=32、computed=0", "(0, False)：count 32 < 阈值 64", "短拉不划算——本地重算更便宜（kv_recompute_threshold=64，双向回拉分支，多轮对话归下一章）"],
+      ["P 腿骨架·正好过界", "remote_num_tokens=64", "(64, True)", "边界含等号：=64 就值得拉"],
+      ["登记待收", "update_state_after_alloc（未哈希块 [0,1,2,3]）", "_reqs_need_recv=[[[0,1,2,3]]]；do_remote_prefill 翻 False、_remote_blocks_processed=True；重入换块表 [[4,5]] 也不改账", "一请求只触发一次传输（抢占重入不重发）→ 接 ch16 等待路径"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "每个 do_remote_prefill 请求至多登记一次待收（_reqs_need_recv 至多写一次）。",
+    "argument": "update_state_after_alloc 的登记臂有两条互斥入口谓词（remote_block_ids 非空且坐标齐全才登记），臂尾无条件执行 params[\"do_remote_prefill\"]=False 与 _remote_blocks_processed=True（基例：首入登记并翻转）；此后 get_num_new_matched_tokens 与 update_state_after_alloc 的入口谓词均以 do_remote_prefill 为门，恒 False（归纳步：翻转后两条路径都不可能再进登记臂）。trace 实证：重入换块表 [[4,5]] 后账本仍是首入的 [[0,1,2,3]]。"
+   },
+   "quantified": "D 腥三档 (N−computed, True)：0→16、12→4、16→0；P 腿骨架阈值三档：32<64 跳过、=64 过界、128 直拉；落地缓冲=未入哈希表的块（本例 4 块）；本地全命中时登记空列表（m6 的 notif-only 输入）、部分命中时本地 2 块（m6 的尾裁剪输入）。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m5",
+   "intuition": "两台引擎要互相直接读写显存之前，先在一条侧门（side channel）上「对暗号+换钥匙」：对暗号是比 compatibility hash（配置指纹，对不上当场拒之门外，免得数据传错才知道）；换钥匙是交换内存描述符（货位表）。全程走 ZMQ，跟数据面完全分开——这就是「带外」。",
+   "worked_example": {
+    "params": "P/D 两台引擎（同机、真 ZMQ tcp 套接字）；worker 各注册 1 个 KV 区域（8 块 × 512 B）；握手走 base_worker._nixl_handshake 真 ZMQ REQ。",
+    "trace_source": "run",
+    "trace_ref": "traces/m05.json",
+    "table": {
+     "columns": ["步骤", "动作", "关键标量（实测）", "判定"],
+     "rows": [
+      ["P 待命", "启动即聚合 worker 握手元数据、起 ROUTER 监听线程", "线程 nixl_handshake_listener 存活；compat hash 64 位十六进制；agent 元数据：8 块 × 512 B、布局 HND、物理块比 1", "握手服务端先于任何请求就位（EngineCore 装配期注入）"],
+      ["D→P 握手", "ZMQ REQ 发 (GET_META, 0, 0)", "返回 agent 表 {(0, 0): <uuid>}；时钟偏移 0.00028s（同机近似 0）；整趟 4.998ms", "握手不走数据面——两台引擎的控制通道；RTT 中点顺带估出两机时钟偏移（租约要用）"],
+      ["兼容门", "D 的 hash 强制改为 64 个 0", "RuntimeError: NIXL compatibility hash mismatch（在解 agent 元数据之前）", "配置漂移在握手期炸，不等数据传错才炸"],
+      ["单飞", "连续两次 _ensure_handshake", "在飞期两次都拿到 future；完成后第三次返回 None、agent 表与时钟偏移落账", "每个远端至多一个在飞握手"],
+      ["hash 因子", "只改 model 名 / 只改注意力后端", "10 因子摘要：任一因子变 → hash 变（64 位）", "版本+模型+dtype+后端全进门；TP/block_size/布局不在 hash 里（运行期另校验，支持异构）"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "每个 engine_id 至多一个在飞握手，且握手成功恰注册一次 agent 描述符。",
+    "argument": "_ensure_handshake 在锁内查三态：已注册（engine_id ∈ _remote_agents）→ 返回 None；在飞（_handshake_futures 有键）→ 返回既有 future；否则 submit 新 future 并记表——单飞由 _handshake_futures 的键存在性保证（基例：首次插入；归纳步：完成回调在锁内先删表键再落 _remote_agents，故同一 engine_id 的表项生命周期是「插入一次、删除一次」，不可能并发两个握手）。trace 实证：在飞两次均返回 future、完成后返回 None。"
+   },
+   "quantified": "一次握手 = 一趟 ZMQ 往返（本机实测整趟 4.998ms、时钟偏移 0.00028s；REQ 超时 5000ms 防死等，base_worker.py:L631）；hash 64 位十六进制、10 因子（vLLM 版本+连接器版本 5+模型+dtype+KV 头数+头维+层数+后端+cache dtype+HMA/跨层）；两段解码先 hash 后 agent metadata；握手在后台 future 里做、不堵调度热路径。",
+   "figure_specs": [
+    {
+     "figure_id": "ch37-fig-oob-handshake-gate",
+     "template": "flow",
+     "l0_zoom": "L0 双实例+KV 边界的下排「启动待命」到中排⑤后台握手的 side channel 放大；对应 L2 章图站 2/7。",
+     "claim": "带外握手三件套：side channel（每引擎调度器侧一个 ZMQ ROUTER 常驻握手元数据）+ 两段解码（先比 compatibility hash、过门才解 agent 元数据）+ RTT 中点时钟偏移——先证明两台引擎配置一致，再让它们互读显存。",
+     "numbers": [
+      {"value": "P 待命：ROUTER 监听线程 nixl_handshake_listener 启动期就位；agent 元数据 8 块 × 512 B、布局 HND、物理块比 1", "provenance": "traces/m05.json p_side_channel_standby + base_scheduler.py:L281-L322 + core.py:L181-L200"},
+      {"value": "兼容 hash 64 位十六进制、10 因子；model 名或注意力后端任一变 → hash 变", "provenance": "traces/m05.json hash_factors + metadata.py:L81-L141"},
+      {"value": "不匹配在解 agent 元数据之前报 RuntimeError（两段解码）", "provenance": "traces/m05.json compat_gate_mismatch + base_worker.py:L661-L683"},
+      {"value": "REQ 超时 5000ms 防死等；本机整趟 4.998ms、时钟偏移 0.00028s（RTT 中点估计，取最低 RTT 样本）", "provenance": "traces/m05.json d_to_p_handshake + base_worker.py:L608-L643（RCVTIMEO 在 L631）"},
+      {"value": "单飞：在飞两次返回 future、完成后返回 None；agent 表由完成回调落账", "provenance": "traces/m05.json single_flight + base_worker.py:L853-L941"},
+      {"value": "协议版本 NIXL_CONNECTOR_VERSION=5（版本史：2=remote_request_id、4=心跳续租、5=到期时刻+时钟同步）", "provenance": "metadata.py:L26-L45 + traces/m05.json hash_factors.nixl_connector_version"}
+     ],
+     "caption_draft": "左 D worker、右 P scheduler 两个框，中间上下两条通道：上面的侧门（ZMQ side channel，紫）走三步——REQ (GET_META,0,0) → 回显握手字节+时戳 → 时钟偏移=remote_perf−(start+recv)/2；下面的数据面（KV 边界）画成锁着的门，标注「hash 对上才开」。右侧一个小流程框：两段解码（先 hash 门再 agent metadata）。图注结论：对暗号在侧门完成，数据面大门只对指纹一致的两台引擎打开。",
+     "illustrator_notes": "side channel 用 ZMQ 紫、数据面门用 KV 青；「锁/钥匙」元素克制（一处即可）；hash 门画成菱形判定（匹配/不匹配两个出口，不匹配标 RuntimeError）；不要画成第二种架构图——整体框引用 L2 站 2/7 的位置。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m6",
+   "intuition": "READ 像图书馆的馆际互借的「读者自取」版：D 拿着握手期换到的货位表（描述符），直接从 P 显存的货架上把整块 KV 抱走——P 的店员（CPU/引擎线程）全程不参与，甚至不知道哪本书被取走了；取完了 D 才递一张回条（notif）过去，P 这才把货架腾出来。",
+   "worked_example": {
+    "params": "16-token prompt；P 块 [0,1,2,3] 填 7.0、D 同号块清零；每块 512 B（128 个 float32）；拉模式 NixlConnector。数据面为 SEAM 替身（进程内按描述符裸地址搬字节，单边语义保留；真 RDMA 异步、本机观察不到 PROC 阶段）。",
+    "trace_source": "run",
+    "trace_ref": "traces/m06.json",
+    "table": {
+     "columns": ["轮次", "动作", "关键标量（实测）", "判定"],
+     "rows": [
+      ["备料", "P 块 [0,1,2,3] 填 7.0、D 清零", "每块 512 B × 4 块 = 2048 B；块校验和 P=896.0、D=0.0", "D 的落地缓冲是未入哈希表的新块"],
+      ["首遇远端", "start_load_kv：P 不在 _remote_agents", "后台握手在飞、READ 未发（handle=0）、D 校验和仍 0.0", "首次跨引擎必须先换描述符（m5）"],
+      ["发 READ", "握手完成后排空 _ready_requests", "make_prepped_xfer('READ')+transfer；handle=1；D 四块 torch.equal 全 True、校验和 896.0", "D 直接按描述符裸地址拉——P 的引擎线程零参与"],
+      ["D 收", "get_finished 轮询本地 handle", "done_recving={req-1}（本地 DONE 判定）、发送侧空", "完成信号源一：本地轮询"],
+      ["P 放", "P 翻对端 notif 收件箱", "收到 notif 'req-1:1'（格式 req:tp_size）→ done_sending={req-1}、_reqs_to_send 删键", "完成信号源二：对端通知——P 本地没有 handle 可轮询（不对称）"],
+      ["对照·本地全命中", "落地块表为空", "不发 READ（handle=0），只发 notif；P 收到即放块", "全命中免拉——notif 本身就是收据"],
+      ["对照·部分本地前缀命中", "_apply_prefix_caching([[0,1]], [[0,1,2,3]])", "远端裁到尾段 [[2,3]]：实拉 2 块、跳过 2 块", "只拉未命中的尾段（如共享 system prompt 的本地前缀）"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "READ 完成后 D 的目标块与 P 的对应块逐字节相等；且 P 侧引擎线程对传输本身的参与度为零（无任何函数进入数据路径）。",
+    "argument": "逐字节相等：传输原语只消费握手期交换的描述符（(基址, 块长) 数组按块号索引）——make_prepped_xfer 的参数集中没有任何指向 P 侧代码的入口（回调/钩子/远端调用均不存在），故字节搬运路径上 P 的 Python 栈不出现；相等性由 torch.equal 逐块断言（trace 实测 4 块全 True），其标量投影 896.0=128×7.0 恰为块内容之和。对照分支封死另一侧：块表空 → 提前 return，handle 恒 0（trace 实测），即「不拉就不可能有传输副作用」。"
+   },
+   "quantified": "4 块 × 512 B = 2048 B 一条 READ（非阻塞、handle 入 _recving_transfers 轮询）；notif 1 条（'req-1:1'，携消费者数）；部分命中裁剪后实拉 2 块（跳过 2 块，传输量对半）；P 侧本地 handle 0 个。SEAM 差异：替身 transfer() 当场搬完（真 RDMA 异步、check_xfer_state 会先回 PROC）——顺序约束与完成判定路径不变。",
+   "figure_specs": [
+    {
+     "figure_id": "ch37-fig-rdma-read-before-after",
+     "template": "before-after",
+     "l0_zoom": "L0 双实例+KV 边界的「KV 边界」本体放大：中排⑥ READ 直读 P 显存；对应 L2 章图站 8。",
+     "claim": "单边 READ 的前后对照：发起前 D 的落地块全零（校验和 0.0）、P 的块装着 KV（7.0 填充，块校验和 896.0）；一条 make_prepped_xfer('READ') 把 P 显存里 4 块 × 512 B 原样搬进 D——P 的 CPU 零参与，完成后 D 靠一条 'req-1:1' notif 让 P 放块。",
+     "numbers": [
+      {"value": "每块 512 B（128 个 float32，HND 张量 (8,2,4,16)）× 4 块 = 2048 B", "provenance": "traces/m06.json setup（blocks_per_block_bytes=512、total_bytes=2048）+ traces/m01.json hnd_geometry"},
+      {"value": "前：P 块校验和 896.0（7.0 填充）、D 同号块 0.0", "provenance": "traces/m06.json setup.p_block_checksum / d_block_checksum_before"},
+      {"value": "后：D 四块 torch.equal 全 True、校验和 896.0；handle 1 个（非阻塞）", "provenance": "traces/m06.json step2_read_issued"},
+      {"value": "P 侧完成信号=对端 notif 'req-1:1'（格式 req:tp_size，携消费者数）；P 本地 handle 0 个", "provenance": "traces/m06.json step4_p_done_sending.notifs_received + traces/m07.json p_side.p_local_handles"},
+      {"value": "全命中对照：handle=0、只发 notif；部分命中对照：远端裁尾 [[2,3]]（拉 2 跳 2）", "provenance": "traces/m06.json variant_full_hit_notif_only / variant_partial_hit_tail_trim"},
+      {"value": "READ 本体：make_prepped_xfer('READ')+transfer 非阻塞、handle 入 _recving_transfers", "provenance": "pull_worker.py:L225-L344 + traces/m06.json step2_read_issued"}
+     ],
+     "caption_draft": "左右对照两幅小图，中间一条粗箭头（READ）：左幅 P 的 KV 张量画 8 个块格、4 个着色（7.0）4 个灰；右幅 D 的张量同构，before 状态全灰（0.0）、after 状态同 4 格着色（896.0）——箭头上标「按描述符裸地址、P 的 CPU 零参与」；底部一行三个小结：全命中只发 notif（0 次传输）、部分命中裁尾、完成后 'req-1:1' 回条让 P 放块。图注结论：一台引擎的显存就这样变成另一台的外存，店员不用动。",
+     "illustrator_notes": "块格图与 ch13/ch16 的 KV 块视觉语言保持同源（块=小方格、KV 青系）；before/after 各一幅、共用块号轴；「CPU 零参与」用 P 侧店员图标打盹/缺位表达（一处比喻即止）；notif 回条画成小信封沿反方向走。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m7",
+   "intuition": "同一场交接的「完成」在两端长得不一样：D 是自己亲手搬的，本地轮询把手柄翻成 DONE 就算收完；P 全程没碰数据，只能等 D 的回条（notif）才算送完。TP 多卡时中间还要过一个点名的聚合器：每个 worker 各报一次、点齐了名才向调度器上报——少一个 rank 就放块，等于把还在被读的货架腾了。",
+   "worked_example": {
+    "params": "8-token prompt、块 [0,1]；TP=1（expected_finished_count=1）为主线，TP=2 聚合器对照（expected_finished_count=2）；D/P 两端真代码路径各驱动一轮。",
+    "trace_source": "run",
+    "trace_ref": "traces/m07.json",
+    "table": {
+     "columns": ["视角", "动作", "输入", "输出/判定（实测）"],
+     "rows": [
+      ["D（收端）", "get_finished 轮询本地 handle", "在飞 handle 1 个", "done_recving={req-1}；done_sending 空"],
+      ["P（发端）", "get_finished 翻对端 notif 收件箱", "本地 handle 0 个", "done_sending={req-1}；_reqs_to_send 删键——两个物理来源不对称"],
+      ["TP 聚合·第 1 拍", "aggregate（expected=2：worker0 报 r1、worker1 没报）", "计数 2−1=1", "finished_recving=None——不上报"],
+      ["TP 聚合·第 2 拍", "worker1 也报 r1（迟到单独报同理）", "计数归零", "finished_recving={r1}——齐了才上报"],
+      ["调度器落点", "_update_from_kv_xfer_finished", "D 侧 finished_recving / P 侧 finished_sending", "D：请求提升回调度（finished_recving_kv_req_ids）；P：块放、请求删"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "聚合器上报某请求的 finished_recving 当且仅当每个 worker 各报过一次（计数归零）；P 侧放块当且仅当消费者计数齐。",
+    "argument": "聚合侧：每个请求一个计数器，初值 expected_finished_count（基例：首报减 1，若 expected=1 则立即归零上报）；每拍 aggregate 对集合内每个 req_id 恰减 1、到 0 上报并删键（归纳步：非负整数严格递减必到 0；删键使同一请求不可能二次上报）。P 侧：consumer_notification_counts_by_req 每收一条 notif 加 1，达到 consumers_per_producer（对称 TP=1）才进 done_sending 并删键——同一守恒式在两端各出现一次。trace 实证 expected=2 时第一拍 None、第二拍/迟到拍均 {r1}。"
+   },
+   "quantified": "expected_finished_count=world_size：TP=1 → 1 拍即上报；TP=2 → 2 拍（第一拍必空）；P 侧 consumers_per_producer=1（对称 TP；异构时按 tp_ratio 放大）。调度器两侧落点实测：D 提升、P 放块+删请求。KVOutputAggregator 由 executor 装配（init_kv_output_aggregator，engine/core.py:L173-L174）。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m8",
+   "intuition": "租约是押金单、心跳是续押：P 押出块时写死一个到期时刻（30 秒）；D 排队等着的时候每隔 5 秒喊一声「我还活着，这块还要」，P 每听到一声就把到期时刻往后推 20 秒（只推不回）；要是 D 崩了、再也无人喊话，P 到期自动没收押金（放块）——显存自己救自己，不用任何人来收尸。",
+   "worked_example": {
+    "params": "租约默认 30s（kv_lease_duration）；重基准示例 scheduler_clock=99000、截止=100000；真 HB notif 跨端续租（D 发 P 收）。",
+    "trace_source": "run",
+    "trace_ref": "traces/m08.json",
+    "table": {
+     "columns": ["轮次", "动作", "关键标量（实测）", "判定"],
+     "rows": [
+      ["常量面", "构造期读 extra config", "租约 30s、心跳间隔 30//6=5s、续租 30×2//3=20s", "每租约 6 次心跳、续期速率 4 倍消耗——单条心跳丢失不致命"],
+      ["跨进程重基准", "worker 收到 meta（scheduler_clock=99000、截止=100000）", "剩余 1000s 原样搬进本机时钟域（实测差 1000.0s、落在 (990,1010)）", "perf_counter 跨进程不可比；广播延迟只会拉长租约=安全方向"],
+      ["旧式对照", "scheduler_clock=0（旧 metadata）", "截止时刻 100000.0 原样保留", "缺基准不重基准——v5 之前的线上格式"],
+      ["心跳续租", "D 发 'HB:req-1'、P 收（真 notif 过线）", "旧租约剩 1.0s → 到期时刻后移 19.0s（新到期=now+20）", "P 只认 notif 清单里的请求续租"],
+      ["只增不减", "紧接着第二条心跳", "位移 +0.01s 且 max() 保旧值", "乱序/重复心跳都不会把租约改短"],
+      ["节流与停跳", "build_meta 打包心跳", "间隔内第二份 meta 不带心跳（空表）；传输完成（finished_recving）即停跳", "心跳税按引擎分组、每 5s 至多一次"],
+      ["到期收割", "租约已过 1s 无人来读", "get_finished 强制 done_sending={req-dead}、账本删键", "D 失联时 P 显存自愈"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "每个请求的租约到期时刻单调不减；且只要 D 活着（心跳按 5s 间隔到达），到期时刻恒领先当前时刻至少 15s。",
+    "argument": "单调不减：_handle_heartbeat 写 max(old, now+20)——两个候选取大者，序列不可能下降（基例：初值 t0+30；归纳步：每次更新 new≥old）。领先性：设上一条心跳在时刻 t 到达，则到期时刻 ≥ t+20；下一条心跳最迟 t+5 到达，其间任意时刻 s∈[t, t+5) 的剩余租约 = (t+20)−s > 15——即丢一条心跳只损失 5s 预算，仍剩 ≥15s 等下一条。收割侧配套不变量：_reqs_to_send/_push_registration_deadlines 的到期时刻按非降序插入（单调时钟+常量 TTL、每请求只武装一次），支撑 get_finished/watchdog 的按插入序早退扫描。"
+   },
+   "quantified": "三个常量 30/5/20（lease=30s、间隔=30//6=5s、续租=30×2//3=20s）；每租约 6 次心跳、续期速率 4×；重基准公式 remaining=now_local+(deadline−scheduler_clock)，示例 1000s（实测 1000.0s）；时钟偏移由握手 RTT 中点估计（m5：0.00028s 同机）；#50326 的反面教材：跨机纪元差大于 TTL 会在 READ 到达瞬间判过期——重基准正是修它。",
+   "figure_specs": [
+    {
+     "figure_id": "ch37-fig-lease-heartbeat-timeline",
+     "template": "state-table",
+     "l0_zoom": "L0 双实例+KV 边界的中排⑧ 租约心跳与过期放大（D 等待期与 P 钉住期的对偶）；对应 L2 章图站 10。",
+     "claim": "三个数撑起自愈：租约 30s（P 钉住块等多久）、心跳间隔 5s（D 用什么证明还活着）、续租 20s（每声心跳把到期推多远）——到期时刻单调不减、D 失联最多 30s 后 P 自动放块。",
+     "numbers": [
+      {"value": "租约 30s / 心跳间隔 5s（30//6）/ 续租 20s（30×2//3）：每租约 6 次心跳、续期速率 4 倍消耗", "provenance": "traces/m08.json constants + base_scheduler.py:L70-L76 + base_worker.py:L273-L277"},
+      {"value": "跨进程重基准：remaining = now_local + (deadline − scheduler_clock)；示例 99000/100000 → 1000s（实测 1000.0s，区间 (990,1010)）", "provenance": "traces/m08.json rebase + pull_worker.py:L94-L110"},
+      {"value": "真 HB notif 续租：旧租约剩 1.0s → 到期后移 19.0s（新到期=now+20）；第二条心跳位移 +0.01s、max() 只增不减", "provenance": "traces/m08.json heartbeat_renewal + base_worker.py:L2189-L2208"},
+      {"value": "节流：间隔内第二份 meta 不带心跳；传输完成即停跳", "provenance": "traces/m08.json heartbeat_packaging + base_scheduler.py:L459-L468"},
+      {"value": "到期收割：过期即强制 done_sending 放块（D 失联自愈）；账本按到期非降序插入支撑早退扫描", "provenance": "traces/m08.json expiry_harvest + base_worker.py:L2145-L2164"},
+      {"value": "#50326 反面教材：不重基准时跨机 perf_counter 纪元差大于 TTL → READ 到达瞬间判过期", "provenance": "dossier WC4 + pull_worker.py:L96-L101 注释"}
+     ],
+     "caption_draft": "一条横向时间轴（P 的视角）：0s 处画「交接：钉住 4 块、到期=+30s」的起桩；随后每隔 5s 一根向上的心跳刻度线（HB:），每根把到期线向右推 20s（画成只右移的游标）——顶端标「续期速率 4 倍消耗，丢一条心跳不致命」；轴下方画两个分支出口：D 读完（notif 计数齐→放块）与失联（到期收割→放块）。旁注小框：重基准公式 remaining=now_local+(deadline−scheduler_clock) 与 99000/100000→1000s 算例。图注结论：P 的显存靠一只单调不减的到期游标自愈。",
+     "illustrator_notes": "时间轴+游标表达「只增不减」（游标永不负移）；心跳刻度与续租推幅用同一比例尺；两个出口（notif/收割）用不同颜色虚线；旁注公式框放轴下方、字号小一档；避免「账本」字样延伸到时间轴之外的语境。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m9",
+   "intuition": "推模式把「取货」变「送货上门」：D 刚分到货架（块）就把自家地址寄给 P（注册），P 那边配货完成（prefill 终局）后由一个专职快递员线程（nixl-push-writer）拿着地址直接把货写进 D 的货架——两边谁先到就先记账等着，凑齐一对就发货；传输不再排在 D 的排队后面。",
+   "worked_example": {
+    "params": "8-token prompt、块 [0,1] 填 3.0；推模式 NixlPushConnector 两台引擎；注册 watchdog 默认 480s。",
+    "trace_source": "run",
+    "trace_ref": "traces/m09.json",
+    "table": {
+     "columns": ["轮次", "动作", "关键标量（实测）", "判定"],
+     "rows": [
+      ["D 分配即注册", "update_state_after_alloc 暂存、build_meta 打包", "注册载荷 11 键（decode_* 4 项 + remote_* 4 项 + request_id + local_block_ids + pp_size）；watchdog 480s", "不等 D 被调度——传输提前到分配时刻（与排队重叠）"],
+      ["P 终局", "request_finished 把完成块交 writer", "delay_free=True；完成块 {req-1: [[0,1]]}；has_pending_push_work=True；租约戳 30s", "P 钉住块等配对"],
+      ["配对+WRITE", "writer 线程四收件箱配对（谁先到都能配）", "块 [0,1] 填 3.0 → D 块校验和 384.0 = P 侧；自轮询 1ms 仅在有未配对块时", "WRITE 直写 D 预分配块——D 本地 handle=0"],
+      ["双端完成", "P 轮询 WRITE handle；D 收完成 notif", "P done_sending={req-1}；D done_recving={req-1}（物化空条目上报）", "完成判定与拉模式互为镜像（handle/notif 两源换边）"],
+      ["后缀剥离", "get_base_request_id", "'req-a-1a2b3c4d' → 'req-a'；大小写不匹配不配；精确键优先", "两腿 request_id 差 8 位十六进制随机后缀——剥掉才配得上"],
+      ["注册 watchdog", "注册后 480s 内没等到 WRITE", "过期注册丢弃、不再打包", "P 侧 WRITE 失败不能标 invalid 块（无 recv 元数据），只能弃单等租约/watchdog"],
+      ["保活", "has_requests 纳入 has_pending_push_work", "无活请求+有待推送块 → 引擎继续步进", "WRITE 可能在全部活请求结束后还在飞——引擎不许提前歇"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "每个请求的 WRITE 恰好发起一次，且只在「P 完成块」与「D 注册」两腿齐备时发起；两腿的先后任意。",
+    "argument": "writer 线程对每个请求维持两张匹配表（_pending_d_registrations / _push_finished_blocks）。基例：单腿先到 → 存表不发货。归纳步：另一腿到达时 pop 配对（pop 是删除性读出）→ _do_start_push_kv 发起 WRITE 并从两表移除——同一 request_id 不可能二次 pop，故至多一次。配对键匹配先精确、后剥 8 位十六进制随机后缀归一（get_base_request_id 的等价类划分，大小写敏感：'REQ-A' 不配 'req-a'，trace 实测）。"
+   },
+   "quantified": "注册载荷 11 键；watchdog 480s（显式常量，原借 decoder_kv_blocks_ttl）；writer 自轮询 1ms（仅当存在未配对的完成块，其余事件驱动）；四收件箱（注册待发/延迟推送/完成块/淘汰）；本例 2 块 × 512 B 直写、D 块校验和 384.0；TTFT 分解：拉模式 T_xfer 串行在 (T_proxy+T_queue) 之后，推模式与后者重叠——理想下 TTFT ≈ max(T_pfill+T_proxy, T_xfer)+T_first_decode（dossier theory）；代价：常驻线程+两张匹配表+watchdog 整套机器，且不支持双向回拉（a2cb08b3d5）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch37-fig-push-pairing-machine",
+     "template": "flow",
+     "l0_zoom": "L0 双实例+KV 边界的下排「推模式对照」放大：同一 KV 边界的第二种填法；对应 L2 章图站 12。",
+     "claim": "推模式配对机器：D 分配即发 PUSH_REG 注册（11 键载荷，携 D 自己的坐标+块号），P 的 nixl-push-writer 后台线程把「D 注册」与「P 完成块」两腿配对（谁先到先存表，剥 8 位随机后缀归一匹配）后 WRITE 直写 D 预分配块——传输与 D 的排队等待重叠。",
+     "numbers": [
+      {"value": "注册载荷 11 键：decode_engine_id/host/port/tp_size + remote_engine_id/host/port/tp_size + request_id + local_block_ids + remote_pp_size；watchdog 480s", "provenance": "traces/m09.json d_registration（reg_key_count=11、watchdog_timeout_s=480.0）+ push_scheduler.py:L156-L206"},
+      {"value": "writer 四收件箱（注册待发/延迟推送/完成块/淘汰）+ notif 路由；自轮询 1ms 仅在有未配对完成块时", "provenance": "traces/m09.json write_landed（writer_inboxes=4、writer_poll_interval_ms=1.0）+ push_worker.py:L210-L272"},
+      {"value": "后缀剥离匹配：'req-a-1a2b3c4d'→'req-a'；精确键优先；大小写不匹配不配", "provenance": "traces/m09.json suffix_matching + push_worker.py:L369-L399"},
+      {"value": "WRITE 直写：块 [0,1] 填 3.0 → D 块校验和 384.0=P 侧；D 本地 handle=0（完成靠 P 的 notif 物化空条目）", "provenance": "traces/m09.json write_landed / completion + push_worker.py:L656-L686"},
+      {"value": "P 侧完成=WRITE handle 轮询 DONE（done_sending）；与拉模式两源换边", "provenance": "traces/m09.json completion.p_completion_source + push_worker.py:L748-L774"},
+      {"value": "保活：无活请求+has_pending_push_work=True → 引擎继续步进", "provenance": "traces/m09.json keepalive + scheduler.py:L2406-L2420"}
+     ],
+     "caption_draft": "中间一个大圆角框=配对机器（nixl-push-writer 线程），框内四格收件箱+两张匹配表（D 注册表 / P 完成块表）；左上进「D 分配即注册」（11 键载荷小票）、左下进「P 终局完成块」，两箭头在框内汇合于一个菱形配对点（先到者存表）——右侧出一条 WRITE 粗箭头直写 D 的预分配块格图（3.0 着色、384.0 校验和）；底部三个小注：后缀剥离匹配（req-a-1a2b3c4d→req-a）、watchdog 480s、has_pending_push_work 保活。图注结论：送货上门让传输躲开排队，代价是一整套配对机器。",
+     "illustrator_notes": "配对机器框内布局参考 L2 站 12 的组件框（同源视觉）；两腿输入用不同颜色（D 侧 API 蓝、P 侧 GPU 绿）、汇合菱形与 WRITE 箭头用 KV 青；两张匹配表画成小账本格子（已立「账本」语境内可用）；不要画第二个架构图——整体仍是 KV 边界的放大。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m10",
+   "intuition": "拒绝回执是「退货也是一封信」：D 的前台拒收（请求根本没进引擎），但 P 那边货还押着——于是 D 发一条占位请求过去、进门就立即作废，唯一作用是踩一下 P 的收尾钩子，让 P 走「空收货」流程把押金退了（放块）。",
+   "worked_example": {
+    "params": "m10 在 dossier 中 needs_worked_example=false——控制面链路（serving 拒收 → abort_immediately 占位请求 → P 空 recv → notif 放块）已由测试 test_serving_rejection_chain_releases_prefill_blocks 全程跑通（36 passed 基线），数值素材并入 m3 的 ABORTED/空 recv 分支与 m6 的 notif-only 对照，不另立表。",
+    "trace_source": "manual",
+    "manual_reason": "dossier 将 m10 标为无需 worked_example；其可观察行为（占位请求 add 后立即 abort、do_remote_prefill 仍 True 判定「从未被调度」→ 空 recv → notif 放块）在 m03/m06 的 trace 里已有对应分支实测（ABORTED 不交接、notif-only 放块），且测试套件 test_serving_rejection_chain_releases_prefill_blocks 已覆盖全链（36 passed）。此处不重复取证；引用源码锚点：serving.py:L218-L259、async_llm.py:L743-L769、core.py:L479-L483、pull_scheduler.py:L210-L221。",
+    "table": {
+     "columns": ["跳点", "动作", "判定依据"],
+     "rows": [
+      ["D serving 层拒收", "create_* 返回 ErrorResponse（请求未进引擎）且回执带 do_remote_prefill", "才触发清理包装（否则静默）"],
+      ["占位请求", "notify_kv_transfer_request_rejected：prompt=[0]、max_tokens=1、abort_immediately=True", "add 完立即 abort——只为踩 request_finished 钩子"],
+      ["P 侧空 recv", "request_finished 见 do_remote_prefill 仍 True ⇒ 从未被调度", "登记空块列表的待收项 → worker 发 notif 放块（m06 对照实测）"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "P 侧每个被钉住的请求最终都会收到一条 notif（正常读完/空 recv/拒绝回执三种来源之一），块不搁浅。",
+    "argument": "钉住（_reqs_need_send 有键）后块的释放只经 notif 计数齐或到期收割（m3 枚举）；拒绝回执链保证「D 根本来读」这一情形也产生 notif——占位请求经 add_request→abort_immediately→finish_requests(ABORTED)→request_finished，其 do_remote_prefill 仍为 True 的分支登记空块列表待收项（pull_scheduler.py:L210-L221），worker 对空列表走 notif-only 路径（m06 对照实测 handle=0、P 收 notif 即放块）。"
+   },
+   "quantified": "占位请求成本极小：prompt 1 个 token（[0]）、max_tokens=1、从不被调度；空 recv 的传输量 0 字节、仅 1 条 notif。链路四跳点全在 trace 覆盖面内（m03 ABORTED 分支、m06 notif-only 对照）。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m11",
+   "intuition": "搬运失败不装没事：把这次要收的块全部标记为「不可信」（invalid），再把请求本身放进失败名单——调度器看到失败名单就把请求当「收完了但货是坏的」处理：要么直接报错，要么从第一个坏块处截断、把后面重算一遍。清单取走即清空，绝不让坏块被当成好块用两次。",
+   "worked_example": {
+    "params": "8-token prompt、D 本地块 [0,1]；失败源=传输 setup 异常（_read_blocks 的 except 路径与 _pop_done_transfers 的异常路径共用同一入口 _handle_failed_transfer）。",
+    "trace_source": "run",
+    "trace_ref": "traces/m11.json",
+    "table": {
+     "columns": ["步骤", "动作", "关键标量（实测）", "判定"],
+     "rows": [
+      ["元数据先落账", "start_load_kv 存 _recving_metadata", "本地块 [0,1] 在账（2 块）", "失败回滚的输入先于传输存在（「always store metadata for failure recovery」）"],
+      ["触发失败", "_handle_failed_transfer", "失败队列 +1", "块标 invalid、请求入失败队列"],
+      ["上报", "get_finished", "done_recving={req-1}（失败并入）；invalid 块首取 {0,1}、再取为空", "失败请求按「收完」上报；坏块清单一次性取走即清空"],
+      ["P 侧特例", "推模式 WRITE 失败", "P 的 _recving_metadata 为空（0 项）、无可标 invalid 的块", "WRITE 纯出站——只能弃单等租约/看门狗兜底"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "失败上报恰一次、坏块清单取走即清空（幂等的一次性上报）。",
+    "argument": "_handle_failed_transfer 做两个原子入队：块集合进 _invalid_block_ids、req_id 进 _failed_recv_reqs；get_finished 把失败队列 drain 进 done_recving（set 语义天然去重，基例：单次失败单次上报）；get_block_ids_with_load_errors 的实现是「取出并置空」（trace 实测首取 {0,1}、再取空集）——归纳步：清单一旦为空，任何后续取用都是空集，坏块不可能被消费第二次。下游（截断重算/报错）归前章立的失败回滚，本章只负责把清单送到边界。"
+   },
+   "quantified": "2 块 invalid、1 个请求并入 done_recving；P 侧对照 0 条 recv 元数据。下游消费点（前章已立）：invalid_block_ids → 第一个坏块截断 num_computed_tokens + 补登记清零（scheduler.py:L2846-L2914 一带）；失败请求 fail=FINISHED_ERROR 或 recompute。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m12",
+   "intuition": "过户不搬整屋：滑动窗口组的 KV 只有窗口内的尾巴还有用（老 token 的 KV 再也不会被读到），交接时只把窗口盖住的尾块搬走；full 组才是整屋搬迁。这条「只搬还会被用到的」剪裁在引擎里是一张每组一张的窗口块数表。",
+   "worked_example": {
+    "params": "混合配置：full 组 + SWA 组（sliding_window=10 tokens、block_size=4、同几何 2 头×8 维×float32 → 每块 512 B）；对照纯 full 配置。调度器半边直构（不引 ZMQ 监听——listener 只在握手元数据注入时启动）。",
+    "trace_source": "run",
+    "trace_ref": "traces/m12.json",
+    "table": {
+     "columns": ["配置/场景", "输入块表", "get_exchange_clipped_blocks 输出（实测）", "判定"],
+     "rows": [
+      ["纯 full 配置（非混合）", "([[0..7]],)", "原样返回 [0..7]", "_is_hma_required=False——不剪，直通"],
+      ["混合配置 full+SWA（窗 10 tokens）", "两组各 [0..7]", "full 组保 8 块；SWA 组只留尾 4 块 [4,5,6,7]", "blocks_per_sw=[0,4]：cdiv(10,4)+1=4（+1 保守吸收窗口与块边界不对齐）"],
+      ["剪掉的是什么", "SWA 组头部 4 块", "不过线", "窗口外的头块不再被任何注意力读到——过线就是白搬"],
+      ["host buffer 旗标", "kv_buffer_device=cpu（宿主 CPU 平台）", "use_host_buffer=False（宿主观察；真 CUDA 平台为 True）", "非 CUDA 平台必经的旁路实现已按减法计划删，旗标与判定保留"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "剪裁后每组保留的块集合是「恢复计算所需最小集」的超集：full 组恒不剪，SWA 组保留尾部 cdiv(W, block_size)+1 块。",
+    "argument": "基例：blocks_per_sw[i]=0 的组（full）走 `if n_sw := ...` 为假分支，块表原样返回。归纳步：对 n_sw>0 的组取 blocks[-n_sw:]——滑动窗口注意力在第 t 个 token 处只读 (t−W, t] 区间的 KV，覆盖该区间的块数至多 cdiv(W, block_size)+1（+1 吸收窗口端点落在块中间的情形），故尾部块集合覆盖全部可能读取；头部块永不再被读（窗口只前进不后退）。Mamba/SSM 组的状态槽剪裁是深水区（减法计划删除项 2），本章只保留「剪到可恢复计算所需最小集」的结论面。"
+   },
+   "quantified": "窗 10 tokens、块 4 tokens → cdiv=3、+1=4 块；本例 SWA 组 8→4（省一半传输量）、full 组 8 不变；两组每块各 512 B。host buffer 旗标宿主观测 False（pin 的 CUDA 平台 True，base_scheduler.py:L77-L82）。",
+   "figure_specs": []
+  }
+ ]
+}
