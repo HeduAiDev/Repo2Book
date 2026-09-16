@@ -10,6 +10,6 @@ if (!A.prompt) { return { error: 'no prompt' } }
 const r = await agent(
   A.prompt,
   { schema: { type: 'object', additionalProperties: false, required: ['status', 'note'], properties: { status: { type: 'string', enum: ['OK', 'BLOCKED'] }, note: { type: 'string' }, blocker_reason: { type: 'string' } } },
-    label: 'fig:' + (A.label || 'one'), phase: 'Fig', agentType: 'illustrator', model: A.model || 'claude-haiku-4-5' }
+    label: 'fig:' + (A.label || 'one'), phase: 'Fig', agentType: 'illustrator', model: A.model || 'claude-haiku-4-5-20251001' }
 )
 return r

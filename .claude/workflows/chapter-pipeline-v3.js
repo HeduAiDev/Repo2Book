@@ -55,7 +55,7 @@ function mo(base, role, visual) {
   // /v1/models 实测仅 haiku-4-5/opus-4-8/opus-5/sonnet-5/glm-5.3/qwen3.8-27b 在列。
   // 按用户「视觉=专用廉价模型」的分工意图选 claude-haiku-4-5；盲审质量不足可
   // A.models.blind='claude-opus-5' 拉回主模型）。A.models.<role> 显式覆盖仍最高优先。
-  const m = (A.models && A.models[role]) || (visual ? 'claude-haiku-4-5' : null)
+  const m = (A.models && A.models[role]) || (visual ? 'claude-haiku-4-5-20251001' : null)
   if (m) o.model = m
   return o
 }
