@@ -136,6 +136,30 @@ def ink_boxes(elems):
     return out
 
 
+_RECT_RE = re.compile(
+    r'<rect x="([-\d.]+)" y="([-\d.]+)" width="([\d.]+)" height="([\d.]+)"')
+
+
+def box_leaves(elems):
+    """元素流里的**叶子框**（裁切边不得拦腰切开的矩形；exp-2026-09-14 ch28 盲审
+    L1-partVI：下缘把 spec decode 面板切掉底边框+圆角与两条文字——ink 护栏只看
+    文字墨迹，切口恰好落在两条文字行之间就放行，框被切而护栏全绿）。
+
+    容器豁免沿 lint_diagram_geometry.is_container 口径：完整装着另一框 = 容器
+    （EngineCore 带/白底/循环框），裁切穿过容器内部去取景其子组件是 Part 放大的
+    常态、合法；<40×18 的小色块（图例/徽标底）同 linter 口径跳过。"""
+    boxes = []
+    for _, s_ in elems:
+        m = _RECT_RE.match(s_)
+        if m:
+            x, y, w, h = map(float, m.groups())
+            boxes.append((x, y, x + w, y + h))
+    return [r for r in boxes
+            if r[2] - r[0] >= 40 and r[3] - r[1] >= 18
+            and not any(o is not r and o[0] >= r[0] and o[1] >= r[1]
+                        and o[2] <= r[2] and o[3] <= r[3] for o in boxes)]
+
+
 def _walk(edge, ivs, d, lo_cap, hi_cap):
     """从 edge 沿方向 d 走查到第一个墨迹净空位；越出 cap 即该向不可行（返回 None）。"""
     t = edge
@@ -173,7 +197,7 @@ def _guard_edge(edge, ivs, lo_cap, hi_cap, struct, pid, tag, glog):
     return new
 
 
-def guard_crop(crop, inks, reg, pid, g, glog):
+def guard_crop(crop, inks, leaves, reg, pid, g, glog):
     """四条裁切边逐条过护栏；三趟迭代收敛（边动过会改变对侧的相关文字过滤范围）。"""
     cx0, cy0, cx1, cy1 = crop
     rx0, ry0, rx1, ry1 = reg
@@ -185,6 +209,25 @@ def guard_crop(crop, inks, reg, pid, g, glog):
         cy1 = _guard_edge(cy1, ivy, ry1 - SHAVE, float(g['H']), (ry1,), pid, '下缘', glog)
         cx0 = _guard_edge(cx0, ivx, 0.0, rx0 + SHAVE, (rx0,), pid, '左缘', glog)
         cx1 = _guard_edge(cx1, ivx, rx1 - SHAVE, float(lc.W), (rx1,), pid, '右缘', glog)
+        # 裁切边拦腰切开叶子框 → 推到框外缘 +CROP_M（与区域边距同口径；exp-2026-09-14
+        # ch28 盲审 L1-partVI：下缘把 spec decode 面板切掉底边框+圆角与两条文字，ink
+        # 护栏对「切口落在文字行之间」全绿，此处按框补位）。只查上下缘——左右缘走查会
+        # 把 Part 窗口横向放大、牵动 k/dh 全局，超出本缺陷类；出画布则钳回（告警）。
+        for (bx0, by0, bx1, by1) in leaves:
+            if bx1 <= cx0 or cx1 <= bx0:
+                continue                     # 框不在裁切 x 窗内
+            if by0 + 3 < cy1 < by1 - 3:
+                t = min(by1 + CROP_M, float(g['H']))
+                if t > cy1:
+                    glog.append(f'L1-{pid} 下缘 {cy1:.1f} -> {t:.1f}（不拦腰切框 '
+                                f'{bx0:.0f},{by0:.0f} {bx1 - bx0:.0f}×{by1 - by0:.0f}）')
+                    cy1 = t
+            if by0 + 3 < cy0 < by1 - 3:
+                t = max(by0 - CROP_M, 0.0)
+                if t < cy0:
+                    glog.append(f'L1-{pid} 上缘 {cy0:.1f} -> {t:.1f}（不拦腰切框 '
+                                f'{bx0:.0f},{by0:.0f} {bx1 - bx0:.0f}×{by1 - by0:.0f}）')
+                    cy0 = t
         if (cx0, cy0, cx1, cy1) == before:
             break
     return cx0, cy0, cx1, cy1
@@ -214,7 +257,7 @@ def regions_for(g, pid):
     return [(g['CX'], g['CY0'], g['CX'] + CW, g['C4Y'] + g['c4h'])]   # VII 采样与出口列
 
 
-def build_part(pid, part, elems, g, chapters, inks, glog):
+def build_part(pid, part, elems, g, chapters, inks, leaves, glog):
     regions = regions_for(g, pid)
     full = pid in ('I', 'VIII')
     rx0 = min(r[0] for r in regions)
@@ -225,9 +268,9 @@ def build_part(pid, part, elems, g, chapters, inks, glog):
     cx0, cy0 = max(0.0, rx0 - CROP_M), max(0.0, ry0 - CROP_M)
     cx1 = min(float(lc.W), rx1 + CROP_M)
     cy1 = min(float(g['H']), ry1 + CROP_M)
-    if not full:                       # 裁切护栏：切口不得落在文字行中间（半行残字）
-        cx0, cy0, cx1, cy1 = guard_crop((cx0, cy0, cx1, cy1), inks,
-                                        (rx0, ry0, rx1, ry1), pid, g, glog)
+    if not full:                       # 裁切护栏：切口不得落在文字行中间（半行残字）、
+        cx0, cy0, cx1, cy1 = guard_crop(   # 也不得拦腰切开叶子框（见 box_leaves 头注）
+            (cx0, cy0, cx1, cy1), inks, leaves, (rx0, ry0, rx1, ry1), pid, g, glog)
     cw, chh = cx1 - cx0, cy1 - cy0
 
     band = BAND_H_VIII if pid == 'VIII' else BAND_H
@@ -350,6 +393,7 @@ def render_png(svg_path, png_path):
 def main():
     elems, g, warn = lc.build_l0()
     inks = ink_boxes(elems)
+    leaves = box_leaves(elems)
     glog = []
     chapters = {p['id']: [] for p in PLAN['parts']}
     for c in PLAN['chapters']:
@@ -359,7 +403,7 @@ def main():
     parts = {p['id']: p for p in PLAN['parts']}
     metas = []
     for pid in ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII']:
-        m = build_part(pid, parts[pid], elems, g, chapters, inks, glog)
+        m = build_part(pid, parts[pid], elems, g, chapters, inks, leaves, glog)
         cp = m['crop']
         mm_s = '省（全景页）' if pid in ('I', 'VIII') else f'×{S:.3f} 暗{m["n_dim"]}/亮{m["n_bright"]}'
         print(f"Part {pid}: canvas={CANVAS_W}x{m['H']} crop=({cp[0]:.0f},{cp[1]:.0f})-"

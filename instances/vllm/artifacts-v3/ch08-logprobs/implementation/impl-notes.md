@@ -100,13 +100,13 @@
 | `Sampler.forward` 骨架 | vllm/v1/sample/sampler.py:L72-L149 | 顺序逐字；spec 分支/采样实现占位（SUBTRACTED 标注） | m1/m16/m18（delete 项 1） |
 | `compute_logprobs`/`gather_logprobs` | vllm/v1/sample/sampler.py:L304-L306、L308-L356 | **逐字**（mark_unbacked 注释原话） | must_keep×2；m1/m2 |
 | `batched_count_greater_than` | vllm/v1/sample/ops/logprobs.py:L10-L27 | **逐字**（@torch.compile 装饰行原样；backend 值为 seam，见 §Seam） | must_keep；计数 rank kernel |
-| `greedy_sample`/`sample`（greedy 路径） | vllm/v1/sample/sampler.py:L239-L241、L243-L302 | greedy 快路径逐字（processed_* 物化点）；随机路径删+NotImplementedError | m16（delete 项 1——随机域归 Part VII ch29-33） |
+| `greedy_sample`/`sample`（greedy 路径） | vllm/v1/sample/sampler.py:L239-L241、L243-L302 | greedy 快路径逐字（processed_* 物化点）；随机路径删+NotImplementedError | m16（delete 项 1——随机域归 Part VII ch30-33） |
 | `gather_specific_token_logprobs` | vllm/v1/sample/sampler.py:L151-L225 | docstring/gather/mask/rank 原样；pinned 逐位填充循环 SUBTRACTED 标注（构造结果同契约） | m17 轻讲（delete 项 10） |
 | `apply_logits_processors`/`apply_temperature`/`_combine_*` | vllm/v1/sample/sampler.py:L371-L417、L228-L237、L359-L369 | 调用点保留；实现体删/占位（空处理器批真码同样原样返回） | delete 项 1（Part VII 域） |
 | `SamplingMetadata` | vllm/v1/sample/metadata.py:L14-L57 | logprobs 三字段+贪心面保留；采样域字段 SUBTRACTED | 站 2-4 触达面（delete 项 1） |
 | `CachedRequestState` | vllm/v1/worker/gpu_input_batch.py:L34-L57 | logprobs 域字段（prompt_token_ids/num_computed_tokens/in_progress_prompt_logprobs_cpu）+采样参数面；其余 SUBTRACTED | m11 挂账字段（must_keep） |
 | `InputBatch` | vllm/v1/worker/gpu_input_batch.py:L269-L273 字段、L435-L444 登记、L530/L573-574 弹出、L1149-L1151 max 属性 | logprobs 登记逐字；批的 persistent 机制/`_make_sampling_metadata` 准备段精简（恒贪心面 HOST 注） | must_keep `max_num_logprobs`；m3（delete 项 3） |
-| `LogprobsLists`/`LogprobsTensors` | vllm/v1/outputs.py:L28-L137 | **逐字**（四接口全真；filter/cat 的 spec 域 SUBTRACTED——ch31） | must_keep×4；m4 切行/搬运 |
+| `LogprobsLists`/`LogprobsTensors` | vllm/v1/outputs.py:L28-L137 | **逐字**（四接口全真；filter/cat 的 spec 域 SUBTRACTED——ch32） | must_keep×4；m4 切行/搬运 |
 | `SamplerOutput`/`ModelRunnerOutput` | vllm/v1/outputs.py:L212-L219、L260-L308 | logprobs 字段面保留；pooler/nans/cudagraph/routed SUBTRACTED | 载体（delete 项 2/3） |
 | `AsyncGPUModelRunnerOutput` | vllm/v1/worker/gpu_model_runner.py:L258-L344 | copy stream 段+get_output 逐字（routed/EP fault/parse_output 分支 SUBTRACTED——多 token 批按同一 tolists 面处理） | must_keep×2；m4（delete 项 2） |
 | `async_tensor_h2d`/`tensor_data` | vllm/utils/torch_utils.py:L573-L584、vllm/v1/utils.py:L777-L787 | **逐字** | m11 触达的真实小件 |

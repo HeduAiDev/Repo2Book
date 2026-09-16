@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch28 机制图 · MoE 装配双后端分岔(ch28-fig-moe-dual-backend, 模板 flow)
+"""ch29 机制图 · MoE 装配双后端分岔(ch29-fig-moe-dual-backend, 模板 flow)
 
 放大自 L0『GPU 执行臂·模型层 forward + 编译』块里 DecoderLayer 的 FFN 半层
 (L2 拍片④/⑨ 的机制版下钻; ch23 同位置是 dense SwiGLU MLP)。
@@ -180,7 +180,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', lc.DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch28-fig-moe-dual-backend.svg'
+out = HERE / 'ch29-fig-moe-dual-backend.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

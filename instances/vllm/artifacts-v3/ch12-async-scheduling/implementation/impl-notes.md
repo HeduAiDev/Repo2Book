@@ -48,7 +48,7 @@
 | `scheduler.py _update_after_schedule` | `vllm/v1/core/sched/scheduler.py:L1317-L1365` | 乐观推进三件套 + has_structured_output_requests 置位逐字；删 defer_block_free/routed 快照 | 第 4 条 + 观测 |
 | `scheduler.py _preempt_request` async 账单 | `vllm/v1/core/sched/scheduler.py:L1274-L1315` | L1297-L1308 逐字（stale=assign、占位清零）；encoder free 删 | 第 2 条（ch11 删项同源） |
 | `scheduler.py update_from_output` 热循环 | `vllm/v1/core/sched/scheduler.py:L1670-L2055` | 扣在途+stale 锁步 drain（L1736-L1743）与 spec 拒绝回扣（L1766-L1791）逐字恢复；删 logprobs/routed/connector/perf/encoder | 观测/子系统面 |
-| `scheduler.py get_grammar_bitmask` | `vllm/v1/core/sched/scheduler.py:L1646-L1668` | 逐字（manager 为 ch30 seam：全 1 位掩码） | m14 |
+| `scheduler.py get_grammar_bitmask` | `vllm/v1/core/sched/scheduler.py:L1646-L1668` | 逐字（manager 为 ch31 seam：全 1 位掩码） | m14 |
 | `vllm_config.py max_concurrent_batches` | `vllm/config/vllm.py:L539-L550` | 逐字（v0.27.1 唯一出处；v0.21 在 executor 侧——迁移陷阱） | m2 |
 | `vllm_config.py check_and_set_default_async_scheduling` | `vllm/config/vllm.py:L1057-L1143` | 显式 True 硬失败（L1064-L1094）+ None→True 五类降级（L1095-L1143）逐字；ROCm 判定 HOST SEAM 恒 False | m1 |
 | `scheduler_config.py get_scheduler_cls` | `vllm/config/scheduler.py:L170-L178` | 逐字（scheduler_cls 自定义分支删） | 装配面 |
@@ -69,8 +69,8 @@
 - **脚本化前向**（`enqueue_logits`/`_seam_logits`，ch17 边界）：每步一个
   {req_id: logits 行} 字典；greedy argmax（sampler.py:L239-L241 逐字）采出
   可预测 token。不在环内伪造 forward。
-- **StructuredOutputManager**（ch30 边界）：grammar_bitmask 恒全 1（=无约束），
-  数值不变；掩码算法归 ch30。
+- **StructuredOutputManager**（ch31 边界）：grammar_bitmask 恒全 1（=无约束），
+  数值不变；掩码算法归 ch31。
 - **CpuGpuBuffer / InputBatch**（ch18 边界）：.cpu/.gpu/copy_to_gpu 消费面；
   容器内景（condense/block table）归 ch18。
 - **KVCacheManager**（ch13/ch15 边界）：块池朴素分配；前缀命中恒 0；

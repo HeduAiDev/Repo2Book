@@ -34,7 +34,7 @@ BLOCKING）**；must_keep 52 符号经 linter `over_subtraction` 项全数核在
 | `vllm/model_executor/models/deepseek_v2.py` | 同名 | **主文件 3**（站 1-4/7）：DeepseekV32IndexerCache（L616-L642 逐字）+ Indexer（L645-L819——__init__ 逐字 + forward else 分支逐字）+ _try_load_fp8_indexer_wk（L822-L871 逐字）+ DeepseekV2MLAAttention 装配段（skip_topk 三旋钮块 L1091-L1141 逐字）+ DeepseekV2Model 的 buffer 段（站 1）+ load_weights 的 indexer 切面 |
 | `vllm/model_executor/layers/mla.py` | 同名 | **主文件 4**（站 6）：全文减 delete[4]（dense_mha 绑定）——**L205-L206 的 indexer 接线位逐字**（本章命脉：纯副作用、返回值无人接收） |
 | `vllm/models/deepseek_v4/attention.py` | 同名 | **主文件 5**（站 10/13/m10-m12）：compress_ratios 逐层表 L207-L213 逐字 + compress_ratio==4 才建 indexer L276-L297 逐字 + DeepseekV4IndexerCache 逐字 + DeepseekV4Indexer（delete[2] fp4 分支/缓冲；//4 压缩坐标 + 短上下文全选 + 双流 join 逐字）+ _fill_short_context_topk_indices（kernel 垫片）|
-| `vllm/models/deepseek_v4/compressor.py` | 同名 | **主文件 6**（站 13/m11）：CompressorStateCache（L155-L208 逐字——块共享注释原文）+ DeepseekCompressor（fused_wkv_wgate L284-L292 逐字 + save_partial_states 前置 + 融合尾步分派的 indexer triton 臂；head=512 cutedsl/two-stage → ch25/ch28）|
+| `vllm/models/deepseek_v4/compressor.py` | 同名 | **主文件 6**（站 13/m11）：CompressorStateCache（L155-L208 逐字——块共享注释原文）+ DeepseekCompressor（fused_wkv_wgate L284-L292 逐字 + save_partial_states 前置 + 融合尾步分派的 indexer triton 臂；head=512 cutedsl/two-stage → ch25/ch29）|
 | `vllm/models/deepseek_v4/nvidia/flashmla.py` | 同名 | **主文件 7**（站 14/m13）：forward_mqa 切刀 + _forward_decode 逐字（C4A 换算/C128A 直算表/tile_sched 三型/一核双源调用面）+ _forward_prefill 逐字（双 gather + combine_topk_swa_indices 并集 + flash_mla_sparse_fwd）|
 | `vllm/v1/attention/backends/mla/flashmla_sparse.py` | 同名 | **主文件 8**（站 12/m14）：656B/584B 布局 docstring 逐字 + FlashMLASparseBackend/Metadata 逐字 + get_prefill_workspace_size（魔数 5）+ FlashMLASparseImpl 三条 KV 路径（builder → ch21/ch25）|
 | `vllm/v1/attention/backends/mla/sparse_utils.py` | 同名 | m07：triton_convert_req_index_to_global_index（HOST SEAM 精确数学：块表换算/-1 直通/越界守卫/prefill workspace 偏移/valid 计数；DCP 过滤器删——delete[0] 族）|
@@ -62,7 +62,7 @@ BLOCKING）**；must_keep 52 符号经 linter `over_subtraction` 项全数核在
 | _prepare_decode_tensors | indexer.py:L616-L734 | **逐字**（uniform kernel 走垫片） | 站 5——flatten 变长注释原例 [8,9,10,7,9,10,11,12] 与 native 2D |
 | builder 的压缩坐标换算 | indexer.py:L793-L811/L932-L941 | **逐字** | m11——compress_ratio>1 时 slot/seq 全部 //ratio |
 | DeepseekV4Indexer.__init__/forward | deepseek_v4/attention.py:L719-L892 | 逐字减 delete[2]（L782-L785 fp4 分支、L870-L871 fused 缓冲） | must_keep（compress_ratio//4、skip_k_cache_insert、_fill_short_context、maybe_execute_in_parallel）；站 13 |
-| DeepseekCompressor.forward | compressor.py:L329-L478 | 逐字减章界（cutedsl L422-L439/two-stage L440-L448 → ch25/ch28） | must_keep（fused_wkv_wgate/save_partial_states）；m11 |
+| DeepseekCompressor.forward | compressor.py:L329-L478 | 逐字减章界（cutedsl L422-L439/two-stage L440-L448 → ch25/ch29） | must_keep（fused_wkv_wgate/save_partial_states）；m11 |
 | V4 _forward_decode | nvidia/flashmla.py:L151-L244 | **逐字** | must_keep（compute_global_topk_indices_and_lens/extra_k_cache/flash_mla_with_kvcache）；站 14——NSA 三支路回归字面载体 |
 | V4 _forward_prefill 并集 | nvidia/flashmla.py:L246-L363 | **逐字** | must_keep（combine_topk_swa_indices）；m13——topk ∪ SWA |
 | FlashMLASparseImpl.forward_mqa | flashmla_sparse.py:L838-L875 | **逐字** | must_keep（forward_mqa/取 buffer 前 num_actual_toks 行）；站 12 |
@@ -154,9 +154,9 @@ BLOCKING）**；must_keep 52 符号经 linter `over_subtraction` 项全数核在
 - **章界外（→ chN，非 delete 项）**：mla_attention.py 的 MQA 吸收腿/混批切刀
   /输出量化/吸收重排（→ ch25）；deepseek_v2.py 的 min-latency GEMM
   （→ ch25 站 2）、DecoderLayer 选型三岔与 MoE/MLP、Model forward/load 的
-  MoE 段（→ ch25/ch28）、旧 MHA/GQA 层（→ ch24/ch25）；deepseek_v4 的
-  融合 GEMM/norm/RoPE/kv 插入链与三路重叠（→ ch25/ch28/ch19）、fp8 o_proj
-  （→ ch27）、compressor 的 head=512 cutedsl/two-stage（→ ch25/ch28）；
+  MoE 段（→ ch25/ch29）、旧 MHA/GQA 层（→ ch24/ch25）；deepseek_v4 的
+  融合 GEMM/norm/RoPE/kv 插入链与三路重叠（→ ch25/ch29/ch19）、fp8 o_proj
+  （→ ch27）、compressor 的 head=512 cutedsl/two-stage（→ ch25/ch29）；
   sparse_mla_attention 的 builder 与 chunked-context 机器（→ ch25）；
   flashmla_sparse 的 MetadataBuilder（→ ch21/ch25）；sparse_swa 的 builder/
   tile scheduler（→ ch25/ch21）；sparse_mla.py 的 V4 MetadataBuilder（正文

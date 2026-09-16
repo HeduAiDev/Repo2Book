@@ -204,7 +204,7 @@ R3Y, R3H = 548, 118
 content(IRX, R3Y, IRW, R3H, '输出线程 · sockets[client_index]', [
     ('按章查表：client_index=0 → sockets[0]', 'n', 9),
     ('选回程 PUSH socket（core.py:L1804）', 'n', 8.8),
-    ('每前端一条 socket · 多前端回程路由 → ch34 预告', 'm', 8.6),
+    ('每前端一条 socket · 多前端回程路由 → ch35 预告', 'm', 8.6),
 ], lc.C_ENG_S, badge=10, tfs=10.5, tag='sock')
 
 # 右泳道内部纵向箭头

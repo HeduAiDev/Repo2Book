@@ -162,9 +162,9 @@ lc.text(R4X + R4W / 2, AGY + 54, 'r0 → 75（下一 token id）', 10, R0_S, 'mi
         tag='out0')
 lc.text(R4X + R4W / 2, AGY + 74, 'r1 行同样物化——', 8.2, R1_S, 'middle', tag='out1a')
 lc.text(R4X + R4W / 2, AGY + 88, '属部分请求，被丢弃', 8.2, R1_S, 'middle', tag='out1b')
-# ④ 后续：交给采样管线（预告 ch29）
+# ④ 后续：交给采样管线（预告 ch30）
 lc.seg(R4X + R4W + 6, R4Y + 9, BXR - 60, R4Y + 9, lc.C_SAM_S, 2.0, 'std')
-lc.text(R4X + R4W + 14, R4Y + 2, '→ ch29 采样管线（预告）', 8.5, lc.C_SAM_S, 'start', tag='next')
+lc.text(R4X + R4W + 14, R4Y + 2, '→ ch30 采样管线（预告）', 8.5, lc.C_SAM_S, 'start', tag='next')
 
 # ---------------- 底部：反事实条带 ----------------
 CFY, CF_H = 560, 156

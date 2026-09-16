@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch34 机制图 · m19 wave 共识时序（figure_spec ch34-fig-wave-consensus）
+"""ch35 机制图 · m19 wave 共识时序（figure_spec ch35-fig-wave-consensus）
 
 放大自 L0 多实例视角 ⑥ DP 协调·拍间 wave（L2 站 16）的时序展开。
 
@@ -232,7 +232,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch34-fig-wave-consensus.svg'
+out = HERE / 'ch35-fig-wave-consensus.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

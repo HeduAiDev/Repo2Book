@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch28 机制图 · 第三代 MLA 装配投影链(ch28-fig-mla-gen3-projections, 模板 flow)
+"""ch29 机制图 · 第三代 MLA 装配投影链(ch29-fig-mla-gen3-projections, 模板 flow)
 
 放大自 L0『GPU 执行臂·模型层 forward + 编译』块里 DecoderLayer 的注意力半层投影链
 (L2 拍片③/⑧ 的机制版下钻——③=MLA 第三代装配(站 6)、⑧=Attention 一拍(站 12);
@@ -167,7 +167,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', lc.DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch28-fig-mla-gen3-projections.svg'
+out = HERE / 'ch29-fig-mla-gen3-projections.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

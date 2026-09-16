@@ -1,4 +1,4 @@
-# 第 34 章　分布式 TP/PP/DP/EP
+# 第 35 章　分布式 TP/PP/DP/EP
 
 模型大到一张卡装不下，流量大到一台引擎接不住，切是唯一的路。但「切」远不是一句话能带过的：TP（tensor parallel，张量并行）把一层之内的权重矩阵劈到多卡，每层前向付一次 all_reduce（全量归约，组内每张卡各出一份、人人拿回求和结果的集合通信）；PP（pipeline parallel，流水线并行）沿层序把模型切成几段各驻一卡，段与段之间点对点传激活；DP（data parallel，数据并行）干脆整台引擎复制 M 份，各接各的请求；EP（expert parallel，专家并行）把 MoE（mixture of experts，混合专家，路由器给每个 token 只挑少数专家算的稀疏结构）的专家摊到各卡，每个 MoE 层做一次全网 token 重排。四种切法各收什么、各付什么通信税？
 
@@ -8,7 +8,7 @@
 
 ## 你在这里
 
-Part VIII 共七章，全部长在[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 图右下那块带放大镜挂角的虚线块「多实例视角」上：ch34 分布式 TP/PP/DP/EP（本章，四刀与协同）、ch35 部署实战（量化档位与官方配方）、ch36 P/D 分离、ch37 KV 池化、ch38 OpenAI 服务、ch39 运维与弹性、ch40 终章回望。
+Part VIII 共七章，全部长在[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 图右下那块带放大镜挂角的虚线块「多实例视角」上：ch35 分布式 TP/PP/DP/EP（本章，四刀与协同）、ch36 部署实战（量化档位与官方配方）、ch37 P/D 分离、ch38 KV 池化、ch39 OpenAI 服务、ch40 运维与弹性、ch41 终章回望。
 
 ![Part VIII 导览：走向生产——真实服务不止一个引擎](../diagrams/L1-partVIII.png)
 
@@ -16,7 +16,7 @@ Part VIII 共七章，全部长在[第 1 章](../../ch01-vllm-v1-in-one-map/narr
 
 放大到本章自己这一层：
 
-![L2 章图：多实例集群，四轴并行与控制面](../diagrams/L2-ch34.png)
+![L2 章图：多实例集群，四轴并行与控制面](../diagrams/L2-ch35.png)
 
 > *图注：本章放大的是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 图右下「多实例视角」虚线块的主体：M 台 EngineCore 并排（各含 TP×PP×PCP workers；PCP＝prefill context parallel，长 prompt 沿序列切卡的进阶维度，建组节展开）× N 个前端 + DPCoordinator 控制面进程。三段读图：上排两条是请求进出集群（入＝前端多实例的打分选路与盖章定向、出＝按 client_index 回发，[第 4 章](../../ch04-two-usage-faces-one-trio/narrative/chapter.md)与[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)埋的两根线头在这里收口）；中排 ①-⑥ 是多实例的本体：① 建组 5 维 rank 张量、② GroupCoordinator 双群组（CPU/GPU 两条通信线路）、③ TP 层内、④ PP 段间、⑤ EP 全网重排、⑥ DP 协调（批对齐与 wave）；下排是 worker 入 world（DP rank 偏移）、出生分叉、三 socket 控制面、all_reduce 回退链、两条 why 注（MoE 锁步、wave 竞态）、abort 路由与邻章分界标记。接在五块已读结构上：[第 17 章](../../ch17-executor-worker-model-runner/narrative/chapter.md)的执行三层与 PP 接力点名、[第 12 章](../../ch12-async-scheduling/narrative/chapter.md)的 prev_sampled_token_ids 回填、[第 18 章](../../ch18-persistent-batch-fixed-addresses/narrative/chapter.md)的差量协议、[第 19 章](../../ch19-compile-capture/narrative/chapter.md)的 piecewise 编译与 CUDA graph 档位、[第 23 章](../../ch23-model-layer-assembly/narrative/chapter.md)的 TP 切头数学。站号 = 讲解装配顺序：启动 1-7、请求进集群 8-10、一拍数据面 11-14、拍间控制面 15-16，共 16 站；正文按讲解需要编排（本章先立地基与集群，再按一拍的时序重排数据面各站），不必照站号读。*
 
@@ -207,7 +207,7 @@ TP 刀最朴素：不需要 transpose（TP 已在末维），直接 `view(-1, tp
 
 表内值得停两眼。PP 组是 [[0,2],[1,3],[4,6],[5,7]]：每台引擎各有一条 tp0 流水线与一条 tp1 流水线，PP 是引擎内的段序、不跨引擎；而 [[0,4],[1,5]] 那种跨引擎配对是 **DP** 组。容易想反，真跑一遍就记牢了（本表即实跑输出：8 进程真建组、只把 `init_model_parallel_group` 换成记录器，world 组与 rank 偏移走真实路径）。最后一行是这笔设计的代价实数：22 个组、每个组要建双份进程组（下节），44 个 `new_group`（按本章四刀+PCP 计；真源还默认建 DCP 单例组，同一形状真数是 30 组 60 个 `new_group`，代价只多不少）。torch.distributed 的进程组是稀缺资源（每组要在后端通信库占一个 communicator 与配套资源），维度再往多加配额就吃紧。
 
-![8 rank 五维表切四刀](../diagrams/ch34-fig-rank-tensor-cuts.png)
+![8 rank 五维表切四刀](../diagrams/ch35-fig-rank-tensor-cuts.png)
 
 > *图注：全部 rank 先排进 (1,2,2,1,2) 五维张量（左上格子图是它的物理落位：引擎×pp 行×TP 列；右上注框标 shape＝外DP×DP×PP×PCP×TP 与收起两维的说明），四条彩色路径各导出一刀的组：TP 相邻两格、PP 跨段 stride 2、DP 跨引擎 stride 4、EP 四格合并。每条路径旁标 transpose/reshape 的机械式，格子里的 rank 号与组列表一一对应。左下注：dense 对照与特权件——dense 模型只剩 TP/PP/DP 三刀、EP 刀不切（factory 调用 5 次变 4 次），TP 组独享 SHM（共享内存）广播、EP 组独享 all2all。右下注：worker 入全局 world——global = dp_rank×4 + engine_rank（rank5 = 1×4+1），各引擎的 worker 同处一个全局 world，跨引擎的 DP/EP 组才建得起来（正文表内 rank 偏移行同账）。组不是名单，是同一张表的不同撕法。*
 
@@ -293,7 +293,7 @@ TP 刀最朴素：不需要 transpose（TP 已在末维），直接 `view(-1, tp
 
 类顶那行注释还立着一把钥匙：**三套坐标**。`rank` 是全局编号（跨引擎唯一标识进程）；`local_rank` 是节点内序号（决定绑哪块卡）；`rank_in_group` 是组内序号（集合原语的 src/dst 都用它，经 `self.ranks[i]` 翻回全局）。源码注释里那张 4-rank/2-node 的表（`parallel_state.py:L394-L400`）是理解三者的教具：跨节点时同一 PP 组的两个进程 local_rank 相同、rank 不同。
 
-![GroupCoordinator 解剖与四个同构实例](../diagrams/ch34-fig-group-coordinator.png)
+![GroupCoordinator 解剖与四个同构实例](../diagrams/ch35-fig-group-coordinator.png)
 
 > *图注：一个并行维度 = 一个 GroupCoordinator 实例。以 TP 为例的解剖框：cpu_group（gloo，真部署里管元数据、对象、barrier）与 device_group（真部署为 NCCL，管张量集合与点对点）双群组按数据类型分流，解剖框上部并排两小框：左为三套坐标的 4-rank/2-node 注释表、右为 TP=2 实测小账（rank0 出部分和 1.0、rank1 出 2.0、归约后两卡同得 3.0）；device_communicator 是真正挑内核的下沉点（七级回退链对调用方透明）；TP 组额外挂 SHM mq_broadcaster（取证环境以 torch.distributed 对象广播承载同一可观察契约）。右列四个同构小框：TP/PP/DP/EP 各一个进程级单例 get_*_group()，TP 框多一枚 SHM 徽标。底行给 8 GPU 例的账：22 组 × 2 双群组 = 44 个 ProcessGroup，「一个维度一个实例」与双群组的配额代价同框。*
 
@@ -358,7 +358,7 @@ TP 刀最朴素：不需要 transpose（TP 已在末维），直接 `view(-1, tp
 
 引擎侧的「小票」怎么来？每台 MoE 引擎每拍调一次 `_maybe_publish_request_counts`（`vllm/v1/engine/core.py:L2075-L2090`）：counts 有变才发，`SchedulerStats` 带着 waiting/running/kv_cache_usage 外加锁步的 step_counter 与 current_wave，投的是 `(-1, EngineCoreOutputs(scheduler_stats=stats))`，这就是 **client_index=-1 哨兵**。输出线程看到 -1 不走任何前端 PUSH，拐进协调者（`core.py:L1788-L1793`；[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)输出线程那段省略号注释「client_index == -1 走 coordinator 的哨兵分支（Part VIII 分布式章）」在此兑现）。
 
-![DP 集群全景：数据面与控制面分家](../diagrams/ch34-fig-dp-cluster.png)
+![DP 集群全景：数据面与控制面分家](../diagrams/ch35-fig-dp-cluster.png)
 
 > *图注：DP 集群全景。上排 N 个前端（AsyncMPClient 家族），下排 M 台引擎（各含 TP×PP×PCP workers 的 GPU 小格），右侧独立的 DPCoordinator 进程持三 socket（front XPUB 播聚合看板、back XPUB 广播控制、output PULL 收统计）。实线是数据面：前端 ROUTER→引擎 DEALER 定向进（信封首帧=引擎 identity，[第 5 章](../../ch05-zmq-topology-and-protocol/narrative/chapter.md)的伏笔在此写上名字）、引擎按 client_index 选 PUSH 回发起前端（[第 4 章](../../ch04-two-usage-faces-one-trio/narrative/chapter.md)的章在此成为坐标系）。虚线是控制面：引擎负载小票经 -1 哨兵拐进协调者、前端 XSUB 订看板、引擎 XSUB 订 wave 信令，统计 100ms 聚合发布、START_DP_WAVE 广播唤醒。一句话：请求与输出一个字节都不经过控制面。*
 
@@ -474,7 +474,7 @@ DP=1 就是[第 4 章](../../ch04-two-usage-faces-one-trio/narrative/chapter.md)
 
 前五行是突发剧本：快照全 0（100ms 窗口内协调者还没来得及刷），5 个请求被地板推成轮询散开 [0,1,2,3,0]，每选一家，`current_counts[eng_index][0] += client_count` 与 `engine_inflight += 1` 双记账，下一家的地板与快照都抬起来。kv1 行是斜坡剧本：同样 4 个 waiting，KV 用 0.4 的引擎 0 得 4 分，KV 满载的引擎 1 得 16 分（4 + 4×6.0×0.5），重载 100 分的垫底，同队列因 KV 压力差出 4 倍避让。最后两行是记账的闭环：finished 回收（`process_engine_outputs` 里 `reqs_in_flight.pop` 与 `engine_inflight -= 1` 成对发生，`core_client.py:L1532-L1539`），abort 按登记表找到 r3 在引擎 2、定向发 ABORT（`L1587-L1602`）。记账守恒有论证：每个 +1 都挂着一个 -1 与之配对（选路与回收都同时动两张表），所以地板恒等于「已选这台且未完结的本 client 请求数」，这正是它能被快照信任的原因。守恒被破坏的方式只有一种：finished 回收漏了（比如引擎死掉没回 finished_requests），那台引擎的分数永久虚高，变成事实上的「惩罚」。
 
-![LB 打分的决策表](../diagrams/ch34-fig-lb-score.png)
+![LB 打分的决策表](../diagrams/ch35-fig-lb-score.png)
 
 > *图注：score=max(client_count×inflight, waiting+running)+KV 斜坡的实跑决策表。主矩阵行=突发请求 r1-r5、列=引擎 0-3，每格粗体是 max 结果，其下小字一行分列「快照 X · 地板 Y」两项，选中格高亮成一条对角线 [0,1,2,3,0]，旧快照全 0 时地板把突发摊开的视觉证据。右侧对照条：KV 斜坡场景 [4,16,100,100]（同样 4 个 waiting，KV 满载的引擎 1 得 16 分、重载引擎垫底）与平局轮转（t1/t2 两轮 start_index 0→1 消偏置）。表尾一行：选中即 reqs_in_flight 登记 + engine_inflight+1（abort 找回路、finished 回收），另有外部 LB 模式对照：绑定引擎原样返回（实测 bound 2 → returned 2）。*
 
@@ -819,7 +819,7 @@ direct_register_custom_op(
 
 七级候选加一条兜底，从上到下：NCCL 对称内存（NCCL 2.27 起的原生对称窗口注册，直接在用户缓冲区上规约、省一次拷贝）→ quick reduce（仅 AMD MI3 系）→ flashinfer（UW/CMU 学界协作出身、被多家推理引擎集成的 kernel 库）→ aiter（AMD）→ **CustomAllreduce**（vLLM 自研的低延迟小张量 all-reduce：TP 小 batch decode 时 all_reduce 张量很小，NCCL 的通用路径延迟压不下来，vLLM 自己写了一份基于缓冲区注册的直读实现，这是 TP 延迟的关键件）→ PyTorch 自研的 symm_mem 模块（注意它与第一级的 NCCL 对称内存是两条独立代码栈，解决同一问题：链首是 NCCL 原生特性、这一级是 PyTorch 自带模块，名字极像、实现无关）→ pynccl（vLLM 绕开 torch.distributed、直调 NCCL C 接口的轻封装）→ 兜底 `torch.distributed.all_reduce`。链尾注释自述：跑模型时 all-reduce 只发生在 TP 组，那里总有 custom allreduce 或 pynccl 可用，兜底通常只在测试出现；取证环境的实跑落点正是 pynccl 这一级（前六级构造面存在、判定面不启用，图上标着 host 实跑落点）。对调用方这一切完全透明：模型层喊一句「把部分和合一下」，内核挑选是这条链自己的事。
 
-![all_reduce 的派发路径](../diagrams/ch34-fig-allreduce-dispatch.png)
+![all_reduce 的派发路径](../diagrams/ch35-fig-allreduce-dispatch.png)
 
 > *图注：一次 tensor_model_parallel_all_reduce 的三条出路。入口是模型层唯一认识的自由函数；菱形一「world_size==1？」命中则原样返回同一张量对象（TP=1 部署每层的零成本旁路，判据是 TP 组的 world_size、与 DP 无关；实测 out is input=true、in=[5.0,7.0] 原样返回）；菱形二「use_custom_op_call？」命中走 torch.ops.vllm.all_reduce(input, group_name="tp:0")（字符串可符号化、配 fake 实现供编译期形状推断，group 名即实测的 tp:0；host 默认 false、真 CUDA 平台 true，强开后同出 3.0），否则直接 _all_reduce_out_place。两支汇入 device_communicator 的七级回退链加兜底（竖排：NCCL symm → quick → flashinfer → aiter → CustomAllreduce → symm_mem → pynccl → torch.distributed 兜底），host 实跑落点标在 pynccl 一行（其替代实现内部即 torch.distributed，真源自述的 testing 路径）。三条路对模型层完全透明。*
 
@@ -1060,7 +1060,7 @@ class AsyncIntermediateTensors(IntermediateTensors):
 
 前四行验证钩子语义（构造不等、他人属性不触发、首触必等、幂等不重等）；后三行是收益账。串行版（irecv 即 wait）0.8s：先等 0.5s 传输、再干 0.3s 本地准备。懒同步版 0.5s：irecv 发出先去干本地准备（KV 取址、注意力元数据构建这些与接收无关的活），真要碰 `.tensors` 那刻才回头等——0.3s 本地准备整段藏进等待窗，省下的正是它的时长（本例占等待的六成）。注意末行标着建模值：gloo 本机传输瞬完、造不出真实在飞延迟，时长是 host 建模的；但「irecv 返回时句柄未 wait」「0.3s 后触碰才等待」这些结构是真实代码路径的实跑证据。decode 一拍几十毫秒，段间气泡直接吃吞吐——这笔重叠就是拿回来的。代价也要诚实记：钩子是运行期约定，不是类型系统能查的约束，任何代码提前碰 `.tensors` 都会静默触发一次同步，调试栈也因此更绕；这份透明的安全前提，还要靠上面 record_stream 与下一拍收割的纪律兜住。
 
-![PP 段间张量字典的交接](../diagrams/ch34-fig-pp-tensor-dict.png)
+![PP 段间张量字典的交接](../diagrams/ch35-fig-pp-tensor-dict.png)
 
 > *图注：相邻两段 Worker 的交接。上泳道首段、下泳道次段，中间两条平行通道：上方细虚线是 cpu_group（gloo）走「装箱单」——metadata 列表（键名/形状/dtype）经 send_object 先行，本例 3 键字典（hidden/residual/scalar_meta）里那个 {\"num\":42} 的非张量对象也走这条；下方粗实线是 device_group 逐张量 isend/irecv（本例 hidden 与 residual 两个张量句柄）。次段把到货包成 AsyncIntermediateTensors（句柄外带、碰 .tensors 才 wait）；首段的发送句柄存 _pp_send_work 下一拍收割。双群组分工在点对点上同样成立。*
 
@@ -1244,7 +1244,7 @@ dispatch 是一次 `all_gatherv`（变长全收集：按 sizes 沿 dim 0 拼接�
 
 设定：2 rank 各 3 个 token、hidden 4 维，专家 e 归 rank `e % 2`（rank0 持专家 0/2、rank1 持专家 1/3）。路由三行里 [0,1] 与 [1,2] 一奇一偶、必跨 rank；[2,0] 双偶、两个专家都在 rank0。dispatch 后每 rank 桌上摆着全网 6 行（12 行投递）：六行里四行一奇一偶必跨 rank，两行是 [2,0] 的双份拷贝、全落 rank0——rank1 那 2 行「完全不命中」正来自它们，白收、白传，这就是 AgRs 多付的税。本地算完（未命中的行贡献写 0），combine 按原 sizes 求和切回：专家划分互斥，每行的两个 top-k 槽位各被恰一个 rank 认领，认领份额的加权和恒为 0.5+0.5=1（[2,0] 行两槽全由 rank0 认领、rank1 贡献 0），归约后原值复原。线上账：AgRs 投递 12 行、真 all-to-all 只需 10 行（rank0 要 6、rank1 要 4），多付 2 行。规模感更直观：AgRs 的投递量随 rank 数线性放大（每行发给所有 rank），真 A2A 只发命中行——集群越大税越重，这正是真 A2A 后端存在的理由。
 
-![EP 全网重排三段流](../diagrams/ch34-fig-ep-dispatch-combine.png)
+![EP 全网重排三段流](../diagrams/ch35-fig-ep-dispatch-combine.png)
 
 > *图注：EP 每个 MoE 层的两次集合通信。左列两 rank 各持 3 行 token（奇/偶小色点=路由命中的专家归属，偶专家归 rank0、奇专家归 rank1）；中段 dispatch=all_gatherv(sizes=[3,3]) 把两叠行拼成每桌 6 行，多出来的行画灰色「不归我管」；中列本地计算：rank0 桌上 6 行全亮（都命中偶专家）、rank1 桌上 4 亮 2 灰（白收白传），两桌贡献槽位 8 对 4、计算量也不均；右段 combine=reduce_scatterv 按原 sizes 把每行两侧贡献求和送回原主（每 rank 收回 3 行=原值，权重 0.5+0.5=1.0 倍）。底部对账条：AgRs 12 行投递 vs 真 A2A 10 行（rank0 需 6 + rank1 需 4，多付 2 行、比真 A2A 多 20%）+ 一句「DeepEP 等真 A2A 后端替换的是这两个方法、接口不变」。*
 
@@ -1338,7 +1338,7 @@ docstring 自己就是真值表：**元素 0 求和大于 0 等价于逻辑或**
 
 共识「全体无活」后（L2163-L2166）：dp_rank 0 发一条 `wave_complete`（client_index=-1 哨兵、走协调者），`current_wave` 加一、step_counter 清零。**wave 编号**的语义协调者类 docstring 给了权威表述：全体引擎在 running 与 paused 两态间交替，wave 就是「集体从 running 转入 paused 的次数」。暂停之后谁叫醒？前端的新请求走两条路：正常路是 ADD 直接进某台引擎的输入队列；抢先路是本章中段埋过的那条——引擎们暂停时，`add_request_async` 检测 `not engines_running`，经 PAIR socket 直投协调者一条 FIRST_REQ，协调者立刻向 back XPUB 广播 START_DP_WAVE（带 exclude：已收到该请求的引擎不用再叫），一台不落（`coordinator.py:L347-L365`、`core_client.py:L1418-L1421`）。
 
-![wave 共识时序](../diagrams/ch34-fig-wave-consensus.png)
+![wave 共识时序](../diagrams/ch35-fig-wave-consensus.png)
 
 > *图注：MoE DP 锁步的全过程时序。三条竖直生命线：引擎 0、引擎 1 的忙循环与 DPCoordinator。第 1-32 拍两引擎连续 dummy batch（活动条上标「空转维持锁步——EP all2all 缺席者会挂死全员」）；第 32 拍一条水平消息=2 元素 SUM all-reduce，旁边小真值表框：SUM[0]>0 等价或（继续跑）、SUM[1]==dp_size 等价全体同意暂停；随后引擎 0 向协调者一条 wave_complete（-1 哨兵），两引擎状态条 running 转 paused、wave 0 转 1；暂停期一条在途 START_DP_WAVE 被 ignore_start_dp_wave 丢弃（虚线打叉）。图尾标注代价：最坏 31 拍的滞留感知。*
 

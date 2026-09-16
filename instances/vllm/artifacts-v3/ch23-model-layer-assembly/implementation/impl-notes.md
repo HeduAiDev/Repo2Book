@@ -49,7 +49,7 @@ must_keep 71 符号经 linter `over_subtraction` 项全数核在。
 | `vllm/model_executor/parameter.py` | 同名 | BasevLLMParameter（weight_loader 属性/tp 戳记）+ _ColumnvLLMParameter/RowvLLMParameter/ModelWeightParameter（量化参数族 SUBTRACTED——delete[7]） |
 | `vllm/model_executor/custom_op.py` | 同名 | op_registry/PluggableLayer（register/register_oot——m13 OOT 面）/ CustomOp（dispatch_forward 派发主干 + enabled/default_on） |
 | `vllm/v1/worker/gpu_model_runner.py` | 同名 | 两薄层（delete[13]）：load_model 线（L5303-L5390 减法——三段删除 + **delete[10] 明示保留的 L5362 调用与 L5376-L5390 EPLB 块**）+ execute_model 尾段（L4432-L4456 with 块 + **delete[11] 明示保留的 L4459-L4465 aux 解包与 L4467 主路径头** + L4484-L4485 采样位切片两行逐字）+ _model_forward（L3879-L3907 逐字） |
-| `vllm/models/deepseek_v4/__init__.py` | 同名 | m9 布局证据：平台分发骨架（L14-L32 的 if/elif/else 逐字；子包本体归 ch28） |
+| `vllm/models/deepseek_v4/__init__.py` | 同名 | m9 布局证据：平台分发骨架（L14-L32 的 if/elif/else 逐字；子包本体归 ch29） |
 | `vllm/sequence.py` | 同名 | IntermediateTensors 全类（L12-L53 逐字） |
 | `vllm/forward_context.py` | 同名 | ForwardContext（no_compile_layers/attn_metadata/slot_mapping 三字段）+ get/create/override/set_forward_context 主干 |
 | `vllm/ir/ops/layernorm.py` + `vllm/ir/` | 同名 | rms_norm/fused_add_rms_norm native 数学（逐字）+ maybe_inplace 通道的 HOST SEAM 载体 |
@@ -94,7 +94,7 @@ must_keep 71 符号经 linter `over_subtraction` 项全数核在。
 | [3] | ENCODER_ONLY 分流与适配器 | llama.py：L203-L207 attn_cls 三元 / L273-L280 / EncoderOnlyAttention import / L543-L552 两适配器类 |
 | [4] | logits_as_input/soft_cap/scale≠1 | logits_processor.py forward：L69-L81 对应分支 |
 | [5] | _apply_head 的 head_dtype 分支 | logits_processor.py：L110-L135（head_dtype 配置位 __init__ 保留——m13 叙事锚） |
-| [6] | get_top_tokens | logits_processor.py：L155-L205（LocalArgmaxMixin.get_top_tokens 保留声明——调用位归 ch33 回填） |
+| [6] | get_top_tokens | logits_processor.py：L155-L205（LocalArgmaxMixin.get_top_tokens 保留声明——调用位归 ch34 回填） |
 | [7] | weight_loader 量化/低比特特例 + weight_loader_v2 族 | linear.py：QKV 循环内量化块 L1266-L1307 + q/k/v 路径 L1329-L1374；Merged bnb raise L779-L787 + 循环内 L794-L810/L812-L821 + 单段 L836-L868；Row bnb 判整 L1719-L1723；is_sharded_weight 分支头（narrow 落成无条件）；parameter.py 量化参数族；vocab packed_dim 段；_maybe_allow_fp8_block_shape_mismatch **未删**（原样保留——未量化路径早退无操作）。**豁免保留**（checkpoint 格式面非量化面，不删）：QKV fused-on-disk 骨架 L1236-L1265 + 递归装载尾 L1309-L1313 + needs/警告尾 L1385-L1397；Merged L788-L793 构造+循环头 + L823-L826 narrow/递归尾 + L873-L886 尾部；adjust_scalar_to_fused_array（L116-L140 逐字）与 validate_shard_id 的 tuple 支（L729-L744 逐字）随之恢复 |
 | [8] | registry 收缩 | registry.py：条目表→五条目单表；_RegisteredModel/探测族/transformers 后端/_PREVIOUSLY_SUPPORTED/OOT 名单删 |
 | [9] | loader 族收缩 | model_loader/__init__.py：表只留 default/dummy；其余 loader 文件不进 |
@@ -108,7 +108,7 @@ must_keep 71 符号经 linter `over_subtraction` 项全数核在。
 1. **`vllm/config/__init__.py`**（CONFIG SEAM）：VllmConfig 六 config namespace 的
    本章消费字段子集（ch03 域的数千行装配链不重建）；set/get_current_vllm_config
    语义逐字（compilation_counter 计数→ch19）。
-2. **`vllm/distributed/__init__.py`**（DIST SEAM，ch34 领地）：divide/
+2. **`vllm/distributed/__init__.py`**（DIST SEAM，ch35 领地）：divide/
    split_tensor_along_last_dim/get_pp_indices **逐字**；GroupCoordinator 以
    `_GroupCoordinatorSeam`（rank_in_group/world_size/first/last/is_first/
    is_last_rank）承载；集合通信保真实 world_size==1 旁路语义（parallel_state.py
@@ -119,7 +119,7 @@ must_keep 71 符号经 linter `over_subtraction` 项全数核在。
 4. **`vllm/envs.py` / `vllm/logger.py`**：VLLM_BATCH_INVARIANT=False /
    VLLM_PP_LAYER_PARTITION=None（真实默认值）；no-op logger。
 5. **`vllm/forward_context.py`**（FORWARD CONTEXT 切面）：CUDAGraphMode/
-   UBatchSlices 以 None 常量位承载（ch19/ch34 域）；create/set_forward_context
+   UBatchSlices 以 None 常量位承载（ch19/ch35 域）；create/set_forward_context
    装配主干逐字。
 6. **`vllm/compilation/decorators.py`**：@support_torch_compile 签名与 docstring
    逐字；包装本体→ch19（原类直返——标记语义保留）。
@@ -145,7 +145,7 @@ must_keep 71 符号经 linter `over_subtraction` 项全数核在。
   （L5308-L5312）、EplbState 预构（L5314-L5316，`eplb_models = 0` 计数位所在）、
   try/DeviceMemoryProfiler/time_before_load（L5318-L5320）与计时汇报
   （L5392-L5393）、except OutOfMemoryError 收尾（L5394 起）——**不在新
-  delete[10] 的三段批准内**，按章界外惯例删（tracing 观测域 + EPLB 域 ch34）。
+  delete[10] 的三段批准内**，按章界外惯例删（tracing 观测域 + EPLB 域 ch35）。
   后果显式记录：保留的 EPLB enable 块体内 `eplb_models += 1`（L5390 逐字）在
   块体恒不进的削减语义下为死代码位（其初始化位随 EplbState 预构删——同一
   恒假条件族，正常路径不可达）。

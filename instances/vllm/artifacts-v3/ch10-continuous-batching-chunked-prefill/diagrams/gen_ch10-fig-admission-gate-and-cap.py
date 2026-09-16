@@ -130,7 +130,7 @@ px, py, pw, ph = PZ
 lc.rect(px, py, pw, ph, '#ffffff', lc.C_MUTE, rx=7, sw=1.1, dash=True)
 lc.text(px + 14, py + 18, '第三态亲戚：PAUSED_ALL → token_budget = 0（L460-L462）', 8.5, lc.C_MUTE,
         'start', maxw=pw - 28, tag='pz:l1')
-lc.text(px + 14, py + 34, '两个入环条件同时失效，一拍空转返回（弹性场景 → ch39）', 8, lc.C_MUTE,
+lc.text(px + 14, py + 34, '两个入环条件同时失效，一拍空转返回（弹性场景 → ch40）', 8, lc.C_MUTE,
         'start', maxw=pw - 28, tag='pz:l2')
 
 # ---------------- cap 地形小注（左下） ----------------

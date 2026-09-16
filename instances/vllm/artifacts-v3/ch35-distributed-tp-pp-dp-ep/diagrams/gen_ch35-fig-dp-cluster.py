@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch34 机制图 · m18 DP 集群全景：数据面与控制面分家（figure_spec ch34-fig-dp-cluster）
+"""ch35 机制图 · m18 DP 集群全景：数据面与控制面分家（figure_spec ch35-fig-dp-cluster）
 
 放大自 L0 多实例视角全景（DPCoordinator·三 socket L2 站 7 + 北条前端进出/
 按 client_index 回发）——本章头图候选。
@@ -226,7 +226,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch34-fig-dp-cluster.svg'
+out = HERE / 'ch35-fig-dp-cluster.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

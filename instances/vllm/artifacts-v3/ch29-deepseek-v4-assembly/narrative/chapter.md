@@ -1,4 +1,4 @@
-# 第 28 章　实战：DeepSeek-V4 拼装
+# 第 29 章　实战：DeepSeek-V4 拼装
 
 [第 23 章](../../ch23-model-layer-assembly/narrative/chapter.md)立过一句大话：接入新架构只需拼层，Attention 是插座不是实现。期末考来了：把 DeepSeek-V4 这台真旗舰摆上装配线，Llama 那五件套（注意力、FFN、残差、输出头、数值格式）挨个对过去，居然一件都不在原样。残差不再是「加回去」：它扩成 hc_mult 条并行流（hc_mult 是 config 里的并行流条数），每半层由一组学出来的门控重新调和，走出主干前还要 hc_head 压回单流。这个凭空多出来的「多流残差」到底是什么？凭什么值得每半层多付一组参数？
 
@@ -8,7 +8,7 @@
 
 ## 你在这里
 
-![L2 章图：实战 DeepSeek-V4 拼装——装配幕 ①-⑤、运行幕 ⑥-⑨、四本 KV 账与五条 why 注](../diagrams/L2-ch28.png)
+![L2 章图：实战 DeepSeek-V4 拼装——装配幕 ①-⑤、运行幕 ⑥-⑨、四本 KV 账与五条 why 注](../diagrams/L2-ch29.png)
 
 > *图注：本章放大的是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 图中列「GPU 执行臂」的「模型层 forward + 编译」盒——[第 23 章](../../ch23-model-layer-assembly/narrative/chapter.md)在这只盒里点亮了 Llama 四件套骨架，[第 25 章](../../ch25-mla-two-expansions/narrative/chapter.md)、[第 26 章](../../ch26-deepseek-indexer-nsa-dsa/narrative/chapter.md)换上 MLA 与索引器零件，[第 27 章](../../ch27-quantization/narrative/chapter.md)定了数值格式；本章把整只盒装成一台 DeepSeek-V4 整机，Part VI 到此收官。上排是进出的四件：arch 字符串与三份配置、checkpoint 权重流、runner 的输入张量、交给采样的 hidden→logits；中排两幕：①-⑤ 装配幕（registry 与平台分发 → 骨架三池 → MLA 装配 → MoE 装配与 FP4 分发 → 权重流入 finalize），⑥-⑨ 运行幕（forward 主干 → 单层两半 → Attention 一拍 → MoE 一拍与出口加 MTP 钩子）；下排是四本 KV 账的解剖与五条 why 注、delta over Llama 对照、MTP 钩子注。站号 = 请求流经代码的顺序：装配期 1-9 站一生一次，运行期 10-14 站一拍之内（①-⑨ 是格子序号、不等于正文站号——五格装配幕依次盖站 1-2、3-5、6、7-8、9，四格运行幕依次盖站 10、11、12、13-14）；正文按讲解需要编排、不必照站号读。*
 
@@ -20,7 +20,7 @@
 
 ## 开考：Llama 五件套的更换单
 
-![V4 整机架构：三色注意力层、hc_mult 条残差流、每层 MoE、出口 hc_head 与 MTP 草稿头](../diagrams/ch28-fig-v4-architecture-overview.png)
+![V4 整机架构：三色注意力层、hc_mult 条残差流、每层 MoE、出口 hc_head 与 MTP 草稿头](../diagrams/ch29-fig-v4-architecture-overview.png)
 
 > *图注：本图是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 图「GPU 执行臂」模型层的整机放大：token 从图顶进，纵穿 L 层主干（每层就是一个注意力半层加一个前馈半层），hc_mult=4 条残差流贯穿全栈，出口在图底、压回单流再出 logits，MTP 草稿头挂最末层之后。它只回答「这台机器长什么样、部件怎么配合怎么分布」，不解释代码；型号与参数细节在正文与图右侧分读面板。*
 
@@ -48,7 +48,7 @@
 
 具体怎么合：每个 token 先各自投出两份东西，一份是将来要被合并的内容，一份是用来算权重的分数。当前窗的 4 个 token 和前一个窗的 4 个 token 一起过 softmax，8 个位置竞争出一组和为 1 的权重，再用这 8 个权重对 8 份内容加权求和，得到 1 条压缩条目。相邻两个窗共享一半输入，所以每条压缩条目实际吸收了约 8 个 token 的信息，块的边界也就不会硬切；序列长度精确压到 1/4。
 
-![压缩不是写摘要，是学出来的软池化：8 个位置（当前窗 4 加前窗 4，共 2m）过 softmax 得权重和 1，再对 8 份内容加权求和成 1 条；下方窗重叠条示相邻条目共享一半输入、每条吸约 8 个 token，序列精确压到 1/4](../diagrams/ch28-fig-compressor-softpool.png)
+![压缩不是写摘要，是学出来的软池化：8 个位置（当前窗 4 加前窗 4，共 2m）过 softmax 得权重和 1，再对 8 份内容加权求和成 1 条；下方窗重叠条示相邻条目共享一半输入、每条吸约 8 个 token，序列精确压到 1/4](../diagrams/ch29-fig-compressor-softpool.png)
 
 这一步最容易讲歪：它不是「让模型写摘要」，压缩机里没有生成、没有语言，只有一次可微的加权求和。
 
@@ -67,7 +67,7 @@
 
 第二列是显存与带宽账，第三列才是算力账：CSA 把候选压到 25 万条之后只挑不到千分之五，HCA 则用「条目少到可以不挑」把这一列压成一个常量级。两档不是谁省谁不省，是分工：CSA 保 4 倍分辨率但要挑着看，HCA 用 32 倍粗的分辨率换「不用挑也不会漏」。
 
-![同一段 1M 历史的三档分辨率并置：上滑窗层、中 CSA、下 HCA；左列缓存条数（显存与带宽账）、右列每 query 实看条数（算力账）；CSA 保 4 倍分辨率但要挑看，HCA 用粗分辨率换全看不挑——两档是分工，不是降级](../diagrams/ch28-fig-resolution-ladder.png)
+![同一段 1M 历史的三档分辨率并置：上滑窗层、中 CSA、下 HCA；左列缓存条数（显存与带宽账）、右列每 query 实看条数（算力账）；CSA 保 4 倍分辨率但要挑看，HCA 用粗分辨率换全看不挑——两档是分工，不是降级](../diagrams/ch29-fig-resolution-ladder.png)
 
 ### 三、第二招：保真（滑窗是压缩的补丁）
 
@@ -240,7 +240,7 @@ class DeepseekV4ForCausalLM(
         self.extract_moe_parameters(example_moe)
 ```
 
-三件事。其一，bases 里的 `SupportsPP`/`SupportsEagle3`/`DeepseekV4MixtureOfExperts` 就是 ch23 站 5 讲过的 hasattr 探测靶：runner 与调度器不 import 模型类，只探测能力接口，管流水线并行的能力、喂 EAGLE 式 draft（EAGLE，用小草稿模型加速解码的投机解码一族）的能力、MoE 的元数据接口全挂在这三个基类上。其二，`hf_to_vllm_mapper` 是类属性默认 fp4 版、实例按 `expert_dtype` 覆盖。词典（checkpoint 名到 vLLM 参数名的翻译表）要在构造期就选好，长什么样、选错会怎样，装配幕四第 8 站展开（装载侧怎么消费这份词典，装配幕五继续）。其三，`set_moe_parameters` 在装配期遍历全部层，把每层的 MoE 模块登记进列表。这是给谁看的？给 EPLB（Expert Parallelism Load Balancer，DeepSeek 官方的专家负载均衡工具：把过载的「热」专家复制多份、再启发式地打包到各 GPU，输出的物理槽位到逻辑专家映射允许一个逻辑专家落多个物理槽）和分布式调度用的元数据。它们要的专家数、层数在这里一次算好，运行期不再遍历。专家重排怎么触发、怎么调度，归[第 34 章](../../ch34-distributed-tp-pp-dp-ep/narrative/chapter.md)；本章只需要记住「装载代码要为多槽布局留活口」，装配幕五会看到那个活口。
+三件事。其一，bases 里的 `SupportsPP`/`SupportsEagle3`/`DeepseekV4MixtureOfExperts` 就是 ch23 站 5 讲过的 hasattr 探测靶：runner 与调度器不 import 模型类，只探测能力接口，管流水线并行的能力、喂 EAGLE 式 draft（EAGLE，用小草稿模型加速解码的投机解码一族）的能力、MoE 的元数据接口全挂在这三个基类上。其二，`hf_to_vllm_mapper` 是类属性默认 fp4 版、实例按 `expert_dtype` 覆盖。词典（checkpoint 名到 vLLM 参数名的翻译表）要在构造期就选好，长什么样、选错会怎样，装配幕四第 8 站展开（装载侧怎么消费这份词典，装配幕五继续）。其三，`set_moe_parameters` 在装配期遍历全部层，把每层的 MoE 模块登记进列表。这是给谁看的？给 EPLB（Expert Parallelism Load Balancer，DeepSeek 官方的专家负载均衡工具：把过载的「热」专家复制多份、再启发式地打包到各 GPU，输出的物理槽位到逻辑专家映射允许一个逻辑专家落多个物理槽）和分布式调度用的元数据。它们要的专家数、层数在这里一次算好，运行期不再遍历。专家重排怎么触发、怎么调度，归[第 35 章](../../ch35-distributed-tp-pp-dp-ep/narrative/chapter.md)；本章只需要记住「装载代码要为多槽布局留活口」，装配幕五会看到那个活口。
 
 第 4 站下到 `DeepseekV4Model.__init__` 的中段，这里藏着本章运行幕的全部伏笔：三个全模型共享的池子。
 
@@ -455,7 +455,7 @@ def deep_gemm_fp8_o_proj(
 
 输出链三步：`fused_inv_rope_fp8_quant` 先把注意力输出上的 RoPE 解开（V4 的 RoPE 在输出侧是可逆的，解完才能与未旋转的 wo_a 权重对齐），顺手做 FP8 量化；`fp8_einsum('bhr,hdr->bhd')` 按组做低秩压缩；`wo_b` 回 hidden。`compute_fp8_einsum_recipe` 按架构选 scale 布局，SM90 与 SM100 的组尺度排布不同，构造期一次定好——顺带解开节选里那个变量名：`tma_aligned_scales` 在 SM100 起为真，意思是 scale 要按 TMA（Hopper 代起的 GPU 异步张量搬运单元，负责给计算单元喂数据）的对齐要求排布。投影链的全貌见下图：
 
-![第三代 MLA 的投影链：低秩进、平台核、低秩出](../diagrams/ch28-fig-mla-gen3-projections.png)
+![第三代 MLA 的投影链：低秩进、平台核、低秩出](../diagrams/ch29-fig-mla-gen3-projections.png)
 
 > *图注：一条横向数据流。hidden 先过 fused_wqa_wkv（标注 disable_tp=True、每卡复制不切 TP），一枪出 q_lora 段与 kv 潜向量段；split 后 fused_q_kv_rmsnorm 双归一；wq_b 上投进虚线框的 eager break 段——平台核 forward_mqa 写入按 padded_heads（64 或 128）预分配的输出缓冲，attn_sink 垫 -inf 的标注挂在旁边，indexer 与 compressor 两支淡化处理（[第 26 章](../../ch26-deepseek-indexer-nsa-dsa/narrative/chapter.md)的主角，本章只画接线位）。输出切片切回真头数（`[:n_local_heads]`）后进输出链：逆 RoPE 加 FP8 量化、fp8_einsum 按组低秩（wo_a）、wo_b 回 hidden。右下注对照 ch25 的 V3.2 外层链：fused_qkv_a_proj 对应 fused_wqa_wkv，差异是 V4 把低秩做到两头。主 KV 账 584B/token 的字节构成也标在图上。*
 
@@ -487,7 +487,7 @@ def deep_gemm_fp8_o_proj(
 
 `compress_ratio <= 1` 的滑窗层主账返回 None（滑窗账在 `DeepseekV4SWACache` 另开）；压缩层报 `MLAAttentionSpec`，fp8_ds_mla 布局要 576 字节页对齐。这一个方法只报了一本账，但 `__init__` 里还建了三本：`compress_ratio == 4` 才建 indexer（连同它的 IndexerCache，`attention.py:L276-L297`）、`compress_ratio > 1` 建 compressor（连同 CompressorStateCache）、每层都建 SWACache。四本账一次看全：
 
-![一个注意力层的四本 KV 账](../diagrams/ch28-fig-four-kv-ledgers.png)
+![一个注意力层的四本 KV 账](../diagrams/ch29-fig-four-kv-ledgers.png)
 
 > *图注：一个注意力层框内四条并排的账本条。主 MLA 账一条 584B/token 的潜向量，按 448B NoPE、128B RoPE、8B fp8 scale 三段着色，spec 是 MLAAttentionSpec（alignment 576、storage_block=block_size//compress_ratio，树内 eval 配置 block-size 256 加 fp8 下 storage_block=64）；IndexerCache 一条 68B 的 FP4 打分缓存（64B 打包值加 4B UE8M0，FP8 版 132B）；CompressorStateCache 一格 fp32 部分状态（块 4 或 8）；SWACache 一格短窗副本（块 64，格数为示意）。右侧三类层小表：C4A（compress_ratio=4）四本全开、C128 三本、C1 滑窗层只开一本。热点注在右下机制注框的末行：后三本的页大小不是自己选的，是「与 KV 块共享同一物理张量、必须同页大小」的约束锁死的（compressor.py 注释大意，原文英文）。spec 自报→账本分组的机制是 ch25 站 6 立的，在旗舰上变成一层的四重奏。*
 
@@ -497,7 +497,7 @@ def deep_gemm_fp8_o_proj(
 
 第 7 站，DecoderLayer 的 FFN 半层。原理节交代过这块积木为什么存在（容量与算力解绑），这里把它的来历、词汇与装配细节讲透。
 
-**MoE（Mixture-of-Experts，混合专家）是什么**。2017 年 Google 的一篇论文（[arXiv:1701.06538](https://arxiv.org/abs/1701.06538)）提出稀疏门控 MoE 层：在层里放几百上千个「专家」FFN，再养一个可训练的「门」（gate）给每个输入打分，只挑分数最高的 k 个专家干活：容量随参数量涨、计算量只随 k 涨，论文做出了最多 137B 参数的 MoE 层、模型容量提升千倍以上而计算效率只受轻微损失。这就是「条件计算」：专家有很多个，每个 token 只咨询少数几个；没被选中的专家对这个 token 完全不跑。本书反复撞到的三个词都出自这套词汇：gate（打分的门）、top-k（每 token 选 k 个）、experts（被挑的 FFN）。所以 MoE 模型的「总参数」和「激活参数」是两个数：V4-Pro 总参 1.6T、每 token 激活 49B；V4-Flash 284B 对 13B（V4 论文摘要口径）。谱系上 Shazeer 2017 立范式、GShard 与 Switch 把它搬进 Transformer FFN 位置并放大到千亿级、DeepSeekMoE 改进「专家怎么切」，前两跳的分布式视角归[第 34 章](../../ch34-distributed-tp-pp-dp-ep/narrative/chapter.md)。
+**MoE（Mixture-of-Experts，混合专家）是什么**。2017 年 Google 的一篇论文（[arXiv:1701.06538](https://arxiv.org/abs/1701.06538)）提出稀疏门控 MoE 层：在层里放几百上千个「专家」FFN，再养一个可训练的「门」（gate）给每个输入打分，只挑分数最高的 k 个专家干活：容量随参数量涨、计算量只随 k 涨，论文做出了最多 137B 参数的 MoE 层、模型容量提升千倍以上而计算效率只受轻微损失。这就是「条件计算」：专家有很多个，每个 token 只咨询少数几个；没被选中的专家对这个 token 完全不跑。本书反复撞到的三个词都出自这套词汇：gate（打分的门）、top-k（每 token 选 k 个）、experts（被挑的 FFN）。所以 MoE 模型的「总参数」和「激活参数」是两个数：V4-Pro 总参 1.6T、每 token 激活 49B；V4-Flash 284B 对 13B（V4 论文摘要口径）。谱系上 Shazeer 2017 立范式、GShard 与 Switch 把它搬进 Transformer FFN 位置并放大到千亿级、DeepSeekMoE 改进「专家怎么切」，前两跳的分布式视角归[第 35 章](../../ch35-distributed-tp-pp-dp-ep/narrative/chapter.md)。
 
 **DeepSeekMoE 切法**（[arXiv:2401.06066](https://arxiv.org/abs/2401.06066)）：两条策略。细粒度专家分割：把专家切得更小更专，每 token 多选几个，同样算力下组合数指数级变多；共享专家隔离：固定留几个共享专家给所有 token 无条件过，兜住通用知识，路由专家只当专才。V4 论文明说沿用这套（§2.1），官方 V4-Flash config 一手：256 个路由专家、每 token 选 6 个、1 个共享专家，单专家中间维 2048（hidden 4096 的一半，「切得细」的直观数据）。路由亲和度从 V3 的 Sigmoid 改成 Sqrt(Softplus(·))，就是代码里的 `scoring_func="sqrtsoftplus"`；训练时激活值做了钳位（论文 §4.2.3 的 SwiGLU Clamping 小节），落进 config 就是 `swiglu_limit=10.0`。这两个「config 里看起来突兀的值」都有官方出处。
 
@@ -587,13 +587,13 @@ class DeepseekV4MoE(nn.Module):
             self._init_fused_moe_experts(vllm_config, config, quant_config, prefix)
 ```
 
-读出五件事。**旋钮**：`use_mega_moe` 只看 `kernel_config.moe_backend` 是不是 `'deep_gemm_mega_moe'`（合法值表在 `vllm/config/kernel.py:L121-L131`，默认 `'auto'`），装配期读一次定终身。**三条守卫**：mega 路必须开专家并行（EP，专家分布多卡而不是复制，与 TP 相对的另一种切法，深讲归[第 34 章](../../ch34-distributed-tp-pp-dp-ep/narrative/chapter.md)）、路由只支持 sqrtsoftplus、专家只支持 fp4。三条 `NotImplementedError` 全部 fail-fast 不静默降级，消息自带修法提示（「加 --enable-expert-parallel，或换个 moe backend」「丢掉这个 backend 配置」）。**gate 是个打分员**：`GateLinear` 输出 fp32 分数，内部还有六级 GEMM 分派（`vllm/model_executor/layers/fused_moe/router/gate_linear.py:L18-L48` 的 docstring 列了 cuteDSL、DSV3 特化核、cuBLAS（NVIDIA 官方的矩阵乘库）到兜底的优先级表）。**两个互斥的路由附件**：hash 层挂 `tid2eid` 查表参数，其余层按 `topk_method=='noaux_tc'` 挂 `e_score_correction_bias` 偏置。**shared_experts 的 reduce_results 跟着后端走**：mega 路为 True、fused 路为 False。这个参数名容易读反：它是 RowParallelLinear「输出归约在这里做」的开关，不是免归约标记。mega 路为 True，TP 切分下 shared 的 down_proj 当场 all_reduce，forward 里那句外部相加拿到手的已是完整和；fused 路为 False，shared 的部分和不在自己这里归约——构造时整个 shared_experts 模块被交进 FusedMoE 工厂，由工厂内部的 runner 与路由专家的输出合并成一次归约。聚合位置两路相反，双后端图里标的就是这个。
+读出五件事。**旋钮**：`use_mega_moe` 只看 `kernel_config.moe_backend` 是不是 `'deep_gemm_mega_moe'`（合法值表在 `vllm/config/kernel.py:L121-L131`，默认 `'auto'`），装配期读一次定终身。**三条守卫**：mega 路必须开专家并行（EP，专家分布多卡而不是复制，与 TP 相对的另一种切法，深讲归[第 35 章](../../ch35-distributed-tp-pp-dp-ep/narrative/chapter.md)）、路由只支持 sqrtsoftplus、专家只支持 fp4。三条 `NotImplementedError` 全部 fail-fast 不静默降级，消息自带修法提示（「加 --enable-expert-parallel，或换个 moe backend」「丢掉这个 backend 配置」）。**gate 是个打分员**：`GateLinear` 输出 fp32 分数，内部还有六级 GEMM 分派（`vllm/model_executor/layers/fused_moe/router/gate_linear.py:L18-L48` 的 docstring 列了 cuteDSL、DSV3 特化核、cuBLAS（NVIDIA 官方的矩阵乘库）到兜底的优先级表）。**两个互斥的路由附件**：hash 层挂 `tid2eid` 查表参数，其余层按 `topk_method=='noaux_tc'` 挂 `e_score_correction_bias` 偏置。**shared_experts 的 reduce_results 跟着后端走**：mega 路为 True、fused 路为 False。这个参数名容易读反：它是 RowParallelLinear「输出归约在这里做」的开关，不是免归约标记。mega 路为 True，TP 切分下 shared 的 down_proj 当场 all_reduce，forward 里那句外部相加拿到手的已是完整和；fused 路为 False，shared 的部分和不在自己这里归约——构造时整个 shared_experts 模块被交进 FusedMoE 工厂，由工厂内部的 runner 与路由专家的输出合并成一次归约。聚合位置两路相反，双后端图里标的就是这个。
 
 两个附件的来历各给一句。`tid2eid`（hash MoE）：V4 论文 §2.1 原话，早期若干层的目标专家「由一个关于输入 token ID 的预定义哈希函数决定」；config 一手 `num_hash_layers=3`。分工是「选谁定死查表、给多少分现算」：专家 id 直接按 token id 索引出来，但权重仍要从 gate 的分数里取（该层 gate 照算，运行幕三有数值实证）。这个思路 2021 年 Meta 的 Hash Layers 就系统研究过（[arXiv:2106.04426](https://arxiv.org/abs/2106.04426)）：免路由参数、免负载均衡损失、免分配算法；它家的经验是「聚焦最局部的特征（token 本身）的均衡随机哈希效果最好」，与 V4 把 hash 路由放在最前几层（最贴近嵌入、上下文最浅的位置）方向一致。为什么只用前几层？论文可见文本没有解释，这里如实交代、不替它补理由。顺带一提代码里那个 `randint`：真实模型的表从 checkpoint 装载，`randint` 只是 dummy 模式（`--load-format=dummy`）的防垃圾值初始化，注释原话就是为了避免垃圾值在空跑时造成非法访存。`e_score_correction_bias`（noaux_tc）：出自 Loss-Free Balancing（[arXiv:2408.15664](https://arxiv.org/abs/2408.15664)，DeepSeek 研究员的免辅助损失负载均衡）——训练时不加辅助损失，只给每个专家的打分动态调一个偏置摁平负载；关键设计是偏置只进「选择」（排序选 top-k）不进「权重」（门控权重仍用无偏分数算），所以不污染模型学到的表征。V3 起定型为 `topk_method='noaux_tc'`，推理期这个偏置冻结成常量。手算实证放运行幕三。
 
 装配判定全场景走一遍（树内测试构造：4 专家 top-2、hash 层 1 个、EP 两卡各得 2 个本地专家、H=I=128（H 即 hidden_size、I 即 MoE 中间维 moe_intermediate_size，E 后文字节账里记专家数）、玩具 vocab=16（vocab 即词表大小）；判定条件与报错消息逐字复刻源码；表尾的 SP 指序列并行，把序列维切块分给各卡，dp 指数据并行（Data Parallel，同一份模型复制多卡、各吃不同数据），深讲归分布式篇；条件里的 ∧ 读「且」（各项同时成立）、∨ 读「或」（任一成立））：
 
-<!-- trace: ch28-m08 -->
+<!-- trace: ch29-m08 -->
 | 场景 | 输入条件 | 装配判定 | 建出的参数（形状） | 后端/报错 |
 |---|---|---|---|---|
 | S1 层0（hash 层） | moe_backend=deep_gemm_mega_moe，EP=on | is_hash_moe=true → tid2eid；dtype=int64 | tid2eid(16,2) int64；gate(128,4) fp32 | MegaMoE(EP)：w13(2,256,64) uint8 + scale(2,256,4)；shared reduce_results=true |
@@ -606,7 +606,7 @@ class DeepseekV4MoE(nn.Module):
 
 装配期的穷举不变量一句话立住：每个 MoE 层恰好建一个 gate、零或一个路由附件（tid2eid 与 bias 由 if/elif 互斥）、恰好一个专家后端（mega 与 fused 二岔恰走一支）、零或一个 shared_experts；mega 一旦成立，EP/sqrtsoftplus/fp4 三前置必须全真，否则在任何专家参数分配之前当场报错、零参数落地。真实旗舰的部署形态树内有账：DeepSeek-V4-Flash 以 `--moe-backend deep_gemm_mega_moe` 加 EP 加 TP=2 跑 GSM8K（一组小学数学应用题的常用基准）的 eval 配置（`tests/evals/gsm8k/configs/moe-refactor/DeepSeek-V4-Flash-deepgemm-mega-moe.yaml`），三条限定全满足的活体。双后端的全貌：
 
-![MoE 双后端：一份 gate，两个专家楼](../diagrams/ch28-fig-moe-dual-backend.png)
+![MoE 双后端：一份 gate，两个专家楼](../diagrams/ch29-fig-moe-dual-backend.png)
 
 > *图注：上半是公共段：hidden 进 gate（fp32 出分）交给 fused_topk_bias（sqrtsoftplus 路由，三个谁打分谁选择谁加权的分工见运行幕三），hash 层用灰色小旁路标「ids 查表免打分」。中间是守卫带：三条 NotImplementedError 消息原文逐字引用，红虚线框标明它们守在专家装配之前。下半左右分岔：左 mega 路进 EP 单算子专家（w13(2,256,64) uint8 字节参数、对称缓冲（多进程对称内存里的预分配工作缓冲，分布式篇展开）按 7 元组键跨层复用、deep_gemm.fp8_fp4_mega_moe 一发算完），shared_experts 在外部相加、reduce_results=true；右 fused 路进通用 FusedMoE 工厂（TP 切专家），is_internal_router 分岔画在工厂内部，shared 聚合位置两路相反。分岔权在 kernel_config.moe_backend，装配期一次定死；底部 SP 门四条件与部署真值（--moe-backend deep_gemm_mega_moe + EP + TP=2）一并标注。*
 
@@ -674,7 +674,7 @@ docstring 把家底交代干净：V4 的线性层与注意力层恒 FP8 block；
 
 量化数学本身（MXFP4 的格点、UE8M0 为什么只有 2 的幂）是[第 27 章](../../ch27-quantization/narrative/chapter.md)的主菜，本章只讲分发与字节。但分发有一个容易踩的坑值得数值实证：同一个 `.scale` 后缀，在两条路径要翻成两套参数名：
 
-<!-- trace: ch28-m11 -->
+<!-- trace: ch29-m11 -->
 | checkpoint 键 | fp4 路径产物 | fp8 路径产物 |
 |---|---|---|
 | layers.3.ffn.experts.17.w1.scale | model.layers.3.ffn.experts.17.w1.weight_scale | model.layers.3.ffn.experts.17.w1.weight_scale_inv |
@@ -749,7 +749,7 @@ docstring 把家底交代干净：V4 的线性层与注意力层恒 FP8 block；
 
 FP4 的完整字节账用实跑立住（树内测试构造：EP 两卡各 2 个本地专家、H=I=128）：
 
-<!-- trace: ch28-m10 -->
+<!-- trace: ch29-m10 -->
 | 条目 | 形状（uint8） | 字节 | 对照/语义 |
 |---|---|---|---|
 | w13_weight | [2,256,64] | 32768 | 两个 fp4 打包一字节（H//2 列） |
@@ -771,7 +771,7 @@ FP4 的完整字节账用实跑立住（树内测试构造：EP 两卡各 2 个�
 
 把字节左移 23 位正好落进 fp32 的指数字段，值等于 $`2^{b-127}`$（b=0 特判为 0）。字节布局的全解剖：
 
-![FP4 专家权重的字节布局与装载纪律](../diagrams/ch28-fig-fp4-byte-layout.png)
+![FP4 专家权重的字节布局与装载纪律](../diagrams/ch29-fig-fp4-byte-layout.png)
 
 > *图注：左上解剖一个专家的 w13 一行：上段 H/2 个「双人格」字节（半格双色，两个 4 位值挤一格），下段 H/32 个 UE8M0 尺度字节（每格标 2 的幂）。右上字节账四行：w13 32768B 加 scale 2048B、w2 16384B 加 1024B、合计 52224B 对 bf16 196608B（3.7647 倍、每值 0.53125B、尺度税 5.88%）。左下 UE8M0 解码表：bytes [0,120,126,127,128] 解码为 [0.0,0.0078125,0.5,1.0,2.0]，公式 (sf.to(int32)<<23).view(float32) 逐字标注；解码表正下方是 copy_ 死亡现场三 case：0.0078125 数值 copy_ 得 0（死，红）、.view(uint8) 保住字节 120（活，绿）、1.0 与 8.0 数值 copy 无损（对照）。右下装载→finalize 流程三站：checkpoint 的 e8m0fnu 经 .view(uint8) 进 uint8 参数，finalize 时变换成 DeepGEMM 布局、四个原参数置 None（箭头标注）；对称缓冲按 7 元组键 (group,device,E,max_tokens,topk,H,I) 跨层复用。*
 
@@ -799,7 +799,7 @@ FP4 的完整字节账用实跑立住（树内测试构造：EP 两卡各 2 个�
         self.w2_weight_scale = None
 ```
 
-装载侧的四个参数在 finalize 后全部置 None，让位给 DeepGEMM 布局的变换视图，显存不双份、所有权清晰；代价是权重热更新与 EPLB 重排要走 `get_expert_weights` 的专用视图（`model.py:L407-L434`）。为什么值得变换成 DeepGEMM 布局？答案在 DeepGEMM 这个外部项目的 Mega MoE 内核（[github.com/deepseek-ai/DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)，项目身份[第 26 章](../../ch26-deepseek-indexer-nsa-dsa/narrative/chapter.md)立过）：它把 EP dispatch、两段线性层（FP8×FP4）、SwiGLU、EP combine 全部融合重叠进单个 mega-kernel，让 NVLink（NVIDIA 显卡之间的专用高速互联）通信与 Tensor Core 计算互相交叠，而常规管线里这五段是多次 kernel 发射加两次通信各跑各的。这能力 2026 年 4 月才加进 DeepGEMM，vLLM 的 mega 路就是它的封装：`finalize_mega_moe_weights` 对应 README 的 `transform_weights_for_mega_moe`，对称缓冲对应 `get_symm_buffer_for_mega_moe`（要求多进程对称内存，概念归[第 34 章](../../ch34-distributed-tp-pp-dp-ep/narrative/chapter.md)），scale 要按 SM100 的 UE8M0 打包格式（回指[第 27 章](../../ch27-quantization/narrative/chapter.md)）。这也解开了装配幕四的悬念：三条守卫里，EP 强制与 fp4-only 的根源就是这块核——对称缓冲要多进程对称内存（EP 的派发与收回都在核内）、算子本身就是 FP8 激活乘 FP4 权重；sqrtsoftplus-only 那条源码没有给根因（`nvidia/model.py:L552-L555` 一句报错、无注释），nvidia 与 xpu 两处同款守卫表明它是 mega 单算子路径族的既定契约；这里如实交代，不替它补理由。[第 27 章](../../ch27-quantization/narrative/chapter.md)立过「量化与 kernel 耦合」的账：离线产什么格式、运行期就吃哪个 kernel；FP4 专家侧的耦合在这里推到极致：格式直接决定能不能走单算子路径。
+装载侧的四个参数在 finalize 后全部置 None，让位给 DeepGEMM 布局的变换视图，显存不双份、所有权清晰；代价是权重热更新与 EPLB 重排要走 `get_expert_weights` 的专用视图（`model.py:L407-L434`）。为什么值得变换成 DeepGEMM 布局？答案在 DeepGEMM 这个外部项目的 Mega MoE 内核（[github.com/deepseek-ai/DeepGEMM](https://github.com/deepseek-ai/DeepGEMM)，项目身份[第 26 章](../../ch26-deepseek-indexer-nsa-dsa/narrative/chapter.md)立过）：它把 EP dispatch、两段线性层（FP8×FP4）、SwiGLU、EP combine 全部融合重叠进单个 mega-kernel，让 NVLink（NVIDIA 显卡之间的专用高速互联）通信与 Tensor Core 计算互相交叠，而常规管线里这五段是多次 kernel 发射加两次通信各跑各的。这能力 2026 年 4 月才加进 DeepGEMM，vLLM 的 mega 路就是它的封装：`finalize_mega_moe_weights` 对应 README 的 `transform_weights_for_mega_moe`，对称缓冲对应 `get_symm_buffer_for_mega_moe`（要求多进程对称内存，概念归[第 35 章](../../ch35-distributed-tp-pp-dp-ep/narrative/chapter.md)），scale 要按 SM100 的 UE8M0 打包格式（回指[第 27 章](../../ch27-quantization/narrative/chapter.md)）。这也解开了装配幕四的悬念：三条守卫里，EP 强制与 fp4-only 的根源就是这块核——对称缓冲要多进程对称内存（EP 的派发与收回都在核内）、算子本身就是 FP8 激活乘 FP4 权重；sqrtsoftplus-only 那条源码没有给根因（`nvidia/model.py:L552-L555` 一句报错、无注释），nvidia 与 xpu 两处同款守卫表明它是 mega 单算子路径族的既定契约；这里如实交代，不替它补理由。[第 27 章](../../ch27-quantization/narrative/chapter.md)立过「量化与 kernel 耦合」的账：离线产什么格式、运行期就吃哪个 kernel；FP4 专家侧的耦合在这里推到极致：格式直接决定能不能走单算子路径。
 
 第二步 finalize 是 hc 首层广播权的预折（`model.py:L1369-L1380`）：把首层混合权沿流维求和存成 `hc_attn_fn_broadcast`。为什么可折、折了省什么，运行幕一讲完 mHC 就明白。
 
@@ -896,9 +896,9 @@ $`X_l`$ 是 $`(n_{hc} \times d)`$ 的多流残差（$`n_{hc}`$ 即 config 的 `h
         return hidden_states
 ```
 
-七件事按出现顺序。embed 出的是普通 2D `(T, H)`，不再显式 repeat，首层核内自己展开（下一段看）。mega 模式下 `input_ids` 先转 int64：hash 层的查表索引要 64 位。序列并行的 `sp_shard` 在入口把序列切碎分给各卡（门与包裹位置装配幕四表里立过，原理归[第 34 章](../../ch34-distributed-tp-pp-dp-ep/narrative/chapter.md)）。主干循环里层与层之间交接的永远是 4 元组 `(hidden_states, residual, post_mix, res_mix)`；hidden_states 恒 2D、多流形态活在 residual 里，这是全干形状主线一句话。`aux_hidden_state_layers` 命中的层中途做一次 `mhc_post` 重建 aux 流再取均值：这是给 EAGLE-3 式 draft 用的。EAGLE-3 是融合目标模型多层特征来预测 token 的投机解码框架（[arXiv:2503.01840](https://arxiv.org/abs/2503.01840)），所以目标模型要在指定深度开窗暴露中间层隐状态，`SupportsEagle3` 基类与这段重建就是它的接口侧；末层命中时结果复用、不重复塌回。PP 非末 rank 以 3D 多流形状直接打包 IntermediateTensors，注释原话「V4 expands the token embedding to hc_mult streams before the first decoder layer and keeps that shape until hc_head() collapses it」（严格说穿层的 hidden_states 是 2D，3D 的是 PP 载荷）。末 rank 层尾三连：`mhc_post` 塌回 3D、**先** `copy_` 进 `_mtp_hidden_buffer`、**再** `hc_head` 压回 2D。顺序是刻意的，暂存的是「还没被输出头定型」的残差，运行幕四看它喂谁。全干形状主线一图收拢：
+七件事按出现顺序。embed 出的是普通 2D `(T, H)`，不再显式 repeat，首层核内自己展开（下一段看）。mega 模式下 `input_ids` 先转 int64：hash 层的查表索引要 64 位。序列并行的 `sp_shard` 在入口把序列切碎分给各卡（门与包裹位置装配幕四表里立过，原理归[第 35 章](../../ch35-distributed-tp-pp-dp-ep/narrative/chapter.md)）。主干循环里层与层之间交接的永远是 4 元组 `(hidden_states, residual, post_mix, res_mix)`；hidden_states 恒 2D、多流形态活在 residual 里，这是全干形状主线一句话。`aux_hidden_state_layers` 命中的层中途做一次 `mhc_post` 重建 aux 流再取均值：这是给 EAGLE-3 式 draft 用的。EAGLE-3 是融合目标模型多层特征来预测 token 的投机解码框架（[arXiv:2503.01840](https://arxiv.org/abs/2503.01840)），所以目标模型要在指定深度开窗暴露中间层隐状态，`SupportsEagle3` 基类与这段重建就是它的接口侧；末层命中时结果复用、不重复塌回。PP 非末 rank 以 3D 多流形状直接打包 IntermediateTensors，注释原话「V4 expands the token embedding to hc_mult streams before the first decoder layer and keeps that shape until hc_head() collapses it」（严格说穿层的 hidden_states 是 2D，3D 的是 PP 载荷）。末 rank 层尾三连：`mhc_post` 塌回 3D、**先** `copy_` 进 `_mtp_hidden_buffer`、**再** `hc_head` 压回 2D。顺序是刻意的，暂存的是「还没被输出头定型」的残差，运行幕四看它喂谁。全干形状主线一图收拢：
 
-![全干形状主线：从 embed 的 2D 到 hc_head 压回的 2D](../diagrams/ch28-fig-trunk-shape-journey.png)
+![全干形状主线：从 embed 的 2D 到 hc_head 压回的 2D](../diagrams/ch29-fig-trunk-shape-journey.png)
 
 > *图注：横幅主线从 embed 到 norm。首层块标 broadcast 特判（x.dim()==2 走 mhc_pre_broadcast_tilelang、核内展开 hc_mult 流、用预折的 fn_broadcast）；每层画成一对半层核芯片（融合核乘二），层间穿四条针线：x 的 2D 粗线、residual 的多流带、post_mix 与 res_mix 细线；某中间层画 aux 重建分叉（蓝虚线：idx+1∈aux_hidden_state_layers 时 mhc_post+mean(dim=1)，EAGLE-3 的开窗）；层尾三连 mhc_post→MTP buffer→hc_head；PP 断点画 rank 边界竖线标 IntermediateTensors 载荷 (T, hc_mult, hidden)。mega 下 input_ids 先 int64 化、SP 时 sp_shard 入口标在起点旁。与下一张图互为表里：本图讲全干形状，那张讲一个 token 在单层里的门控旅程。*
 
@@ -1002,7 +1002,7 @@ def mhc_post_ref(x, residual, post_layer_mix, comb_res_mix):
 
 一个 token 走完整旅程的数值（hc_mult=2、H=2 缩到可手查，注意力与 FFN 两半用固定占位值——mHC 混合不关心 x 从哪来，注意力本体归 ch25/26；数值是对拍基准实跑后按生产语义落 bf16 的值，0.6 显示成 0.6016 是因为 bf16 只有 8 位尾数）：
 
-<!-- trace: ch28-m04 -->
+<!-- trace: ch29-m04 -->
 | 站 | 动作 | 形状变化 | 关键数值（实跑） |
 |---|---|---|---|
 | 1 | 首层 mhc_pre（broadcast）：2D 按流展开 + pre 门控 | x0(1,2) → residual(1,2,2)+post_mix(1,2,1)+res_mix(1,2,2)+layer_input(1,2) | post_mix=[1.3667,1.3345]，layer_input=[1.2422,2.4844]，res_mix=[[0.5056,0.4944],[0.4944,0.5056]] |
@@ -1017,7 +1017,7 @@ def mhc_post_ref(x, residual, post_layer_mix, comb_res_mix):
 
 两行附录各有分量：Sinkhorn 一轮迭代行和偏差就降到 2.47e-4、第二轮起 1e-6，「搬运矩阵不创造不销毁流量」的双随机形态收敛得很快（config 的 20 次是充分到奢侈的取值）；预折等价是装配幕五那步 finalize 的数值背书。形状不变量归纳一句：每半层 4 元组进 4 元组出，三件套形状恒为 residual `(T,hc_mult,H)`、post_mix `(T,hc_mult,1)`、res_mix `(T,hc_mult,hc_mult)`，子层接口恒 2D；hc_head 是唯一收敛算子，一步压回 `(T,H)`。hc_head 自己的数学也在对拍基准里（`test_mhc_kernels.py:L82-L96`）：多流残差先 RMS 归一、乘形状 `(hc_mult, hc_mult·H)` 的可学矩阵 hc_head_fn 得每流分数，sigmoid 加权（hc_head_scale 一个标量做缩放、hc_head_base 每流一个偏置）后沿流维加权求和压回 `(T,H)`——与每半层的门控同构，但没有 A/B/C 三段切片、也没有 Sinkhorn，是出口处一次性的单权混合。单层旅程图：
 
-![一个 token 的多流残差旅程](../diagrams/ch28-fig-mhc-residual-journey.png)
+![一个 token 的多流残差旅程](../diagrams/ch29-fig-mhc-residual-journey.png)
 
 > *图注：上层是 2D 的 x 通路（embed 与注意力、FFN 两个占位子层，子层接口恒 2D）；三座 hc 核塔——首层核（broadcast）、融合核（每半层一个的 mhc_fused_post_pre，post+pre 融一核、RMSNorm weight/eps 进核）、层尾核——纵向贯通，立在通路各节点之间；两个占位子层正下方各挂一组三件套：residual 的两条流带（hc_mult=2）、post_mix 每流一格、res_mix 的 2×2 小方阵。首层核标 broadcast 展开（2D 输入、fn_broadcast 预折权）；注意力与 MoE 两子层画成灰虚线占位框（本体归 ch25/26 与运行幕三）；层尾右侧三连：mhc_post 塌回 3D（residual_out 的实跑值逐流标出）、旁路虚线 copy_ 进 _mtp_hidden_buffer（标 pre-hc_head，MTP 的原料）、主路 hc_head 加权压回 2D（hidden_out=[2.7188,3.25]）。图上全部数值为 hc_mult=2、H=2 的实跑 trace；hc_mult=4 时三件套形状同构放大。*
 
@@ -1174,7 +1174,7 @@ def mhc_post_ref(x, residual, post_layer_mix, comb_res_mix):
 
 C4A 层（带索引器的层）三路并行：默认流跑 `wq_b` 上投加 kv 缓存插入，aux[0] 跑整个索引器、aux[1] 跑压缩机，最后 `forward_mqa` 平台核把注意力写进预分配缓冲。注释给出谱系锚：对齐 TRT-LLM 的 PR #14142 Level 1 方案。捕获期还有一道门：`BreakableCUDAGraphCapture.is_active()` 时 aux 流整体退化为顺序（`vllm/utils/multi_stream_utils.py:L52-L55`），因为捕获窗口内开多流是非法的——breakable cudagraph 与多流 overlap 是一对互相退让的优化。这也解释了骨架那个 `DeepseekV4EagerScratchPool`：eager 段里的分配不经过图缓存，不池化就每拍裸分配。四条泳道的时间线：
 
-![注意力一拍的四泳道时间线](../diagrams/ch28-fig-multistream-timeline.png)
+![注意力一拍的四泳道时间线](../diagrams/ch29-fig-multistream-timeline.png)
 
 > *图注：四条竖直生命线（默认流实心绿、aux0/1/2 虚线灰），共享时间轴纵向下行。第一段输入 GEMM：默认流跑最重的 fused_wqa_wkv（长条），aux0/1/2 各跑一个轻 GEMM（短条），ln_events[0] 是 fan-out 起点、[1..3] 是各 aux 完成事件，join 屏障后 split 加双 rmsnorm 回默认流。中段琥珀色 eager break 背景带横跨全图（捕获图在此断开）：默认流跑 wq_b+qnorm+RoPE+kv_insert，aux0 跑整个 indexer、aux1 跑 compressor、aux2 预留给 indexer 内部 overlap，forward_mqa 在带内收尾。末段 o_proj 回捕获图。两道闸门画在泳道左侧：token 数 ≤1024（VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD，大批关多流）与捕获期强制顺序（BreakableCUDAGraphCapture.is_active）。页脚注明活动条高度为定性时长示意（重 GEMM 长条、轻 GEMM 短条），非实测刻度；谱系锚 TRT-LLM PR #14142 Level 1 与 scratch 池四组 256 对齐草稿区一并标注。*
 
@@ -1298,7 +1298,7 @@ def _topk_softplus_sqrt_torch(
 
 三分离清清楚楚：**打分**用 $`\sqrt{\mathrm{softplus}(g)}`$（softplus 把任意实数映到正数、负分不死只是分低，开方压动态范围）；**选择**用「分数加偏置」的 topk，偏置只决定谁入围；**加权**从无偏分数 gather、归一化后乘 routed_scaling_factor。注释还给了实证：DSv4-Flash 的全部偏置约 8.08、近均匀，若把偏置算进权重会把整个分布压平——这正是 Loss-Free Balancing「偏置只进选择」设计的代码级回声。hash 层的分工也在这里：专家 id 查表定死，分数只用来发工资。手算走一遍（4 专家 top-2、两个 token、renormalize、scaling=1.5；偏置故意设 [0, 0.3, 0, 0] 让 token0 的选择被翻转）：
 
-<!-- trace: ch28-m09 -->
+<!-- trace: ch29-m09 -->
 | token/案例 | scores=sqrt(softplus(g)) | 选择(ids) | 无bias会选 | 权重（无偏gather→归一→×1.5） | 判定 |
 |---|---|---|---|---|---|
 | A·token0（带bias） | [1.2097,0.9243,0.6885,1.4584] | [3,1] | [3,0] | [0.9181,0.5819] | bias=0.3 把 e0 顶掉换 e1 入围（选择翻转） |
@@ -1448,7 +1448,7 @@ def _topk_softplus_sqrt_torch(
 
 draft 侧五步：flat 残差 reshape 回训练期的 3D 形态；`fused_mtp_input_rmsnorm` 一核做完 mask 首位加双归一；`h_proj`（上一拍的残差）加 `e_proj`（本 token 嵌入）两路投影相加。V3 是融合的 eh_proj、V4 拆成两段（源码注释自述）；复用整层 `DeepseekV4DecoderLayer`（含它的 MoE，所以 checkpoint 里每个 MTP 层都背一份完整层权重，缺了直接报错，`mtp.py:L493-L504` 的完整性检查）；返回的还是 flat 的 pre-hc_head 残差，hc_head 被推迟到 draft 自己的 `compute_logits` 里才跑（`mtp.py:L253-L279`：先 `hc_head_fused_kernel_tilelang` 压回稠密 hidden、再过 shared_head 出 logits）。多猜一步时这份 flat 残差还能续喂下一个 spec step。MTP 本身（训练时多预测一步、推理时当草稿模型的来历）[第 26 章](../../ch26-deepseek-indexer-nsa-dsa/narrative/chapter.md)立过，V4 论文 §2.1 原话「沿用 V3 的策略不做修改」；草稿怎么被批量验证、拒绝采样怎么判，归投机解码的两章。钩子三段接力一图收拢：
 
-![MTP 钩子：主干尾部的分叉与 draft 侧的延迟 hc_head](../diagrams/ch28-fig-mtp-hook-fork.png)
+![MTP 钩子：主干尾部的分叉与 draft 侧的延迟 hc_head](../diagrams/ch29-fig-mtp-hook-fork.png)
 
 > *图注：三分区。左（绿）模型层尾部：mhc_post 塌回 3D 后分两路，主路 hc_head→norm→compute_logits 定型出厂，旁路虚线 copy_ 进 _mtp_hidden_buffer（形状 (max_num_batched_tokens, hc_mult×hidden_size)，speculative_config 用 eagle/draft_model 才建）并由 get_mtp_target_hidden_states 暴露。中（品红）runner 段：采样后 getattr 探测的五行代码（注释原话「Let the target override the hidden state fed to the drafter」），双向解耦与缺钩子时 alt=None 的退化路画在框下。右（灰）draft 侧六站：flat 残差 reshape 回 3D→fused_mtp_input_rmsnorm（mask 首位+enorm+hnorm 一核）→h_proj(prev)+e_proj(embed)→复用整层 DecoderLayer→flat 残差（num_speculative_tokens>1 可续喂，回环箭头）→hc_head 画在虚框里标「推迟到 draft 自己的 compute_logits」。底部部署真值：method=mtp、num_speculative_tokens=2（树内 eval 配置）。*
 
@@ -1485,4 +1485,4 @@ draft 侧五步：flat 残差 reshape 回训练期的 3D 形态；`fused_mtp_inp
 
 带四件事走。第一，**装配契约的成色**：模型文件只做层组装加权重名映射，这条 ch23 的判断在旗舰上复验成立；新布局（平台分楼）改的是代码组织，不是契约。第二，**形状旅程的骨架**：2D 进 2D 出、多流活在层间、hc_head 是唯一收敛算子、MTP 钩子在定型前分叉，这是 V4 全部结构创新的形状语言。第三，**路由三分离**：打分（sqrt(softplus)）、选择（带偏置 topk）、加权（无偏 gather 加归一化）各走各路，偏置与 hash 表都不碰权重。第四，**字节纪律**：FP4 的 0.53125 字节每值、e8m0fnu 的按字节装载、finalize 后的原参数清零——量化格式的每一条规矩都长在装载与 kernel 的交界上。
 
-模型层的故事到这里讲完，但这台机器还没跑完一整拍。hc_head 压回的 hidden_states 交给 lm_head 后，出来的是全词表的 logits：129280 个数（约 13 万维，V4-Flash 官方 config 一手）里选 1 个 token 出门，vLLM 把这件事拆成九道关卡，还在主路径上明令弃用 `torch.multinomial`。[下一章](../../ch29-sampler-pipeline/narrative/chapter.md)打开采样出口列：Sampler 的 9 步管线，Part VII「选一个 token 出门」由此开篇。再往后，分布式篇会把本章装配出的整机拆到多卡（EP/SP 的深账在 [第 34 章](../../ch34-distributed-tp-pp-dp-ep/narrative/chapter.md)），部署实战章会把它整台塞进 96 GB 的显卡——这台机器的真正考题，都在后面。
+模型层的故事到这里讲完，但这台机器还没跑完一整拍。hc_head 压回的 hidden_states 交给 lm_head 后，出来的是全词表的 logits：129280 个数（约 13 万维，V4-Flash 官方 config 一手）里选 1 个 token 出门，vLLM 把这件事拆成九道关卡，还在主路径上明令弃用 `torch.multinomial`。[下一章](../../ch30-sampler-pipeline/narrative/chapter.md)打开采样出口列：Sampler 的 9 步管线，Part VII「选一个 token 出门」由此开篇。再往后，分布式篇会把本章装配出的整机拆到多卡（EP/SP 的深账在 [第 35 章](../../ch35-distributed-tp-pp-dp-ep/narrative/chapter.md)），部署实战章会把它整台塞进 96 GB 的显卡——这台机器的真正考题，都在后面。

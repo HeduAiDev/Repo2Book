@@ -83,7 +83,7 @@ example**(2×2 不交换律演示、Llama-2-7B 0.5MB/token 算例)、**补写本
   forward_mqa 双路调度与 Sq/Skv 比值分流、混批 num_mha_tokens/num_mqa_tokens、
   chunked prefill workspace 与 merge_attn_states(ch25);DSV4 第三代 MLA
   (统一 head_dim=512、fp8_ds_mla 584B、compress_ratio、o_lora/o_groups——本论文
-  包止于 V3,以源码为准,ch25 末节/ch28);NSA/DSA 索引器(ch26);FlashAttention
+  包止于 V3,以源码为准,ch25 末节/ch29);NSA/DSA 索引器(ch26);FlashAttention
   kernel 数学(√d 缩放的 softmax 侧,ch20);PagedAttention 分页/账本接入(ch13/
   ch14);KV cache 6-bit 量化(§3.2.3,ch27)。
 - **einsum 头下标修复(重要)**:中断运行遗留的 `"hts,sid->tid"` 把 probs 的头

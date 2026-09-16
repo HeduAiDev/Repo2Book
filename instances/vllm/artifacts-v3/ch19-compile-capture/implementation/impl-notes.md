@@ -42,7 +42,7 @@
 | `v1/cudagraph_dispatcher.py` | `vllm/v1/cudagraph_dispatcher.py` | CudagraphDispatcher 全类（delete[2] LoRA 专化路径删净）；上游 tests/v1/cudagraph/test_cudagraph_dispatch.py 的 dispatch/capture-descs 用例在本书 tests 镜像复证 |
 | `v1/worker/worker_base.py` | `vllm/v1/worker/worker_base.py` | CompilationTimes NamedTuple；WorkerBase 控制面 ch17 域删 |
 | `v1/worker/gpu_model_runner.py` | `vllm/v1/worker/gpu_model_runner.py` | 执行形态 spans：padding 四件套（四个载体方法）、一拍裁决（_determine_batch_execution_and_padding 全文 + execute_model 两个 pinned 段 + _model_forward + _is_uniform_decode + _pad_for_sequence_parallelism）、捕获编排（capture_model/_warmup_and_capture/_capture_cudagraphs/_freeze_gc）、load_model 尾段 FULL wrapper 挂载、_check_and_update_cudagraph_mode 最弱链、_get_slot_mappings 全文 |
-| `v1/worker/gpu_worker.py` | `vllm/v1/worker/gpu_worker.py` | Worker.compile_or_warm_up_model 启动编排全文（delete[7] 的 startup_plan/KV 建议段与 V2 分支删、@instrument 观测删）；Worker 其余 ch17/ch34 域删 |
+| `v1/worker/gpu_worker.py` | `vllm/v1/worker/gpu_worker.py` | Worker.compile_or_warm_up_model 启动编排全文（delete[7] 的 startup_plan/KV 建议段与 V2 分支删、@instrument 观测删）；Worker 其余 ch17/ch35 域删 |
 | `_host_seams.py` | （跨域缝合，见 §Seam 清单） | HOST SEAM 登记处 |
 
 ## 1:1 Source Map（精简版 ↔ 真实源码 ↔ 改动 ↔ 原因；核心行）
@@ -60,7 +60,7 @@
 | `Attention.forward` | attention.py:L488-L582 | 逐字（kv_sharing 两处守卫随 delete[10] 删） | must_keep（m05 out-variant） |
 | `unified_kv_cache_update`(+fake+注册) | attention.py:L775-L814 | **逐字** | must_keep（m05 dummy 依赖保序） |
 | `unified_attention_with_output`(+fake+注册) | attention.py:L817-L867 | **逐字** | must_keep（m05 统一算子） |
-| `get_attention_context` | attention.py:L732-L772 | **逐字**（含 DBO list 支——spec decode 回指 ch33） | must_keep（m04 消费口） |
+| `get_attention_context` | attention.py:L732-L772 | **逐字**（含 DBO list 支——spec decode 回指 ch34） | must_keep（m04 消费口） |
 | `BatchDescriptor` / `ForwardContext` / `set_forward_context` | forward_context.py:L29-L58 / L131-L193 / L259-L344 | 逐字 minus delete[8]（batchsize 统计/SP 扩展/MoE 计数器族） | must_keep ×5 |
 | `should_split` | compilation/partition_rules.py:L14-L38 | **逐字** | must_keep（m08 切点判定） |
 | `split_graph` | compilation/backends.py:L553-L627 | 逐字 minus delete[4]（_decompose_size_nodes/_merge_empty_only_subgraphs 及调用行） | must_keep（m08）；tests 保留多切点样例证切图仍正确 |
@@ -131,8 +131,8 @@
   选择/impl 构造（attn.impl/attn.attn_backend 由调用方/测试注入——ch21 接口）。
 - **ch13-16**：get_kv_cache_spec/KV cache 初始化/connector。
 - **ch22**：slot_mapping 的 Triton 数学（本章只留尾部 -1 pad 段）。
-- **ch33**：spec decode/drafter 尾段、DBO（ubatch_slices 构造消费点）。
-- **ch34**：DP 对齐全貌（coordinate_batch_across_dp HOST SEAM 结构洞——单 DP 部署
+- **ch34**：spec decode/drafter 尾段、DBO（ubatch_slices 构造消费点）。
+- **ch35**：DP 对齐全貌（coordinate_batch_across_dp HOST SEAM 结构洞——单 DP 部署
   不可达）。
 - **m17 路线图脚注**：BreakableCUDAGraph/use_inductor_graph_partition 只留 env 门与
   分支删除注记（正文脚注素材，不进正典链）。
@@ -150,7 +150,7 @@
   CPU 注册面）；"CUDA" 面是 vllm 容器域。
 - **distributed**：graph_capture（nullcontext=非 CUDA no-op 支）/get_world_group/
   is_global_first_rank/get_pp_group；`coordinate_batch_across_dp` 结构洞
-  （DP>1 不可达即 raise——ch34 域）。
+  （DP>1 不可达即 raise——ch35 域）。
 - **UBatchSlices**：DBO 注记占位类型。
 - **kernel_warmup**：no-op（kernel 调优域，调用位保留在编排序里）。
 - **ir**：vllm.ir 的 IrOp 包装面——RMSNorm forward_native 的引用目标；**native 数学

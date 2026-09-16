@@ -2,7 +2,7 @@
 """ch27 机制图 8 · 两级 scale:FP4 的一把秤称不动整张权重(figure_spec ch27-fig-two-level-scale,模板 before-after)
 
 放大自 L0 GPU 执行臂(绿)第三块『模型层 forward + 编译』里量化 Linear 的权重格式——
-modelopt.py 装载的 NVFP4 三件套就是这两级秤。推导链第 8 环,直供 ch28,不画架构元素。
+modelopt.py 装载的 NVFP4 三件套就是这两级秤。推导链第 8 环,直供 ch29,不画架构元素。
 
 claim:e2m1 只有 16 个格点(块内动态范围 6/0.5=12):单级全局 scale 下,16 值全 ~0.1 的
 小块在张量 amax=6 的尺子上全部坍缩到 0(平均误差 0.0983);两级(块 scale e4m3 × 全局
@@ -157,7 +157,7 @@ lc.text(MX + 16, BY + 20, '分组思想的论文账(GPTQ §5):粒度是买来的
         lc.C_TXT, 'start', True, maxw=1340, tag='nt:h')
 lc.text(MX + 16, BY + 42, 'group-size 1024 ≈ 每 权重 0.02 额外 bit · g128 ≈ 0.15 额外 bit · Table 7:2-bit 下 g128 9.58 → g32 8.94(Wiki2 PPL,更低更好)',
         8.5, '#334155', 'start', maxw=1340, tag='nt:l1')
-lc.text(MX + 16, BY + 62, '两级 scale 的这套词汇(QuantKey 的 scale + scale2)直通 ch28:DSV4-Flash 的 FP4 MoE capstone(预告)',
+lc.text(MX + 16, BY + 62, '两级 scale 的这套词汇(QuantKey 的 scale + scale2)直通 ch29:DSV4-Flash 的 FP4 MoE capstone(预告)',
         8.5, '#334155', 'start', maxw=1340, tag='nt:l2')
 
 lc.text(MX, BY + 116, '格式出处:OCP MX / NVIDIA Blackwell(不在论文包) · 格点为按规范位级枚举 · 论文账 arXiv:2210.17323 §5 · 行号基线 vLLM v0.27.1',

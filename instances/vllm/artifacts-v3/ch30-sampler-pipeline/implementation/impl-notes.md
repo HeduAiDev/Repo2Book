@@ -1,4 +1,4 @@
-# impl-notes — v3 ch29《Sampler 9 步管线》(Part VII)
+# impl-notes — v3 ch30《Sampler 9 步管线》(Part VII)
 
 标准代码章（非 primer）：对 vLLM **v0.27.1（6e448d0ea）** 的只做减法精简版——
 同名、同结构、同控制流；只删 dossier `subtraction_plan.delete` 批准项，
@@ -22,7 +22,7 @@ v0.27.1 现核，v2 资产旧行号未沿用），删除处标 `# SUBTRACTED:`�
 - `vllm/v1/sample/ops/logprobs.py` —— rank 不排序计数（m16）。
 - `vllm/v1/sample/logits_processor/{__init__,interface,builtin,state}.py` ——
   argmax 不变性二分（m2）：两列分类容器、三件套构造器/声明/apply、
-  build_logitsprocs（spec 互斥警告前指 ch32/33）+ 插件/FQCN 加载链。
+  build_logitsprocs（spec 互斥警告前指 ch33/33）+ 插件/FQCN 加载链。
 - `vllm/model_executor/layers/utils.py` —— 惩罚真算式（m6：scatter_add_ 计数
   + OpenAI 两式 + repetition 自定义 op 调用）。
 - `vllm/v1/outputs.py` —— LogprobsLists/LogprobsTensors/SamplerOutput 出件载体。
@@ -109,18 +109,18 @@ requirements/cuda.txt」）；conftest 默认设 0 走真实禁用支路（L45-L
 | `layers/utils.get_token_bin_counts_and_mask`/`apply_penalties` | vllm/model_executor/layers/utils.py:L34-L89 | 无（逐字；repetition 的 torch.ops._C 经 HOST SEAM _custom_ops 退化） | 惩罚真算式（OpenAI 两式+正除负乘） |
 | `logits_processor.state.LogitsProcessors` | vllm/v1/sample/logits_processor/state.py:L148-L166 | 删同文件 BatchUpdateBuilder L18-145 | delete[6]；两列分类容器是 m2 结构基础、逐字保留 |
 | `logits_processor.builtin.{MinP,MinTokens,LogitBias}*` | vllm/v1/sample/logits_processor/builtin.py:L23-L233 | 删三组 update_state/add_request/process_dict_updates/apply_with_spec_decode | delete[6]/[2]；构造器+_device_tensor+is_argmax_invariant+apply 全保留（计划禁删清单） |
-| `logits_processor.__init__.build_logitsprocs` | vllm/v1/sample/logits_processor/__init__.py:L185-L218 | 无（逐字） | BUILTIN 三件套构造入口+spec 互斥警告（m17 前指 ch32/33） |
+| `logits_processor.__init__.build_logitsprocs` | vllm/v1/sample/logits_processor/__init__.py:L185-L218 | 无（逐字） | BUILTIN 三件套构造入口+spec 互斥警告（m17 前指 ch33/33） |
 | `metadata.SamplingMetadata` | vllm/v1/sample/metadata.py:L14-L49 | 删 L51-55 两旁路字段+L11 import | delete[2]/[1]；19 字段−2=17 字段（v0.21→v0.27 快照字段零增长，WC4） |
 | `ops.topk_topp_triton.apply_top_k_top_p_triton` | vllm/v1/sample/ops/topk_topp_triton.py:L856-L957 | 无（整文件逐字+4 行 SOURCE 标记） | must_keep「整文件保留」；m12 只讲外部契约 |
 | `v1.outputs.{LogprobsTensors,SamplerOutput}` | vllm/v1/outputs.py:L28-L79/L212-L220 | 删 filter/cat/empty_cpu 与文件其余类 | 出件载体面；D2H 装配归 ch8 |
 
 ## 测试与运行
 
-- host：`python -m pytest instances/vllm/artifacts-v3/ch29-sampler-pipeline/tests -q`
+- host：`python -m pytest instances/vllm/artifacts-v3/ch30-sampler-pipeline/tests -q`
   → **82 passed, 1 skipped**（skip=flashinfer 容器专属，host 未装）。
 - GPU 容器（flashinfer 在场）：
   `MSYS_NO_PATHCONV=1 VLLM_IMAGE=vllm/vllm-omni:latest bash scripts/vllm_docker.sh
-  -m pytest /work/instances/vllm/artifacts-v3/ch29-sampler-pipeline/tests -q`
+  -m pytest /work/instances/vllm/artifacts-v3/ch30-sampler-pipeline/tests -q`
   → **83 passed**（真跑 flashinfer 三 API 分支 + forward_cuda 绑定正支路）。
 - 结果台账：`tests/test-report.json`。
 - 行为基准全部对真实源码现核：允许掩码极性（gpu_input_batch.py:L282-L283

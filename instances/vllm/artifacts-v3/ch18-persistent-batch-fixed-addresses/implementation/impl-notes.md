@@ -20,7 +20,7 @@
 
 | 精简版文件 | 真实文件 | 本章切面 |
 |---|---|---|
-| `output.py` | `vllm/v1/core/sched/output.py` | 差量协议三类载体全文：NewRequestData（新请求全量）/ CachedRequestData（老请求 diff + resumed 语义注释 L118-L121）/ SchedulerOutput（协议二分头 L193-L205，含 v0.27 新增的 new_block_ids_to_zero/kv_cache_block_copies/partial_tail_offloads 字段全保留）+ ScheduledEncoderInputStats。删除仅 from_request（scheduler 侧构造面，ch10/ch12 域）与 GrammarOutput（ch30 域） |
+| `output.py` | `vllm/v1/core/sched/output.py` | 差量协议三类载体全文：NewRequestData（新请求全量）/ CachedRequestData（老请求 diff + resumed 语义注释 L118-L121）/ SchedulerOutput（协议二分头 L193-L205，含 v0.27 新增的 new_block_ids_to_zero/kv_cache_block_copies/partial_tail_offloads 字段全保留）+ ScheduledEncoderInputStats。删除仅 from_request（scheduler 侧构造面，ch10/ch12 域）与 GrammarOutput（ch31 域） |
 | `gpu_model_runner.py` | `vllm/v1/worker/gpu_model_runner.py` | 本章舞台类 GPUModelRunner 全切面（下表逐方法）；ExecuteModelState 十字段 NamedTuple 逐字 |
 | `gpu_input_batch.py` | `vllm/v1/worker/gpu_input_batch.py` | 持久批次容器全文：CachedRequestState + InputBatch（token_ids_cpu R×L 布局、列式 CPU 镜像、采样参数列、add/remove/condense/swap_states/refresh_metadata、_make_sampling_metadata、异步三件 update_async_*、property 族） |
 | `block_table.py` | `vllm/v1/worker/block_table.py` | BlockTable/MultiGroupBlockTable 全方法 + Triton kernel `_compute_slot_mapping_kernel` **逐字**（delete[8] 明示 kernel 本体不动、hybrid 细分与 CP 局部量原样保留）；仅加 CPU host 镜像 seam |
@@ -29,8 +29,8 @@
 | `metadata.py` | `vllm/v1/sample/metadata.py` | SamplingMetadata 纯 dataclass 逐字（refresh_metadata 产出型） |
 | `logits_processor/interface.py` | `vllm/v1/sample/logits_processor/interface.py` | MoveDirectionality / BatchUpdate / LogitsProcessor ABC |
 | `logits_processor/state.py` | `vllm/v1/sample/logits_processor/state.py` | BatchUpdateBuilder 全文逐字（removed 恒降序/pop_removed/peek_removed）+ LogitsProcessors |
-| `logits_processor/__init__.py` | `vllm/v1/sample/logits_processor/__init__.py` | re-export + build_logitsprocs（pooling 短路支逐字；BUILTIN 链归 ch30，空集承载同调用面） |
-| `ngram_proposer_gpu.py` | `vllm/v1/spec_decode/ngram_proposer_gpu.py` | update_scheduler_for_invalid_drafts **全文逐字**（must_keep；可变性裁决的就地裁剪实现）；NgramProposerGPU drafter 类归 ch33 |
+| `logits_processor/__init__.py` | `vllm/v1/sample/logits_processor/__init__.py` | re-export + build_logitsprocs（pooling 短路支逐字；BUILTIN 链归 ch31，空集承载同调用面） |
+| `ngram_proposer_gpu.py` | `vllm/v1/spec_decode/ngram_proposer_gpu.py` | update_scheduler_for_invalid_drafts **全文逐字**（must_keep；可变性裁决的就地裁剪实现）；NgramProposerGPU drafter 类归 ch34 |
 | `math_utils.py` / `torch_utils.py` | `vllm/utils/math_utils.py` / `.../torch_utils.py` | cdiv / PIN_MEMORY（消费面） |
 | `_host_seams.py` | （跨域缝合，见 §Seam 清单） | HOST SEAM 登记处 |
 
@@ -86,7 +86,7 @@
    DMA、等待即刻满足（完成时刻是同步的）；record/synchronize 的**调用顺序**（m13 防踩
    协议）以计数器观测（test_synchronize_input_prep 断言「先等后录」）。
 2. **前向 ENGINE SEAM**（ch17 边界、ch12 同款）：真实 L4255-L4514 的
-   cascade/DBO/cudagraph/ubatch/attention-metadata/前向段归 ch19/ch21/ch22/ch34；精简版以
+   cascade/DBO/cudagraph/ubatch/attention-metadata/前向段归 ch19/ch21/ch22/ch35；精简版以
    `enqueue_logits()` 测试钩子 + `_seam_model_forward()` 脚本化 logits 行承载
    （每请求一行 [vocab] 张量），`hidden_states/sample_hidden_states/aux_hidden_states/
    ec_connector_output/cudagraph_stats/slot_mappings/kv_connector_output` 以 None 绑定
@@ -101,7 +101,7 @@
    镜像（同一恒等式 slot = 块号×block_size+块内偏移、同一 PAD 尾、同一 CP 变量名与单卡退化）；
    CUDA 设备分支 kernel 派发逐字保留（容器内真跑）。ch13 差分电池同款手法。
 6. **`LateInteractionRunner` / `KVBlockZeroer` / `ThinkingBudgetStateHolder` / `build_logitsprocs`**：
-   调用面/构造面逐字保留、域外本体 no-op（ch29/ch14/ch30 域）——delete[2][6] 防悬空条款的
+   调用面/构造面逐字保留、域外本体 no-op（ch30/ch14/ch31 域）——delete[2][6] 防悬空条款的
    承载侧。
 7. **配置/环境占位**：`PIN_MEMORY=False`（host 无 pinned；行为分支无涉，只影响拷贝速度）、
    envs 三剖面开关默认 False、distributed group 面（单机单卡 world_size=1 / is_last_rank=True，
@@ -116,7 +116,7 @@
 ## 已知偏差（非 seam 的显式记录）
 
 - `_update_states_after_model_execute` 保留签名、方法体以 `return None` 承载（mamba 对齐
-  GPU 后处理与 num_accepted 记账归 ch14/ch33；精简配置 spec=None 下真实首行守卫即返回，
+  GPU 后处理与 num_accepted 记账归 ch14/ch34；精简配置 spec=None 下真实首行守卫即返回，
   行为等价）。
 - `sample_tokens` 异步支（use_async_scheduling=True）返回同步形态 ModelRunnerOutput——
   AsyncGPUModelRunnerOutput 包裹协议 ch12 已全文立；本章保留 _bookkeeping_sync 的 async

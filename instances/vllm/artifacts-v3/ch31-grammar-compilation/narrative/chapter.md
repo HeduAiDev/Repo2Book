@@ -1,4 +1,4 @@
-# 第 30 章　约束解码 I：语法编译
+# 第 31 章　约束解码 I：语法编译
 
 用户只给了一句话：「必须输出合法 JSON」。或者一条正则、一个候选列表、一份 schema。可采样器认识的只有 logits：从约 13 万个分数里挑一个 token 出门。这句人话怎么变成每个采样位置上「哪些 token 合法」的判定？
 
@@ -10,9 +10,9 @@
 
 ## 你在这里
 
-![L2 章图：约束解码 I 语法编译](../diagrams/L2-ch30.png)
+![L2 章图：约束解码 I 语法编译](../diagrams/L2-ch31.png)
 
-> *图注：本章放大的是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 图采样出口列里那块「结构化输出位掩码」（图面块名；本书行文与 L2 图顶带称结构化输出组，同一块），就是那张图里画在采样器下方、写入却在采样之前先行的那块位掩码，[第 29 章](../../ch29-sampler-pipeline/narrative/chapter.md)门口第 1 站交接点 `apply_grammar_bitmask` 的上游。三块已读地基直接踩上来：采样列 9 步管线与 `allowed_token_ids` 白名单（[第 29 章](../../ch29-sampler-pipeline/narrative/chapter.md)，白名单是「不带状态机的粗粒结构化输出」，本章是它的完全体）；五拍循环第三拍的掩码窗口（[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)，掩码藏进前向窗口的位置账）；阻塞态与侧队机制（[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)，本章只是它的一次实例化）。读图：上排是请求进出条，中排 ①-⑥ 是语法对象的一生，下排是两层契约与四后端对照。站号 = 请求流经代码的顺序：第 1 站在前端进程（请求还没进引擎），第 2-8 站在引擎进程（IO 线程→编译线程→调度器）；正文按讲解需要编排、不必照站号读。*
+> *图注：本章放大的是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 图采样出口列里那块「结构化输出位掩码」（图面块名；本书行文与 L2 图顶带称结构化输出组，同一块），就是那张图里画在采样器下方、写入却在采样之前先行的那块位掩码，[第 30 章](../../ch30-sampler-pipeline/narrative/chapter.md)门口第 1 站交接点 `apply_grammar_bitmask` 的上游。三块已读地基直接踩上来：采样列 9 步管线与 `allowed_token_ids` 白名单（[第 30 章](../../ch30-sampler-pipeline/narrative/chapter.md)，白名单是「不带状态机的粗粒结构化输出」，本章是它的完全体）；五拍循环第三拍的掩码窗口（[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)，掩码藏进前向窗口的位置账）；阻塞态与侧队机制（[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)，本章只是它的一次实例化）。读图：上排是请求进出条，中排 ①-⑥ 是语法对象的一生，下排是两层契约与四后端对照。站号 = 请求流经代码的顺序：第 1 站在前端进程（请求还没进引擎），第 2-8 站在引擎进程（IO 线程→编译线程→调度器）；正文按讲解需要编排、不必照站号读。*
 
 读法建议：想知道「为什么是掩码不是重试」的原理账，直奔[「掩码不是重试」](#掩码不是重试采样前把非法-token-掐掉)；被「四家后端怎么选」困扰的，跳[「auto 降级阶梯」](#auto-降级阶梯校验期一次定终身)和[「四家后端，同一份契约」](#四家后端同一份契约分歧点对照)；本章的命门是异步编译门，在[「侧队与百微秒门控」](#第-56-站侧队与百微秒门控没编完的不进批也拖不住别人)；思考模型怎么跟语法联动，看[「先想后说的门」](#先想后说的门思考模型联动)；想跟全程，按序读。
 
@@ -20,7 +20,7 @@
 
 ## 掩码不是重试：采样前把非法 token 掐掉
 
-先还一张欠条。[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)拆五拍循环时在第三拍埋过一个窗口：同一行 logits，先被掩码改写、再采样，实测 argmax 从 5 号翻到 4 号。当时只给了掩码的**用法**，把「这张每 token 一位的允许表从哪来」留给了 Part VII；[第 29 章](../../ch29-sampler-pipeline/narrative/chapter.md)走到采样列门口又复述了一遍：用户给的是一段 JSON schema 或一条正则，它怎么变成每个位置上「哪些 token 合法」的判定？本章开始还账，先还前半：语法怎么编译、后端怎么选、编译怎么不挡路。后半（状态机怎么逐拍填表、掩码怎么在 GPU 前向窗口里算完传完盖完）是下一章的事。
+先还一张欠条。[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)拆五拍循环时在第三拍埋过一个窗口：同一行 logits，先被掩码改写、再采样，实测 argmax 从 5 号翻到 4 号。当时只给了掩码的**用法**，把「这张每 token 一位的允许表从哪来」留给了 Part VII；[第 30 章](../../ch30-sampler-pipeline/narrative/chapter.md)走到采样列门口又复述了一遍：用户给的是一段 JSON schema 或一条正则，它怎么变成每个位置上「哪些 token 合法」的判定？本章开始还账，先还前半：语法怎么编译、后端怎么选、编译怎么不挡路。后半（状态机怎么逐拍填表、掩码怎么在 GPU 前向窗口里算完传完盖完）是下一章的事。
 
 ### 语法编译成什么：一台只往前走的状态机
 
@@ -45,7 +45,7 @@ p_{\mathrm{mask}}(x)=\frac{p(x)\cdot\mathbf{1}[x\in A(s)]}{\sum_{x'\in A(s)}p(x'
 
 其中 $`\mathbf{1}[\cdot]`$ 是指示函数，方括号里的条件成立取 1、否则取 0。工程上不用真做这套归一化：把非法位的 logit 写成 −inf，softmax 之后它的概率恰好为零，归一化自动完成，采样器一行不用改。每步采样必落在 $`A(s)`$ 内，采完 FSM 前进到新状态、下一拍对新状态再掩码——链式保证整串合法。
 
-这条 why 链的完整四要素。**旧设计**：两条朴素路——a) 「生成→校验→重采样」循环，每步多轮 GPU 前向、延迟成倍；b) v0 早期 outlines 集成的形态：每步在 CPU 枚举合法 token id 列表传给采样器，合法集是 list[int]。**痛点**：词表 13 万，枚举/序列化合法集本身就有 O(V) 开销，一个 Python list 没法与批处理 GPU 管线拼合；重试路径根本不保证有限步终止，每轮重试还多一次 GPU 前向。**v1 方案**：语法编译成 FSM，每步 `fill_next_token_bitmask` 在预分配的位掩码上标记非法 token，掩码传到 worker 侧把非法 logits 原位写 −inf（`vllm/v1/structured_output/backend_xgrammar.py:L78-L126` 编译、采样侧执法是[第 29 章](../../ch29-sampler-pipeline/narrative/chapter.md)站 1 交接点）。**代价**（诚实账）：FSM 活在调度器进程，每步一次 CPU FSM 走查加一次跨进程传输；位掩码在 worker 侧常驻一份显存，且每步还要过一遍 H2D（host-to-device，主机内存到显存的拷贝；下一章的账）；xgrammar 啃不动的 JSON 特性直接拒单（下文降级阶梯）；掩码写入发生在采样管线之前，与惩罚/bad_words 的先后顺序是一条隐式契约。
+这条 why 链的完整四要素。**旧设计**：两条朴素路——a) 「生成→校验→重采样」循环，每步多轮 GPU 前向、延迟成倍；b) v0 早期 outlines 集成的形态：每步在 CPU 枚举合法 token id 列表传给采样器，合法集是 list[int]。**痛点**：词表 13 万，枚举/序列化合法集本身就有 O(V) 开销，一个 Python list 没法与批处理 GPU 管线拼合；重试路径根本不保证有限步终止，每轮重试还多一次 GPU 前向。**v1 方案**：语法编译成 FSM，每步 `fill_next_token_bitmask` 在预分配的位掩码上标记非法 token，掩码传到 worker 侧把非法 logits 原位写 −inf（`vllm/v1/structured_output/backend_xgrammar.py:L78-L126` 编译、采样侧执法是[第 30 章](../../ch30-sampler-pipeline/narrative/chapter.md)站 1 交接点）。**代价**（诚实账）：FSM 活在调度器进程，每步一次 CPU FSM 走查加一次跨进程传输；位掩码在 worker 侧常驻一份显存，且每步还要过一遍 H2D（host-to-device，主机内存到显存的拷贝；下一章的账）；xgrammar 啃不动的 JSON 特性直接拒单（下文降级阶梯）；掩码写入发生在采样管线之前，与惩罚/bad_words 的先后顺序是一条隐式契约。
 
 配上实测。手工构造一行 logits，让非法 token 得分最高（gpt2 词表 50257，`####` 是词表里真实存在但语法外的 token）：
 
@@ -59,7 +59,7 @@ p_{\mathrm{mask}}(x)=\frac{p(x)\cdot\mathbf{1}[x\in A(s)]}{\sum_{x'\in A(s)}p(x'
 
 位置 0 为什么恰好允许 5 个 token？`choice ["yes","no"]` 的合法开头是 y 和 n 两个字符，但 gpt2 词表里 `no`、`ye`、`yes` 本身各是一个 token——**FSM 按 token 接受，一个 token 可以一口吃掉多个字符**，所以位置 0 的合法集是 choice 的前缀闭包：77('n')、88('y')、3919('no')、5948('ye')、8505('yes')，恰好五个。5/50257 ≈ 0.01%：若模型对约束一无所知（分布近似均匀），自由采样踩非法 token 的概率约 99.99%；本例又构造了非法位得分最高，argmax 必错。掩码一盖，一步翻正。
 
-![概念链：choice 到位掩码到 argmax 翻转](../diagrams/ch30-fig-concept-chain.png)
+![概念链：choice 到位掩码到 argmax 翻转](../diagrams/ch31-fig-concept-chain.png)
 
 > *图注：从用户一句话到 logits 上的一次预过滤，全程五步。上带是编译段（每个语法一次）：choice 改写成 EBNF、编译成 FSM、FSM 在位置 0 算出词表上的合法集（50257 个 token 只剩 5 个）；下带是应用段（每个采样位置一次）：合法集打包成一行 1571 个 int32 的位掩码，bit=0 的位在采样前写 −inf，argmax 从 4242('####', 5.0) 翻到 8505('yes', 2.0)。底部对照重试法：落在非法集的概率非零就可能永远落错，不保证有限步终止。本图收「允许表从哪来」的前半，逐拍填表与 GPU 窗口归下一章。*
 
@@ -265,7 +265,7 @@ def get_structured_output_key(params: StructuredOutputsParams) -> StructuredOutp
 
 骨架一句话：**auto 不是运行期试错，是校验期一次定终身**。先试 xgrammar（试编 + JSON 特性预检），`ValueError` 则查两个 skip 判据再决定降 guidance 还是跳级降 outlines；显式指定后端时不做任何降级，编不动就拒单。两个判据：`_is_non_tekken_mistral`（tekken 是 Mistral 较新的 tiktoken 系分词器，tiktoken 即 OpenAI 开源的那套 BPE 分词器实现；**非** tekken 的老 SentencePiece 系 Mistral 分词器与 guidance 的分词器包装不兼容，这类请求跳过 guidance）和 `has_guidance_unsupported_json_features`（schema 特性扫描）。LMFE（lm-format-enforcer，开篇四家里的第四家，下文用缩写）不在 auto 的选项里——源码 auto 分支只有 xgrammar→guidance/outlines 三条路，LMFE 只能显式点名使用；它也是四家里唯一不开投机解码的一家（引擎侧编译期即拒，为什么，第 4 站展开）。
 
-![auto 降级阶梯](../diagrams/ch30-fig-auto-ladder.png)
+![auto 降级阶梯](../diagrams/ch31-fig-auto-ladder.png)
 
 > *图注：auto 的决策树，全部发生在前端校验期（请求还没进引擎）。六形态入口先过「试编 xgrammar」菱形：试编成功且 JSON 特性预检通过，落 `_backend=xgrammar`；ValueError 则查两个 skip 判据（非 tekken Mistral 分词器、guidance 不支持的 schema 特性），命中任一降 outlines，都不命中降 guidance。旁栏是四个显式后端分支与引擎级单后端的冲突拒单。三例实测：choice [yes,no] 编得过 → xgrammar；json 带 multipleOf=5（xgrammar 预检不过）→ guidance；json {"a":{"type":"integer"}} → xgrammar 直接过。能力差异暴露在校验期（拒单或降级）而非运行中段。*
 
@@ -572,7 +572,7 @@ class StructuredOutputBackend(ABC):
 
 为什么恰好是这两层：**重的东西全引擎一份，轻的东西每请求一个**。编译要为 FSM 每个状态算出词表上的可接受集合，是一次性的重活，编译器（带缓存）与词表（分词器）归引擎级 Backend；逐 token 推进的状态机每请求独立行走，归请求级 Grammar。请求级六方法各有分工：`accept_tokens` 是真推进（第 7 站唯一写者用它）、`validate_tokens` 是不推进的试走、`rollback` 是回退、`fill_bitmask` 是与采样的唯一接口、`is_terminated` 判终态、`reset` 归零。诚实交代一处：`reset` 在 v0.27.1 全仓没有引擎侧调用者（只有各后端内部用），它在契约里是完整性存在，别脑补使用场景。这份六方法契约也是 vLLM 能一个接口收编四家的原因：不管机器内部是 DFA、下推还是 Earley，对外的接口都是「喂 token、问允许集、回退 N 步」。
 
-![两层契约](../diagrams/ch30-fig-two-layer-contract.png)
+![两层契约](../diagrams/ch31-fig-two-layer-contract.png)
 
 > *图注：引擎级 Backend 全引擎一份：三字段（vllm_config/tokenizer/vocab_size，四个后端的构造签名由此固定）加三方法（compile_grammar/allocate_token_bitmask/destroy），怀里抱着 GrammarCompiler（LRU+512MB 字节预算缓存）与词表这类重资源，首个结构化请求到达时定型。请求级 Grammar 每请求一个：六方法加各自独立推进的 FSM，经 1→N 的 compile_grammar 扇出产生。四家后端在引擎级并列、同一套签名；它们的请求级产物都实现同一套六方法——「换后端不动引擎」的接缝就在这两层 ABC 上。*
 
@@ -656,7 +656,7 @@ class StructuredOutputBackend(ABC):
 
 直觉：语法编译出的 FSM 像导航输入框的自动补全——每敲一个 token，它立刻算出「下一个合法字符集」。`choice ["yes","no"]` 的导航在起点只亮 n、y 两个方向的开头（连同能一口吃多字的 no/ye/yes 共五个键）；敲成完整 yes 后，屏幕上只剩一个绿色的「到达」按钮：EOS（end of sequence，词表里的结束标记 token）。
 
-![choice FSM](../diagrams/ch30-fig-choice-fsm.png)
+![choice FSM](../diagrams/ch31-fig-choice-fsm.png)
 
 > *图注：一条 EBNF（root ::= "yes" \| "no"）走成状态机，图面画 token 级可观测位置：实测轨迹停驻的两个（位置 0 与吃完整词后的位置 1）加终态共三个；字符级编译产物有 5 个状态（本章开头的 S0/S1/S2/S4/S3），半路键停下的中间位不单列成框。位置 0 的出边束是五个前缀 token：半路键 n/y/ye 停中间位、整词键 no/yes 一口吃完，位置 0 的合法集因此是 choice 的前缀闭包；位置 1 只允许 EOS 边到终态。打叉虚线是 4242('####')：词表内、语法外，accept_token 返回 False、计数不动——掩码层正是把这些转移在采样前掐掉。侧栏读法：状态数由语法决定（本例 3 个可观测状态），与词表大小无关；词表大小决定的是每个状态上「挑选合法 token」的工作量，那是一次性编译算好的。*
 
@@ -1061,7 +1061,7 @@ outlines 一切先转正则（JSON Schema 用 `build_regex_from_schema` 转正�
 | 第一拍 | schedule() 窥侧队队头 gr-1 | result(timeout=0.0001) 超时→None | 未就绪 | 批里只有 plain-1；gr-1 prepend 回侧队，状态仍 WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR |
 | 第二拍 | schedule() 再窥 gr-1 | Future 已原地换成 XgrammarGrammar | 就绪→晋升 | gr-1 当拍入批→RUNNING；has_structured_output_requests=True |
 
-![异步编译门时间线](../diagrams/ch30-fig-async-gate-timeline.png)
+![异步编译门时间线](../diagrams/ch31-fig-async-gate-timeline.png)
 
 > *图注：三个泳道横向时间——IO 线程（grammar_init 提交线程池，不占忙循环）、编译线程池（半 CPU，gr-1 的语法在这里编）、调度器忙循环（每拍 schedule→execute→…→update）。gr-1 生命线：进门即 WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR 入侧队，第一拍窥队头百微秒探测超时、prepend 回侧队，同拍 plain-1 正常入批照常出 token；编译完成 Future 原地换成品，第二拍窥队头就绪、当拍入批转 RUNNING。旁注两笔：external_launcher 模式回退同步编译（每 rank 门迁移时刻漂移破坏确定性）；编译失败走 Exception 态只杀单请求。*
 
@@ -1134,7 +1134,7 @@ outlines 一切先转正则（JSON Schema 用 `build_regex_from_schema` 转正�
 
 ## 第 7、8 站：采样之后——FSM 的唯一写者与交棒
 
-晋级入批的请求开始出 token。采样本身是[第 29 章](../../ch29-sampler-pipeline/narrative/chapter.md)的领地（掩码之下 9 步照走），本章只看 token 回流的那一段：谁拿着「真正落定」的 token 去推进状态机。
+晋级入批的请求开始出 token。采样本身是[第 30 章](../../ch30-sampler-pipeline/narrative/chapter.md)的领地（掩码之下 9 步照走），本章只看 token 回流的那一段：谁拿着「真正落定」的 token 去推进状态机。
 
 ### fill→sample→accept：环的闭合不变式
 
@@ -1294,7 +1294,7 @@ outlines 一切先转正则（JSON Schema 用 `build_regex_from_schema` 转正�
 
 一行 = 词表按 32 打包的 int32 数组，$`\lceil V/32 \rceil`$ 个。行数那头的 (1+spec 位) 里，注释把那个 1 叫 bonus token——投机验证草稿全对后引擎白送的额外 token；非投机请求每步的正常单 token 也走这一位。xgrammar 库的分配函数 `allocate_token_bitmask(max_num_seqs, vocab_size)` 按此分配（行数、词表各一参）；引擎级 ABC 方法只收行数一个参数，词表用构造时存下的 `vocab_size` 字段、内部转调这个双参库函数（`backend_xgrammar.py:L128-L129`）。取证词表 50257 → 每行 1571 个 int32、6284 B，批 16 行共 100544 B。生产 128k 词表（129280）→ 4040 个 int32 = 16160 B ≈ 16KB 每行；对比逐 token 的 fp32 logits（129280×4B ≈ 512KB），**恰好 1/32**。位打包正是它扛得住每步「跨进程加拷上 GPU」的定量理由。位约定一条记牢：xgrammar 约定 bit=1 允许、bit=0 才写 −inf，于是 int32 的 −1 等于全允许——负整数按补码（two's complement，带符号整数的标准二进制表示）存储，−1 的补码恰是 32 位全 1（验算：0−1 逐位借位，32 位全翻成 1）。源码三处用同一条约定兜底：outlines/LMFE 的 `allocate_token_bitmask` 用 `torch.full(..., -1)` 构造（`backend_outlines.py:L99-L105`、`backend_lm_format_enforcer.py:L141-L147`）；调度器侧 `_full_mask = torch.tensor(-1)`（`__init__.py:L58`）给本步不填掩码的行兜底；worker 侧重排基底张量也以 −1 预填（重排＝worker 侧把调度器行序换成 GPU 执行序，下一章展开；`utils.py:L126-L131`）。效果：非语法请求行、思考段请求行都是全允许，它们的 logits 每拍照常被采样，只是不受约束——畅通，不是禁足。
 
-![位掩码布局](../diagrams/ch30-fig-bitmask-layout.png)
+![位掩码布局](../diagrams/ch31-fig-bitmask-layout.png)
 
 > *图注：一行位掩码的物理形态。左：allocate_token_bitmask(16, 50257)（xgrammar 库层双参签名）产出的 [16, 1571] int32 张量，抽三行放大：位置 0 行五个允许位、位置 1 行只有 EOS 一个位、−1 行全 1 即全允许（非语法行的畅通兜底）。中：一个 int32 的 32 格位展开，bit=1 允许、bit=0 在采样前写 −inf，例 int32 第 265 个覆盖 token 8480-8511、bit25 即 8505('yes')。右：对比条，128k 词表每行约 16KB 对逐 token fp32 logits 约 512KB，恰为 1/32，位打包是掩码能上每步热路径的定量理由。分配按批上限乘 (1+投机位) 一次做足预算。行的流转（跨进程、拷上 GPU、盖 logits）归下一章。*
 

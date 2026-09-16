@@ -1,9 +1,9 @@
-# ch34《分布式 TP/PP/DP/EP》impl-notes —— 只做减法精简版
+# ch35《分布式 TP/PP/DP/EP》impl-notes —— 只做减法精简版
 
 对应真实源码 pin **vLLM v0.27.1（6e448d0ea）**，行号全部现核（2026-09-14，
 `instances/vllm/source`）。**不是** v2 资产的 v0.21.0 旧行号。
 
-运行：`cd instances/vllm/artifacts-v3/ch34-distributed-tp-pp-dp-ep && python -m pytest tests/ -q`
+运行：`cd instances/vllm/artifacts-v3/ch35-distributed-tp-pp-dp-ep && python -m pytest tests/ -q`
 → **41 passed**（全 host：单进程单元 + spawn gloo 进程池 1/2/4/8 进程形态；
 无 vllm 包安装、无 CUDA——NCCL 专有面以 pynccl/torch.distributed seam 承载）。
 ⚠ 上一轮崩溃残留 `tests/.tmp/` 的 FileStore 文件会毒化 rendezvous（gloo file
@@ -35,7 +35,7 @@ _spans_missing_source` 的跨度判据（span=def 行上一行到函数尾）。
 | `vllm/v1/engine/coordinator.py` | 同名 | **主文件 6**（m18/m19/m20）：DPCoordinator/EngineState/DPCoordinatorProc（三 socket 主循环 L189-L455 逐字 minus SCALE_ELASTIC_EP 处理块；wave 语义 docstring L23-L57 逐字；_send_start_wave L458-L467） |
 | `vllm/v1/worker/dp_utils.py` | 同名 | **主文件 7**（m21/站 15）：_run_ar（4×dp AR）+ _post_process_dp_padding/cudagraph_mode + _synchronize_dp_ranks + coordinate_batch_across_dp（L164-L225 逐字 minus 阈值面） |
 | `vllm/distributed/device_communicators/cuda_communicator.py` | 同名 | **主文件 8**（m6/站 11）：__init__（L30-L207 minus 后端家族分支）+ all_reduce 七级回退链（L275-L341 逐字）+ all_gather/reduce_scatter(v)（symm-mem 臂注为省略）+ all_gatherv（L604-L668）+ dispatch/combine 转发（L710-L769） |
-| `vllm/distributed/device_communicators/all2all.py` | 同名 | **主文件 9**（m22/站 14）：AgRsAll2AllManager（L44-L153 逐字：dispatch=all_gatherv/combine=reduce_scatterv）；DeepEP/MoRI/nixl/flashinfer 全家族 → ch26/ch39 |
+| `vllm/distributed/device_communicators/all2all.py` | 同名 | **主文件 9**（m22/站 14）：AgRsAll2AllManager（L44-L153 逐字：dispatch=all_gatherv/combine=reduce_scatterv）；DeepEP/MoRI/nixl/flashinfer 全家族 → ch26/ch40 |
 | `vllm/distributed/device_communicators/base_device_communicator.py` | 同名 | 整文件逐字（All2AllManagerBase 契约 + DeviceCommunicatorBase 用户面；仅 ray CACHE 键清理/checkpoint 面按域注记） |
 | `vllm/model_executor/layers/linear.py` | 同名 | 站 11/m7：UnquantizedLinearMethod（裸 Parameter+形状断言=nn.Linear 面；ModelWeightParameter → ch23）+ LinearBase/ColumnParallel（__init__ 装配子集）+ RowParallelLinear.__init__/forward（**L1748-L1774 逐字**——bias 只在 rank0） |
 | `vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py` | 同名 | m22 消费现场：MoEPrepareAndFinalizeNaiveDPEPModular（prepare 尾段 **dispatch 调用位 L158-L164 逐字**、finalize L187-L209 逐字）；量化细节 → ch27、Monolithic → 删除项 9 |
@@ -54,7 +54,7 @@ _spans_missing_source` 的跨度判据（span=def 行上一行到函数尾）。
 | envs/logger/divide/is_moe_layer 等 | envs.py/logger.py/utils/__init__.py | 接口位 stand-in（默认值对 pin；消费面仅属性访问） |
 | `EngineCoreProc` 收窄载体 | core.py:L1008-L1915 + EngineCore L103-L1000 | EngineCore 基类按 ch09 域扁平并入（保留下游 DPE 触碰方法的原始行号）；scheduler/model_executor 由测试注入；_process_input_queue（L1404-L1433）→ ch09 域以注入承载 |
 | `AsyncMPClient` 扁平载体 | core_client.py:L974-L1246 + MPClient L503-L777 | 引擎发射/握手/ready 等待 → ch05；identity 表段/ensure_alive 族按原行号并入；outputs IO 任务以注入承载 |
-| `VllmConfig`/`SchedulerOutput`/`ModelRunnerOutput`/`SchedulerStats`/`EngineCoreRequest(Output s)` 字段子集 | vllm.py:L331+/sched/output.py:L193-L283/outputs.py:L261-L321/stats.py:L186-L214/__init__.py:L97-L154 等 | 本章消费面字段子集（差量协议/logprobs/观测族 → ch18/ch08/ch29） |
+| `VllmConfig`/`SchedulerOutput`/`ModelRunnerOutput`/`SchedulerStats`/`EngineCoreRequest(Output s)` 字段子集 | vllm.py:L331+/sched/output.py:L193-L283/outputs.py:L261-L321/stats.py:L186-L214/__init__.py:L97-L154 等 | 本章消费面字段子集（差量协议/logprobs/观测族 → ch18/ch08/ch30） |
 | `distributed_executor_backend` 类型 | parallel.py:L243-L246 | `type[Executor]` 联合臂与 None 回填（L909-L941 ray/平台判定）→ ch17，类型收窄为 `str | DataParallelBackend | None` |
 
 ## 1:1 Source Map（核心行；改动=减法或 seam，原因=批准条/章节边界）

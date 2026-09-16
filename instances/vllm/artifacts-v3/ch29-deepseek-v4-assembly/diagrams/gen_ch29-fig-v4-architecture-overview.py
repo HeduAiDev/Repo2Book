@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch28 理论图 · DeepSeek-V4 整机全貌（ch28-fig-v4-architecture-overview，模板 layout）
+"""ch29 理论图 · DeepSeek-V4 整机全貌（ch29-fig-v4-architecture-overview，模板 layout）
 
 本章开篇「开考：Llama 五件套的更换单」节首的模型级全貌图：**只回答「这台机器长
 什么样、部件怎么配合怎么分布」，不解释代码**。纵向层栈 = 一个 token 的路径；右侧
@@ -379,7 +379,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', lc.DEFS, EXTRA_DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch28-fig-v4-architecture-overview.svg'
+out = HERE / 'ch29-fig-v4-architecture-overview.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

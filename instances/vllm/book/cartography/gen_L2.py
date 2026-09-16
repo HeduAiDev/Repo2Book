@@ -68,6 +68,42 @@ SHARP = "E:/Laboratory/Repo2Book/node_modules/sharp"
 
 _TOK = re.compile(r'[!-~→·]+|\s+|.')   # ascii 词连串成 token（空格处断开），空白自成 token，其余逐字（CJK 友好断行）
 
+# markdown 强调符净化（exp-2026-09-14 ch28 盲审：stations[].what 里的 `**手动**`/`**惰性**`/
+# `**先**…**再**` 成对强调标记被生成器原样落进 SVG text 节点——全书其余 L0/L1/L2 星号数为 0，
+# 本图独有 5 处裸 `**`、其中一对还被换行拆到两行）。成对 `**强调**` 剥标记留内文（lc.text
+# 无 tspan 粗体通道，8.5px 灰字轨道文字按纯文本出）；**成对判定**是刻意的——`head_dim**-0.5`
+# 这类 Python 幂运算符只含单个 `**`、不成对，逐字节保留（ch26 两处合法星号即此形态）。
+_MD_EM = re.compile(r'\*\*(?=\S)(.+?)(?<=\S)\*\*', re.S)
+
+
+def _md_strip(spec):
+    def walk(o):
+        if isinstance(o, dict):
+            return {k: walk(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [walk(v) for v in o]
+        if isinstance(o, str):
+            return _MD_EM.sub(r'\1', o)
+        return o
+    return walk(spec)
+
+
+def _md_residual(spec):
+    """剥完成对标记后仍剩的孤立 `**`（幂运算符或真笔误）——打一行提示供人工核，不阻断。"""
+    out = []
+
+    def walk(o, path):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                walk(v, f'{path}.{k}' if path else k)
+        elif isinstance(o, list):
+            for i, v in enumerate(o):
+                walk(v, f'{path}[{i}]')
+        elif isinstance(o, str) and '**' in o:
+            out.append(path)
+    walk(spec, '')
+    return out
+
 
 def wrap_cn(s, fs, maxw):
     """贪心断行：CJK 逐字、ascii 连串；超长 ascii token **不断词**（见下）。"""
@@ -729,6 +765,43 @@ def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vse
             captions.append(((p_in[0] + p_out[0]) / 2, label,
                              zone_of.get(f['from'] if inner is a else f['to'])))
         return
+    # opt-in 绕行右走廊（exp-2026-09-14 ch28 盲审②「箭头压字」）：⑨→出 up 直落竖线的
+    # 重叠中点 x=2086.8 正穿 center 头带 where 源码路径标注 [1963..2148]×[301..310] 的
+    # 字形带——白 halo 只能让线在字处视觉断开，盲审仍判「笔画压在 · 上」且按 SVG 几何
+    # 复审（线 bbox ∩ 文字 bbox）会再次命中，必须真改道。两头的常规让位全灭：where 在
+    # 头带无处可躲（y=308 是同行 hop 车道走廊 [900.9..1995.6]、[308..324] 又夹拍片顶/
+    # 骑框徽标带）；直落竖线在重叠区 [2013.6..2160] 内除 [2154..2160] 6px 夹缝外全被
+    # where 与「第13-14站」徽标占满，挪过去=贴框擦边、标签又出画布。走盲审给的第三案：
+    # 出源框右边 → detail 外框右线与（源/目标更右者）框右线之间的竖走廊 → 入目标框
+    # 右边（marker orient=auto，箭簇自动指向行进方向）。触发式：未 opt-in route:'wrap'
+    # 的流逐字节不变。
+    if f.get('route') == 'wrap':
+        wall = R['frame']['x'] + R['frame']['w']          # detail 外框右线
+        edge = max(a['x'] + a['w'], b['x'] + b['w'])     # 源/目标中更右的框右线
+        if wall - edge < 10 or abs((a['x'] + a['w']) - (b['x'] + b['w'])) > 2:
+            print(f'  [warn] L2 wrap 流『{(label or f["from"])[:14]}』右走廊净宽 '
+                  f'{wall - edge:.0f}px（需≥10）或源/目标右边不齐（差 '
+                  f'{abs((a["x"] + a["w"]) - (b["x"] + b["w"])):.0f}px），回退常规路由'
+                  f'——需人工核图')
+        else:
+            wcol = lc.C_ENG_S if f.get('up') else color
+            gx = (edge + wall) / 2
+            ay, by = a['y'] + a['h'] / 2, b['y'] + b['h'] / 2
+            lc.parrow([(a['x'] + a['w'], ay), (gx, ay), (gx, by), (b['x'] + b['w'], by)],
+                      wcol, 1.8, 'up' if f.get('up') else 'std', dash)
+            if vsegs is not None:
+                vsegs.append((gx, min(ay, by), max(ay, by)))
+            if label:
+                # 标签贴走廊竖段左侧（end 锚左伸 7px 净距），y 取目标框底之下 22px 的
+                # 行间净空带（ch28 实测落 north↔center 行间带，无框线/徽标/头带/邻签）；
+                # 记档 mid_labels 供后画的流避让（同直落/肘形标签口径）。
+                ly = b['y'] + b['h'] + 22
+                lc.text(gx - 7, ly, label, 8.5, wcol, 'end', maxw=640,
+                        tag='L2fl:' + label[:10])
+                if mid_labels is not None:
+                    mid_labels.append((gx - 9 - lc.tw(label, 8.5), ly - 8.8,
+                                       gx - 5, ly + 3.7))
+            return
     oy0, oy1 = max(a['y'], b['y']), min(a['y'] + a['h'], b['y'] + b['h'])
     if oy1 - oy0 > 0.4 * min(a['h'], b['h']):          # 同行 → 横向
         if b['x'] > a['x']:
@@ -1066,7 +1139,9 @@ def draw_flow(f, R, zone_of, captions, badges=(), note_names=(), lanes=None, vse
 
 
 def build(spec_path):
-    spec = json.loads(Path(spec_path).read_text(encoding='utf-8'))
+    spec = _md_strip(json.loads(Path(spec_path).read_text(encoding='utf-8')))
+    for p_ in _md_residual(spec):
+        print(f'  [note] {spec_path.name} {p_} 含孤立 **（Python 幂运算符合法、markdown 笔误须修）')
     for e in validate(spec):
         print(f'  [{spec_path.name}] {e}')
     no = spec['chapter']
@@ -1147,6 +1222,61 @@ def build(spec_path):
     if south:
         sx, sw_, _ = row_layout(south, ix, iw)
         south_pos0 = {c['name']: (x, w) for c, x, w in zip(south, sx, sw_)}
+
+    # ---- center 头带 hop 车道净空预检（exp-2026-09-14 ch28 盲审②「文字相撞」） ----
+    # 病灶：center 同行流两框间夹拍片 → draw_flow obst 分支的越顶 hop 车道压在
+    # chips_y-16=cfy+12，恰与头带文字同带——ch28 四条 hop 流（②→④/③→⑤/③→⑧/④→⑨）
+    # 车道 y307.1-308.9 横穿容器标题尾部「…MTP 钩子）」与 where 图注（徽标避让上移后
+    # 基线也落 cfy+12）的字带（PNG 2x 严格色掩码：where bbox 内 88 个 #475569 描边
+    # 像素、混色 (107,118,134) 证实真重叠非相邻）；hop 车道不在 halo 兜底的 _segs_all
+    # 清单（那是 vsegs/loop_vs/lane_obs——hop 是同行流、三者皆非），白 halo 救不了，
+    # 盲审口径要求真分离。28px 头带塞不下「标题/where 字带 + hop 车道」两拨 → 命中
+    # 即加高 16px：车道落 cfy+28（距头带文字盒底 4.65px）、徽标带随拍片下移、where
+    # 回自然位 cfy+19（不再触发徽标避让上移）。车道触盒判定逐字镜像 draw_flow 的
+    # obst 分支（chip_pos 即 R 内 center 拍片；north/south 框的 y 带不含拍片中线、
+    # frame/center 容器被 _contains 排除，故只按拍片 x 区镜像即精确）；y 带不必判——
+    # 车道带 [cfy+11.1, cfy+12.9] 恒落在头带两档文字盒带内。触发式：无 hop、或车道
+    # x 跨不触头带文字的章逐字节不变（全 corpus 干跑仅 ch28/ch31 命中；ch31 现图是
+    # obst-hop 逻辑（exp-2026-09-14 ch26）之前的旧渲染器产物、直穿拍片形态已过盲审
+    # 定稿不重渲，本预检只在该章未来重渲时生效）。
+    if ccfg.get('name') and len(center) > 1:
+        _hdr_bx = []
+        _ttl_w_ = min(lc.tw(ccfg.get('title', ''), 11.5), iw - 360)
+        _hdr_bx.append((ix + 12, ix + 12 + _ttl_w_))
+        if ccfg.get('where'):
+            _ww_ = min(lc.tw(ccfg['where'], 9), 320)
+            _hdr_bx.append((ix + iw - 12 - _ww_, ix + iw - 12))
+        _fire = False
+        for f in flows:
+            if (zone_of.get(f['from']) != 'center' or zone_of.get(f['to']) != 'center'
+                    or f['from'] not in chip_pos or f['to'] not in chip_pos):
+                continue
+            (ax_, aw_), (bx_, bw_) = chip_pos[f['from']], chip_pos[f['to']]
+            if bx_ > ax_:
+                _x1_, _x2_ = ax_ + aw_, bx_
+            else:
+                _x1_, _x2_ = ax_, bx_ + bw_
+            _obst_ = sorted(cx_ for cn_, (cx_, _cw_) in chip_pos.items()
+                            if cn_ not in (f['from'], f['to'])
+                            and cx_ + _cw_ > min(_x1_, _x2_) + 2
+                            and cx_ < max(_x1_, _x2_) - 2)
+            if not _obst_:
+                continue
+            if _x2_ > _x1_:
+                _la_ = (_x1_ + _obst_[0]) / 2
+                _lb_ = (_obst_[-1] + cw_each + _x2_) / 2
+            else:
+                _la_ = (_x1_ + _obst_[0] + cw_each) / 2
+                _lb_ = (_obst_[-1] + cw_each + _x2_) / 2
+            if any(min(_la_, _lb_) < _bx1_ and _bx0_ < max(_la_, _lb_)
+                   for _bx0_, _bx1_ in _hdr_bx):
+                _fire = True
+                break
+        if _fire and cfy + cf_pad_top - 16 - 0.9 < cfy + 22.45 + 3:
+            cf_pad_top += 16
+            cf_h += 16
+            chips_y += 16
+            chips_bottom += 16
 
     def _xw(name):
         if name in chip_pos:

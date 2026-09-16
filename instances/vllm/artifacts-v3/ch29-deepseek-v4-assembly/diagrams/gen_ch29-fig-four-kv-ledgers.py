@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch28 机制图 · 一层四本 KV 账(ch28-fig-four-kv-ledgers, 模板 layout)
+"""ch29 机制图 · 一层四本 KV 账(ch29-fig-four-kv-ledgers, 模板 layout)
 
 放大自 L0『显存账本列（青）×GPU 执行臂交界』——ch14/ch25 立的『KV 账本按 spec 分组』
 机制在 V4 推到一层×4 的极致形态(L2 下排『四本 KV 账』注的机制版下钻)。
@@ -241,7 +241,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', lc.DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch28-fig-four-kv-ledgers.svg'
+out = HERE / 'ch29-fig-four-kv-ledgers.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

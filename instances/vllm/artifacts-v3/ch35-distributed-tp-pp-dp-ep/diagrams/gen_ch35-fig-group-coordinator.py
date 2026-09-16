@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch34 机制图 · m1 GroupCoordinator 解剖：一个并行维度一个实例（figure_spec ch34-fig-group-coordinator）
+"""ch35 机制图 · m1 GroupCoordinator 解剖：一个并行维度一个实例（figure_spec ch35-fig-group-coordinator）
 
 放大自 L0 多实例视角 ② GroupCoordinator·双群组（L2 站 4）——
 FIGURE-SYSTEM §3.3 正文机制图：架构归属回指 L0/L2，不另立架构画法。
@@ -192,7 +192,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch34-fig-group-coordinator.svg'
+out = HERE / 'ch35-fig-group-coordinator.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

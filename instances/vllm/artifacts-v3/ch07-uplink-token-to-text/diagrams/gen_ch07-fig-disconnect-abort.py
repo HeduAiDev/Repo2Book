@@ -39,7 +39,7 @@ lc.text(BXR - _cw / 2, 26.5, _ch, 9.5, lc.C_API_S, 'middle', True, maxw=_cw - 4,
 
 # ---------------- 泳道 A：HTTP 层 ----------------
 lc.rect(MX, 108, 340, 308, '#ffffff', lc.C_MUTE, rx=8, sw=1.3)
-lc.text(MX + 16, 132, 'HTTP 层（服务面域 · ch38 展开）', 10, lc.C_TXT, 'start', True, maxw=280,
+lc.text(MX + 16, 132, 'HTTP 层（服务面域 · ch39 展开）', 10, lc.C_TXT, 'start', True, maxw=280,
         tag='la:t')
 lc.rect(84, 152, 120, 46, '#ffffff', lc.C_MUTE, rx=6, sw=1.2)
 lc.text(144, 180, '客户端', 9.5, lc.C_TXT, 'middle', True, maxw=100, tag='cli')
@@ -116,7 +116,7 @@ lc.text(ENG[0] + 14, ENG[1] + 46, '引擎侧双投递：input_queue + aborts_que
 lc.text(ENG[0] + 14, ENG[1] + 64, '（语义 ch5 已讲——收到即从批次摘除）', 8, lc.C_MUTE, 'start',
         maxw=400, tag='eng:l2')
 lc.rect(ENG[0] + 14, ENG[1] + 84, 408, 30, '#ffffff', lc.C_ENG_S, rx=5, sw=1.1, dash=True)
-lc.text(ENG[0] + 218, ENG[1] + 103, '收到之后的故事 → ch38 服务面', 8, lc.C_ENG_S, 'middle',
+lc.text(ENG[0] + 218, ENG[1] + 103, '收到之后的故事 → ch39 服务面', 8, lc.C_ENG_S, 'middle',
         True, maxw=390, tag='eng:hook')
 lc.text(ENG[0] + 14, ENG[1] + 140, 'vllm/v1/engine/core.py', 7.5, lc.C_FAINT, 'start',
         maxw=300, tag='eng:f')
@@ -146,7 +146,7 @@ AW_Y = 702
 lc.rect(MX, AW_Y, BXR - MX, 54, lc.C_ENG_F, lc.C_ENG_S, rx=8, sw=1.2, dash=True)
 lc.text(MX + 16, AW_Y + 22, '喊停是异步的：ABORT 帧在路上时，引擎正在做的这一步还会做完——废 token 有界但不为零',
         9.5, '#9a3412', 'start', True, maxw=1100, tag='aw:t')
-lc.text(MX + 16, AW_Y + 42, '（引擎收到之后如何从批次摘除 → ch38 服务面展开；stop-string 命中的反向 abort 走同一条 hop2 通路）',
+lc.text(MX + 16, AW_Y + 42, '（引擎收到之后如何从批次摘除 → ch39 服务面展开；stop-string 命中的反向 abort 走同一条 hop2 通路）',
         8.5, lc.C_MUTE, 'start', maxw=1100, tag='aw:s')
 
 # ---------------- 图例 + 页脚 ----------------

@@ -52,7 +52,7 @@
 | `EngineCoreReadyResponse` | vllm/v1/engine/__init__.py:L68-L94 | **逐字**（dataclass，全字段） | must_keep；m2 认亲+配置回传 |
 | `FinishReason` | vllm/v1/engine/__init__.py:L43-L65 | **逐字**（IntEnum+__str__） | must_keep；紧凑序列化例子 |
 | `UtilityOutput` | vllm/v1/engine/__init__.py:L218-L227 | **逐字** | must_keep；RPC 回程信封 |
-| `make_zmq_socket` | vllm/utils/network_utils.py:L283-L341 | 逐字 minus `router_handover` 参数与 ROUTER_HANDOVER 段（L328-L329 XPUB、L331-L335 IPv6 尾段一并 SUBTRACTED） | delete 项 2（elastic EP→ch39）+ 项 1（XPUB=coordinator）+ IPv6 尾段机械删（依赖 urllib3 的 split_zmq_path，本章拓扑不走 IPv6） |
+| `make_zmq_socket` | vllm/utils/network_utils.py:L283-L341 | 逐字 minus `router_handover` 参数与 ROUTER_HANDOVER 段（L328-L329 XPUB、L331-L335 IPv6 尾段一并 SUBTRACTED） | delete 项 2（elastic EP→ch40）+ 项 1（XPUB=coordinator）+ IPv6 尾段机械删（依赖 urllib3 的 split_zmq_path，本章拓扑不走 IPv6） |
 | `get_engine_zmq_addresses` | vllm/v1/engine/utils.py:L1005-L1048 | 逐字 minus `defer_api_server_ports` kwarg 与 elastic_ep 翻转（L1037-L1040） | delete 项 2；Rust 前端口即回填场景不在本章 |
 | `EngineZmqAddresses`/`EngineHandshakeMetadata` | vllm/v1/engine/utils.py:L61-L85 | **逐字** | must_keep×2；m14 握手载荷 |
 | `launch_core_engines` | vllm/v1/engine/utils.py:L1053-L1203 | DPCoordinator 运行段/ray 后端/external-LB 双握手链 SUBTRACTED；yield 收窄三元组 | delete 项 1；DP=1 自管路径完整 |

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch30 机制图 · m3 auto 降级阶梯（figure_spec ch30-fig-auto-ladder，模板 flow）
+"""ch31 机制图 · m3 auto 降级阶梯（figure_spec ch31-fig-auto-ladder，模板 flow）
 
 放大自 L0 采样列·结构化输出组的『前端校验期』段（L2 章图站 1，请求还没进引擎）——
 auto 降级阶梯是这一段的决策展开，架构归属回指 L2 章图，不另立第二种架构画法
@@ -205,7 +205,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', lc.DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch30-fig-auto-ladder.svg'
+out = HERE / 'ch31-fig-auto-ladder.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

@@ -524,7 +524,7 @@ def generate_scheduler_kv_cache_config(
 
 **Mamba 与状态空间模型**（SSM）：把「记住全部历史」从「每 token 存一对 K/V」换成「把历史压进一个固定形状的状态张量」，像 RNN 一样边走边压缩，序列再长它的「缓存」也不长一个字节（Mamba 论文 arXiv:2312.00752 的摘要账：5× 于 Transformer 的推理吞吐、序列长度线性伸缩）。主流落地是混合：Jamba（arXiv:2403.19887）按 attention : Mamba = 1:7 掺层，账面收益 "an 8x smaller KV cache compared to a vanilla Transformer"（256K 上下文 4 GB 对纯 Transformer 32 GB）。对账本的意义：Mamba 层进账本时报的是 `MambaSpec`，它的一页装的是一份固定形状的状态张量（卷积状态与 SSM 状态合起来算），大小由**状态形状**决定，既不随 block_size 缩放，也不随序列长度涨——序列跑到十万 token，它要留的还是这一份。这正是它省显存的本钱，也是它在池里最别扭的地方：别的层的页按 token 数算，它按状态形状算，两边的页宽天生对不上。注意它不是 KV cache，账本科目不同，这个差别马上在「页统一」处收账。
 
-这一批模型里还有一位要单独交代：**DeepSeek V4**。它是本书 Part VI（模型层）后半程逐章拆读的主角，[第 24 章](../../ch24-primer-attn-variants/narrative/chapter.md)立注意力变体的数学，[第 26 章](../../ch26-deepseek-indexer-nsa-dsa/narrative/chapter.md)拆它怎么挑要看的 token，[第 28 章](../../ch28-deepseek-v4-assembly/narrative/chapter.md)把它整个拼装起来。本章不展开那条线，只拿它给通用组化规矩做一次压力测试：V4 一层里同时挂着四类缓存、账本上四种页宽并存；真实在产的旗舰模型就是这种量级，通用规矩得接住它。
+这一批模型里还有一位要单独交代：**DeepSeek V4**。它是本书 Part VI（模型层）后半程逐章拆读的主角，[第 24 章](../../ch24-primer-attn-variants/narrative/chapter.md)立注意力变体的数学，[第 26 章](../../ch26-deepseek-indexer-nsa-dsa/narrative/chapter.md)拆它怎么挑要看的 token，[第 29 章](../../ch29-deepseek-v4-assembly/narrative/chapter.md)把它整个拼装起来。本章不展开那条线，只拿它给通用组化规矩做一次压力测试：V4 一层里同时挂着四类缓存、账本上四种页宽并存；真实在产的旗舰模型就是这种量级，通用规矩得接住它。
 
 ### 共用一张表的两难：浪费还是损坏
 

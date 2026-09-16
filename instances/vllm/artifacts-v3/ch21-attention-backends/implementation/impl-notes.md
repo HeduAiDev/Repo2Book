@@ -152,7 +152,7 @@ BLOCKING）**；must_keep 94 符号经 linter `over_subtraction` 项全数核在
 - `flash_attn.py` 的 `forward` 保留 `is_dynamic_causal` 死变量（L972 不在
   批准删除区间；其消费段 L974-L1039 已删）。
 - `_custom_ops.py` 只含 reshape_and_cache_flash 一个 op——其余 ~120 op 属
-  各 kernel 章（ch13/ch20/ch27/ch33），章界收窄。
+  各 kernel 章（ch13/ch20/ch27/ch34），章界收窄。
 - 测试经 `register_backend`（真实第三方注册机制）把包内 FlashAttentionBackend
   挂到 FLASH_ATTN 名下、测试桩挂到 TRITON_ATTN 名下——这本身就是该机制的
   真实用法；未注册成员（FLASHINFER 等）走真实 vllm.* 路径 → host ImportError

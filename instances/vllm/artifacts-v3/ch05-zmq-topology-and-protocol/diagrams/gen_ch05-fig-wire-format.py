@@ -175,7 +175,7 @@ lc.text(MX + 14, PNL_Y + 55, '256B（64×float32）→ 2 帧（aux 独立帧）'
 lc.rect(724, PNL_Y, 500, PNL_H, '#ffffff', lc.C_MUTE, rx=7, sw=1.3)
 lc.text(738, PNL_Y + 18, '标签字节表 EngineCoreRequestType（__init__.py:L261-L274）', 9.5,
         lc.C_TXT, 'start', True, maxw=472, tag='pnl2:t')
-lc.text(738, PNL_Y + 38, '0x00 ADD · 0x01 ABORT（ids 帧 9B）· 0x02 START_DP_WAVE（DP 控制面 · ch34）',
+lc.text(738, PNL_Y + 38, '0x00 ADD · 0x01 ABORT（ids 帧 9B）· 0x02 START_DP_WAVE（DP 控制面 · ch35）',
         8.5, '#334155', 'start', maxw=472, tag='pnl2:l1')
 lc.text(738, PNL_Y + 55, '0x03 UTILITY（四元组帧 32B）· 0x04 / 0x05 引擎内部哨兵，不过线', 8.5,
         '#334155', 'start', maxw=472, tag='pnl2:l2')

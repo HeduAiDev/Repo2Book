@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch30 机制图 · m11 异步编译门时间线（figure_spec ch30-fig-async-gate-timeline，模板 swimlane）
+"""ch31 机制图 · m11 异步编译门时间线（figure_spec ch31-fig-async-gate-timeline，模板 swimlane）
 
 放大自 L0 调度列与采样列之间『编译门』的时序展开——引擎侧 L2 章图站 3-6 的横向
 时间轴（时序视图），架构归属回指 L2 章图，不另立第二种架构画法（FIGURE-SYSTEM §3）。
@@ -195,7 +195,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch30-fig-async-gate-timeline.svg'
+out = HERE / 'ch31-fig-async-gate-timeline.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

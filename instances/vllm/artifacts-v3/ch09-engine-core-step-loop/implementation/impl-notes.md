@@ -72,9 +72,9 @@
 | `EngineCore.__init__` | core.py:L106-L247 | 插件/日志/executor/freeze/envs 逐字；删 KV 剖析（ch13/17）、EEP（项 2）、spec 旗标（项 7）、mm（项 4）、connector 握手（项 3）、ec/pooling（项 3/8）、前缀哈希器装配（ch13，字段保留 None）、idle 回调表（项 5） | must_keep×4（step_fn/batch_queue_size/freeze_gc_heap/…） |
 | `post_step`/`_process_aborts_queue`/`shutdown` | core.py:L616-L623/L741-L749/L751-L767 | post_step 删 draft 分支成直通；其余逐字（cleanup_dist_env_and_memory 为 host seam no-op） | 项 7 + must_keep×2 |
 | `add_request`/`abort_requests`/`log_error_detail`/`_should_throttle_prefills` | core.py:L439-L483/L485-L491/L493-L507/L579-L582 | add_request 删 pooling/kv/ec/abort_immediately 校验；其余逐字 | 项 3/8 + must_keep×3 |
-| `preprocess_add_request` + SEAM 观测/注入钩 | core.py:L969-L991 | 逐字 minus mm_receiver_cache；钩子（enqueue_forward_logits/enqueue_grammar_bitmask/get_step_count/get_request_info/boom_method/clear_forward_scripts）全走真实 UTILITY 反射 RPC | must_keep + m5 + 测试扮演模型/语法编译器（ch17/ch30 边界） |
+| `preprocess_add_request` + SEAM 观测/注入钩 | core.py:L969-L991 | 逐字 minus mm_receiver_cache；钩子（enqueue_forward_logits/enqueue_grammar_bitmask/get_step_count/get_request_info/boom_method/clear_forward_scripts）全走真实 UTILITY 反射 RPC | must_keep + m5 + 测试扮演模型/语法编译器（ch17/ch31 边界） |
 | `EngineShutdownState`/`EngineCoreProc` 全类 | core.py:L1002-L1915 | 双队列/identity/EXECUTOR_FAILED 哨兵/握手窗口/双 IO 线程/busy loop 全家/IO 双线程主循环/输出复用池逐字（ch05 已验证的同款渲染再校）；删 DP 统计（项 1）、tensor IPC（项 4）、FT（项 3）、pause 族（项 5）、XSUB/coord 分支（项 1）、DP config-hash（项 1） | must_keep×22 |
-| `DPEngineCoreProc`/`EngineCoreActor*` | core.py:L1918-L2488 | **整类删** | delete 项 1 → ch34/39 |
+| `DPEngineCoreProc`/`EngineCoreActor*` | core.py:L1918-L2488 | **整类删** | delete 项 1 → ch35/39 |
 | `SchedulerInterface`（schedule 契约等） | vllm/v1/core/sched/interface.py:L22-L253 | schedule docstring（『busy loop 反复调用』书面契约）+ ①③⑤拍/finish/has_* 契约面逐字；删 draft/pause/reset/counts 抽象面 | m13 + must_keep(schedule/has_requests) |
 | `Scheduler`（seam） | vllm/v1/core/sched/scheduler.py:L439-L450、L1325-L1341、L1646-L1668、L1670-L2033、L2213-L2298、L2058-L2111、L2383-L2421 | schedule 头（woosuk 注释）+ `_update_after_schedule` 记账尾 + get_grammar_bitmask + update_from_output 热循环骨架/判停/分桶/finished 簿记 + finish_requests 幂等主线逐字；循环体与抢占（ch10/ch11）、spec（项 7）、stale（项 11）、kv connector（项 3）、routed/stats/events（项 9/30）删；**delete 项 11 批准的同签名最小桩**：waiting 全量 prompt（受 token 预算截为 chunk）、running 补齐/逐 token | ①拍黑盒边界 + m12/m13 |
 | `check_stop` | vllm/v1/core/sched/utils.py:L94-L136 | 逐字 minus repetition 检测分支 | 判停主线（LENGTH/STOP/stop_reason） |
@@ -139,11 +139,11 @@
 | `xgr`（_XgrammarSeam） | §utils | `apply_token_bitmask_inplace` 的 CPU 内核替身 | 文档语义（位清零→-inf）一致；容器内真 xgrammar 优先 import 生效 |
 | `Sampler`（只含 greedy_sample） | §worker | 采样栈 argmax 分支 | greedy_sample 本体逐字（sampler.py:L239-L241）；测试全 temperature=0 |
 | `InputBatch` | §worker | 持久批消费面（req_ids 序 + 新落批/完成清退/末块判定） | apply_grammar_bitmask 的真实重排基准；批同步语义镜像 `_update_states`（空拍也同步——真实顺序在 0-token 早退之前） |
-| `StructuredOutputManager` | §sched | grammar_init no-op + grammar_bitmask 脚本队列 | ch30 边界；③拍调用位与请求序真实 |
+| `StructuredOutputManager` | §sched | grammar_init no-op + grammar_bitmask 脚本队列 | ch31 边界；③拍调用位与请求序真实 |
 | `Scheduler` 循环体 | §sched | 最小 token 账（waiting 全量 prompt 受预算、running 补齐/逐 1） | delete 项 11 批准；头/尾记账逐字 |
 | `UniProcExecutor._init_executor` | §executor | driver_worker=GPUModelRunner + num_gpu_blocks 给定值 128 | worker 生命周期/determine_available_memory 是 ch17 域 |
 | `AsyncGPUModelRunnerOutput` D2H | §worker | CUDA copy stream→`threading.Event` + 预备 CPU 缓冲 | get_output 语义（阻塞至拷贝完成）逐字 |
-| config/params/request 字段 seam | §config | VllmConfig 族/SamplingParams/Request 字段子集 | 装配线是 ch03 产品；`structured_output_request` 为 ch30 注入位（过线真值标记） |
+| config/params/request 字段 seam | §config | VllmConfig 族/SamplingParams/Request 字段子集 | 装配线是 ch03 产品；`structured_output_request` 为 ch31 注入位（过线真值标记） |
 | `logger`/`envs`/`kill_process_tree`/`get_mp_context`(win32 spawn)/`ipc→tcp`/win32 哨兵轮询 | §host | stdlib 替身/平台回退 | ch04/ch05 同款先例 |
 | MsgpackEncoder/Decoder 单帧化 | §serial | 多帧零拷贝/张量/OOB 面 ch05 持有 | 本章线载荷全是 msgpack 原生类型；encode_into 复用 bytearray 的面保留（m6） |
 
@@ -165,7 +165,7 @@
    精简版 config seam 的 `async_scheduling` 默认 **False**（m11 教学顺序：同步四段骨架是理解重叠
    版的唯一地基）；binding 与异步包裹骨架（`if not self.use_async_scheduling: return output`）
    真码保留，AsyncOutputFuture 的 D2H 等待有专测（executor.sample_tokens(non_block=True) 路径）。
-6. **grammar_bitmask 需脚本**：结构化输出请求的位掩码行由测试经 UTILITY 注入（ch30 的 FSM 编译
+6. **grammar_bitmask 需脚本**：结构化输出请求的位掩码行由测试经 UTILITY 注入（ch31 的 FSM 编译
    不在本章）；脚本枯竭即引擎死——错误路径真实。
 7. **`get_supported_tasks` 返回 tuple 过线回 list**（msgpack Any 解码语义）；utility 失败路径
    `Call to X method failed: …` 逐字。

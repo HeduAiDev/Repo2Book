@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch29 机制图 2 · argmax 不变性二分（figure_spec ch29-fig-argmax-dichotomy，模板 flow）
+"""ch30 机制图 2 · argmax 不变性二分（figure_spec ch30-fig-argmax-dichotomy，模板 flow）
 
 放大自 L0 采样出口列（L2 章图 center 拍片 ⑤『非 argmax 不变列』与 ⑦『sample』两拍 +
 south『why·argmax 不变性二分』块）：同一批 logits 在 step5 与 step7c 两个站点分叉生效。
@@ -258,7 +258,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch29-fig-argmax-dichotomy.svg'
+out = HERE / 'ch30-fig-argmax-dichotomy.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

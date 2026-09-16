@@ -6,7 +6,7 @@
 
 ## 你在这里
 
-Part VI 共六章，全部落在 L0 图中间那根 GPU 执行臂的模型层框上：ch23 模型定义层拼装术（本章，Part 开篇）、ch24 注意力变体数学（原理章）、ch25 MLA 的两种展开、ch26 DeepSeek 索引器、ch27 量化（原理章）、ch28 实战：DeepSeek-V4 拼装（收官）。
+Part VI 共六章，全部落在 L0 图中间那根 GPU 执行臂的模型层框上：ch23 模型定义层拼装术（本章，Part 开篇）、ch24 注意力变体数学（原理章）、ch25 MLA 的两种展开、ch26 DeepSeek 索引器、ch27 量化（原理章）、ch29 实战：DeepSeek-V4 拼装（收官）。
 
 ![Part VI 导览：模型的形状](../diagrams/L1-partVI.png)
 

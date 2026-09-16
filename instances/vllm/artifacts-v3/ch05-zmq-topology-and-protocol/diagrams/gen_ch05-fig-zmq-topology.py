@@ -207,7 +207,7 @@ lc.text(MX + 16, WY + 58,
         9, '#334155', 'start', maxw=BXR - MX - 32, tag='why:l2')
 lc.text(MX + 16, WY + 76,
         '演进：#15906 首改 ROUTER 次日即 revert；#17546 随 many-to-many 需求成熟才立住——'
-        '这条带信封的路什么时候才真的需要寻址？ch34 回收',
+        '这条带信封的路什么时候才真的需要寻址？ch35 回收',
         9, '#334155', 'start', maxw=BXR - MX - 32, tag='why:l3')
 lc.text(MX + 16, WY + 98,
         'socket 记账：client 每前端 1 条 ROUTER(bind) + 1 条 PULL(bind)；engine 每前端 1 条 DEALER(connect) '

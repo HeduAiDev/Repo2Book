@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch28 机制图 · FP4 专家参数的字节布局(ch28-fig-fp4-byte-layout, 模板 layout)
+"""ch29 机制图 · FP4 专家参数的字节布局(ch29-fig-fp4-byte-layout, 模板 layout)
 
 放大自 L0『GPU 执行臂·模型层 forward + 编译』块里 MoE 专家参数的内存布局——
 ch27 讲 FP4 格点数学, 本图讲它在 vLLM 参数张量里的字节落位(L2 拍片④/⑤ 的机制版下钻)。
@@ -207,7 +207,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', lc.DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch28-fig-fp4-byte-layout.svg'
+out = HERE / 'ch29-fig-fp4-byte-layout.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

@@ -155,7 +155,7 @@ NY = PY0 + LPH + 24
 lc.rect(MX + 24, NY, BXR - MX - 48, 58, '#ffffff', lc.C_MUTE, rx=7, sw=1.1, dash=True)
 lc.text(MX + 42, NY + 20, '惰性 import：登记册全是字符串对，只在 load_model_cls 三行（L1017-L1019）importlib.import_module + getattr——说「现在要进房」那一刻才出发，一张表只出动一个导游',
         8.8, lc.C_TXT, 'start', maxw=BXR - MX - 84, tag='nb:1')
-lc.text(MX + 42, NY + 40, "两条街并存 = 迁移进行时（'[1/N]'）——读者要能分辨条目走哪条街；DSV4 接入清单六件套归 ch28 capstone（预告）",
+lc.text(MX + 42, NY + 40, "两条街并存 = 迁移进行时（'[1/N]'）——读者要能分辨条目走哪条街；DSV4 接入清单六件套归 ch29 capstone（预告）",
         8.8, lc.C_MUTE, 'start', maxw=BXR - MX - 84, tag='nb:2')
 
 # ---------------- 页脚 ----------------

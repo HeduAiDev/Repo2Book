@@ -1,0 +1,1100 @@
+{
+ "chapter_id": "ch35",
+ "part": "VIII",
+ "title": "P/D 分离",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "chapter_kind": "code",
+ "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。Part VIII 第二章——ch33 已立多实例视角（TP/PP/DP/EP 的『切法与通信税』）、ch16 已立 KVConnector 双面契约的骨架（F8 埋点，本章回收其一）。本章讲契约的第一种真实填法：P/D 分离部署——两台完整引擎实例（P=kv_producer 只算 prefill、D=kv_consumer 接力 decode）、一个 disaggregator 路由器搬运 kv_transfer_params 回执信封、NIXL 连接器用 RDMA 单边 READ/WRITE 把『P 的显存』变成『D 的外存』。L0 缩放 = L0 双实例+KV 边界（multi 视角块：DP / P-D 分离 / 弹性扩缩）。",
+ "hook_suggestion": "「prefill 与 decode 拆成两台引擎，KV 却留在 P 的显存里、活要 D 接着干——块凭什么『过户』：D 直接从 P 显存拉数据、连 P 的 CPU 都不过，那 P 怎么知道块什么时候能放？D 还没开工就崩了、或 serving 层干脆拒收，P 钉住的显存谁解救？一台引擎的显存怎么变成另一台的『外存』——答案是一只随请求/响应过线的回执信封 + 一份带租约心跳的钉住协议 + 一条带兼容门的带外握手。」（从 Part VIII hook『真实服务不止一个引擎』+ 本章主题『P/D 分离』+ deepread/memory-kv.json why_chains[9]（P/D 痛点：decode 实例拿不到 prompt KV 无法开工）+ v0.27.1 新增的租约心跳/拒绝回执链提炼）",
+ "scope_note": "主线 = 一个请求跨 P/D 部署的一生（拉模式 NixlPullConnector 为正典、推模式 NixlPushConnector 作对照）：(A) 部署形态——两台完整引擎（各自 ch1-35 的全套器官）+ kv_role 配置门 + disaggregator 路由器（kv_transfer_params 回执信封：P 终局产、随响应出引擎、proxy 转交 D 入场消费；prompt_token_ids 复用免二次 tokenize）；(B) P 侧终局——request_finished 双条件（LENGTH_CAPPED/STOPPED 才交接）+ delay_free 接管 + 租约 kv_lease_duration=30s + 回执字典（remote_block_ids/engine_id/host/port/tp_size/remote_num_tokens）；(C) D 侧异步拉——get_num_new_matched_tokens 全 prompt 命中、update_state_after_alloc 登记 _reqs_need_recv、接 ch16 WAITING_FOR_REMOTE_KVS 等待路径；(D) 带外握手——EngineCore 聚合 worker 握手元数据 → 调度器侧 ZMQ ROUTER side channel（VLLM_NIXL_SIDE_CHANNEL_*）；D 首遇远端 ZMQ REQ、compat hash 两段解码、RTT 时钟偏移；(E) RDMA 单边 READ——make_prepped_xfer('READ') 直读 P 显存（P CPU 零参与）、全命中 notif-only、handle 轮询；(F) 完成回收——D 轮询 DONE vs P 收 notif 的不对称、KVOutputAggregator 聚 TP、scheduler_clock 租约重基准；(G) 租约心跳与过期——HB: notif 续租 lease×2/3、到期超时放块自愈、双向 D→P 回拉（多轮，ch37 续接）；(H) 拒绝回执——D serving 层拒收 → abort_immediately 占位请求 → P 空 recv → notif 放块；(I) 推模式对照——D 先注册 PUSH_REG（携 D 地址）、P nixl-push-writer 线程 WRITE 直写 D 预分配块、has_pending_push_work 保活、注册 watchdog。边界与邻章分工：契约骨架/调度器集成/WAITING_FOR_REMOTE_KVS/失败回滚/defer 栅栏归 ch16（本章消费不重讲）；TP/PP/DP/EP 建组与集合通信归 ch33；offload 池化（LMCache/Mooncake 把块搬出去再搬回来）归 ch36（F8 回收另一半）；多轮 D→P 双向回拉的完整故事归 ch37。可省略分支：异构 TP（tp_ratio/splits/staging）、MLA replicate、Mamba/HMA 深分支（get_exchange_clipped_blocks 只留 SWA 一支）、host buffer 旁路、packed/cross-layer 布局、stats/telemetry。",
+ "code_spine": [
+  "vllm/config/kv_transfer.py:L41-L72 —— kv_role 三态/kv_rank(1P1D)/kv_connector_extra_config：P=kv_producer、D=kv_consumer 的部署门（engine_id 默认 uuid4，L92-L95）",
+  "vllm/distributed/kv_transfer/kv_connector/factory.py:L176-L193 —— 注册名：NixlConnector（=Pull 别名）/NixlPullConnector/NixlPushConnector",
+  "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:L79-L135 —— NixlBaseConnector facade：按 role 只建半边子对象（scheduler/worker 各一），get_required_kvcache_layout 强制 HND",
+  "vllm/v1/engine/core.py:L173-L174 + L181-L200 —— 启动：init_kv_output_aggregator + 聚合 worker 握手元数据注入调度器侧 connector",
+  "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:L281-L322 —— set_xfer_handshake_metadata → ZMQ ROUTER side channel 监听线程（P/D 各自待命）",
+  "tests/v1/kv_connector/nixl_integration/toy_proxy_server.py:L155-L197 —— disaggregator 发单 P：do_remote_decode=True + max_tokens=1 + stream=False",
+  "vllm/v1/request.py:L100-L122 —— kv_transfer_params 经 extra_args 挂上 Request",
+  "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:L181-L280 —— P 终局：双条件交接 + delay_free + 租约 + 回执字典",
+  "vllm/v1/core/sched/scheduler.py:L1901-L1902 + L1935 —— 回执随 EngineCoreOutput 出引擎（P 的响应体带 kv_transfer_params）",
+  "tests/v1/kv_connector/nixl_integration/toy_proxy_server.py:L219-L237 —— disaggregator 转交 D：回执信封原样附加到同一请求",
+  "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:L34-L110 —— D 查命中：do_remote_prefill → (N−computed, True) 全 prompt 异步拉",
+  "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:L112-L179 —— D 登记 _reqs_need_recv（一次性翻转防重发）",
+  "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:L577-L724 —— _nixl_handshake：ZMQ REQ → compat hash 门 → add_remote_agent + 时钟偏移",
+  "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:L853-L941 —— _ensure_handshake/_background_nixl_handshake：单飞 future + 完成回调补发",
+  "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:L42-L113 —— D start_load_kv：握手或直发 READ + 租约重基准 + 心跳",
+  "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:L225-L344 —— _read_blocks：RDMA 单边 READ（make_prepped_xfer('READ')+transfer）+ 全命中 notif-only",
+  "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:L2044-L2164 —— get_finished：双源完成信号 + 租约到期收割",
+  "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:L346-L399 —— P 侧 _get_new_notifs：READ-done notif + consumer 计数齐才放块",
+  "vllm/distributed/kv_transfer/kv_connector/utils.py:L53-L133 + vllm/v1/executor/abstract.py:L280-L284 —— KVOutputAggregator：TP 多 worker 输出聚成 rank0 视图",
+  "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:L2189-L2305 —— 心跳双端：D 发 HB:（含预握手）/ P 续租 lease×2/3",
+  "vllm/entrypoints/generate/base/serving.py:L218-L259 + vllm/v1/engine/async_llm.py:L743-L769 + vllm/v1/engine/core.py:L479-L483 —— 拒绝回执：D 拒收 → abort_immediately 占位请求 → 立即 abort",
+  "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:L210-L221 —— P 收到占位 abort：do_remote_prefill 仍 True → 空 recv → notif 放块",
+  "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py:L101-L206 + L295-L346 —— 推模式：D 注册 PUSH_REG + watchdog + has_pending_push_work",
+  "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py:L130-L399 + L403-L686 —— nixl-push-writer 线程：配对匹配 + WRITE 直写 D",
+  "vllm/v1/core/sched/scheduler.py:L2406-L2420 —— has_requests 纳入 has_pending_push_work（引擎保活）"
+ ],
+ "stations": [
+  {
+   "n": 1,
+   "where": "vllm/config/kv_transfer.py:L41-L72 + nixl/connector.py:L112-L135",
+   "what": "部署与角色：两台完整引擎，P=kv_role:kv_producer、D=kv_consumer（engine_id 默认 uuid4）；每台内部 scheduler/worker 各建一份 connector，facade 按 role 只建半边"
+  },
+  {
+   "n": 2,
+   "where": "vllm/v1/engine/core.py:L181-L200 + nixl/base_scheduler.py:L281-L322",
+   "what": "待命：启动时聚合全 worker 握手元数据（compat hash+agent metadata）注入调度器侧 connector → 起 ZMQ ROUTER 监听（side channel，VLLM_NIXL_SIDE_CHANNEL_HOST/PORT）"
+  },
+  {
+   "n": 3,
+   "where": "toy_proxy_server.py:L155-L197 + vllm/v1/request.py:L100-L122",
+   "what": "发单 P：do_remote_decode=True + max_tokens=1 + stream=False——P 只算 prefill；回执坐标经 extra_args 挂上 Request"
+  },
+  {
+   "n": 4,
+   "where": "nixl/pull_scheduler.py:L181-L280 + scheduler.py:L1901-L1935",
+   "what": "P 终局【F8 回收①】：只认 LENGTH_CAPPED/STOPPED → delay_free 接管 + 30s 租约戳 → 返回 kv_transfer_params（remote_block_ids/engine_id/host/port/tp_size）随响应出引擎"
+  },
+  {
+   "n": 5,
+   "where": "toy_proxy_server.py:L219-L237 + chat_completion/protocol.py:L465-L472",
+   "what": "转交 D：proxy 掏出 P 回执原样附加到同一请求（do_remote_prefill=True）；可带 prompt_token_ids 免 D 二次 tokenize"
+  },
+  {
+   "n": 6,
+   "where": "nixl/pull_scheduler.py:L34-L66 + L112-L179",
+   "what": "D 查命中：do_remote_prefill → (N−computed, True) 全 prompt 异步拉；登记 _reqs_need_recv（未入哈希表块作缓冲，一次性翻转防重）→ 接 ch16 等待路径"
+  },
+  {
+   "n": 7,
+   "where": "nixl/base_worker.py:L577-L724 + L853-L941",
+   "what": "后台握手：首遇远端 → ZMQ REQ 到 P side channel → 先比 compatibility_hash（版本+模型+后端）再注册 agent 描述符；顺带 RTT 估两机时钟偏移；完成才发 READ"
+  },
+  {
+   "n": 8,
+   "where": "nixl/pull_worker.py:L42-L113 + L225-L333",
+   "what": "RDMA 单边 READ：make_prepped_xfer('READ')+transfer 非阻塞——D 直接从 P 显存拉块、P 的 CPU 零参与；全命中只发 notif 免拉；租约截止时间按 scheduler_clock 重基准"
+  },
+  {
+   "n": 9,
+   "where": "nixl/base_worker.py:L2044-L2064 + L2210-L2255 + pull_worker.py:L346-L399",
+   "what": "双端回收（信号不对称）：D 轮询 handle 全 DONE→done_recving→接 ch16 提升；P 收 READ-done notif（consumer 计数齐）→done_sending 放块；TP 聚合靠 KVOutputAggregator"
+  },
+  {
+   "n": 10,
+   "where": "nixl/base_scheduler.py:L459-L468 + base_worker.py:L2189-L2305 + L2145-L2164",
+   "what": "租约心跳：D 等待期每 租约/6 发 HB: notif，P 续租 lease×2/3（只增不减）；到期未读→P 超时收割放块——D 失联时 P 显存自愈"
+  },
+  {
+   "n": 11,
+   "where": "serving.py:L218-L259 + async_llm.py:L743-L769 + core.py:L479-L483",
+   "what": "拒绝回执：D serving 拒收→notify_kv_transfer_request_rejected 发 abort_immediately 占位请求→立即 abort→P 见 do_remote_prefill 仍 True 登记空 recv→notif 放块"
+  },
+  {
+   "n": 12,
+   "where": "nixl/push_scheduler.py:L101-L206 + push_worker.py:L130-L272",
+   "what": "推模式对照：D 分配即发 PUSH_REG 注册；P 的 nixl-push-writer 线程配对后 WRITE 直写 D 预分配块（传输与 D 排队重叠）；has_pending_push_work 保活引擎"
+  }
+ ],
+ "stations_note": "站号 = 一个请求跨 P/D 部署的流经顺序（disaggregator 双跳：第 3 站进 P、第 5 站进 D）。第 1-2 站部署与待命（两台引擎如何成对存在）；第 3-5 站控制面（发单→P 终局回执→转交——kv_transfer_params 信封的一生）；第 6-9 站数据面主线（查命中→握手→READ→双端回收——F8 回收①的完整落地）；第 10-11 站可靠性（租约心跳防钉死 + 拒绝回执防搁浅）；第 12 站推模式对照（同一契约的第二种填法）。正文按讲解需要编排——建议先立部署形态与 disaggregator 回执回路（m1/m2），再走拉模式主线（m3-m7），可靠性作进阶幕（m8-m10），推模式收尾对照（m9）。",
+ "key_classes": [
+  {
+   "name": "NixlBaseConnector",
+   "file": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py",
+   "responsibility": "NIXL facade 基类（L79-L320）：按 role 只建半边子对象（connector_scheduler 或 connector_worker），全部契约方法转发给所在半边；get_required_kvcache_layout 强制 HND 布局（传输性能）；wait_for_layer_load/save_kv_layer 为 no-op（不逐层、不显式 save——READ/WRITE 以块为单位整请求传输）。"
+  },
+  {
+   "name": "NixlPullConnector / NixlConnector",
+   "file": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py",
+   "responsibility": "拉模式 connector（L322-L347）：D 用 RDMA READ 从 P 显存拉 KV（默认形态；'NixlConnector' 注册名是它的别名，factory.py:L176-L181）。调度器半边=NixlPullConnectorScheduler、worker 半边=NixlPullConnectorWorker。"
+  },
+  {
+   "name": "NixlPushConnector",
+   "file": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py",
+   "responsibility": "推模式 connector（L350-L383）：D 预分配块并注册（PUSH_REG notif），P 的 writer 线程用 RDMA WRITE 直写 D——传输与 D 的排队等待重叠（#35264 引入）。"
+  },
+  {
+   "name": "NixlBaseConnectorScheduler",
+   "file": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py",
+   "responsibility": "调度器侧公共层（L51-L505）：side channel 配置与 ZMQ ROUTER 监听（L281-L365）、租约/心跳常量、_reqs_need_recv/_reqs_need_send/_reqs_in_batch/_reqs_not_processed 四账本、build_connector_meta（L437-L476，含 scheduler_clock 时钟基准）、get_exchange_clipped_blocks（混合模型传输剪裁）。"
+  },
+  {
+   "name": "NixlPullConnectorScheduler",
+   "file": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py",
+   "responsibility": "拉模式调度器侧（L23-L280）：D 面 get_num_new_matched_tokens（do_remote_prefill→全 prompt 异步拉；do_remote_decode→双向回拉含 kv_recompute_threshold 短拉不划算判定）、update_state_after_alloc 登记 _reqs_need_recv；P 面 request_finished 双条件交接+租约+回执字典；abort 未调度请求登记空 recv 防搁浅。"
+  },
+  {
+   "name": "NixlPushConnectorScheduler",
+   "file": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py",
+   "responsibility": "推模式调度器侧（L54-L356）：D 面 update_state_after_alloc 打包 PUSH_REG 注册（decode_engine_id/host/port/本地块号+P 坐标）+ 注册 watchdog；P 面 request_finished 把完成块交给 writer 匹配；has_pending_push_work 保活引擎。"
+  },
+  {
+   "name": "NixlBaseConnectorWorker",
+   "file": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py",
+   "responsibility": "worker 侧公共层（2598 行）：NIXL agent 与内存注册（register_kv_caches L1037）、带外握手（_nixl_handshake L577：ZMQ REQ+compat hash+时钟偏移；_ensure_handshake L853 单飞 future；_background_nixl_handshake L911）、get_finished（L2044：双源完成信号+租约收割）、_pop_done_transfers/_handle_failed_transfer、心跳双端（L2189/L2275）。"
+  },
+  {
+   "name": "NixlPullConnectorWorker",
+   "file": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py",
+   "responsibility": "拉模式 worker（L31-L399）：start_load_kv（握手或直发 READ+租约重基准+心跳）、_read_blocks_for_req/_read_blocks（RDMA 单边 READ；全命中 notif-only）、P 面 _get_new_notifs（READ-done notif+consumer 计数）。"
+  },
+  {
+   "name": "NixlPushConnectorWorker",
+   "file": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py",
+   "responsibility": "推模式 worker（L77-L778）：nixl-push-writer 后台线程（_push_writer_loop：四收件箱+notif 路由；配对机器 _handle_push_reg_notif/_pop_matching_registration/_pop_matching_finished_blocks——get_base_request_id 剥 -<8hex> 随机后缀归一匹配，L274-L399）、_do_start_push_kv/_xfer_blocks_for_req（WRITE 直写 D 预分配块，整请求原子记账）、D 面 notif 转发与完成判定。"
+  },
+  {
+   "name": "NixlConnectorMetadata / ReqMeta / RemoteMeta",
+   "file": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py",
+   "responsibility": "跨进程元数据（L156-L239）：reqs_to_recv/reqs_to_save/reqs_to_send（值=租约到期时刻）/scheduler_clock/reqs_in_batch/reqs_not_processed/heartbeat_by_engine + push 两表（push_registrations/push_finished_blocks）。RemoteMeta 携带 P 的块号与 side channel 地址。"
+  },
+  {
+   "name": "NixlHandshakePayload / NixlAgentMetadata",
+   "file": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py",
+   "responsibility": "握手线上格式（L48-L78）：两段解码——先比 compatibility_hash（vLLM 版本+模型结构+KV dtype+注意力后端；NIXL_CONNECTOR_VERSION=5 入参）再解 agent metadata（基址/块数/块长/布局/物理块比）；版本史 L28-L45。"
+  },
+  {
+   "name": "KVOutputAggregator",
+   "file": "vllm/distributed/kv_transfer/kv_connector/utils.py",
+   "responsibility": "TP 聚合器（L53-L133）：每 worker 各持 KV 分片各报一次，按 expected_finished_count（=world_size 或 get_finished_count 自报）计数归零才向调度器上报请求级完成；EngineCore 启动时经 init_kv_output_aggregator 装配（engine/core.py:L173-L174）。"
+  },
+  {
+   "name": "disaggregator（toy_proxy_server 为参考实现）",
+   "file": "tests/v1/kv_connector/nixl_integration/toy_proxy_server.py",
+   "responsibility": "P/D 之间的路由器/代理（生产对应 vllm-router 等）：发单 P（do_remote_decode+max_tokens=1+stream=False）、掏 P 回执转交 D（do_remote_prefill+remote_*）、round-robin 多实例；多轮版（disagg_proxy_multiturn.py）按 conversation_id 缓存 D 回执做双向回拉。"
+  },
+  {
+   "name": "Request.kv_transfer_params",
+   "file": "vllm/v1/request.py",
+   "responsibility": "回执信封在请求上的挂点（L100-L122）：HTTP extra_args → SamplingParams.extra_args → 构造时摘出；do_remote_prefill/do_remote_decode/remote_block_ids/remote_engine_id/remote_request_id/remote_host/remote_port/tp_size——调度器侧 connector 的全部外部世界坐标。"
+  },
+  {
+   "name": "notify_kv_transfer_request_rejected / abort_immediately",
+   "file": "vllm/v1/engine/async_llm.py + vllm/v1/engine/core.py",
+   "responsibility": "拒绝回执通道（async_llm.py:L743-L769 + core.py:L479-L483 + engine/__init__.py:L146）：serving 层拒收时发占位请求立即 abort——只为触发 P 侧 request_finished 钩子释放钉住块；EngineClient 协议面见 engine/protocol.py:L113-L125。"
+  }
+ ],
+ "data_flow": [
+  "总述：本章数据流 = deepread/memory-kv.json data_flow 的 [异步 KV] 整段（WAITING_FOR_REMOTE_KVS → worker get_finished → _update_waiting_for_remote_kv → 回 WAITING/PREEMPTED，ch16 已立、本章不重挖）外面包一圈『跨引擎部署』：控制面（回执信封经 disaggregator 双跳）+ 数据面（RDMA READ/WRITE 直读直写显存）+ 可靠性（租约心跳/拒绝回执）。",
+  "【部署】P/D 各 vllm serve：--kv-transfer-config {kv_connector:NixlConnector, kv_role:kv_producer|kv_consumer}（kv_transfer.py:L41-L49）；每台内部 scheduler 侧 + worker 侧各建一份 connector（ch16 站1-2 的双份展开）。",
+  "【待命】启动时 worker register_kv_caches 注册 KV 张量并算 compat hash → EngineCore 聚合握手元数据注入调度器侧 connector（core.py:L181-L200）→ ZMQ ROUTER 监听（base_scheduler.py:L281-L322）。",
+  "【P 腿】disaggregator 发单（do_remote_decode=True, max_tokens=1, stream=False）→ P 正常调度 prefill（ch9-15 全套）→ 请求 FINISHED_LENGTH_CAPPED → _free_request → _connector_finished → NixlPullScheduler.request_finished：块不释放（delay_free=True）+ 租约戳 + 回执字典 → EngineCoreOutput.kv_transfer_params（scheduler.py:L1901-L1935）→ P 响应体带回执出引擎。",
+  "【转交】disaggregator 掏回执附加到同一请求发 D（do_remote_prefill=True + remote_*）→ D 的 Request.kv_transfer_params 挂载（request.py:L116-L119）。",
+  "【D 腿·查】waiting 循环 get_num_new_matched_tokens → (N−computed, True) → allocate_slots(delay_cache_blocks=True)（ch16 站5-6 原样复用）→ WAITING_FOR_REMOTE_KVS。",
+  "【D 腿·拉】build_connector_meta 带 _reqs_need_recv → worker start_load_kv：首遇 P 后台握手（ZMQ REQ→compat hash→add_remote_agent+时钟偏移）→ make_prepped_xfer('READ')+transfer 非阻塞 → handle 入 _recving_transfers；等待期间 D 发 HB: 心跳、P 续租。",
+  "【完成】D：每步 get_finished 轮询 handle 全 DONE → done_recving（KVOutputAggregator 聚 TP）→ 调度器 _update_from_kv_xfer_finished → _try_promote → _update_waiting_for_remote_kv 补缓存+全命中退一 token（ch16 站9）→ 回 WAITING 重入调度、正常 decode 出流；P：收 READ-done notif（consumer 计数齐）→ done_sending → 放块（或租约到期超时放块）。",
+  "【兜底】D serving 拒收 → 拒绝回执链（站11）；握手/READ 失败 → invalid_block_ids + failed_recv_reqs → ch16 失败回滚（fail=FINISHED_ERROR / recompute=第一个坏块截断重算）。",
+  "【推模式变体】D 分配即 PUSH_REG 注册（P 不必等 D 的请求被调度）→ P writer 线程配对 → WRITE 直写 D 预分配块 → D 收完成 notif（无本地 handle，materialize 空条目报完）→ finished_recving 提升；P 侧 WRITE handle 全 DONE → done_sending 放块；has_pending_push_work 保活。"
+ ],
+ "why_chains": [
+  {
+   "id": "WC1",
+   "card": "deepread/memory-kv.json why_chains[9]（本章为其回收章：ch16 立契约骨架、本章填第一种真实传输后端）",
+   "decision": "KVConnector 双面契约：把外部 KV 世界（P/D 分离、CPU/NVMe offload）接到同一个池",
+   "old_design": "KV 困在单引擎进程的 GPU 池里；P/D 早期靠定制传输（v0 kv_transfer 基本只有 NIXL 一条路）；offloading 与 P/D 各写各的，无法组合；混合模型+connector 的多组语义（每组的块表/命中长度都不同）曾直接不支持。",
+   "pain": "prefill 算力密集、decode 带宽密集，同卡混跑互相拖累；decode 实例拿不到 prompt KV 无法开工；offload 需要「把块搬出去再搬回来」的通用通道；每个传输后端各写一套调度钩子 = 不可组合。",
+   "solution": "KVConnectorBase_V1 把契约劈成两半（vllm/distributed/kv_transfer/kv_connector/v1/base.py:L7-L41 docstring 逐条列原语）。调度器侧（scheduler 进程）：get_num_new_matched_tokens 把外部缓存当第二个前缀缓存查（scheduler.py:L769-L789；返回 None=「稍后再问」，请求进 skipped 队列 L783-L789）、update_state_after_alloc（L1000-L1005）、request_finished 返回 True 即接管块的异步释放（base.py:L559-L577；混合模型走 SupportsHMA.request_finished_all_groups，base.py:L93-L114；调度器侧实例还可用 bind_gpu_block_pool 直读块池元数据，scheduler.py:L291-L294）。worker 侧（每个 worker 进程）：start_load_kv/wait_for_layer_load 逐层异步加载与计算重叠（base.py:L305-L334）、save_kv_layer/wait_for_save（L337-L367；wait_for_save 的存在理由原话「This prevents overwrites of paged KV buffer before saving done」）、handle_preemptions（L297-L302，OffloadingConnector 在块被覆写前抢救）。异步加载路径：请求先占块但延迟入缓存（allocate_slots 的 delay_cache_blocks，kv_cache_manager.py:L549-L552 注释「P/D: delay caching blocks if we have to recv from remote」），状态置 WAITING_FOR_REMOTE_KVS 停在 skipped 队列（scheduler.py:L1023-L1053，num_computed_tokens 先行设置但闲置）；传输完成后 _update_waiting_for_remote_kv 补缓存并对全命中回退一个 token 重算（L2635-L2676）。加载失败的块按第一个坏块截断 num_computed_tokens 并对截断后重算区补登记清零（L2643-L2663 + kv_cache_manager.py:L817-L829 record_blocks_for_zeroing；_update_requests_with_invalid_blocks L2743 起）。异步准入护轨：async load 请求须 fits in (free − 其余在途 prefill 的预约)（reserved_blocks，scheduler.py:L965-L971 + _request_remaining_blocks L2614-L2626 + _inflight_prefill_reserved_blocks L2628-L2633），防死锁与可预期抢占。数据所有权转移点三处：异步加载期「已分配未缓存」；请求结束且 request_finished→True 时块不释放直到 get_finished 报完成（_update_from_kv_xfer_finished，scheduler.py:L2714-L2741 + _free_request L2300-L2327）；异步调度+consumer 场景 free 整体延迟到在途步处理完（defer_block_free L150-L156 + _free_request_blocks L2341-L2354 带 sched_step_seq 栅栏）。",
+   "cost": "① 双查找路径：本地前缀缓存与 connector 缓存都要查再手工合并（含子块尾仲裁 L791-L811、混合 per-group 发散回退 L813-L821 两处补丁性逻辑）；② 异步加载期占着池块却不产生前向进度（容量空转窗口），还要靠预约护轨防它挤死在途 prefill；③ wait_for_save 是强制同步点；④ 调度器侧/worker 侧必须分开构建、不许共享状态（factory 双角色）；⑤ invalid-block 回滚链路（截断+去重+重登记清零）复杂且正确性敏感；⑥ requires_kv_delivery 的 producer 在 hand-off 未决时抢占要 drop_stale_output（scheduler.py:L617-L621、base.py:L184-L194）。本章视角的增量：契约的『异步世界账实分离』在 P/D 部署里显形为三笔新账——租约（P 侧块钉多久）、心跳（D 用什么证明自己还活着）、拒绝回执（D 不来了谁销账）。"
+  },
+  {
+   "id": "WC2",
+   "card": "deepread/memory-kv.json why_chains[10]（护栏组合链——本章取其 async-load 面；P 侧租约/心跳是该护栏在跨引擎场景的对偶，见 WC4）",
+   "decision": "护栏组合：整序列准入门 + 回收感知准入上限 + 新块清零 + CoW 拷贝管线 + 采样式驻留指标",
+   "old_design": "chunked prefill 只检查第一个 chunk 的块需求——一条比池还长的请求可能被放进来，prefill 中途才发现装不下（死锁/中途 OOM 的温床，issue #39734）。回收型 spec（SWA）的稳态块数远小于全长，但准入门若按全长算会把并发压到浪费，若按 chunk 算又可能超收。",
+   "pain": "被卡的指标是活性（不崩溃）与并发利用率的平衡：门太松死锁、太紧浪费容量。",
+   "solution": "① full-ISL 准入门：allocate_slots 先按整序列算块数对比空闲块（含水位），不够直接 None 拒之门外（kv_cache_manager.py:L472-L488；scheduler_reserve_full_isl 默认 True，vllm/config/scheduler.py:L130；传入 scheduler.py:L982）。② 回收感知准入上限：SWA/chunked-local 的 admission cap = cdiv(window-1+max_in_flight_tokens, block_size)+1，与启动期池大小器同源（vllm/v1/kv_cache_interface.py:L522-L546、L587-L608 docstring「Single source of truth for both startup pool sizing and the runtime admission gate」；运行时应用于 get_num_blocks_to_allocate 的 apply_admission_cap，single_type:L179-L191）。③ 新块清零：调度器每步 drain 新块 id（take_new_block_ids kv_cache_manager.py:L796-L801 → scheduler.py:L1260-L1272 _get_new_block_ids_to_zero，含 async-load 覆写区跳过集合 _skip_zero_block_ids L1043-L1052），worker 用 KVBlockZeroer 清零，理由注释原话「to prevent stale NaN/data from corrupting attention or SSM computation」（gpu_model_runner.py:L1219-L1222）；加载失败区补登记 record_blocks_for_zeroing（start_token 必须块对齐，kv_cache_manager.py:L817-L829）。④ CoW 拷贝管线：kv_cache_block_copies 跨进程到 worker 原地拷贝（gpu_model_runner.py:L1223-L1228）。⑤ 1% 采样驻留指标（vllm/v1/core/kv_cache_metrics.py:L46-L96：块生命周期/空闲时长/复用间隔，驱逐时落账；access_history 限长 4）。",
+   "cost": "① 整序列门更保守 = batch 可能装不满（吞吐换活性）；SWA 用准入上限换回部分并发；② 清零 kernel 每步一次、即将被 prefill 全量覆写的块也被清 = 浪费带宽（部分由 skip 集合缓解）；③ 指标是抽样非全量，只够调参用；④ CoW 拷贝管线让调度器输出多一类负载体、worker 多一类副作用，两端必须对账（retained 块的释放带步序栅栏）。本章消费点：async load 的『已分配未缓存』窗口 + _skip_zero_block_ids（防清零与远端写入竞争）正是 D 侧等待路径的护栏；P 侧的对应物=租约（WC4）。"
+  },
+  {
+   "id": "WC3",
+   "card": "本章现核（源码 + 引入 PR #35264 的设计文档 docs/design/nixl_kv_push_connector.md，git 88ed636218）",
+   "decision": "拉（READ）为默认、推（WRITE）为对照：D 从 P 显存单边读 vs P 直写 D 预分配块",
+   "old_design": "默认 NIXL 连接器只有拉模式：D 在收到转交请求、被调度器准入、分配好本地块之后才发起 READ——传输串行在「P 完成→proxy 转交→D 排队+准入」整条链路之后（design doc 原话：the decode (D) instance reads KV blocks from the prefill (P) instance via NIXL READ after prefill completes）。",
+   "pain": "TTFT 账上多一段纯等待：KV 明明已经算完躺在 P 显存里，D 却要等自己被准入才能去搬；高并发下 D 队列深，传输时延被排队时延放大。",
+   "solution": "NixlPushConnector（#35264，2026-06）：D 一分配到块就发 PUSH_REG notif 把『我的坐标+块号』注册给 P（push_scheduler.py:L156-L206）；P 的 nixl-push-writer 后台线程把注册项与 P 完成块配对（两边谁先到都能配，push_worker.py:L210-L272），make_prepped_xfer('WRITE') 直写 D 预分配块（L656-L669）——传输与 D 的排队等待重叠。D 侧不持 handle，收 P 的完成 notif 即报完（materialize 空 _recving_transfers 条目，L713-L728）；P 侧 WRITE handle 全 DONE 才 done_sending。",
+   "cost": "① 每引擎每 TP rank 一条常驻 writer 线程 + 四个跨线程队列（单消费者）；② 两张匹配表（_pending_d_registrations/_push_finished_blocks）+ 随机后缀剥离匹配（P/D 两腿的 request_id 差一个引擎内随机后缀，get_base_request_id 归一）；③ D 侧注册 watchdog（注册后 push_registration_timeout 内没等到 WRITE 即弃）+ P 侧 WRITE 提交失败不能走 _handle_failed_transfer（P 无 recv 元数据会踩断言，只能弃单等租约/看门狗）；④ has_pending_push_work 保活让引擎在无活请求时空转步进；⑤ 不支持双向回拉（a2cb08b3d5 显式禁用）。"
+  },
+  {
+   "id": "WC4",
+   "card": "本章现核（源码 + #50326 rebasing bugfix 实证）",
+   "decision": "租约+心跳：P 钉住的块必须有个到期时刻，D 用心跳续租",
+   "old_design": "朴素做法：P 把交接块钉住直到 D 来读（无界等待）；或者定时器用各自进程的时钟直接比（#50326 之前的 bug：租约截止时间由调度器进程的 perf_counter 盖戳，worker 在另一进程/另一节点，perf_counter 纪元不同——跨机时差大于租约会在 READ 到达瞬间就判过期，块先被释放）。",
+   "pain": "P 的 KV 池是共享预算：钉住的块=挤占在途请求的容量。D 崩溃/失联/排队过久时，无界等待=P 的显存被死块慢慢锁死；而粗暴的短租约又会在 D 排队高峰误杀活块。",
+   "solution": "三层：① 租约 kv_lease_duration 默认 30s（base_scheduler.py:L70-L76）：P 终局时 _reqs_need_send[req]=now+租约（pull_scheduler.py:L244-L257），build_connector_meta 附 scheduler_clock 时钟基准（L459），worker 重基准 remaining=now_local+(deadline−scheduler_clock)——广播延迟只会拉长租约，安全方向（pull_worker.py:L94-L109，注释原话明说反例后果）；② 心跳：D 请求在等待队列期间按引擎分组定期发 'HB:req1,req2'（间隔=租约/6，L459-L468），P 收到把租约延 lease×2/3、只增不减（base_worker.py:L2189-L2208）；③ 到期收割：get_finished 按到期序扫描，过期即强制 done_sending 放块+记 kv_expired_req（L2145-L2162）——D 失联时 P 显存自愈。",
+   "cost": "① 心跳是有界租约下的必要税：每请求每 lease/6 一条 notif（节流在 meta 层做）；② 时钟域换算链路（RTT 中点估偏移→重基准→5s 安全边际 _KV_BLOCKS_EXPIRY_SAFETY_MARGIN）正确性敏感，#50326 就是这条链的实证 bug；③ 最坏情况 D 白等：租约已过但 D 的 READ 在路上——P 已放块，READ 读到被复用的块（靠 invalid/失败路径兜底重算）。"
+  },
+  {
+   "id": "WC5",
+   "card": "本章现核（源码 + docs/features/disagg_prefill.md 官方口径）",
+   "decision": "disaggregator 控制面：kv_transfer_params 作为『回执信封』随请求/响应在 P/D 之间搬运",
+   "old_design": "没有跨引擎协调器时，一台引擎既不知道「另一台在哪、块在谁手里」，也无法把 P 的块坐标告诉 D——两台引擎各有各的 request_id 坐标系、各有各的调度循环，天然互相失明。",
+   "pain": "P/D 拆分后请求必须双跳（先 P 算 KV、再 D 接力生成）：谁来定「这条请求去哪个 P、P 完成后去哪个 D」？块号/engine_id/host/port 这些传输坐标怎么从 P 的引擎内部流到 D 的引擎内部？出错了（D 拒收/崩溃）谁来通知 P 销账？",
+   "solution": "外部 disaggregator（toy_proxy_server 为最小参考实现 / 生产为 vllm-router）：① 发单 P：do_remote_decode=True + max_tokens=1 + stream=False（toy_proxy L155-L172）——P 只算 prefill；② P 终局把传输坐标打包成 kv_transfer_params 随响应体出引擎（connector request_finished 返回 → EngineCoreOutput → RequestOutput）；③ proxy 原样附加到同一请求转交 D：do_remote_prefill=True + remote_*（L219-L237）→ D 的 Request.kv_transfer_params（request.py:L116-L119）；④ 拒收回执：D serving 层拒收时 notify_kv_transfer_request_rejected 发 abort_immediately 占位请求让 P 释放钉住块（serving.py:L218-L259 + async_llm.py:L743-L769）；⑤ 可选 prompt_token_ids 复用免 D 二次 tokenize（disagg_prefill.md「Reusing prefill token ids on decode」节）。",
+   "cost": "① 请求双跳增加一整段 RTT 与 proxy 的转交延迟（P 的 max_tokens=1 响应也要走完整 HTTP 往返）；② proxy 必须有状态才能做多轮（conversation_id→D 回执缓存，disagg_proxy_multiturn.py）——控制面复杂度转移到外部组件；③ kv_transfer_params/conversation_id 是 OpenAI 规范之外的非标字段（严格前端会拒）；④ 官方明示拆分不提升吞吐（disagg_prefill.md 原话「Disaggregated prefill DOES NOT improve throughput」）——买的是 TTFT/ITL 分别调优与尾 ITL 控制，不是吞吐。"
+  },
+  {
+   "id": "WC6",
+   "card": "本章现核（源码 + nixl/metadata.py 版本史 L28-L45）",
+   "decision": "带外握手 + 兼容 hash 门：先证明两台引擎配置一致，再让它们互读显存",
+   "old_design": "无握手：D 直接对 P 的地址发 RDMA——块大小/布局/dtype/后端任一不匹配都不会在连接期报错，而是静默传错数据（KV 错位=生成乱码，且难归因）。",
+   "pain": "两台引擎独立部署独立演进：vLLM 版本、模型结构、KV dtype、注意力后端、block_size 都可能漂移；运行期数据损坏是最贵的失败模式。",
+   "solution": "三件套：① side channel：每台引擎的调度器侧起 ZMQ ROUTER（VLLM_NIXL_SIDE_CHANNEL_HOST/PORT+DP rank），常驻本引擎全部 worker 的握手元数据（EngineCore 启动聚合注入，core.py:L181-L200）；② 两段解码：先解 NixlHandshakePayload 比 compatibility_hash（vLLM 版本+NIXL_CONNECTOR_VERSION+模型+dtype+kv_heads+head_size+层数+后端+cache_dtype 的 SHA-256，metadata.py:L81-L141），不匹配即报错并列出可能原因；过门才解 NixlAgentMetadata（基址/块数/块长/布局/物理块比）；③ 版本纪律：NIXL_CONNECTOR_VERSION 现为 5，每次不兼容变更必 bump（版本史注释 L28-L45：2=remote_request_id、4=心跳续租、5=到期时刻+时钟同步）。握手顺带用 RTT 中点估两机时钟偏移（base_worker.py:L608-L643，供租约判断）。",
+   "cost": "① 首请求多一次 ZMQ 往返 + agent 注册（后台 future 异步做，不堵调度热路径）；② hash 因子集是权衡：太严（TP/block_size 不入 hash 但运行时校验）支持异构部署、太松会漏检——注释自认「likely to evolve」；③ enforce_handshake_compat 可关（逃生舱）但关掉=自担静默传错风险。"
+  }
+ ],
+ "embed_excerpts": [
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py",
+   "lines": "L112-L135",
+   "what": "NixlBaseConnector.__init__：facade 按 role 只建半边子对象（scheduler 侧或 worker 侧），另半边恒 None——ch16 role-split『分开构建、不共享状态』在真实后端的形态；kv_both 弃用警告点明 P/D 各设一职的正统。",
+   "elide": [
+    "可省略：L82-L110 prefer_cross_layer_blocks 属性（跨层单张量布局优化，默认 False 的快路径）"
+   ],
+   "code": "    def __init__(\n        self,\n        vllm_config: VllmConfig,\n        role: KVConnectorRole,\n        kv_cache_config: \"KVCacheConfig\",\n    ):\n        super().__init__(vllm_config, role, kv_cache_config)\n        assert vllm_config.kv_transfer_config is not None\n        assert vllm_config.kv_transfer_config.engine_id is not None\n\n        if vllm_config.kv_transfer_config.kv_role == \"kv_both\":\n            logger.warning_once(\n                \"Using kv_role='kv_both' with NixlConnector is deprecated \"\n                \"and will be removed in a future release. Please set \"\n                \"kv_role='kv_producer' for prefill instances and \"\n                \"kv_role='kv_consumer' for decode instances. \"\n            )\n\n        self.kv_cache_config = kv_cache_config\n        self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id\n        self.kv_transfer_config = vllm_config.kv_transfer_config\n        # Subclasses must set self.connector_scheduler and self.connector_worker\n        self.connector_scheduler: NixlBaseConnectorScheduler | None = None\n        self.connector_worker: NixlBaseConnectorWorker | None = None"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py",
+   "lines": "L277-L300",
+   "what": "拉模式下的 worker 侧四抽象如何被『填空』：wait_for_layer_load/save_kv_layer 是 no-op（不逐层、不显式 save——KV 就留在 paged 池里等人来读），wait_for_save 只在 host buffer 模式才有实质（把设备块落一份到主机缓冲）；has_pending_push_work 转发 push 保活。",
+   "elide": [],
+   "code": "    def wait_for_layer_load(self, layer_name: str) -> None:\n        \"\"\"NixlConnector does not do layerwise saving.\"\"\"\n        pass\n\n    def save_kv_layer(\n        self,\n        layer_name: str,\n        kv_layer: torch.Tensor,\n        attn_metadata: AttentionMetadata,\n        **kwargs,\n    ) -> None:\n        \"\"\"NixlConnector does not save explicitly.\"\"\"\n        pass\n\n    def wait_for_save(self):\n        assert self.connector_worker is not None\n        assert isinstance(self._connector_metadata, NixlConnectorMetadata)\n        if self.connector_worker.use_host_buffer and self.connector_worker.copy_blocks:\n            self.connector_worker.save_kv_to_host(self._connector_metadata)\n\n    def has_pending_push_work(self) -> bool:\n        if self.connector_scheduler is not None:\n            return self.connector_scheduler.has_pending_push_work()\n        return False"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py",
+   "lines": "L322-L347",
+   "what": "NixlPullConnector：拉模式 facade——SCHEDULER role 建 NixlPullConnectorScheduler、WORKER role 建 NixlPullConnectorWorker；start_load_kv 转发。『NixlConnector』注册名即它的向后兼容别名。",
+   "elide": [],
+   "code": "class NixlPullConnector(NixlBaseConnector):\n    \"\"\"Pull-based (READ) NIXL KV transfer connector.\"\"\"\n\n    def __init__(\n        self,\n        vllm_config: VllmConfig,\n        role: KVConnectorRole,\n        kv_cache_config: \"KVCacheConfig\",\n    ):\n        super().__init__(vllm_config, role, kv_cache_config)\n        if role == KVConnectorRole.SCHEDULER:\n            self.connector_scheduler = NixlPullConnectorScheduler(\n                vllm_config, self.engine_id, kv_cache_config\n            )\n            self.connector_worker = None\n        elif role == KVConnectorRole.WORKER:\n            self.connector_scheduler = None\n            self.connector_worker = NixlPullConnectorWorker(\n                vllm_config, self.engine_id, kv_cache_config\n            )\n\n    def start_load_kv(self, forward_context: \"ForwardContext\", **kwargs) -> None:\n        assert self.connector_worker is not None\n        assert isinstance(self.connector_worker, NixlPullConnectorWorker)\n        assert isinstance(self._connector_metadata, NixlConnectorMetadata)\n        self.connector_worker.start_load_kv(self._connector_metadata)"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py",
+   "lines": "L350-L383",
+   "what": "NixlPushConnector：推模式 facade。start_load_kv 的 docstring 点名分工——worker 把注册/完成块入队给后台 nixl-push-writer 线程，WRITE 与 notif 轮询全部离开发动机主线程。",
+   "elide": [],
+   "code": "class NixlPushConnector(NixlBaseConnector):\n    \"\"\"Push-based (WRITE) NIXL KV transfer connector.\"\"\"\n\n    def __init__(\n        self,\n        vllm_config: VllmConfig,\n        role: KVConnectorRole,\n        kv_cache_config: \"KVCacheConfig\",\n    ):\n        super().__init__(vllm_config, role, kv_cache_config)\n        self.connector_scheduler: NixlPushConnectorScheduler | None = None\n        self.connector_worker: NixlPushConnectorWorker | None = None\n        if role == KVConnectorRole.SCHEDULER:\n            self.connector_scheduler = NixlPushConnectorScheduler(\n                vllm_config, self.engine_id, kv_cache_config\n            )\n        elif role == KVConnectorRole.WORKER:\n            self.connector_worker = NixlPushConnectorWorker(\n                vllm_config, self.engine_id, kv_cache_config\n            )\n        else:\n            raise ValueError(f\"Unsupported KVConnectorRole: {role}\")\n\n    def start_load_kv(self, forward_context: \"ForwardContext\", **kwargs) -> None:\n        \"\"\"Drive push processing on the worker.\n\n        The worker enqueues registrations / finished blocks for the\n        background ``nixl-push-writer`` thread; the writer issues the\n        WRITE transfers and polls NIXL notifs without further\n        engine-thread involvement.\n        \"\"\"\n        assert self.connector_worker is not None\n        assert isinstance(self._connector_metadata, NixlConnectorMetadata)\n        self.connector_worker.start_load_kv(self._connector_metadata)"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py",
+   "lines": "L64-L76",
+   "what": "调度器侧构造的三个部署常量：side channel 地址（VLLM_NIXL_SIDE_CHANNEL_HOST/PORT + DP rank 偏移——握手 ZMQ 端点）；KV 租约 kv_lease_duration 默认 30s（P 算完把块钉住等多久）；心跳间隔 = 租约/6。",
+   "elide": [],
+   "code": "        self.side_channel_host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST\n        self.side_channel_port = (\n            envs.VLLM_NIXL_SIDE_CHANNEL_PORT\n            + vllm_config.parallel_config.data_parallel_index\n        )\n        assert vllm_config.kv_transfer_config is not None\n        self._kv_lease_duration: int = (\n            vllm_config.kv_transfer_config.get_from_extra_config(\n                \"kv_lease_duration\", 30\n            )\n        )\n        # NOTE (NickLucche): For now we use a hardcoded value for a simpler interface.\n        self._heartbeat_interval = self._kv_lease_duration // 6"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py",
+   "lines": "L281-L322",
+   "what": "P 侧握手元数据就位即启动 ZMQ ROUTER 监听线程：EngineCore 把各 worker 的 NixlHandshakePayload 聚合（按 (pp_rank, tp_rank)）注入这里，msgpack 编码后常驻内存等 D 来查——『带外握手』的服务端。",
+   "elide": [
+    "可省略：L324-L365 _nixl_handshake_listener 线程体（收 (GET_META_MSG, pp, tp)、回显 encoded_data 与本进程 perf_counter 时戳——时戳供 D 估时钟偏移）"
+   ],
+   "code": "    def set_xfer_handshake_metadata(\n        self, metadata: dict[tuple[int, int], KVConnectorHandshakeMetadata]\n    ) -> None:\n        \"\"\"\n        Set the KV connector handshake metadata for this connector.\n\n        Args:\n            metadata (dict): the handshake metadata to set.\n        \"\"\"\n        encoded_data: dict[tuple[int, int], bytes] = {}\n        encoder = msgspec.msgpack.Encoder()\n        for (pp_rank, tp_rank), rank_metadata in metadata.items():\n            if not isinstance(rank_metadata, NixlHandshakePayload):\n                raise ValueError(\n                    \"NixlConnectorScheduler expects NixlHandshakePayload for \"\n                    \"handshake metadata.\"\n                )\n            encoded_data[(pp_rank, tp_rank)] = encoder.encode(rank_metadata)\n            logger.debug(\n                \"PP rank %d, TP rank %d: encoded NixlHandshakePayload size: %s bytes\",\n                pp_rank,\n                tp_rank,\n                str(len(encoded_data[(pp_rank, tp_rank)])),\n            )\n\n        # Only start the listener when we have metadata to serve.\n        if self._nixl_handshake_listener_t is None:\n            ready_event = threading.Event()\n            self._nixl_handshake_listener_t = threading.Thread(\n                target=self._nixl_handshake_listener,\n                args=(\n                    encoded_data,\n                    ready_event,\n                    self._stop_event,\n                    self.side_channel_host,\n                    self.side_channel_port,\n                ),\n                daemon=True,\n                name=\"nixl_handshake_listener\",\n            )\n            self._nixl_handshake_listener_t.start()\n            ready_event.wait()  # Wait for listener ZMQ socket to be ready."
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py",
+   "lines": "L437-L476",
+   "what": "build_connector_meta 全貌：reqs_to_recv（D 要收的）+ reqs_to_save（host buffer 模式 P 要存的）+ reqs_to_send（P 钉住待读的，值=过期时刻）+ scheduler_clock（调度器进程时钟基准，worker 拿它把租约截止时间重基准到自己时钟）+ 心跳包——一份 meta 同时服务 P/D 两个角色。",
+   "elide": [],
+   "code": "    def build_connector_meta(\n        self,\n        scheduler_output: SchedulerOutput,\n    ) -> KVConnectorMetadata:\n        meta = NixlConnectorMetadata()\n\n        # Loop through scheduled reqs and convert to ReqMeta.\n        for req_id, (req, block_ids) in self._reqs_need_recv.items():\n            assert req.kv_transfer_params is not None\n            meta.add_new_req_to_recv(\n                request_id=req_id,\n                local_block_ids=block_ids,\n                kv_transfer_params=req.kv_transfer_params,\n            )\n\n        if self.use_host_buffer:\n            self._build_save_meta(meta, scheduler_output)\n\n        meta.reqs_to_send = self._reqs_need_send\n        # Clock reference for reqs_to_send: deadlines above are in this\n        # process's perf_counter domain; workers (possibly on other nodes,\n        # where perf_counter has a different epoch) rebase against this.\n        meta.scheduler_clock = time.perf_counter()\n        meta.reqs_in_batch = self._reqs_in_batch\n        meta.reqs_not_processed = self._reqs_not_processed\n\n        # Package heartbeats, throttled by heartbeat_interval.\n        if self._heartbeat_by_engine:\n            now = time.perf_counter()\n            if now - self._last_heartbeat_time >= self._heartbeat_interval:\n                self._last_heartbeat_time = now\n                meta.heartbeat_by_engine = self._heartbeat_by_engine\n\n        # Clear the list once workers start the transfers\n        self._reqs_need_recv.clear()\n        self._reqs_in_batch = set()\n        self._reqs_not_processed = set()\n        self._reqs_need_send = {}\n\n        return meta"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py",
+   "lines": "L34-L66",
+   "what": "D 侧查命中：请求带 do_remote_prefill=True → 整段 prompt 的 KV 都在远端（Mamba 模型少一个 token），返回 (可拉取数, True=异步加载)——之后就走 ch16 立好的 WAITING_FOR_REMOTE_KVS 等待路径。",
+   "elide": [
+    "可省略：L68-L110 do_remote_decode（双向 D→P 回拉）分支与 kv_recompute_threshold 短拉不划算判定——多轮对话进阶路径，ch37 续接"
+   ],
+   "code": "    def get_num_new_matched_tokens(\n        self, request: \"Request\", num_computed_tokens: int\n    ) -> tuple[int, bool]:\n        \"\"\"\n        For remote prefill, pull all prompt blocks from remote\n        asynchronously relative to engine execution.\n\n        Args:\n            request (Request): the request object.\n            num_computed_tokens (int): the number of locally\n                computed tokens for this request\n        Returns:\n            * the number of tokens that can be loaded from the\n              external KV cache beyond what is already computed.\n            * true if the external KV cache tokens will be loaded\n              asynchronously (between scheduler steps).\n        \"\"\"\n\n        params = request.kv_transfer_params\n        logger.debug(\n            \"NIXLConnector get_num_new_matched_tokens: \"\n            \"num_computed_tokens=%s, kv_transfer_params=%s\",\n            num_computed_tokens,\n            params,\n        )\n\n        if params is not None and params.get(\"do_remote_prefill\"):\n            # Remote prefill: get all prompt blocks from remote.\n            token_ids = request.prompt_token_ids or []\n            actual = self._get_remote_prefill_token_count(len(token_ids))\n            count = actual - num_computed_tokens\n            if count > 0:\n                return count, True"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py",
+   "lines": "L153-L179",
+   "what": "D 侧登记待收：从分配结果取『未入本地哈希表的块』（get_unhashed_block_ids_all_groups）作落地缓冲，连同 P 坐标写进 _reqs_need_recv；翻 do_remote_prefill=False/_remote_blocks_processed=True 保证一请求只触发一次传输（抢占重入不重发）。",
+   "elide": [],
+   "code": "                    unhashed_local_block_ids: BlockIds = (\n                        blocks.get_unhashed_block_ids_all_groups()\n                        if num_external_tokens > 0\n                        else ()\n                    )\n                    local_block_ids = self.get_exchange_clipped_blocks(\n                        unhashed_local_block_ids\n                    )\n\n                    # Get unhashed blocks to pull from remote. Mind that a full prefix\n                    # cache hit is indicated with an empty list.\n                    self._reqs_need_recv[request.request_id] = (\n                        request,\n                        local_block_ids,\n                    )\n\n                else:\n                    logger.warning(\n                        \"Got invalid KVTransferParams: %s. This \"\n                        \"request will not utilize KVTransfer\",\n                        params,\n                    )\n            else:\n                assert num_external_tokens == 0\n            # Only trigger 1 KV transfer per request.\n            params[\"do_remote_prefill\"] = False\n            params[\"_remote_blocks_processed\"] = True"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py",
+   "lines": "L210-L221",
+   "what": "P 侧终局前奏的解围分支：request_finished 时 do_remote_prefill 仍为 True ⇒ update_state_after_alloc 从未跑过（请求在调度前就被 abort——如 D 侧拒收回执的占位请求）→ 登记『空块列表』的待收项，让 worker 发 notif 释放 P 已钉住的块，防搁浅。",
+   "elide": [],
+   "code": "        if params.get(\"do_remote_prefill\"):\n            # If do_remote_prefill is still True when the request is finished,\n            # update_state_after_alloc must not have been called (the request\n            # must have been aborted before it was scheduled, e.g. via the\n            # abort_immediately path used to clean up KV-transfer requests\n            # rejected at the D-side serving layer).\n            # To avoid stranding the prefill blocks in the prefill instance,\n            # we must add empty block_ids to _reqs_need_recv so that our\n            # worker side will notify and free blocks in the prefill instance.\n            self._reqs_need_recv[request.request_id] = (request, [])\n            params[\"do_remote_prefill\"] = False\n            return False, None"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py",
+   "lines": "L239-L280",
+   "what": "P 侧终局·租约+回执（本章的契约落地点）：有可交接块 → delay_free_blocks=True（ch16 的『connector 接管异步释放』）+ _reqs_need_send 盖 now+租约 戳；返回 kv_transfer_params 字典（remote_block_ids/engine_id/request_id/host/port/tp_size/remote_num_tokens，双向模式还带 D 块到期时刻）——这个字典就是随 P 响应出引擎的『回执』。",
+   "elide": [
+    "可省略：L226-L235 非正常终局（abort 等）只记 _reqs_not_processed 不交接；get_exchange_clipped_blocks 的混合模型剪裁在 m12 单独讲"
+   ],
+   "code": "        delay_free_blocks = any(len(group) > 0 for group in block_ids)\n        remote_num_tokens = 0\n        blocks_expiry_time = None\n        if delay_free_blocks:\n            # Prefill request on remote. It will be read from D upon completion\n            request_kv_blocks_ttl = self._kv_lease_duration\n            if is_d_node:\n                # For blocks pinned on D, use a simpler timeout for now instead of a\n                # lease mechanism as turn2 request is client-driven.\n                request_kv_blocks_ttl = self.decoder_kv_blocks_ttl\n            logger.debug(\n                \"NIXLConnector request_finished(%s) waiting for %d seconds \"\n                \"before releasing blocks\",\n                request.request_id,\n                request_kv_blocks_ttl,\n            )\n            self._reqs_need_send[request.request_id] = (\n                time.perf_counter() + request_kv_blocks_ttl\n            )\n            if is_d_node:\n                # D blocks expiry time exported for the turn-2 readback.\n                blocks_expiry_time = self._reqs_need_send[request.request_id]\n            # NOTE HMA will \"mark\" empty/null blocks in groups with 0s (eg SWA ones),\n            # trimming down after allocating for the whole sequence length. Empty\n            # blocks are always at the start of the list.\n            # Here we \"unpad\" blocks to send the actual remote blocks to be read.\n            block_ids = self.get_exchange_clipped_blocks(block_ids)\n\n            remote_num_tokens = request.num_computed_tokens\n\n        return delay_free_blocks, dict(\n            do_remote_prefill=is_p_node,\n            do_remote_decode=is_d_node,\n            remote_block_ids=block_ids,\n            remote_engine_id=self.engine_id,\n            remote_request_id=request.request_id,\n            remote_host=self.side_channel_host,\n            remote_port=self.side_channel_port,\n            tp_size=self.vllm_config.parallel_config.tensor_parallel_size,\n            remote_num_tokens=remote_num_tokens,\n            remote_blocks_expiry_time=blocks_expiry_time,\n        )"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py",
+   "lines": "L42-L113",
+   "what": "D worker start_load_kv 全貌：每个待收请求要么已握手→立刻发 READ、要么首遇远端→后台握手（完成后从 _ready_requests 取出补发）；租约截止时间用 meta.scheduler_clock 重基准到本 worker 时钟（perf_counter 跨进程不可比，广播延迟只会拉长租约=安全方向）；末尾发心跳。",
+   "elide": [],
+   "code": "    def start_load_kv(self, metadata: NixlConnectorMetadata):\n        \"\"\"\n        Start loading by triggering non-blocking nixl_xfer.\n        We check for these trnxs to complete in each step().\n        \"\"\"\n        for req_id, meta in metadata.reqs_to_recv.items():\n            meta.local_physical_block_ids = self._logical_to_kernel_block_ids(\n                meta.local_block_ids, self._physical_blocks_per_logical_kv_block\n            )\n            assert meta.remote is not None\n            # Remote block IDs are kept logical here; expanded in\n            # _read_blocks_for_req using the remote engine's phys ratio.\n            remote_engine_id = meta.remote.engine_id\n            logger.debug(\n                \"start_load_kv for request %s from remote engine %s. \"\n                \"Num local_block_ids: %s. Num remote_block_ids: %s. \",\n                req_id,\n                remote_engine_id,\n                len(meta.local_physical_block_ids),\n                len(meta.remote.block_ids),\n            )\n            # always store metadata for failure recovery\n            self._recving_metadata[req_id] = meta\n            if remote_engine_id not in self._remote_agents:\n                # Initiate handshake with remote engine to exchange metadata.\n                with self._handshake_lock:\n                    if remote_engine_id not in self._remote_agents:\n                        self._background_nixl_handshake(req_id, remote_engine_id, meta)\n                        continue\n\n            # Handshake already completed, start async read xfer.\n            self._read_blocks_for_req(req_id, meta)\n\n        # Start transfers for requests whose handshakes have now finished.\n        while not self._ready_requests.empty():\n            self._read_blocks_for_req(*self._ready_requests.get_nowait())\n\n        # Keep around the requests that have been part of a batch. This is\n        # needed because async scheduling pushes the misalignment between the\n        # moment in which requests expiration is set (P side) and the moment in\n        # which blocks are read from D. As P can now more easily lag behind D\n        # while processing the next batch, we make sure to only set an\n        # expiration for requests that have not been read from D yet.\n        for req_id in metadata.reqs_in_batch:\n            self._reqs_to_process.add(req_id)\n\n        # Remove all requests that are not to be processed (eg aborted).\n        for req_id in metadata.reqs_not_processed:\n            self._reqs_to_process.discard(req_id)\n            # We should never get an abort after setting an expiry timer\n            assert req_id not in self._reqs_to_send\n\n        # Add to requests that are waiting to be read and track expiration.\n        # Deadlines are stamped with the scheduler process's perf_counter,\n        # which is not comparable to ours when the worker runs in another\n        # process on another node (perf_counter epochs differ by boot time).\n        # Rebase the remaining TTL onto our clock; broadcast latency only\n        # lengthens the lease, which is the safe direction. A cross-node\n        # epoch gap larger than the TTL otherwise expires the lease on\n        # arrival and the blocks are freed before D reads them.\n        now_local = time.perf_counter()\n        for req_id, expiration_time in metadata.reqs_to_send.items():\n            if req_id in self._reqs_to_process:\n                if metadata.scheduler_clock:\n                    expiration_time = now_local + (\n                        expiration_time - metadata.scheduler_clock\n                    )\n                self._reqs_to_send[req_id] = expiration_time\n\n        # Send heartbeats to P-side engines to keep KV blocks alive while\n        # requests sit in the D scheduler WAITING queue.\n        self._send_heartbeats(metadata)"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py",
+   "lines": "L262-L333",
+   "what": "READ 本体：本地全命中只发 notif 免拉（P 收到即放块）；否则 make_prepped_xfer('READ')+transfer 非阻塞发起——D 直接从 P 显存拉本请求各组的块，P 的 CPU 全程不参与；handle 存 _recving_transfers 留待后续步轮询。",
+   "elide": [
+    "可省略：L301-L313 两次 _compute_desc_ids 调用的 block_size_ratio/物理块比换算细节（对称 TP 下比例=1 直通；异构换算分支已列入减法计划）",
+    "L287-L295 的 _apply_prefix_caching 调用勿当异构分支裁掉：非 Mamba 分支（base_worker.py:L2398-L2422）是通用『D 本地部分前缀命中→远端块表尾裁剪、只拉未命中尾块』路径，对称 TP 下 D 有本地部分前缀缓存（如跨请求共享 system prompt）即触发；减法计划只批准删其 Mamba/异构 front-trim else 分支（L2423-L2485）"
+   ],
+   "code": "        # Number of D TP workers that will read from dst P. Propagate info\n        # on notification so that dst worker can wait before freeing blocks.\n        notif_id = f\"{remote_request_id}:{self.world_size}\".encode()\n\n        # Full prefix cache hit: do not need to read remote blocks,\n        # just notify P worker that we have the blocks we need.\n        if len(local_block_ids) == 0:\n            # A full prefix cache hit is indicated with an empty list.\n            agent_name = self._remote_agents[dst_engine_id][(0, remote_rank)]\n            try:\n                self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)\n            except Exception as e:\n                self._log_failure(\n                    failure_type=\"notification_failed\",\n                    msg=\"P worker blocks will be freed after timeout. \"\n                    \"This may indicate network issues.\",\n                    req_id=request_id,\n                    error=e,\n                    dst_engine_id=dst_engine_id,\n                    remote_rank=remote_rank,\n                    remote_agent_name=agent_name,\n                )\n                self.xfer_stats.record_failed_notification()\n            return\n\n        assert (\n            len(remote_block_ids)\n            == len(local_block_ids)\n            == len(self.kv_cache_config.kv_cache_groups)\n        )\n        remote_physical_per_logical = remote_info.remote_physical_blocks_per_logical\n        local_block_ids, remote_block_ids = self._apply_prefix_caching(\n            local_block_ids, remote_block_ids, remote_physical_per_logical\n        )\n\n        # NOTE (nicolo) With homogeneous TP, each TP worker loads KV from\n        # corresponding rank. With heterogeneous TP, fixing D>P, the D tp\n        # workers will issue xfers to parts of the P worker remote kv caches.\n\n        # Get descs ids.\n        remote_block_descs_ids = self._compute_desc_ids(\n            block_ids=remote_block_ids,\n            dst_num_blocks=self.dst_num_blocks[dst_engine_id],\n            block_size_ratio=None,\n            physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,\n        )\n        local_block_descs_ids = self._compute_desc_ids(\n            block_ids=local_block_ids,\n            dst_num_blocks=self.dst_num_blocks[self.engine_id],\n            block_size_ratio=block_size_ratio,\n            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,\n        )\n\n        assert len(local_block_descs_ids) == len(remote_block_descs_ids)\n\n        # Prepare transfer with Nixl.\n        handle = None\n        try:\n            handle = self.nixl_wrapper.make_prepped_xfer(\n                \"READ\",\n                local_xfer_side_handle,\n                local_block_descs_ids,\n                remote_xfer_side_handle,\n                remote_block_descs_ids,\n                notif_msg=notif_id,\n            )\n\n            # Begin async xfer.\n            self.nixl_wrapper.transfer(handle)\n\n            # Use handle to check completion in future step().\n            self._recving_transfers[request_id].append(handle)"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py",
+   "lines": "L608-L643",
+   "what": "握手客户端（D→P）：向 P 的 side channel 发 (GET_META_MSG, pp_rank, tp_rank)，收握手字节 + P 的 perf_counter 时戳；用往返 RTT 估两机时钟偏移（取最低 RTT 样本的中点估计——后续租约到期判断要用）。",
+   "elide": [],
+   "code": "        path = make_zmq_path(\"tcp\", host, port)\n        # Clock offset to the peer, estimated from the handshake round-trip.\n        # Keep the lowest-RTT sample: hop cost is ~uniform across ranks, so a\n        # higher RTT is just noise that skews the midpoint estimate.\n        best_rtt = float(\"inf\")\n        best_offset: float | None = None\n\n        with zmq_ctx(zmq.REQ, path) as sock:\n            for remote_pp_rank, remote_rank in itertools.product(\n                range(remote_pp_size), p_remote_ranks\n            ):\n                logger.debug(\n                    \"Querying metadata on path: %s at remote pp rank %s, tp rank %s\",\n                    path,\n                    remote_pp_rank,\n                    remote_rank,\n                )\n\n                # Send query for the request.\n                msg = msgspec.msgpack.encode(\n                    (GET_META_MSG, remote_pp_rank, remote_rank)\n                )\n                # Set receive timeout to 5 seconds to avoid hanging on dead server\n                sock.setsockopt(zmq.RCVTIMEO, 5000)  # milliseconds\n                start_time = time.perf_counter()\n                sock.send(msg)\n                reply_parts = sock.recv_multipart()\n                recv_time = time.perf_counter()\n                assert len(reply_parts) == 2\n                handshake_bytes = reply_parts[0]\n\n                remote_perf = msgspec.msgpack.decode(reply_parts[1])\n                rtt = recv_time - start_time\n                if rtt < best_rtt:\n                    best_rtt = rtt\n                    best_offset = remote_perf - (start_time + recv_time) / 2"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py",
+   "lines": "L661-L683",
+   "what": "兼容性门：先解 NixlHandshakePayload 比对 compatibility_hash（vLLM 版本+模型结构+KV dtype+注意力后端的 SHA-256），不匹配直接报错并列原因——两台引擎独立部署，配置漂移必须在握手期炸、不能等数据传错才炸；过了门才解码 agent metadata 注册远端。",
+   "elide": [
+    "可省略：L685-L703 agent metadata 解码与 engine_id 校验"
+   ],
+   "code": "                # Check compatibility hash BEFORE decoding agent metadata\n                assert self.compat_hash is not None\n                if (\n                    self.enforce_compat_hash\n                    and handshake_payload.compatibility_hash != self.compat_hash\n                ):\n                    raise RuntimeError(\n                        f\"NIXL compatibility hash mismatch. \"\n                        f\"Local: {self.compat_hash}, \"\n                        f\"Remote: {handshake_payload.compatibility_hash}. \"\n                        f\"Prefill and decode instances have incompatible \"\n                        f\"configurations. This may be due to: different vLLM versions,\"\n                        f\" models, dtypes, KV cache layouts, attention backends, etc. \"\n                        f\"Both instances must use identical configurations.\"\n                        f\"Disable this check using \"\n                        f'--kv-transfer-config \\'{{\"kv_connector_extra_config\": '\n                        f'{{\"enforce_handshake_compat\": false}}}}\\''\n                    )\n\n                logger.info(\n                    \"NIXL compatibility check passed (hash: %s)\",\n                    handshake_payload.compatibility_hash,\n                )"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py",
+   "lines": "L2044-L2064",
+   "what": "worker get_finished 头部：完成信号的两个物理来源——发完成=收对端 notif（_get_new_notifs），收完成=本地 xfer handle 轮询转 DONE（_pop_done_transfers）；握手/传输setup失败的请求从失败队列并入 done_recving（块已标 invalid，交给 ch16 失败回滚）。",
+   "elide": [
+    "可省略：L2066-L2143 收完后的 host buffer 回拷与异构块后处理"
+   ],
+   "code": "    def get_finished(self) -> tuple[set[str], set[str]]:\n        \"\"\"\n        Get requests that are done sending or recving on this specific worker.\n        The scheduler process (via the MultiprocExecutor) will use this output\n        to track which workers are done.\n        \"\"\"\n        assert self.transfer_topo is not None\n        done_sending = self._get_new_notifs()\n        done_recving = self._pop_done_transfers(self._recving_transfers)\n\n        # Drain queue of requests where handshake or transfer setup failed.\n        failed_recv_reqs = set[ReqId]()\n        while not self._failed_recv_reqs.empty():\n            try:\n                failed_recv_reqs.add(self._failed_recv_reqs.get_nowait())\n            except queue.Empty:\n                break\n\n        # Add failed requests to done_recving for scheduler tracking\n        # (blocks are already marked invalid, scheduler will handle recompute)\n        done_recving.update(failed_recv_reqs)"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py",
+   "lines": "L2145-L2164",
+   "what": "租约到期收割：_reqs_to_send 按到期时刻排序，过期即强制 done_sending（放块）并记 kv_expired_req——D 崩溃/失联时 P 的显存自愈，不靠任何人来收尸。",
+   "elide": [],
+   "code": "        # Handle timeout to avoid stranding blocks on remote.\n        now = time.perf_counter()\n        while self._reqs_to_send:\n            req_id, expires = next(iter(self._reqs_to_send.items()))\n            # Sorted dict, oldest requests are put first so we can exit early.\n            if now < expires:\n                break\n            count = self.consumer_notification_counts_by_req.pop(req_id, 0)\n            self.xfer_stats.record_kv_expired_req()\n            logger.warning(\n                \"Releasing expired KV blocks for request %s which were \"\n                \"retrieved by %d remote worker(s) before lease expired.\",\n                req_id,\n                count,\n            )\n            self._reqs_to_process.remove(req_id)\n            del self._reqs_to_send[req_id]\n            done_sending.add(req_id)\n\n        return done_sending, done_recving"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py",
+   "lines": "L2189-L2208",
+   "what": "P 侧收心跳：『HB:req1,req2』notif 里每个请求的租约延长 lease×2/3（只增不减：max(old, new)）。",
+   "elide": [],
+   "code": "    def _handle_heartbeat(self, payload: str) -> None:\n        \"\"\"Extend leases for requests referenced in a heartbeat.\n\n        Args:\n            payload: comma-separated P-side request IDs, e.g.\n                     \"req_abc,req_def\".\n        \"\"\"\n        new_expiry = time.perf_counter() + self._lease_extension\n        for req_id in payload.split(\",\"):\n            if req_id in self._reqs_to_send:\n                old = self._reqs_to_send[req_id]\n                self._reqs_to_send[req_id] = max(old, new_expiry)\n                logger.debug(\n                    \"Heartbeat extended lease for request %s \"\n                    \"by %ds (old_expiry=%.1f, new_expiry=%.1f)\",\n                    req_id,\n                    self._lease_extension,\n                    old,\n                    new_expiry,\n                )"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py",
+   "lines": "L2275-L2305",
+   "what": "D 侧发心跳：请求还在等待队列时按引擎分组发 HB notif 续租；顺手做『先握手后心跳』——这个请求可能还排在队里，提前把到 P 的 agent 建好，下一条心跳就能走通。",
+   "elide": [],
+   "code": "    def _send_heartbeats(self, metadata: NixlConnectorMetadata) -> None:\n        \"\"\"\n        Send heartbeat notifications to remote engines, extending lease on KV blocks.\n        \"\"\"\n        for engine_id, hb_info in metadata.heartbeat_by_engine.items():\n            # Proactive handshake (this request may still be in waiting queue) so\n            # the **next** heartbeat for this remote can go through.\n            if (\n                self._ensure_handshake(\n                    engine_id,\n                    hb_info.host,\n                    hb_info.port,\n                    hb_info.tp_size,\n                    hb_info.pp_size,\n                    self._hb_handshake_notif_only and hb_info.pp_size > 1,\n                )\n                is not None\n            ):\n                continue  # handshake is still pending\n\n            # Build the heartbeat message: \"HB:req1,req2,...\"\n            hb_msg = (\"HB:\" + \",\".join(hb_info.req_ids)).encode()\n            for agent_name in self._remote_agents[engine_id].values():\n                try:\n                    self.nixl_wrapper.send_notif(agent_name, notif_msg=hb_msg)\n                except Exception:\n                    logger.debug(\n                        \"Failed to send heartbeat to engine %s\",\n                        engine_id,\n                        exc_info=True,\n                    )"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py",
+   "lines": "L156-L206",
+   "what": "推模式的 D 侧登记：D 分配到块即把『自己的坐标 + 本地块号 + P 的坐标』打包成注册项（PUSH_REG 载荷），并 seed 空 remote_block_ids 让引擎继续按『待收』跟踪；翻 do_remote_prefill=False 防重。",
+   "elide": [],
+   "code": "        # D side: only act on the first call (``do_remote_prefill`` is\n        # unset on re-entry by the marker below).\n        if not params.get(\"do_remote_prefill\"):\n            return\n\n        if num_external_tokens <= 0:\n            # Nothing to receive: full prefix-cache hit on D, no\n            # registration to stage.\n            return\n\n        # First-pass D path: stash registration data the worker will\n        # ship to P on the next ``build_connector_meta`` cycle.\n        logger.debug(\n            \"KV PUSH mode: D node storing registration for request %s\",\n            request.request_id,\n        )\n        local_block_ids: BlockIds = blocks.get_unhashed_block_ids_all_groups()\n        local_block_ids = self.get_exchange_clipped_blocks(local_block_ids)\n\n        # ``remote_*`` fields are P's coordinates (from D's perspective).\n        # ``decode_*`` fields are D's own info that P needs for the\n        # reverse handshake before WRITE-ing.\n        self._push_pending_registrations[request.request_id] = {\n            \"request_id\": request.request_id,\n            \"decode_engine_id\": self.engine_id,\n            \"decode_host\": self.side_channel_host,\n            \"decode_port\": self.side_channel_port,\n            \"decode_tp_size\": (self.vllm_config.parallel_config.tensor_parallel_size),\n            \"local_block_ids\": local_block_ids,\n            \"remote_engine_id\": params[\"remote_engine_id\"],\n            \"remote_host\": params[\"remote_host\"],\n            \"remote_port\": params[\"remote_port\"],\n            \"remote_tp_size\": params[\"tp_size\"],\n            \"remote_pp_size\": params.get(\"pp_size\", 1),\n        }\n        self._push_registration_deadlines[request.request_id] = (\n            time.perf_counter() + self._push_registration_timeout\n        )\n        # In push mode D doesn't know P's blocks; P determines them\n        # from the registration. We still track the request as\n        # needing recv so the engine waits for P's WRITE completion.\n        # ``remote_block_ids`` is also seeded to an empty tuple so the\n        # base scheduler's ``add_new_req_to_recv`` can build the\n        # ReqMeta without a KeyError — the actual remote block IDs are\n        # learned by P over the NIXL handshake at WRITE time.\n        params[\"remote_block_ids\"] = ()\n        self._reqs_need_recv[request.request_id] = (request, local_block_ids)\n\n        # Mark as processed so a re-entry (e.g. preemption + reschedule)\n        # doesn't re-stage the registration.\n        params[\"do_remote_prefill\"] = False"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py",
+   "lines": "L210-L272",
+   "what": "nixl-push-writer 后台线程主循环：四个收件箱（D 注册待发/P 完成块待配/延迟推送/淘汰）+ notif 路由（PUSH_REG 内部处理、其余转交主线程）；配对成功即发 WRITE，单边先到就先存着等另一边——完全事件驱动，只有 P 块无注册匹配时才 1ms 自轮询。",
+   "elide": [
+    "可省略：L265-L271 尾部唤醒模型分支（有活自轮询/无活等事件）——模块 docstring 已详述"
+   ],
+   "code": "    def _push_writer_loop(self) -> None:\n        sleep_s = _PUSH_WRITER_POLL_INTERVAL_MS / 1000.0\n\n        while not self._push_writer_stop.is_set():\n            try:\n                # 1. D registrations to send.\n                while True:\n                    try:\n                        rid, rd = self._reg_send_inbox.get_nowait()\n                    except queue.Empty:\n                        break\n                    self._send_registration_to_p(rid, rd)\n\n                # 2. Deferred P→D pushes whose handshake just completed; do xfer now\n                while True:\n                    try:\n                        rid, blocks, rd = self._deferred_push_inbox.get_nowait()\n                    except queue.Empty:\n                        break\n                    self._do_start_push_kv(rid, blocks, rd)\n\n                # 3. P-side finished blocks; match against pending regs.\n                while True:\n                    try:\n                        rid, blocks = self._finished_blocks_inbox.get_nowait()\n                    except queue.Empty:\n                        break\n                    matched = self._pop_matching_registration(rid)\n                    if matched is not None:\n                        self._do_start_push_kv(rid, blocks, matched)\n                    else:\n                        self._push_finished_blocks[rid] = blocks\n\n                # 3b. Evict finished blocks for requests that have either\n                # completed (WRITE acknowledged) or whose lease expired\n                # without a D registration.  Drop pending registrations\n                # for the same reason so we don't leak state.\n                while True:\n                    try:\n                        rid = self._evict_finished_inbox.get_nowait()\n                    except queue.Empty:\n                        break\n                    self._push_finished_blocks.pop(rid, None)\n                    self._pending_d_registrations.pop(rid, None)\n\n                # 4. NIXL notifs: route PUSH_REG; forward the rest.\n                for notifs in self.nixl_wrapper.get_new_notifs().values():\n                    for notif in notifs:\n                        if notif.startswith(PUSH_REG_NOTIF_PREFIX):\n                            self._handle_push_reg_notif(notif)\n                        else:\n                            self._pending_completion_notifs.put(notif)\n            except Exception:\n                logger.exception(\"nixl-push-writer error; continuing\")\n\n            # Self-poll only while there is no other wake source: P-side\n            # finished blocks waiting for a D PUSH_REG match. All other\n            # progress is event-driven (see module docstring).\n            if self._push_finished_blocks:\n                self._push_writer_stop.wait(timeout=sleep_s)\n            else:\n                self._push_writer_wake.wait()\n                self._push_writer_wake.clear()"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py",
+   "lines": "L274-L399",
+   "what": "推模式配对机器本体（m9『随机后缀剥离匹配』的代码落点）：_handle_push_reg_notif（P 收 D 的 PUSH_REG notif：先与已完成块表精确配对，配不上先存 _pending_d_registrations 等另一腿）、_send_registration_to_p（D 侧：_ensure_handshake 完成才发，未完挂 future 回调重排队并唤醒 writer）、_do_send_reg_notif（逐 rank 发送注册）、_pop_matching_registration/_pop_matching_finished_blocks（两腿 request_id 差 input_processor.assign_request_id 追加的 -<8hex> 随机后缀：先精确键匹配，再用 get_base_request_id（nixl/utils.py:L66-L68）剥后缀归一匹配——注册与完成块谁先到都能配上）。",
+   "elide": [
+    "可省略：L341-L365 _do_send_reg_notif 逐 rank 发送与异常处理（发送原语 send_notif 已在 must_keep，正文一笔带过即可）"
+   ],
+   "code": "    def _handle_push_reg_notif(self, notif: bytes) -> None:\n        try:\n            reg_data = msgspec.msgpack.decode(notif[len(PUSH_REG_NOTIF_PREFIX) :])\n        except Exception:\n            logger.exception(\"Failed to decode PUSH_REG notification payload\")\n            return\n        rid = reg_data.get(\"request_id\") if isinstance(reg_data, dict) else None\n        if not isinstance(rid, str):\n            logger.warning(\"PUSH_REG notif missing request_id; dropping\")\n            return\n\n        match = self._pop_matching_finished_blocks(rid)\n        if match is not None:\n            fin_id, blocks = match\n            self._do_start_push_kv(fin_id, blocks, reg_data)\n        else:\n            self._pending_d_registrations[rid] = reg_data\n\n    # --- D-side registration send (writer thread) ---------------------- #\n\n    def _send_registration_to_p(\n        self,\n        req_id: str,\n        reg_data: dict[str, Any],\n    ) -> None:\n        \"\"\"Handshake (if needed) then send PUSH_REG. ``send_notif`` always\n        executes on the writer; the handshake runs on the background executor\n        and the request is re-queued onto ``_reg_send_inbox`` once it\n        completes (at which point ``_ensure_handshake`` returns ``None`` and we\n        send directly).\"\"\"\n        remote_pp_size = reg_data.get(\"remote_pp_size\", 1)\n        fut = self._ensure_handshake(\n            reg_data[\"remote_engine_id\"],\n            reg_data[\"remote_host\"],\n            reg_data[\"remote_port\"],\n            reg_data[\"remote_tp_size\"],\n            pp_size=remote_pp_size,\n            # D only ever sends PUSH_REG notifs to P and never reads or writes\n            # P's memory in push mode, so it never needs the transfer\n            # descriptors set up by the full add_remote_agent path.\n            notif_agents_only=True,\n        )\n        if fut is None:\n            self._do_send_reg_notif(req_id, reg_data)\n            return\n\n        def _on_handshake(\n            f: Future[tuple[dict[tuple[int, int], str], float]],\n            rid: str = req_id,\n            rd: dict[str, Any] = reg_data,\n        ) -> None:\n            try:\n                f.result()\n            except Exception as e:\n                self._log_failure(\n                    failure_type=\"push_reg_handshake_failed\", req_id=rid, error=e\n                )\n                self._handle_failed_transfer(rid, None)\n                return\n            # Re-queue for the writer to send now that the handshake is done.\n            self._reg_send_inbox.put((rid, rd))\n            # Wake the writer so it sends the PUSH_REG promptly even if\n            # otherwise parked.\n            self._push_writer_wake.set()\n\n        fut.add_done_callback(_on_handshake)\n\n    def _do_send_reg_notif(self, req_id: str, reg_data: dict[str, Any]) -> None:\n        engine_id = reg_data[\"remote_engine_id\"]\n        notif_msg = PUSH_REG_NOTIF_PREFIX + msgspec.msgpack.encode(reg_data)\n        agents = self._remote_agents.get(engine_id)\n        if not agents:\n            logger.error(\n                \"No remote agents for engine %s; cannot send registration for %s\",\n                engine_id,\n                req_id,\n            )\n            self._handle_failed_transfer(req_id, None)\n            return\n        for rank, agent_name in agents.items():\n            try:\n                self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_msg)\n            except Exception as e:\n                self._log_failure(\n                    failure_type=\"push_reg_notif_failed\",\n                    req_id=req_id,\n                    error=e,\n                    remote_rank=rank,\n                )\n        logger.debug(\n            \"Sent PUSH_REG for %s to engine %s (%dB)\", req_id, engine_id, len(notif_msg)\n        )\n\n    # --- Matching helpers --------------------------------------------- #\n\n    def _pop_matching_registration(self, request_id: str) -> dict[str, Any] | None:\n        \"\"\"Pop the D-side registration matching *request_id*.\n\n        Exact key first, then a match after stripping the random suffix from\n        both sides. No match leaves the request unmatched (push not started).\n        \"\"\"\n        data = self._pending_d_registrations.pop(request_id, None)\n        if data is not None:\n            return data\n        base_id = get_base_request_id(request_id)\n        for reg_id in list(self._pending_d_registrations):\n            if get_base_request_id(reg_id) == base_id:\n                return self._pending_d_registrations.pop(reg_id)\n        return None\n\n    def _pop_matching_finished_blocks(\n        self, request_id: str\n    ) -> tuple[str, BlockIds] | None:\n        \"\"\"Pop the P-side finished blocks matching *request_id*.\n\n        Same lookup as ``_pop_matching_registration``: exact key, then a\n        match after stripping the random suffix from both sides.\n        \"\"\"\n        blocks = self._push_finished_blocks.pop(request_id, None)\n        if blocks is not None:\n            return request_id, blocks\n        base_id = get_base_request_id(request_id)\n        for fin_id in list(self._push_finished_blocks):\n            if get_base_request_id(fin_id) == base_id:\n                return fin_id, self._push_finished_blocks.pop(fin_id)\n        return None"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py",
+   "lines": "L656-L669",
+   "what": "WRITE 本体：make_prepped_xfer('WRITE')+transfer——P 直接写进 D 注册的预分配块；返回 handle 交给调用方整请求原子记账（一把 publish，防 _pop_done_transfers 提前报完）。",
+   "elide": [],
+   "code": "        handle = None\n        try:\n            handle = self.nixl_wrapper.make_prepped_xfer(\n                \"WRITE\",\n                local_xfer_side_handle,\n                local_block_descs_ids,\n                remote_xfer_side_handle,\n                remote_block_descs_ids,\n                notif_msg=notif_id,\n            )\n            self.nixl_wrapper.transfer(handle)\n            # Caller tracks the handle (atomically with the request's other\n            # writes) so P can free blocks once all of them are done.\n            return handle"
+  },
+  {
+   "path": "vllm/v1/engine/async_llm.py",
+   "lines": "L743-L769",
+   "what": "拒绝回执的前端入口：构造一条 prompt=[0]、max_tokens=1、abort_immediately=True 的占位 EngineCoreRequest 原样发给引擎——它唯一的作用是触发引擎侧 request_finished 钩子，让 P 释放被钉住的 prefill 块。",
+   "elide": [],
+   "code": "    async def notify_kv_transfer_request_rejected(\n        self,\n        request_id: str,\n        kv_transfer_params: dict[str, Any],\n        *,\n        data_parallel_rank: int | None = None,\n    ) -> None:\n        \"\"\"Submit a pre-aborted request so the connector's request_finished\n        hook runs to free any pre-admission KV-transfer resources (e.g. NIXL\n        prefill blocks pinned on the P node).\"\"\"\n        request = EngineCoreRequest(\n            request_id=request_id,\n            prompt_token_ids=[0],\n            mm_features=None,\n            sampling_params=SamplingParams(\n                max_tokens=1,\n                extra_args={\"kv_transfer_params\": dict(kv_transfer_params)},\n            ),\n            pooling_params=None,\n            arrival_time=time.time(),\n            lora_request=None,\n            cache_salt=None,\n            data_parallel_rank=data_parallel_rank,\n            abort_immediately=True,\n        )\n        await self.engine_core.add_request_async(request)\n"
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L479-L483",
+   "what": "abort_immediately 的引擎侧落点：add_request 之后立刻 abort——请求从未被调度，但 request_finished 钩子照样跑。",
+   "elide": [],
+   "code": "        self.scheduler.add_request(request)\n        if request.abort_immediately:\n            # Immediately abort so the connector's request_finished hook runs\n            # to free any pre-admission KV-transfer resources.\n            self.abort_requests([request.request_id])"
+  },
+  {
+   "path": "vllm/v1/engine/core.py",
+   "lines": "L181-L200",
+   "what": "P 启动装配（第2站）：EngineCore 从全部 worker 收集握手元数据（{(pp_rank, tp_rank): metadata}），合并后注入调度器侧 connector——worker 产元数据、scheduler 进程持 ZMQ 监听，角色分工再次显现。",
+   "elide": [],
+   "code": "        # If a KV connector is initialized for scheduler, we want to collect\n        # handshake metadata from all workers so the connector in the scheduler\n        # will have the full context\n        kv_connector = self.scheduler.get_kv_connector()\n        if kv_connector is not None:\n            # Collect and store KV connector xfer metadata from workers\n            # (after KV cache registration)\n            xfer_handshake_metadata = (\n                self.model_executor.get_kv_connector_handshake_metadata()\n            )\n\n            if xfer_handshake_metadata:\n                # xfer_handshake_metadata is list of dicts from workers\n                # Each dict already has structure {(pp_rank, tp_rank): metadata}\n                # Merge all worker dicts into a single dict\n                content: dict[tuple[int, int], Any] = {}\n                for worker_dict in xfer_handshake_metadata:\n                    if worker_dict is not None:\n                        content.update(worker_dict)\n                kv_connector.set_xfer_handshake_metadata_pp_aware(content)"
+  },
+  {
+   "path": "vllm/entrypoints/generate/base/serving.py",
+   "lines": "L218-L259",
+   "what": "D 侧拒收的检测点：serving 层包一层清理——请求抛错或返回 ErrorResponse（根本没进引擎）且带 do_remote_prefill 回执时，通知引擎侧 connector 收拾钉住的远端 prefill 块。",
+   "elide": [],
+   "code": "    async def _with_kv_transfer_rejection_cleanup(\n        self,\n        awaitable: Awaitable[_T],\n        request: ChatCompletionRequest | CompletionRequest | ResponsesRequest,\n        raw_request: Request | None,\n    ) -> _T:\n        \"\"\"Wrap a `create_*` coroutine so that, if it raises or returns an\n        ErrorResponse (i.e. the request never reached the engine), the KV\n        connector is notified to free any pinned remote-prefill blocks.\"\"\"\n        kv_transfer_params = self.has_kv_connector and request.kv_transfer_params\n        if not kv_transfer_params or not kv_transfer_params.get(\"do_remote_prefill\"):\n            return await awaitable\n\n        notify = True\n        try:\n            result = await awaitable\n            if not isinstance(result, ErrorResponse):\n                notify = False\n            return result\n        finally:\n            if notify:\n                try:\n                    await self.engine_client.notify_kv_transfer_request_rejected(\n                        request.request_id,\n                        kv_transfer_params,\n                        data_parallel_rank=self._get_data_parallel_rank(raw_request),\n                    )\n                except Exception:\n                    logger.warning(\n                        \"Failed to notify KV connector about rejected request %s\",\n                        request.request_id,\n                        exc_info=True,\n                    )\n\n    @staticmethod\n    def _get_decoded_token(\n        logprob: Logprob,\n        token_id: int,\n        tokenizer: TokenizerLike | None,\n        return_as_token_id: bool = False,\n    ) -> str:\n        if return_as_token_id:"
+  },
+  {
+   "path": "tests/v1/kv_connector/nixl_integration/toy_proxy_server.py",
+   "lines": "L155-L172",
+   "what": "disaggregator 发单 P（参考实现）：改写 kv_transfer_params={do_remote_decode:True,...}、max_tokens=1、stream=False——P 只算 prefill 一个 token 就收工交块。",
+   "elide": [],
+   "code": "async def send_request_to_service(\n    client_info: dict, endpoint: str, req_data: dict, request_id: str\n):\n    \"\"\"\n    Send a request to a service using a client from the pool.\n    \"\"\"\n    req_data = req_data.copy()\n    req_data[\"kv_transfer_params\"] = {\n        \"do_remote_decode\": True,\n        \"do_remote_prefill\": False,\n        \"remote_engine_id\": None,\n        \"remote_block_ids\": None,\n        \"remote_host\": None,\n        \"remote_port\": None,\n    }\n    req_data[\"stream\"] = False\n    req_data[\"max_tokens\"] = 1\n    if \"max_completion_tokens\" in req_data:"
+  },
+  {
+   "path": "tests/v1/kv_connector/nixl_integration/toy_proxy_server.py",
+   "lines": "L219-L237",
+   "what": "disaggregator 转交 D：从 P 响应里掏出 kv_transfer_params 原样附加到同一请求体发给 D（round-robin 选实例）——控制面的全部工作就是搬运这只『回执信封』。",
+   "elide": [],
+   "code": "async def _handle_completions(api: str, request: Request):\n    try:\n        req_data = await request.json()\n        request_id = str(uuid.uuid4())\n\n        # Get the next prefill client in round-robin fashion\n        prefill_client_info = get_next_client(request.app, \"prefill\")\n\n        # Send request to prefill service\n        response = await send_request_to_service(\n            prefill_client_info, api, req_data, request_id\n        )\n\n        # Extract the needed fields\n        response_json = response.json()\n        await response.aclose()  # CRITICAL: Release connection back to pool\n        kv_transfer_params = response_json.get(\"kv_transfer_params\", {})\n        if kv_transfer_params:\n            req_data[\"kv_transfer_params\"] = kv_transfer_params"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py",
+   "lines": "L26-L45",
+   "what": "线上协议的版本纪律：PUSH_REG 前缀（worker 间注册 notif）+ NIXL_CONNECTOR_VERSION 及其演进史（1→5：兼容检查、remote_request_id、物理块比、心跳续租、到期时刻+时钟同步）——握手兼容 hash 的输入之一，改协议必 bump。",
+   "elide": [],
+   "code": "PUSH_REG_NOTIF_PREFIX = b\"PUSH_REG:\"\n#\n# NIXL Connector Version\n#\n# Increment this version whenever there is an incompatible change to:\n#   - NixlAgentMetadata schema\n#   - kv_transfer_params schema or semantics\n#   - NIXL transfer protocol or wire format\n#   - KV cache memory layout or block organization\n#   - Any other change that breaks P/D interoperability\n#\n# Version History:\n#   1: Initial version with compatibility checking\n#   2: Add remote_request_id to kv_transfer_params\n#   3: Add physical_blocks_per_logical_kv_block to NixlAgentMetadata\n#   4: Add KV block lease renewal through heartbeats\n#   5: Add remote_blocks_expiry_time to kv_transfer_params + handshake\n#      clock-sync timestamp\n#\nNIXL_CONNECTOR_VERSION: int = 5"
+  },
+  {
+   "path": "vllm/distributed/kv_transfer/kv_connector/utils.py",
+   "lines": "L53-L95",
+   "what": "KVOutputAggregator：TP 各 worker 各持一份 KV 分片、各自报 finished_sending/recving——executor 把多 worker 输出聚合成 rank0 视图：每请求计数到 expected_finished_count（=world_size 或 connector 自报）归零才上报调度器。",
+   "elide": [
+    "可省略：L96-L133 stats/worker_meta 聚合段"
+   ],
+   "code": "class KVOutputAggregator:\n    \"\"\"Utility class to aggregate the output of all workers into a single\n    output corresponding to Rank 0 for scheduler.\"\"\"\n\n    def __init__(self, expected_finished_count: int):\n        # Complete transfer tracker. Used to track finished requests\n        # [req_id -> n_remaining_workers]\n        self._recv_remaining_count = dict[str, int]()\n        self._send_remaining_count = dict[str, int]()\n        self._expected_finished_count = expected_finished_count\n\n    @classmethod\n    def from_connector(cls, connector: \"KVConnectorBase\", world_size: int):\n        return cls(connector.get_finished_count() or world_size)\n\n    def aggregate(\n        self, outputs: list[ModelRunnerOutput | None], output_rank: int = 0\n    ) -> ModelRunnerOutput | None:\n        if not outputs[output_rank]:\n            return None\n\n        # Aggregate kv_connector_output from all workers\n\n        def update_finished_set(\n            req_ids: set[str] | None,\n            remaining_count_dict: dict[str, int],\n            finished_set: set[str],\n        ) -> None:\n            for req_id in req_ids or ():\n                remaining_count = remaining_count_dict.get(\n                    req_id, self._expected_finished_count\n                )\n                remaining_count_dict[req_id] = remaining_count - 1\n                if remaining_count_dict[req_id] == 0:\n                    finished_set.add(req_id)\n                    del remaining_count_dict[req_id]\n\n        finished_sending = set[str]()\n        finished_recving = set[str]()\n        aggregated_kv_connector_stats = None\n        aggregated_kv_connector_worker_meta = None\n        combined_kv_cache_events = None\n        invalid_block_ids = set[int]()"
+  },
+  {
+   "path": "vllm/v1/request.py",
+   "lines": "L100-L122",
+   "what": "回执如何随请求进引擎：HTTP 层把 kv_transfer_params 放进 extra_args → SamplingParams.extra_args → Request 构造时摘出来挂在请求上——P/D 坐标从此对调度器侧 connector 可见。",
+   "elide": [],
+   "code": "\n        # P/D: Connector-specific KV transfer parameters.\n        self.kv_transfer_params: dict[str, Any] | None = None\n        # E/P/D: Connector-specific encoder-cache transfer parameters.\n        self.ec_transfer_params: dict[str, Any] | None = None\n\n        if pooling_params is not None:\n            # Pooling models.\n            self.max_tokens = 1\n        elif sampling_params is not None:\n            # Generative models.\n            assert sampling_params.max_tokens is not None\n            self.max_tokens = sampling_params.max_tokens\n            if self.structured_output_request is not None:\n                self.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR\n\n            if sampling_params.extra_args is not None:\n                self.kv_transfer_params = sampling_params.extra_args.get(\n                    \"kv_transfer_params\"\n                )\n                self.ec_transfer_params = sampling_params.extra_args.get(\n                    \"ec_transfer_params\"\n                )"
+  },
+  {
+   "path": "vllm/v1/core/sched/scheduler.py",
+   "lines": "L2406-L2420",
+   "what": "引擎保活钩子：push 模式下 WRITE 可能在全部『活』请求结束后还在飞——has_requests 把 has_pending_push_work 纳入判活，引擎主循环继续步进给 writer 线程收尾机会（TODO 自注：待推广为通用机制）。",
+   "elide": [],
+   "code": "    def has_requests(self) -> bool:\n        # Override the interface default to also keep the engine alive while a\n        # connector still has pending push work (e.g. push-mode WRITE transfers\n        # in flight after all \"live\" requests have finished). Without this hook\n        # the engine would quiesce before the connector can drain completions.\n        # TODO: replace with a more general mechanism for connectors to keep\n        # the scheduler alive.\n        return (\n            self.has_unfinished_requests()\n            or self.has_finished_requests()\n            or (self.connector is not None and self.connector.has_pending_push_work())\n            or (\n                self.ec_connector is not None\n                and self.ec_connector.has_pending_push_work()\n            )"
+  }
+ ],
+ "theory": [
+  "P/D 负载差异与拆分收益账（为什么要拆）：prefill 一次吃 L 个 token、注意力 ~O(L²·d) 算力密集；decode 每步 1 个 token 却读全历史 KV ~O(L·d) 带宽密集。同引擎混跑时 prefill 长算子挡 decode 小步（尾 ITL 恶化）、decode 高频小核打断 prefill 流水；拆开后各自按瓶颈配比（P 堆算力/TP、D 堆带宽/批大小）。官方口径明确「Disaggregated prefill DOES NOT improve throughput」（disagg_prefill.md）——拆的是延迟分布（TTFT 与 ITL 分别调优、尾 ITL 不受 prefill 突发挤压），不是吞吐；控制面双跳（proxy RTT）还是净增开销。",
+  "回执信封的状态机语义：同一份 kv_transfer_params 字典在两条腿上语义翻转——P 腿 do_remote_decode=True（『这个请求的 decode 将在远端发生』，P 由此知道自己只算 prefill 并在终局产回执）；D 腿 do_remote_prefill=True（『这个请求的 prefill 已在远端算完』，D 由此把整段 prompt 当外部命中异步拉）。P 侧终局 request_finished 以 do_remote_prefill 仍为 True 判定『从未被调度』（拒绝回执的占位请求正是靠这个语义触发空 recv 放块）。",
+  "租约时钟账：perf_counter 只在单进程内可比（不同机器纪元差=开机时间差）。重基准公式 remaining = now_local + (deadline − scheduler_clock)；时钟偏移估计 offset = remote_perf − (start+recv)/2（RTT 中点，取最低 RTT 样本去噪）。两条不等式保证正确性：广播延迟只会让 remaining 偏大（多留一会儿，安全）；心跳续租只增不减（max(old,new)）。稳态心跳速率 = 6 次/租约 ≥ 续期消耗速率（每次续 lease×2/3），单条丢失不致命。",
+  "完成信号的两种物理来源与聚合账：RDMA 单边 READ 下 D 能本地 check_xfer_state(handle) 知道自己读完没（DONE/PROC 轮询、全 DONE 才报请求级完成）；P 完全没参与传输，只能靠 D 读完后 send_notif 的通知（notif_id='req:tp_size' 携带消费者数）——异构 TP 下 P 要等 consumers_per_producer 个通知齐才放块。TP 各 worker 各持 KV 分片各报一次 → KVOutputAggregator 按 expected_finished_count 计数归零才上报（否则 P 只有一个 rank 读完就放块，其余 rank 的数据还在被读=use-after-free）。",
+  "拉/推模式的 TTFT 分解对照：拉模式 TTFT ≈ T_pfill + T_proxy + T_queue(D 准入) + T_xfer + T_first_decode（传输串行在准入之后）；推模式把 T_xfer 与 (T_proxy+T_queue) 重叠（D 一分配块就注册、P 一算完就 WRITE）——理想下 TTFT ≈ max(T_pfill+T_proxy, T_xfer) + T_first_decode。代价是 writer 线程/匹配表/看门狗整套机器（WC3）。",
+  "块粒度不变量在跨引擎场景的延续：P 回执的 remote_block_ids 是逻辑块号（worker 发传输时按各自 physical_blocks_per_logical_kv_block 展开为 kernel 块）；remote_num_tokens=num_computed_tokens（块对齐）；D 查命中返回的 count 也块对齐（Mamba 模型 N−1：D 必须重算最后一个 token 从 h(N−1) 推 h(N)，P 侧 _truncate_mamba_request_for_prefill 同步截尾）。交接块经 get_exchange_clipped_blocks 剪裁：SWA 组只传窗口内尾块、SSM 组只传状态槽——『传的是可恢复计算所需的最小集』。"
+ ],
+ "mechanisms": [
+  {
+   "id": "m1",
+   "name": "双实例部署形态：P=kv_producer / D=kv_consumer 两台完整引擎 + disaggregator 路由器；NixlBaseConnector facade 按 role 建半边（NixlConnector=NixlPullConnector 别名；kv_both 已弃用）",
+   "kind": "config",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/config/kv_transfer.py:L41-L72",
+    "vllm/distributed/kv_transfer/kv_connector/factory.py:L176-L193",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:L112-L135",
+    "docs/features/nixl_connector_usage.md:L66-L109"
+   ]
+  },
+  {
+   "id": "m2",
+   "name": "disaggregator 控制回路：kv_transfer_params 回执信封双跳（发单 P→P 终局产回执随响应出引擎→proxy 转交 D→Request 挂载）；prompt_token_ids 复用免二次 tokenize",
+   "kind": "protocol",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "tests/v1/kv_connector/nixl_integration/toy_proxy_server.py:L155-L197",
+    "tests/v1/kv_connector/nixl_integration/toy_proxy_server.py:L219-L237",
+    "vllm/v1/request.py:L100-L122",
+    "vllm/v1/core/sched/scheduler.py:L1901-L1935",
+    "vllm/entrypoints/openai/chat_completion/protocol.py:L465-L472",
+    "docs/features/disagg_prefill.md:L52-L75"
+   ]
+  },
+  {
+   "id": "m3",
+   "name": "P 终局·租约钉住与回执：request_finished 双条件（LENGTH_CAPPED/STOPPED）→ delay_free 接管 + _reqs_need_send 租约戳 + 返回 remote_* 回执字典（F8 回收①：ch16 的所有权转移②在真实后端落地）",
+   "kind": "dataflow",
+   "difficulty": "core",
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:L181-L280",
+    "vllm/v1/core/sched/scheduler.py:L1901-L1935",
+    "vllm/v1/core/sched/scheduler.py:L2300-L2327"
+   ]
+  },
+  {
+   "id": "m4",
+   "name": "D 查命中·全 prompt 异步拉：do_remote_prefill → (N−computed, True) 接 ch16 WAITING_FOR_REMOTE_KVS；update_state_after_alloc 登记 _reqs_need_recv（未入哈希表块作落地缓冲）+ 一次性翻转防重发",
+   "kind": "dataflow",
+   "difficulty": "core",
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:L34-L66",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:L112-L179"
+   ]
+  },
+  {
+   "id": "m5",
+   "name": "带外握手：side channel（EngineCore 聚合 worker 握手元数据→调度器侧 ZMQ ROUTER 待命；D 首遇 ZMQ REQ）；两段解码 compat hash 门（版本+模型+dtype+后端）；RTT 中点时钟偏移",
+   "kind": "protocol",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/v1/engine/core.py:L181-L200",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:L281-L322",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:L577-L645",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:L661-L703",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:L853-L941",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py:L64-L141"
+   ]
+  },
+  {
+   "id": "m6",
+   "name": "RDMA 单边 READ（拉模式）：make_prepped_xfer('READ')+transfer——D 直接从 P 显存拉块、P 的 CPU 零参与；本地全命中 notif-only 免拉；handle 入 _recving_transfers 轮询；notif_id 携消费者数",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:L42-L113",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:L225-L333"
+   ]
+  },
+  {
+   "id": "m7",
+   "name": "完成回收·双端不对称：D 轮询 handle 全 DONE（done_recving→ch16 提升补缓存+退一 token）vs P 收 READ-done notif（consumer 计数齐才 done_sending 放块）；KVOutputAggregator 按 expected_finished_count 聚 TP 各 worker 输出",
+   "kind": "protocol",
+   "difficulty": "core",
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:L2044-L2064",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:L2210-L2255",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:L346-L399",
+    "vllm/distributed/kv_transfer/kv_connector/utils.py:L53-L95",
+    "vllm/v1/executor/abstract.py:L280-L284"
+   ]
+  },
+  {
+   "id": "m8",
+   "name": "租约心跳与过期：kv_lease_duration=30s + HB: notif 续租（间隔=租约/6、续 lease×2/3 只增不减）+ 到期超时放块自愈；scheduler_clock 跨进程重基准（广播延迟只延长租约=安全方向）",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:L64-L76",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:L459-L468",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:L94-L109",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:L2145-L2164",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:L2189-L2305"
+   ]
+  },
+  {
+   "id": "m9",
+   "name": "推模式（NixlPushConnector）：D 分配即 PUSH_REG 注册（携 D 坐标+块号）→ P nixl-push-writer 线程双向配对 → WRITE 直写 D 预分配块（传输与 D 排队重叠）；has_pending_push_work 保活 + 注册 watchdog；随机后缀剥离匹配",
+   "kind": "algorithm",
+   "difficulty": "core",
+   "needs_figure": true,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py:L129-L206",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py:L295-L346",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py:L130-L272",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py:L274-L399",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py:L403-L485",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_worker.py:L656-L686",
+    "vllm/v1/core/sched/scheduler.py:L2406-L2420"
+   ]
+  },
+  {
+   "id": "m10",
+   "name": "拒绝回执：D serving 层拒收（未进引擎）→ _with_kv_transfer_rejection_cleanup → notify_kv_transfer_request_rejected（abort_immediately 占位请求）→ add_request 后立即 abort → P 的 request_finished 见 do_remote_prefill 仍 True → 空 recv → notif 放块",
+   "kind": "protocol",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": false,
+   "source_anchors": [
+    "vllm/entrypoints/generate/base/serving.py:L218-L259",
+    "vllm/v1/engine/async_llm.py:L743-L769",
+    "vllm/v1/engine/core.py:L479-L483",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:L210-L221",
+    "vllm/engine/protocol.py:L113-L125"
+   ]
+  },
+  {
+   "id": "m11",
+   "name": "传输失败处理：握手失败/READ setup 失败/传输异常 → _handle_failed_transfer（块标 invalid_block_ids + req 入 _failed_recv_reqs）→ 并入 done_recving → 接 ch16 失败回滚（fail=FINISHED_ERROR / recompute=第一个坏块截断重算+补登记清零）；push 的 WRITE 提交失败特例（P 无 recv 元数据，只能弃单等租约/看门狗）",
+   "kind": "dataflow",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:L2257-L2273",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:L334-L344",
+    "vllm/v1/core/sched/scheduler.py:L2846-L2914"
+   ]
+  },
+  {
+   "id": "m12",
+   "name": "混合模型传输剪裁与 host buffer 旁路：get_exchange_clipped_blocks（SWA 组只传窗口内尾块、SSM 组只传状态槽+去 scratch；Mamba 的 P 截尾/D 重算末 token N−1）；kv_buffer_device=cpu 时 save_kv_to_host/sync_recved_kv_to_device（wait_for_save 的唯一非空实现，非 CUDA 平台必经）",
+   "kind": "algorithm",
+   "difficulty": "supporting",
+   "needs_figure": false,
+   "needs_worked_example": true,
+   "source_anchors": [
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:L235-L279",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:L367-L398",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:L747-L802",
+    "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:L1892-L1918"
+   ]
+  }
+ ],
+ "subtraction_plan": {
+  "delete": [
+   {
+    "what": "异构 TP 深分支：tp_mapping.py 的多 rank 切分（_build_local_splits_from_plan、staging blocks、tp_ratio<0 的 split handles src_xfer_handles_by_tp_ratio）、base_worker 的 _map_block_ids_for_block_size_ratio/get_mapped_blocks（L2307/L2328）与 _apply_prefix_caching 的 Mamba/异构 front-trim else 分支（base_worker.py:L2423-L2485——注释自述处理 HeteroTP 逻辑块取整导致的 kernel 块数差：SSM 槽/FA 组取 min 前裁剪）、pull_worker/push_worker 中 tp_ratio<0 多读循环与 split_key 分支、post_process_device_kv_on_receive*（含 heterogeneous_attn）、_physical_blocks_per_logical_kv_block≠1 的重映射段与 dst_num_blocks/block_size_ratio 换算。【不删】_apply_prefix_caching 的非 Mamba 尾裁剪路径（base_worker.py:L2398-L2422+L2486）与 pull_worker.py:L287-L295 调用点——那是通用的部分前缀命中裁剪，对称 TP 可达，见 must_keep。",
+    "why_safe": "对称 TP（P/D 同 tp_size、同 block_size）是正典主干：每 D rank 只从对应 P rank 单次 READ/WRITE、块号一一对应。⚠ _apply_prefix_caching 的非 Mamba 分支不是异构专用：D 本地有部分前缀缓存（如跨请求共享 system prompt）时，本地未入哈希表块数 < 远端块数，需把远端块表裁到尾段、只拉未命中块（L2413 注释原话 'Partial prefix cache hit: just read uncomputed blocks'）——若删掉，部分命中请求的 local/remote desc 列表长度不再相等，pull_worker.py:L315 的 assert len(local_block_descs_ids) == len(remote_block_descs_ids) 直接炸。只有 Mamba else 分支（front-trim 取 min）与 block_size_ratio≠1 换算才是异构/HMA 部署变体，删后主控制流（握手→发 READ/WRITE→轮询 DONE→notif 放块）完整闭合；v2 ch35 已验证异构删法安全。"
+   },
+   {
+    "what": "MLA 专属分支：use_mla 的 replicate 读写（write_ranks 扩张）、_region_is_mla/_fa_desc_replicated/_is_region_replicated、MLA 的 reshape/纯 MLA 单读断言与『notify 其余 rank』补发段",
+    "why_safe": "MLA latent 在 TP 间复制带来的多 rank 读写特例，与 READ/WRITE 传输契约正交；非 MLA 主路径逐字保留。"
+   },
+   {
+    "what": "Mamba/HMA 深分支：base_worker 的 _build_mamba_local/_build_mamba_remote/_stack_descs/_build_fa_local/_build_fa_remote、conv_decomp/derive_mamba_conv_split、_sync_device_after_mamba_recv、_ssm_spec_blocks/_ssm_state_slots_are_positional；base_scheduler 的 _get_remote_prefill_token_count Mamba N−1 与 _truncate_mamba_request_for_prefill、get_exchange_clipped_blocks 的 SSM 分支（保留 SWA 尾剪裁一支与函数骨架）",
+    "why_safe": "混合模型（full+SWA+Mamba）块表传输归 ch14/ch16 已立的 HMA 语义，本章只须读者知道『交接块会被剪到可恢复计算所需的最小集』；SSM 状态槽配对是模型特化深水区，删后 SWA/main 路径完整。"
+   },
+   {
+    "what": "host buffer 旁路实现：initialize_host_xfer_buffer、save_kv_to_host、sync_recved_kv_to_device、set_host_xfer_buffer_ops/CopyBlocksOp 接线（保留 use_host_buffer 旗标定义与 wait_for_save 里的判定注释，删实现体）",
+    "why_safe": "仅非 CUDA 平台（kv_buffer_device=cpu）必经；CUDA 主线 use_host_buffer=False 直走设备内存。"
+   },
+   {
+    "what": "packed / cross-layer 布局族：_register_packed_kv_cache（DSv4 连续块打包）、register_cross_layers_kv_caches、prefer_cross_layer_blocks 属性体（保留签名返回 False）",
+    "why_safe": "传输加速的物理布局优化，opt-in 默认关；基础逐层注册路径不受影响。"
+   },
+   {
+    "what": "双向回拉（bidirectional）深分支：is_bidirectional_kv_xfer_enabled 驱动的 update_state_after_alloc 回拉登记与 _remote_blocks_processed 二次路径、decoder_kv_blocks_ttl、_is_turn2_read_expired 与 _KV_BLOCKS_EXPIRY_SAFETY_MARGIN、blocks_expiry_time 的产/传/销（保留旗标定义与 get_num_new_matched_tokens 的 do_remote_decode 分支骨架）",
+    "why_safe": "双向 D→P 是多轮对话进阶路径（ch37 续接）；单向 P→D 主线不触这些分支。"
+   },
+   {
+    "what": "stats/telemetry/Prometheus：NixlKVConnectorStats/NixlPromMetrics、xfer_stats.record_* 全部调用点、get_xfer_telemetry、build_prom_metrics/get_kv_connector_stats 转发（保留契约签名与默认 None 返回）",
+    "why_safe": "纯观测旁路；收发控制流不依赖。"
+   },
+   {
+    "what": "PP-aware 分支：pp_size>1 的握手 product 循环与 NotImplementedError 断言、_remote_region_offset、push 模式 PP 不支持的 raise（保留 pp_size 参数默认 1）",
+    "why_safe": "PP>1 的 KV 传输是进阶部署形态且 push 模式明确不支持；1P1D/TP 主线不受影响。"
+   },
+   {
+    "what": "factory.py 其余后端注册行（LMCache/Mooncake/MoRIIO/MultiConnector/Offloading/FlexKV/HF3FS/DecodeBench/ExampleHiddenStates 等，L152-L175 与 L196-L242）——只保留 NixlConnector/NixlPullConnector/NixlPushConnector 三条注册",
+    "why_safe": "本章只讲 NIXL；注册机制本身由保留的三条示范。其他后端归 ch36（池化）。"
+   },
+   {
+    "what": "引擎侧与本章无关的大块（与 ch16 删法同款）：scheduler 的 lora/encoder-decoder/spec-decode ngram/streaming/pause 状态机、ECConnector 全部、gpu_model_runner 执行主体（只保留 handle_preemptions/no_forward 分支/maybe_get_kv_connector_output 包裹点）、serving 层与 P/D 无关的端点",
+    "why_safe": "平行机制；本章引擎面只需要 connector 挂点与回执过线的收发两端。"
+   },
+   {
+    "what": "toy_proxy_server 的 XPU/shutdown/健康检查/启动样板段（保留发单/转交两个核心函数与 round-robin 选择）",
+    "why_safe": "disaggregator 语义由两个核心函数完整表达；运维样板与教学无关。"
+   }
+  ],
+  "must_keep": [
+   {
+    "symbol": "NixlBaseConnector",
+    "why": "facade 基类——role 半边构建的形态（m1）。"
+   },
+   {
+    "symbol": "NixlPullConnector",
+    "why": "拉模式 connector（正典）。"
+   },
+   {
+    "symbol": "NixlPushConnector",
+    "why": "推模式 connector（对照）。"
+   },
+   {
+    "symbol": "NixlConnector",
+    "why": "注册名=Pull 别名——部署命令行里写的就是它。"
+   },
+   {
+    "symbol": "NixlPullConnectorScheduler",
+    "why": "D 查命中/P 终局的调度器侧实体。"
+   },
+   {
+    "symbol": "NixlPushConnectorScheduler",
+    "why": "推模式调度器侧实体。"
+   },
+   {
+    "symbol": "NixlPullConnectorWorker",
+    "why": "READ 的 worker 实体。"
+   },
+   {
+    "symbol": "NixlPushConnectorWorker",
+    "why": "WRITE 的 worker 实体。"
+   },
+   {
+    "symbol": "NixlBaseConnectorScheduler",
+    "why": "公共层：四账本+side channel+build_connector_meta。"
+   },
+   {
+    "symbol": "NixlBaseConnectorWorker",
+    "why": "公共层：握手+get_finished+心跳。"
+   },
+   {
+    "symbol": "get_num_new_matched_tokens",
+    "why": "D 查命中入口（m4）。"
+   },
+   {
+    "symbol": "update_state_after_alloc",
+    "why": "D 登记 _reqs_need_recv / PUSH_REG 注册（m4/m9）。"
+   },
+   {
+    "symbol": "request_finished",
+    "why": "P 终局：租约+回执（m3）+拒绝回执的空 recv 分支（m10）。"
+   },
+   {
+    "symbol": "build_connector_meta",
+    "why": "元数据面：reqs_to_recv/reqs_to_send/scheduler_clock/push 两表（m7/m8）。"
+   },
+   {
+    "symbol": "_reqs_need_recv",
+    "why": "D 待收账本。"
+   },
+   {
+    "symbol": "_reqs_need_send",
+    "why": "P 钉住账本（值=租约到期时刻）。"
+   },
+   {
+    "symbol": "_reqs_in_batch",
+    "why": "P/D 在批请求跟踪（超时判定输入）。"
+   },
+   {
+    "symbol": "_reqs_not_processed",
+    "why": "非正常终局清单（abort 不交接）。"
+   },
+   {
+    "symbol": "kv_lease_duration",
+    "why": "租约常量（默认 30s）——m8 的锚。"
+   },
+   {
+    "symbol": "kv_transfer_params",
+    "why": "回执信封本体（Request 字段 + 字典字段全名）。"
+   },
+   {
+    "symbol": "do_remote_prefill",
+    "why": "D 腿语义旗标。"
+   },
+   {
+    "symbol": "do_remote_decode",
+    "why": "P 腿语义旗标（is_p_node 判据）。"
+   },
+   {
+    "symbol": "remote_block_ids",
+    "why": "P 的块号——传输坐标核心。"
+   },
+   {
+    "symbol": "remote_engine_id",
+    "why": "P 的引擎标识。"
+   },
+   {
+    "symbol": "remote_request_id",
+    "why": "P 侧请求 id（notif 配对键）。"
+   },
+   {
+    "symbol": "remote_host",
+    "why": "P side channel 地址。"
+   },
+   {
+    "symbol": "remote_port",
+    "why": "P side channel 端口。"
+   },
+   {
+    "symbol": "tp_size",
+    "why": "回执字典字段（P 侧产出 pull_scheduler.py:L277=P 的 tensor_parallel_size）。消费点：①push 注册 push_scheduler.py:L188 \"remote_tp_size\": params[\"tp_size\"]（P 反向握手要知道目标 rank 数）；②ReqMeta 构建 metadata.py:L209 kv_transfer_params.get(\"tp_size\", 1)；③心跳预握手 _send_heartbeats 的 hb_info.tp_size → _ensure_handshake 入参（excerpt 内嵌）。"
+   },
+   {
+    "symbol": "remote_num_tokens",
+    "why": "回执字典字段（P 侧产出 pull_scheduler.py:L267=request.num_computed_tokens、L278 入字典）。消费点：do_remote_decode 分支骨架 pull_scheduler.py:L89-L91——min(remote_num_tokens, num_prompt_tokens)−num_computed_tokens 算可拉数；该分支骨架是减法计划明示保留项（双向回拉深分支条目），字段删掉骨架即失去语义。"
+   },
+   {
+    "symbol": "_nixl_handshake",
+    "why": "握手本体：ZMQ REQ+compat hash+时钟偏移（m5）。"
+   },
+   {
+    "symbol": "_ensure_handshake",
+    "why": "单飞 future 防重复握手。"
+   },
+   {
+    "symbol": "_background_nixl_handshake",
+    "why": "后台握手+完成回调补发（m5）。"
+   },
+   {
+    "symbol": "_ready_requests",
+    "why": "握手完成后待发 READ 的队列。"
+   },
+   {
+    "symbol": "add_remote_agent",
+    "why": "远端内存注册（描述符建立）。"
+   },
+   {
+    "symbol": "_remote_agents",
+    "why": "engine_id→agent 名映射。"
+   },
+   {
+    "symbol": "NixlHandshakePayload",
+    "why": "握手线上格式（两段解码）。"
+   },
+   {
+    "symbol": "NixlAgentMetadata",
+    "why": "agent 元数据（基址/块数/布局）。"
+   },
+   {
+    "symbol": "compute_nixl_compatibility_hash",
+    "why": "兼容 hash 计算与因子集。"
+   },
+   {
+    "symbol": "compatibility_hash",
+    "why": "hash 字段与比对点。"
+   },
+   {
+    "symbol": "NIXL_CONNECTOR_VERSION",
+    "why": "协议版本纪律（版本史注释保留）。"
+   },
+   {
+    "symbol": "make_prepped_xfer",
+    "why": "READ/WRITE 传输创建调用。"
+   },
+   {
+    "symbol": "transfer",
+    "why": "非阻塞发起。"
+   },
+   {
+    "symbol": "check_xfer_state",
+    "why": "DONE/PROC 轮询。"
+   },
+   {
+    "symbol": "send_notif",
+    "why": "READ-done/HB/PUSH_REG 三类通知的发送原语。"
+   },
+   {
+    "symbol": "get_new_notifs",
+    "why": "通知接收（P 放块/D 心跳的入口）。"
+   },
+   {
+    "symbol": "_read_blocks",
+    "why": "READ 本体（含全命中 notif-only 分支）。"
+   },
+   {
+    "symbol": "_read_blocks_for_req",
+    "why": "按请求组装 READ（TP 映射入口）。"
+   },
+   {
+    "symbol": "_apply_prefix_caching",
+    "why": "通用部分前缀命中尾裁剪（base_worker.py:L2398-L2422 非 Mamba 分支：D 本地未入哈希表块数<远端块数→远端各组取尾 num_local 块，只拉未命中的尾段；对称 TP 下 D 有部分本地前缀缓存即触发，如跨请求共享 system prompt）；调用点 pull_worker.py:L293-L295。减法计划只批准删其 Mamba/异构 front-trim else 分支（L2423-L2485）。"
+   },
+   {
+    "symbol": "_recving_transfers",
+    "why": "handle 账本（收完成轮询对象）。"
+   },
+   {
+    "symbol": "_recving_metadata",
+    "why": "请求传输元数据（失败回滚输入）。"
+   },
+   {
+    "symbol": "_xfer_blocks",
+    "why": "WRITE 本体。"
+   },
+   {
+    "symbol": "_do_start_push_kv",
+    "why": "push 配对后的 WRITE 发起。"
+   },
+   {
+    "symbol": "_push_writer_loop",
+    "why": "writer 线程主循环（m9）。"
+   },
+   {
+    "symbol": "_send_registration_to_p",
+    "why": "PUSH_REG 发送（握手后重排队）。"
+   },
+   {
+    "symbol": "_handle_push_reg_notif",
+    "why": "P 侧收注册+配对。"
+   },
+   {
+    "symbol": "_pop_matching_registration",
+    "why": "配对机器核心查找（push_worker.py:L369-L382）：先精确键，再 get_base_request_id 剥 -<8hex> 随机后缀归一匹配（m9 随机后缀剥离匹配的本体）；镜像 _pop_matching_finished_blocks（L384-L399）对完成块表做同款查找。"
+   },
+   {
+    "symbol": "_pending_d_registrations",
+    "why": "worker 侧 D 注册账本（配对机器两张表之一，另一张 _push_finished_blocks 已登记）——注册先到、P 完成块后到时的暂存处（push_worker.py:L290/L375-L381）。"
+   },
+   {
+    "symbol": "_push_pending_registrations",
+    "why": "D 注册账本（调度器侧）。"
+   },
+   {
+    "symbol": "_push_finished_blocks",
+    "why": "P 完成块账本（等待配对）。"
+   },
+   {
+    "symbol": "PUSH_REG_NOTIF_PREFIX",
+    "why": "注册通知线上前缀。"
+   },
+   {
+    "symbol": "get_finished",
+    "why": "worker 完成上报（双源+租约收割）。"
+   },
+   {
+    "symbol": "_pop_done_transfers",
+    "why": "handle 全 DONE 判定。"
+   },
+   {
+    "symbol": "_get_new_notifs",
+    "why": "P 侧 notif→done_sending（consumer 计数）。"
+   },
+   {
+    "symbol": "consumer_notification_counts_by_req",
+    "why": "异构 TP 消费者计数（保留定义与齐数判定骨架）。"
+   },
+   {
+    "symbol": "_handle_failed_transfer",
+    "why": "失败→invalid 块+失败队列（m11）。"
+   },
+   {
+    "symbol": "_invalid_block_ids",
+    "why": "失败块上报集合。"
+   },
+   {
+    "symbol": "_failed_recv_reqs",
+    "why": "失败请求队列（并入 done_recving）。"
+   },
+   {
+    "symbol": "_send_heartbeats",
+    "why": "D 侧心跳发送。"
+   },
+   {
+    "symbol": "_handle_heartbeat",
+    "why": "P 侧续租（lease×2/3 只增不减）。"
+   },
+   {
+    "symbol": "_heartbeat_by_engine",
+    "why": "心跳分组账本。"
+   },
+   {
+    "symbol": "HeartbeatInfo",
+    "why": "心跳载荷结构。"
+   },
+   {
+    "symbol": "scheduler_clock",
+    "why": "租约重基准的时钟基准。"
+   },
+   {
+    "symbol": "_reqs_to_send",
+    "why": "worker 侧租约账本（到期收割对象）。"
+   },
+   {
+    "symbol": "_reqs_to_process",
+    "why": "在批集合（notif 合法性判定）。"
+   },
+   {
+    "symbol": "get_exchange_clipped_blocks",
+    "why": "交接块剪裁（SWA 一支保留）。"
+   },
+   {
+    "symbol": "KVOutputAggregator",
+    "why": "TP 聚合器（m7）。"
+   },
+   {
+    "symbol": "init_kv_output_aggregator",
+    "why": "executor 侧装配点。"
+   },
+   {
+    "symbol": "expected_finished_count",
+    "why": "聚合期望计数。"
+   },
+   {
+    "symbol": "notify_kv_transfer_request_rejected",
+    "why": "拒绝回执前端入口（m10）。"
+   },
+   {
+    "symbol": "abort_immediately",
+    "why": "占位请求旗标（引擎侧立即 abort）。"
+   },
+   {
+    "symbol": "_with_kv_transfer_rejection_cleanup",
+    "why": "D serving 层拒收检测包装。"
+   },
+   {
+    "symbol": "has_pending_push_work",
+    "why": "push 保活（引擎判活纳入）。"
+   },
+   {
+    "symbol": "has_requests",
+    "why": "判活钩子（scheduler.py:L2406）。"
+   },
+   {
+    "symbol": "side_channel_host",
+    "why": "side channel 地址常量。"
+   },
+   {
+    "symbol": "side_channel_port",
+    "why": "side channel 端口常量（DP rank 偏移）。"
+   },
+   {
+    "symbol": "get_base_request_id",
+    "why": "push 配对的随机后缀归一。"
+   },
+   {
+    "symbol": "kv_recompute_threshold",
+    "why": "短拉不划算判定阈值（双向分支保留骨架）。"
+   },
+   {
+    "symbol": "kv_role",
+    "why": "producer/consumer 部署门（m1）。"
+   },
+   {
+    "symbol": "engine_id",
+    "why": "引擎标识（uuid4 默认+TP 广播对齐）。"
+   }
+  ]
+ },
+ "foreshadow_due": {
+  "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，取回必错，不跑）",
+  "should_plant": [],
+  "should_payoff": [
+   {
+    "id": "F8",
+    "text": "KVConnector 双面契约（planted=16, paid=[36, 37]）——本章回收其一",
+    "payoff_how": "ch16 埋下的双面契约（调度器侧五原语/worker 侧收发族、role-split 零共享、不透明 KVConnectorMetadata、三处所有权转移）在本章被 NIXL 连接器整体填实为真实跨引擎部署：m3=m11 的『request_finished→True 接管异步释放』落地为租约钉住+回执；m2 的『get_num_new_matched_tokens 外部=第二个前缀缓存』落地为 do_remote_prefill 全 prompt 命中；m7 的 worker 生命周期落地为 READ/WRITE+双源完成信号；m10 的失败回滚落地为 invalid_block_ids/failed_recv_reqs。回收话术：『ch16 立的契约，本章给它装上了第一条真实的腿』。另一半回收点在 ch36（offload 池化：同一契约把块搬出去再搬回来）——本章结尾留路标。"
+   }
+  ],
+  "note": "本章不埋新伏笔。邻章钩子：双向 D→P 回拉（多轮）在 m4/m8 的可省略分支处留『→ ch37 多轮』路标、不算回收；P/D 与 DP 的关系（ch33 已立多实例视角）在 m1 处一句话回指；ch36 的 KV 池化在 scope_note 的邻章分界处点名。"
+ },
+ "l2_spec": "book/cartography/l2-specs/ch35.json（stations 与本档案 stations 同一份账本）"
+}

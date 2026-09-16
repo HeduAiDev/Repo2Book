@@ -1,4 +1,4 @@
-# 第 29 章　Sampler 9 步管线
+# 第 30 章　Sampler 9 步管线
 
 128000 个 logits 里选 1 个 token 出门，教学代码里这是一行的事：`next_token = torch.multinomial(softmax(logits / T), 1)`。vLLM 为什么把它拆成 9 道关卡，还在主路径上明令弃用 `torch.multinomial`？更怪的安排还在后面。批里既有 temperature=0 的贪心请求、又有随机请求，贪心的凭什么能整条跳过温度、top-k、top-p，两路结果又怎么在同一个张量里合并？`min_tokens` 封禁 EOS、`logit_bias` 手动加分、min_p 砍尾巴，同样是在改 logits 的三件事，为什么前两件必须排在温度之前、对全批生效，min_p 却排在温度之后、只对随机路径生效？把这三个问题串起来的，是采样出口上同一行 logits 的 9 步旅程：先被留底、再被一道道门控改写、最后掷一次骰子。本章把这条出口列整个打开，主战场是 `vllm/v1/sample/sampler.py`。
 
@@ -6,15 +6,15 @@
 
 ## 你在这里
 
-Part VII 共五章，全部落在 L0 图中列「GPU 执行臂」南伸的采样出口列上：ch29 Sampler 9 步管线（本章）、ch30 约束解码 I：语法编译、ch31 约束解码 II：bitmask 落地、ch32 投机解码数学+DSpark（原理章）、ch33 投机解码 vLLM 落地。
+Part VII 共五章，全部落在 L0 图中列「GPU 执行臂」南伸的采样出口列上：ch30 Sampler 9 步管线（本章）、ch31 约束解码 I：语法编译、ch32 约束解码 II：bitmask 落地、ch33 投机解码数学+DSpark（原理章）、ch34 投机解码 vLLM 落地。
 
 ![Part VII 导览：选一个 token 出门](../diagrams/L1-partVII.png)
 
-> *图注：Part VII「选一个 token 出门：128000 个 logits 选谁出门，过 9 道关卡」覆盖 L0 图采样出口列整段（compute_logits → Sampler → 结构化输出位掩码 → spec decode——位掩码画在采样器下方，写入却在采样之前先行，即站 1 的交接点；掩码怎么算归 ch30/31），在此亮起、区域外退后；右侧同区放大即本部舞台，底部一行注明：此处之后 tokens 离开 GPU 出 EngineCore（D2H 归[第 8 章](../../ch08-logprobs/narrative/chapter.md)）。本章取最中间那一块：`Sampler.forward` 的 9 步管线，导览图里角标「9 步 · 采样列的方法级展开」指的就是它。*
+> *图注：Part VII「选一个 token 出门：128000 个 logits 选谁出门，过 9 道关卡」覆盖 L0 图采样出口列整段（compute_logits → Sampler → 结构化输出位掩码 → spec decode——位掩码画在采样器下方，写入却在采样之前先行，即站 1 的交接点；掩码怎么算归 ch31/31），在此亮起、区域外退后；右侧同区放大即本部舞台，底部一行注明：此处之后 tokens 离开 GPU 出 EngineCore（D2H 归[第 8 章](../../ch08-logprobs/narrative/chapter.md)）。本章取最中间那一块：`Sampler.forward` 的 9 步管线，导览图里角标「9 步 · 采样列的方法级展开」指的就是它。*
 
 放大到本章自己这一层：
 
-![L2 章图：Sampler 9 步管线](../diagrams/L2-ch29.png)
+![L2 章图：Sampler 9 步管线](../diagrams/L2-ch30.png)
 
 > *图注：本章放大的是[第 1 章](../../ch01-vllm-v1-in-one-map/narrative/chapter.md) L0 图中列「GPU 执行臂」最南端的采样出口列，就是那张图里 lm_head 之后、token 出 GPU 之前的那一小段。进来的 logits 由[第 23 章](../../ch23-model-layer-assembly/narrative/chapter.md)立的 `compute_logits` 契约产出（lm_head、TP gather、按需切片都在那一章）；出口的 D2H 与判停是[第 8 章](../../ch08-logprobs/narrative/chapter.md)、[第 9 章](../../ch09-engine-core-step-loop/narrative/chapter.md)走过的支路；喂给采样列的一袋参数来自[第 18 章](../../ch18-persistent-batch-fixed-addresses/narrative/chapter.md)的持久批次。本章打开中排 ①-⑨ 九步（raw 留底 → fp32 → 白名单 → bad_words → 非不变列 → 惩罚 → sample → gather → 出件），下排是 ⑦ 深处的后端分发与三张 why 注。站号 = 请求流经代码的顺序：1-2 站 runner 进口（交接与换轨），3-9 站对应 ①-⑦ 步，第 10 站藏在 ⑦ 内部（截断与掷骰的后端分流），11-12 站出件；正文按讲解需要编排、不必照站号读。*
 
@@ -254,7 +254,7 @@ CPU 与 GPU 是两台独立计算机。Python 调 PyTorch 的 GPU 算子只是�
 
 **v1 方案**就是眼前这套：门控逻辑留在 python（批级分支），真正计算密集的子步骤下沉 kernel——top-k/top-p 截断有 Triton 核，掷骰是 `exponential_()` 加 `argmax` 两个纯张量操作，CUDA 上还有 FlashInfer 的采样核。注意准确表述不是「采样很慢所以拆开」，而是「9 道门各管一件事，重的活单独下沉」。
 
-![9 步管线与批级门控](../diagrams/ch29-fig-nine-steps-gating.png)
+![9 步管线与批级门控](../diagrams/ch30-fig-nine-steps-gating.png)
 
 > *图注：上泳道是 ①-⑨ 九道门（站号徽标 3-12 与 L2 章图对齐），箭头下探到下泳道的才是真的「下沉」：③ 的 `masked_fill_`、⑤ 的 `index_put_`、⑥ 的 `scatter_add_` 计数、⑦d 的 Triton pivot 截断、⑦d+⑦e 一并完成的 FlashInfer 拒绝采样（融合核：截断与掷骰一个 kernel 做完，后文后端绑定节）、⑦e 的 `exponential_`+`argmax`、⑧ 的 topk+rank。没有下探箭头的步骤没有专属 kernel、判定与循环整段留在 python（① 的 log_softmax、② 的精度转换这类顺手调框架张量算子的不算专属 kernel）：bad_words 是 4 个禁短语 4 次判定的逐请求循环，惩罚的前置是把 python list 历史 `make_tensor_with_pad` 变张量再 H2D。`all_greedy` 批在 7a 早退（实测温度没跑、调用方 logits 未被改写），橙色旁路从 ⑦ 直接跳 ⑧。*
 
@@ -476,7 +476,7 @@ class LogitsProcessors:
 
 B 行是二分的正面：封掉 token2 之后 argmax 从 2 变 1，这种「能改第一名」的处理器必须在贪心之前生效，贪心采样出的正是封禁后的第一名。C 行是反面：min_p 把尾巴砍到只剩两个幸存者，argmax 前后都是 0，砍不到冠军。D 行是谎报的下场：容器照单全收把它分进不变列，`all_greedy` 批的早退发生在第 7 步 c 之前，封禁从未执行，采样出本该被封的 EOS。接口上没有任何强校验会拦住这个谎——`is_argmax_invariant()` 是抽象方法，正确性靠各处理器自带的测试，不靠类型系统。
 
-![argmax 不变性二分](../diagrams/ch29-fig-argmax-dichotomy.png)
+![argmax 不变性二分](../diagrams/ch30-fig-argmax-dichotomy.png)
 
 > *图注：构造期的 `LogitsProcessors` 容器（`state.py:L148-L160`，声明无人强校验）按声明把处理器分进两列：非不变列（MinTokens/LogitBias，能改第一名）水平挂进 step5·greedy 判定前·对全体生效；不变列（MinP，只砍尾）肘形挂进 step7c·温度后·仅随机路径。`all_greedy` 早退的橙色旁路从 7a 直接跳 ⑧，红虚线是谎报反例的路径：MinTokens 声明 True 进不变列、沿早退旁路走出去、封禁从未执行——终点是「采样出 2（EOS）」，正确答案 1（B 行）。*
 
@@ -944,7 +944,7 @@ def apply_top_k_top_p_pytorch(
 
 四步走同一根**升序轴**。第一步升序 sort：最小位在左、最大位在右，`logits_idx` 记着每个位置原来说的是谁。第二步 top-k 用的是一条索引算术：升序后第 $`k`$ 名的值就在下标 $`V-k`$ 处（`size(1) - k`），gather 出来当阈值，**严格小于**阈值的才 mask，于是与第 $`k`$ 名**并列**的 token 全部保留，截完可能不止 $`k`$ 个。第三步 top-p 从矮个那头累加概率质量，`cumsum` 刚到 1−p 为止：被 mask 的是累积不超过 1−p 的升序前缀，留下的是「累积概率刚超过 $`p`$ 的最小集合」（nucleus 的定义原文）；`top_p_mask[:, -1] = False` 强制保留最末位，p 设得再苛刻也至少留一个。第四步 `scatter_` 按记好的下标把队伍拆回原位，纯位置重排、值不变。两个不变量跟着成立：截断后每行至少留 1 个、必含该行最大位（含并列），argmax 不受 top-k/top-p 影响，它们才有资格放进随机路径。
 
-![top-k 与 top-p 的 sort 截断路径](../diagrams/ch29-fig-topk-topp-sort.png)
+![top-k 与 top-p 的 sort 截断路径](../diagrams/ch30-fig-topk-topp-sort.png)
 
 > *图注：`apply_top_k_top_p_pytorch`（批 <8 或无 Triton 时）四步同一根升序轴。上下两行是两组独立的玩具输入：上行 top-k 用并列例（logits=[3.0, 2.0, 0.5, 2.0, 1.0]），升序 sort 后从第 (V−k) 位取阈值、用「严格小于」留出并列（k=2、阈值 2.0、并列的两个 2.0 都活下来，存活 3 个）；下行 top-p 换无并列的第二组（logits=[3.0, 2.0, 1.0, 0.5, 0.1]，即温度一节那行），从矮个端累加概率质量（cumsum 五值 [0.0335, 0.0836, 0.1661, 0.3904, 1.0]）、加到 1−p 为止，核 {t0,t1,t2} 的质量 0.9164 刚过 0.9；p=0 角案里 cumsum≤1.0 全命中，`top_p_mask[:,-1]=False` 强保最末位，只活 1 个。最后 scatter 回原位。数字全部取自本章实测表。*
 
@@ -1144,7 +1144,7 @@ def flashinfer_sample(
 
 统计等价那行值得多看一眼：k=2 截断后的条件分布是 [0.7311, 0.2689]，FlashInfer 十万掷出 [0.7321, 0.2679]、Gumbel 掷出 [0.7317, 0.2683]，两边都贴住理论（偏差都在十万掷的采样噪声量级内）。等价说的是分布、不是位：两家各用各的随机源，逐次采出的 token 本就不可比对。
 
-![后端绑定与三道回退](../diagrams/ch29-fig-backend-binding.png)
+![后端绑定与三道回退](../diagrams/ch30-fig-backend-binding.png)
 
 > *图注：构造期泳道（左）：`__init__`（L85-L129）三层判定：is_cuda？→ FlashInfer 可用（环境变量加算力门槛 SM80-SM121）？→ logprobs_mode 非 processed 两态？——汇出两个终态：forward_cuda（默认 raw 模式、FlashInfer 拒绝采样核）或 forward_native，判定节点旁标的是实测值（is_cuda=True、capability=sm_120、supported=True，取证机口径）。运行期泳道（右）：forward_cuda 内三道守卫（k/p 全 None、generators 非空、fp64）递回 native，正常调用直达 flashinfer_sample 不经 native。泳道底注是裁决语义：默认态静默回退、用户显式开但算力不支持则构造期直接 RuntimeError。平台变体（CPU/XPU/ROCm aiter）灰角标点名、不展开。*
 

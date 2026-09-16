@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch29 机制图 3 · top-k/top-p 截断的 pytorch sort 路径（figure_spec ch29-fig-topk-topp-sort，模板 tensor-flow）
+"""ch30 机制图 3 · top-k/top-p 截断的 pytorch sort 路径（figure_spec ch30-fig-topk-topp-sort，模板 tensor-flow）
 
 放大自 L0 采样出口列（L2 章图 center 拍片 ⑦d『Apply top_k and/or top_p』的算法内部
 = apply_top_k_top_p_pytorch，批<8 或无 Triton 时每个 decode 步在 GPU 上跑的四步）。
@@ -221,7 +221,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', lc.DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch29-fig-topk-topp-sort.svg'
+out = HERE / 'ch30-fig-topk-topp-sort.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

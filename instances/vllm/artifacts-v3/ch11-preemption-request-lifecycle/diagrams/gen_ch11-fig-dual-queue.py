@@ -154,7 +154,7 @@ FC_Y = TL_Y + TL_H + 22
 lc.rect(MX, FC_Y, BXR - MX, 44, '#ffffff', lc.C_MUTE, rx=8, sw=1.2, dash=True)
 lc.text(MX + 16, FC_Y + 18, '单队列反事实：older 卡在队头则 newer/ready 全体饿死——双队列把阻塞态的代价从『堵住整条队』降为『每拍一次 peek』', 9.5,
         '#334155', 'start', maxw=BXR - MX - 32, tag='fc1')
-lc.text(MX + 16, FC_Y + 34, '三个运行时来源（grammar 编译 / 远程 KV / 流式输入）分别归 ch30 / ch16 / ch12 语境；PRIORITY 择队 = 两队队头比较（L2068-L2073，随精简版删）', 8.6,
+lc.text(MX + 16, FC_Y + 34, '三个运行时来源（grammar 编译 / 远程 KV / 流式输入）分别归 ch31 / ch16 / ch12 语境；PRIORITY 择队 = 两队队头比较（L2068-L2073，随精简版删）', 8.6,
         lc.C_MUTE, 'start', maxw=BXR - MX - 32, tag='fc2')
 
 LEG_Y = FC_Y + 66

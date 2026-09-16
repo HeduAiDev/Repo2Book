@@ -23,13 +23,13 @@
 | 4 | **partial prefix cache + 块内 CoW**（#45939/#46384, 2026-06/07）：cache_partial_block 在块内前缀边界注册哈希不分配新块、部分命中 CoW 拷贝——「只缓存满块」的旧口径已破 | block_pool.py:L445-544 | ch14 前缀缓存 |
 | 5 | **Marconi 式共享前缀钉住 + 稀疏驻留**（#37898/#45845/#47782）：hybrid 场景 junction 检测+跨请求复用不被稀疏缓存杀死 | kv_cache_coordinator | ch14/ch24 hybrid |
 | 6 | **LRU 双不变量**：free 逆序 + **无哈希块先于缓存块驱逐**（第二条为新增澄清） | kv_cache_manager.py:L567-574 | ch14 |
-| 7 | **DPCoordinator 独立进程**（XPUB/XSUB+PULL 三 socket）：数据面/控制面彻底分离，请求输出完全不经过它；统计 100ms 快照、wave 只服务 MoE lockstep | coordinator.py:L23-256 | ch33 分布式 |
-| 8 | **多 API server 水平扩展**（--api-server-count）：client_index 由前端盖章进 EngineCoreRequest、引擎按它选 PUSH socket 回发 | core_client.py:L1145-48 | ch3/ch36 服务面 |
+| 7 | **DPCoordinator 独立进程**（XPUB/XSUB+PULL 三 socket）：数据面/控制面彻底分离，请求输出完全不经过它；统计 100ms 快照、wave 只服务 MoE lockstep | coordinator.py:L23-256 | ch34 分布式 |
+| 8 | **多 API server 水平扩展**（--api-server-count）：client_index 由前端盖章进 EngineCoreRequest、引擎按它选 PUSH socket 回发 | core_client.py:L1145-48 | ch3/ch37 服务面 |
 | 9 | **vllm/models/<name>/ 硬件隔离新布局**：旗舰架构（DSV4 等）走目录级隔离，平台实现与模型定义分层 | vllm/models/ | ch21/ch27 模型层 |
 | 10 | **MLA 三代演化**：DSV2/V3 潜向量 576 维 → DSV4 上下文压缩 + fp8_ds_mla 自定义布局 | mla_attention.py | ch23/ch24 primer |
 | 11 | msgpack 零拷贝工程化：小张量（<256B）内联免拷、引擎输出侧「复用 bytearray+首帧 tracker」替客户端保活 | serial_utils.py | ch4 |
 | 12 | 注意力后端**逐 KV 组混布**、新后端入表（TOKENSPEED_MLA R1 dims+FP8 KV、FLASHINFER_MLA 等） | selector.py/platforms | ch20 |
-| 13 | AsyncMPClient 派生 **DP/LB 子类**（current_wave 盖章） | core_client.py:L1413 | ch33 |
+| 13 | AsyncMPClient 派生 **DP/LB 子类**（current_wave 盖章） | core_client.py:L1413 | ch34 |
 
 ## 1. L0 总图（唯一权威图）
 

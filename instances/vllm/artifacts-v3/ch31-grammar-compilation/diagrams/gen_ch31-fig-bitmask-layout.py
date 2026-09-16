@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""ch30 机制图 · m21 位掩码的物理形态（figure_spec ch30-fig-bitmask-layout，模板 layout）
+"""ch31 机制图 · m21 位掩码的物理形态（figure_spec ch31-fig-bitmask-layout，模板 layout）
 
 放大自 L0 采样列·结构化输出组的『产物表示』层——allocate_token_bitmask 的物理形态
-（L2 章图站 8 交棒件的内部视图；行的流转归 ch31），架构归属回指 L2 章图，不另立
+（L2 章图站 8 交棒件的内部视图；行的流转归 ch32），架构归属回指 L2 章图，不另立
 第二种架构画法（FIGURE-SYSTEM §3）。
 
 claim：位掩码行的物理形态：[行, ceil(V/32)] int32 的张量（本例 [16,1571]、每行 6284B；
@@ -178,7 +178,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', lc.DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch30-fig-bitmask-layout.svg'
+out = HERE / 'ch31-fig-bitmask-layout.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

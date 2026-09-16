@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch29 机制图 4 · TopKTopPSampler 构造期后端绑定（figure_spec ch29-fig-backend-binding，模板 flow）
+"""ch30 机制图 4 · TopKTopPSampler 构造期后端绑定（figure_spec ch30-fig-backend-binding，模板 flow）
 
 放大自 L0 采样出口列（L2 章图 south『TopKTopPSampler·构造期绑后端』支撑块）——
 它是拍片 ⑦d『Apply top_k and/or top_p』在 CUDA 上的执行体。
@@ -226,7 +226,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch29-fig-backend-binding.svg'
+out = HERE / 'ch30-fig-backend-binding.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

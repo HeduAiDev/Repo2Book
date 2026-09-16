@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch34 机制图 · m15 DPLB 打分决策表（figure_spec ch34-fig-lb-score）
+"""ch35 机制图 · m15 DPLB 打分决策表（figure_spec ch35-fig-lb-score）
 
 放大自 L0 多实例视角北条『入·前端多实例』DPLB 打分（L2 站 9）的决策展开。
 
@@ -182,7 +182,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', lc.DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch34-fig-lb-score.svg'
+out = HERE / 'ch35-fig-lb-score.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

@@ -68,7 +68,7 @@
 | `RequestState`（__init__/from_new_request/make_request_output/_new_*） | vllm/v1/engine/output_processor.py:L129-L423 | 三道闸/工厂逐字；删 lora/stats/routed_experts/streaming 字段与 logprobs/pooling/kv-ec 分支（各锚点行内标） | must_keep×10；delete 项 1/2/3/4/5/6 |
 | `OutputProcessor`（__init__/abort_requests/add_request/process_outputs/_finish_request/_update_stats_*） | vllm/v1/engine/output_processor.py:L429-L836 | demux/双轨展开/终态解阻塞/父联动/三表注销逐字；stats 内部删（调用点保留、恒 None 早返回）；`get_num_unfinished_requests`/`has_unfinished_requests` 保留 | must_keep×7；m3/m18/m22 |
 | `AsyncMPClient`（_ensure_output_queue_task/get_output_async/_format_exception/_send_input/add_request_async/abort_requests_async） | vllm/v1/engine/core_client.py:L974-L1014、L1016-L1091、L1093-L1102、L695-L699、L1104-L1114、L1145-L1152 | 队列任务/取队/异常格式化/ADD-ABORT 面逐字（删项 11 的 utility/EEP/FT 分支与 weakref 机制）；`_send_input` 为记录面 seam | must_keep×2 + m1；站 4 |
-| `AsyncLLM`（add_request/_add_request/generate/_run_output_handler/abort/is_running/errored） | vllm/v1/engine/async_llm.py:L72-L418、L420-L435、L544-L655、L657-L727、L729-L738、L1085-L1100 | 上行五件套逐字（删项 3/12 的流式输入与日志行、ch06 域渲染分流、ch38 域面板）；L390-393/L593-599/L608-610 三段注释原话全保留 | must_keep×6；站 1-2/13-14 |
+| `AsyncLLM`（add_request/_add_request/generate/_run_output_handler/abort/is_running/errored） | vllm/v1/engine/async_llm.py:L72-L418、L420-L435、L544-L655、L657-L727、L729-L738、L1085-L1100 | 上行五件套逐字（删项 3/12 的流式输入与日志行、ch06 域渲染分流、ch39 域面板）；L390-393/L593-599/L608-610 三段注释原话全保留 | must_keep×6；站 1-2/13-14 |
 | `InputProcessor.assign_request_id` | vllm/v1/engine/input_processor.py:L231-L249 | **逐字**（ch06 产品域 seam，上行登记的依赖面） | 站 1 前置；m22 双轨 id |
 | `random_uuid`/`length_from_prompt_token_ids_or_embeds`/`as_list` | vllm/utils/__init__.py:L11-36、utils/collection_utils.py:L49-51 | **逐字** | 保留代码触到的真实小件 |
 
@@ -117,7 +117,7 @@
     from e`）与全部 log_requests 日志行（L434-435/L614-615/L620-621/L627/L634-635/L642-651/
     L740-741）。
 13. **serving/SSE 层** ✓ — with_cancellation/listen_for_disconnect/protocol.to_sampling_params/
-    serving generator 不入（ch38 域；F5 第一跳叙事引用——`generate()` 的 CancelledError 路径由
+    serving generator 不入（ch39 域；F5 第一跳叙事引用——`generate()` 的 CancelledError 路径由
     测试直接 cancel 任务驱动，不需要 HTTP 层）。
 14. **LLMEngine/离线同步面** ✓ — step 四步/_run_engine 不入（叙事对照讲；分叉判据
     `queue is None` 与 list.append 分支保留在 process_outputs，测试直驱）。
@@ -131,10 +131,10 @@
 | output_processor.py L631-636 | `pooling_output`/`kv`/`ec` 局部变量读取行删除 | 所喂分支已删、变量无消费者（项 2/6 机械后果） |
 | async_llm.py L352-381 | dict/raw prompt 渲染分流不引入（else 结构洞） | ch06 产品域；非 EngineCoreRequest 的 prompt 会 NameError——与 ch06『n>1 返回 None』同款结构洞，测试不触达 |
 | from_new_request L242-250 | sampling_params 为 None 的 pooling else 结构洞 | 同上（pooling 删除的结构后果，生成式主线恒有 sampling_params） |
-| async_llm.py 面板 | encode/pause/check_health/profile/weight-*/__del__/shutdown 等不入 | 上行主线不触达（ch38/ch34/ch39 域；ch06 同款『章边界不入』先例） |
+| async_llm.py 面板 | encode/pause/check_health/profile/weight-*/__del__/shutdown 等不入 | 上行主线不触达（ch39/ch35/ch40 域；ch06 同款『章边界不入』先例） |
 | core_client.py 面板 | SyncMPClient/InprocClient/DP 面/shutdown 不入 | 同上；本章只保留 AsyncMPClient 上行面 |
 | 装配线 | AsyncLLM.__init__/AsyncMPClient.__init__ 为 seam 构造（注入 engine_core/tokenizer/stream_interval） | ch03 装配产物；L141-146/L173-179/L997/L1006-1014 逐字保留 |
-| Struct 注解 | EngineCoreRequest/Output 的他章域字段类型放宽为 Any（字段名/顺序/默认全保） | 注解面非运行时行为；避免引入 ch8/ch36/metrics 域类型 |
+| Struct 注解 | EngineCoreRequest/Output 的他章域字段类型放宽为 Any（字段名/顺序/默认全保） | 注解面非运行时行为；避免引入 ch8/ch37/metrics 域类型 |
 | utils | `logging`（NullHandler+*_once）/envs/exceptions 为 stdlib seam | ch04/ch05 同款 |
 
 ## Seam 清单（HOST SEAM，全在行内标注）

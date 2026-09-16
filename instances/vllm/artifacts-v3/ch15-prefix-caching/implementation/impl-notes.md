@@ -67,7 +67,7 @@ allocate_slots 两个参数（new_computed_blocks/num_new_computed_tokens）本�
 | `coordinator Hybrid.find` | `coordinator:L685-L817` | eagle 段删（L722-L725/L747/L750-L765/L780-L784）、find_longest_cache_hit_per_group 删（L819-L848）；不动点主循环/收尾/num_uncached 逐字 | 第 3/5 条；m15/m16 must_keep |
 | `coordinator 三态分派` | `coordinator:L851-L903` | 观测参数删；False→NoPrefixCache/单组→Unitary/多组→Hybrid 逐字 | m18 must_keep |
 | `manager get_computed_blocks` | `kv_cache_manager.py:L229-L295` | kv_cache_report_mode='full' 事件段删（L266-L284）；skip 谓词/max_cache_hit_length/junction 折算逐字 | 第 1 条；m4/m16 must_keep |
-| `manager allocate_slots` | `kv_cache_manager.py:L344-L565` | watermark/full-ISL/reserved/lookahead/external-挂块段删（ch14/16/ch33 边界）；三段式主干+命中挂块+写回逐字；delay_cache_blocks 参数占位保留 | 第 5 条「保留 delay_cache_blocks 参数占位」 |
+| `manager allocate_slots` | `kv_cache_manager.py:L344-L565` | watermark/full-ISL/reserved/lookahead/external-挂块段删（ch14/16/ch34 边界）；三段式主干+命中挂块+写回逐字；delay_cache_blocks 参数占位保留 | 第 5 条「保留 delay_cache_blocks 参数占位」 |
 | `manager take_kv_cache_block_copies` | `kv_cache_manager.py:L831-L846` | 逐字（drain→KVCacheBlockCopy+retained 两端） | m14 must_keep |
 | `request.py update_block_hashes/append` | `request.py:L249-L265` | 逐字（增量时机——哈希随 token 到达） | m1 must_keep |
 | `request.py shared_prefix_boundary` | `request.py:L190-L193` | 逐字（Marconi junction 落点字段） | m16 must_keep |

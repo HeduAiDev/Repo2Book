@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""ch29 机制图 1 · 9 步骨架与批级门控（figure_spec ch29-fig-nine-steps-gating，模板 swimlane）
+"""ch30 机制图 1 · 9 步骨架与批级门控（figure_spec ch30-fig-nine-steps-gating，模板 swimlane）
 
-放大自 L0 采样出口列（L2 章图 cartography/l2-specs/ch29.json center 拍片 ①-⑨）的
+放大自 L0 采样出口列（L2 章图 cartography/l2-specs/ch30.json center 拍片 ①-⑨）的
 「执行形态」层：上泳道 = 批级 python 门控（站号与 L2 章图一致，站 3-12），下泳道 =
 按需下沉的 kernel（GPU 角色绿）与两块整段留在 python 的块（约束源在 CPU）。
 不另立第二种架构画法（FIGURE-SYSTEM §3）。
@@ -157,7 +157,7 @@ plain_chip(1036, PY + 182, 388, 132, '⑥ 前置 · 惩罚张量化（H2D）',
             'output=[2,2,3] 先成张量再进核计数',
             '（快照只在批组成变化时重造）',
             '注释自注 quite inefficient'])
-lc.text(1036, PY + KH - 12, '语法 FSM 活在调度器进程（→ ch30/31）同理不出 CPU',
+lc.text(1036, PY + KH - 12, '语法 FSM 活在调度器进程（→ ch31/31）同理不出 CPU',
         8.3, lc.C_MUTE, 'start', maxw=390, tag='p:foot')
 
 # ================= 门控步 → kernel 下探箭头 =================
@@ -218,7 +218,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch29-fig-nine-steps-gating.svg'
+out = HERE / 'ch30-fig-nine-steps-gating.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

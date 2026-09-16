@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch28 机制图 · 一拍注意力的多流 overlap 时间线(ch28-fig-multistream-timeline, 模板 swimlane)
+"""ch29 机制图 · 一拍注意力的多流 overlap 时间线(ch29-fig-multistream-timeline, 模板 swimlane)
 
 放大自 L0『GPU 执行臂·模型层 forward + 编译』块内一拍注意力的执行细节——
 L2 拍片⑧ 的机制版下钻(ch19 的 cudagraph 机制在此处被 @eager_break_during_capture 打断)。
@@ -193,7 +193,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', lc.DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch28-fig-multistream-timeline.svg'
+out = HERE / 'ch29-fig-multistream-timeline.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

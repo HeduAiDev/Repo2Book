@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch28 机制图 · 全干形状主线(ch28-fig-trunk-shape-journey, 模板 tensor-flow)
+"""ch29 机制图 · 全干形状主线(ch29-fig-trunk-shape-journey, 模板 tensor-flow)
 
 = L0『GPU 执行臂·模型层 forward + 编译』块的整条主干(L2 章图 ⑥⑦ 的机制版主图——
 L2 给装配全景, 本图给形状旅程单线索; 与单层两半图互为表里: 那张讲一层的门控,
@@ -116,7 +116,7 @@ box(1180, AX_Y0, 130, 90, 'hc_head 融合核', ['(T,hc_mult,H)→(T,H)', 'bf16 �
     'tilelang.py:L720-L748', fill=lc.C_GPU_F)
 lc.rect(1340, 176, 220, 58, '#ffffff', lc.C_MUTE, rx=8, sw=1.4)
 lc.text(1450, 198, 'norm → hidden (T,H)', 9.5, lc.C_TXT, 'middle', True, maxw=200, tag='out:t')
-lc.text(1450, 218, '→ compute_logits（采样位，ch29）', 8.5, lc.C_MUTE, 'middle', maxw=200,
+lc.text(1450, 218, '→ compute_logits（采样位，ch30）', 8.5, lc.C_MUTE, 'middle', maxw=200,
         tag='out:s')
 lc.seg(1310, 205, 1340, 205, lc.C_GPU_S, 3.2, 'std')
 
@@ -178,7 +178,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', lc.DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch28-fig-trunk-shape-journey.svg'
+out = HERE / 'ch29-fig-trunk-shape-journey.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

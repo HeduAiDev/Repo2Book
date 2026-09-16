@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch34 机制图 · m2 建组四刀：5 维 rank 张量的机械撕法（figure_spec ch34-fig-rank-tensor-cuts）
+"""ch35 机制图 · m2 建组四刀：5 维 rank 张量的机械撕法（figure_spec ch35-fig-rank-tensor-cuts）
 
 放大自 L0 多实例视角 ① 建组·5 维 rank 张量（L2 站 1-3）。
 
@@ -190,7 +190,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', lc.DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch34-fig-rank-tensor-cuts.svg'
+out = HERE / 'ch35-fig-rank-tensor-cuts.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

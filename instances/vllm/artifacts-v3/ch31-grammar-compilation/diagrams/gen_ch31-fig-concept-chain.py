@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch30 机制图 · m1 概念链：『位掩码不是重试』（figure_spec ch30-fig-concept-chain，模板 flow）
+"""ch31 机制图 · m1 概念链：『位掩码不是重试』（figure_spec ch31-fig-concept-chain，模板 flow）
 
 放大自 L0 采样列·结构化输出组『语法→掩码』编译段的机制展开（L2 章图站 4），架构性
 框图回指 L2 章图，不另立第二种架构画法（FIGURE-SYSTEM §3）。
@@ -219,7 +219,7 @@ lc.rect(756, CY0, 684, CH_, lc.C_SAM_F, lc.C_SAM_S, rx=8, sw=1.4)
 lc.text(772, CY0 + 20, '掩码法 = 对分布做合法集上的条件化——一步到位', 10, lc.C_SAM_S, 'start', True,
         maxw=640, tag='c2:t')
 for j, ln in enumerate(['· ch9 已实测：同一行 logits 盖掩码前后 argmax 翻位（回指）；本章给「这张允许表从哪来」的前半',
-                        '· 逐拍填表与 GPU 窗口归 ch31（预告）']):
+                        '· 逐拍填表与 GPU 窗口归 ch32（预告）']):
     lc.text(772, CY0 + 42 + j * 18, ln, 8.6, '#334155', 'start', maxw=652, tag='c2:l' + str(j))
 
 # ================= 图例 + 页脚 =================
@@ -246,7 +246,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch30-fig-concept-chain.svg'
+out = HERE / 'ch31-fig-concept-chain.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

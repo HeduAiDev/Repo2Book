@@ -1,4 +1,4 @@
-# impl-notes — v3 ch30《约束解码 I：语法编译》(Part VII)
+# impl-notes — v3 ch31《约束解码 I：语法编译》(Part VII)
 
 标准代码章（非 primer）：对 vLLM **v0.27.1（6e448d0ea）** 的只做减法精简版——
 同名、同结构、同控制流；只删 dossier `subtraction_plan.delete` 批准项，
@@ -47,7 +47,7 @@ v0.27.1 现核，v2 资产旧行号未沿用），删除处标 `# SUBTRACTED:`�
 - `vllm/v1/core/sched/request_queue.py` —— SchedulingPolicy + RequestQueue
   ABC + FCFSRequestQueue 逐字（窥队/prepend 回侧队的物理载体）。
 - `vllm/v1/core/sched/output.py` —— SchedulerOutput 字段面（行序契约载体；
-  GrammarOutput 归 ch31 不镜像）。
+  GrammarOutput 归 ch32 不镜像）。
 - `vllm/config/structured_outputs.py` —— 六字段+校验器近逐字（m20 对照基准；
   pydantic @config → 显式 `__init__`+尾调用承载同一校验体）。
 
@@ -83,18 +83,18 @@ v0.27.1 现核，v2 资产旧行号未沿用），删除处标 `# SUBTRACTED:`�
 **章边界删除（impl-notes 记账，非 delete 项而是镜像范围裁定）**：
 
 - `utils.py:apply_grammar_bitmask`（L86-L176）——worker 侧掩码落地（重排/
-  pinned H2D/apply_token_bitmask_inplace），与 get_grammar_bitmask 同为 ch31
+  pinned H2D/apply_token_bitmask_inplace），与 get_grammar_bitmask 同为 ch32
   交棒件（dossier scope_note 边界原文），不进本章精简版。
 - scheduler `_try_promote_blocked_waiting_request` 的 REMOTE_KVS（L2683-L2694）
   与 STREAMING_REQ（L2705-L2708）两分支——P/D KV 传输（ch16）/流式会话
-  （ch38）域，依赖 _update_waiting_for_remote_kv/kv_cache_manager/
+  （ch39）域，依赖 _update_waiting_for_remote_kv/kv_cache_manager/
   streaming_queue 等本章不镜像的状态；**语法分支三出口逐字保留**、
   _is_blocked_waiting_status 三阻塞态枚举逐字保留（『机制共用』的证据面）。
 - scheduler schedule()/update_from_output 的非语法域块（RUNNING 相位 KV 预算/
-  抢占/前缀命中/encoder/LoRA/stale/spec 回扣）——ch10-ch12/ch13/ch15/ch33 域，
+  抢占/前缀命中/encoder/LoRA/stale/spec 回扣）——ch10-ch12/ch13/ch15/ch34 域，
   逐块 SUBTRACTED 注明；schedule()/update_from_output/add_request/
   finish_requests/`_update_after_schedule` 均保留真实方法名与控制流骨架。
-- sampling_params `verify` 的六项非结构化校验调用（L762-L767）——本体归 ch29
+- sampling_params `verify` 的六项非结构化校验调用（L762-L767）——本体归 ch30
   的 SamplingParams 完整面（HOST SEAM 未载其字段面）。
 
 ## 已知行为差异（delete[3] 既定口径，writer 勿掩盖；m18 对照表给全量真相）
@@ -139,7 +139,7 @@ v0.27.1 现核，v2 资产旧行号未沿用），删除处标 `# SUBTRACTED:`�
 
 ## 测试与运行
 
-- host：`python -m pytest instances/vllm/artifacts-v3/ch30-grammar-compilation/tests -q`
+- host：`python -m pytest instances/vllm/artifacts-v3/ch31-grammar-compilation/tests -q`
   → **159 passed**（6 文件：params/key、rewrite utils、xgrammar backend、
   validation rewrite、async gate、reasoning gate）。
 - 依赖：`pip install xgrammar==0.2.6 llguidance==1.7.6`（host 曾缺，本次已装；

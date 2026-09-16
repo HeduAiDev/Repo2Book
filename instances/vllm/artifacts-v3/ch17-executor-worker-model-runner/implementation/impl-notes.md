@@ -84,7 +84,7 @@
 
 | 精简版符号 | 真实源码锚点（v0.27.1 现核） | 改动 | 原因 |
 |---|---|---|---|
-| `Executor.get_class` | vllm/v1/executor/abstract.py:L47-L92 | **逐字** minus ray 分支（L60-L68）/ external_launcher 分支（L77-L80）/ 文末兼容导入块（L371-L380） | must_keep；删除项 1（ray 归 ch34） |
+| `Executor.get_class` | vllm/v1/executor/abstract.py:L47-L92 | **逐字** minus ray 分支（L60-L68）/ external_launcher 分支（L77-L80）/ 文末兼容导入块（L371-L380） | must_keep；删除项 1（ray 归 ch35） |
 | `Executor.__init__`/`_init_executor` | abstract.py:L94-L116 | 逐字（@instrument 装饰删——删除项 4 观测装饰） | must_keep×2 |
 | `Executor.initialize_from_config`/`compile_or_warm_up_model`/`register_failure_callback`/`determine_available_memory`/`get_kv_cache_specs` | abstract.py:L118-L150 | 逐字（后者含 max 汇回） | must_keep×4 |
 | `Executor.collective_rpc`（overload×2 + abstract） | abstract.py:L152-L202 | 逐字；docstring 契约逐字 | must_keep（L181-L183 控制面契约原文） |
@@ -165,7 +165,7 @@ usage stats，行内 SUBTRACTED 标注并引 elide 注。）
 | `MessageQueue` 消费侧 wait_for_ready 的 isinstance 断言 | multiproc_executor.py | win32 上 PipeConnection 非 Connection 子类 → 放宽到二元组 | unix 上原断言不变；语义同为「wait 返回 pipe 对象」 |
 | VllmConfig 族 / SchedulerOutput / GrammarOutput / ModelRunnerOutput / DraftTokenIds 等载体 | _host_seams | 字段子集 dataclass | 装配线是 ch03 的产品；保留代码触及的字段全在 |
 | `install_vllm_module_aliases` | _host_seams→包 `__init__` | 真实 vllm 缺席时把 "vllm.v1.…"-前缀 qualname 预置到 sys.modules 指向本包同名模块 | `resolve_obj_by_qualname` 本体逐字保留（importlib 命中 sys.modules）；真实 vllm 在场时不劫持 |
-| distributed 族（init_distributed_environment/ensure_model_parallel_initialized/get_pp_group/…） | _host_seams | 记录 world/rank/local_rank + 单机退化组 | NCCL/分布式全貌归 ch34；TP=1/PP=1 下组语义一致；PP 传输面显式 NotImplementedError（结构洞） |
+| distributed 族（init_distributed_environment/ensure_model_parallel_initialized/get_pp_group/…） | _host_seams | 记录 world/rank/local_rank + 单机退化组 | NCCL/分布式全貌归 ch35；TP=1/PP=1 下组语义一致；PP 传输面显式 NotImplementedError（结构洞） |
 | `MemorySnapshot`/`request_memory`/CuMem 池记录仪 | _host_seams | 显存快照/请求内存/池 tag 记录 | 账本归 ch14；三锚点的**顺序与 tag** 可观察（测试断言） |
 | `kernel_warmup`/`activate_jit_monitor`/`trigger_inductor_lazy_init`/`TensorizerLoader`/`load_general_plugins`/`set_current_vllm_config`/`set_random_seed`/`maybe_attach_gc_debug_callback` | _host_seams / utils | 调用面 no-op / 近似实现 | ch19 编译域/生产面的调用位是本章编排对象；行为=默认关闭路径 |
 | `xgr`（_XgrammarSeam） | structured_output/utils.py | apply_token_bitmask_inplace 的 CPU 位解码内核（bit t 允许位→非 -inf） | xgrammar 内核文档语义（禁位→-inf）；容器内真内核优先 import 生效 |
@@ -179,7 +179,7 @@ usage stats，行内 SUBTRACTED 标注并引 elide 注。）
    账本归 ch14 的精简版。锚点的**位置与调用链**（executor.determine_available_memory →
    collective_rpc → 每 worker）经 e2e 真跑（测试侧 worker 返回 12345 验证链路）。
 2. **runner 前向是注释占位**：execute_model 内 L4180-L4505 深水退化为 None 绑定 + 占位注释
-   （删除项 6 批准）；`_sample` 返回占位 SamplerOutput（真采样栈归 ch29）。两段式协议
+   （删除项 6 批准）；`_sample` 返回占位 SamplerOutput（真采样栈归 ch30）。两段式协议
    （断言/打包/None/解包/清/bitmask/调用位）全部真实可观察。
 3. **abstract 的 sleep/wake_up/profile/lora 族保留但 worker 侧对应面已删**：调用会以
    FAILURE（NotImplementedError 文本）回包——『删掉批准分支后的真码』的机械后果（ch09 结构洞

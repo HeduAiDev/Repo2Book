@@ -20,8 +20,8 @@ ch15 m15/m16 已立的 **partial-hit 粒度配置**（full(16)+mamba-align(16)�
 |---|---|---|
 | `base.py` | `vllm/distributed/kv_transfer/kv_connector/v1/base.py` | **双面契约本体**：模块 docstring（契约正文）、KVConnectorRole、SupportsHMA+supports_hma、两份不透明信封（Metadata/WorkerMetadata）、KVConnectorBase_V1 全方法面（调度器侧五原语+worker 侧六原语+requires_kv_delivery+has_pending_push_work）。删：握手族/cross-layer 族/cudagraph 族/stats-events 族/reset_cache 等 optional 钩子的非默认分支（第 3/4/5/6/7 条） |
 | `factory.py` | `.../kv_connector/factory.py` | 懒加载注册表 + create_connector（NOTE 原话逐字）+ HMA 门 + 外部模块路径优先。删：13 个后端注册行（留 ExampleConnector 一条示范）、MultiConnector 特例、旧 2 参构造告警 |
-| `kv_transfer_state.py` | `.../kv_transfer_state.py` | worker 侧装配：全局 agent、三取用谓词、ensure_kv_transfer_initialized/shutdown。HOST SEAM：_sync_engine_id_across_tp 的 broadcast（单进程恒等，多机 → ch36） |
-| `kv_transfer.py` | `vllm/config/kv_transfer.py` | KVTransferConfig：kv_role 三态+校验、failure policy、三谓词、get_from_extra_config。删：P/D 拓扑/握手参数（→ch36）、permute 布局、compute_hash |
+| `kv_transfer_state.py` | `.../kv_transfer_state.py` | worker 侧装配：全局 agent、三取用谓词、ensure_kv_transfer_initialized/shutdown。HOST SEAM：_sync_engine_id_across_tp 的 broadcast（单进程恒等，多机 → ch37） |
+| `kv_transfer.py` | `vllm/config/kv_transfer.py` | KVTransferConfig：kv_role 三态+校验、failure policy、三谓词、get_from_extra_config。删：P/D 拓扑/握手参数（→ch37）、permute 布局、compute_hash |
 | `kv_connector_model_runner_mixin.py` | `vllm/v1/worker/kv_connector_model_runner_mixin.py` | worker 一拍生命周期（_get_kv_connector_output 逐字）+ no_forward + maybe_get + finalize。删：uniform 布局两函数（第 12 条）、stats/events 两行（第 3 条） |
 | `kv_transfer_utils.py` | `vllm/model_executor/layers/attention/kv_transfer_utils.py` | **61 行全保**——逐层钩子装饰器（契约最深的挂点） |
 | `example_connector.py` | `.../v1/example_connector.py` | 官方 debug 参考实现全流程：ReqMeta slot 寻址、inject/extract、调度器侧两原语、build_connector_meta（调用即重置）。删：MLA reshape 两分支（第 8 条）、resumed-from-preemption 支 |
@@ -65,7 +65,7 @@ ch15 m15/m16 已立的 **partial-hit 粒度配置**（full(16)+mamba-align(16)�
 | `factory.py create_connector` | `factory.py:L43-L75` | 逐字（NOTE『We build separately…』原话） | m1 must_keep |
 | `factory.py register_connector/loader` | `factory.py:L30-L40` | 逐字（懒加载机制） | must_keep |
 | `factory.py 注册行` | `factory.py:L152-L156` | 只留 ExampleConnector（module_path 改 `implementation.example_connector`——包重定位 seam） | 第 2 条『一条示范』 |
-| `kv_transfer_state.py ensure_kv_transfer_initialized` | `kv_transfer_state.py:L72-L94` | 逐字；_sync_engine_id 广播体删（HOST SEAM 恒等） | 第 4 条 → ch36 |
+| `kv_transfer_state.py ensure_kv_transfer_initialized` | `kv_transfer_state.py:L72-L94` | 逐字；_sync_engine_id 广播体删（HOST SEAM 恒等） | 第 4 条 → ch37 |
 | `kv_transfer.py 三谓词/__post_init__` | `config/kv_transfer.py:L92-L121` | 逐字（校验+谓词） | m16 must_keep |
 | `mixin _get_kv_connector_output` | `mixin:L76-L112` | 逐字（bind→start→yield→finally 收尾）；stats/events 两行删 | m7 must_keep / 第 3 条 |
 | `mixin no_forward/maybe_get/finalize` | `mixin:L36-L72` | 逐字 | must_keep |
@@ -109,12 +109,12 @@ ch15 m15/m16 已立的 **partial-hit 粒度配置**（full(16)+mamba-align(16)�
 1. **LOGGER SEAM**：`vllm.logger.init_logger` → stdlib `logging.getLogger`
    （实验性警告/完成回传 debug 账目同构）。
 2. **分布式 SEAM**：`_sync_engine_id_across_tp` 的 `get_tp_group().broadcast_
-   object` → 单进程恒等（TP=1 时 rank0 值即全组值；多机对齐 → ch36）。
+   object` → 单进程恒等（TP=1 时 rank0 值即全组值；多机对齐 → ch37）。
 3. **forward_context SEAM**：create_forward_context 的 compilation_config/DP
    装配链 → 最小直构（attn_metadata/slot_mapping/no_compile_layers 三件）；
    set_forward_context 的 DP 协调删。
 4. **attention SEAM**：get_attention_context 的 DBO 双微批 list 形态删（spec
-   decode → ch33）；层实例取 `no_compile_layers[layer_name].kv_cache` 逐字。
+   decode → ch34）；层实例取 `no_compile_layers[layer_name].kv_cache` 逐字。
 5. **torch_utils SEAM**：LayerName opaque 包装删（str 直通——语义等价）。
 6. **safetensors SEAM**：显式 `import safetensors.torch` 绑定子模块（真实
    环境由包惰性属性提供；host 版需显式）。

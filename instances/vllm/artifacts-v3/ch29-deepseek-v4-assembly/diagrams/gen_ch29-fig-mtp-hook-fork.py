@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""ch28 机制图 · MTP 钩子三段接力(ch28-fig-mtp-hook-fork, 模板 flow)
+"""ch29 机制图 · MTP 钩子三段接力(ch29-fig-mtp-hook-fork, 模板 flow)
 
 放大自 L0『GPU 执行臂·模型层 forward + 编译』块尾部与采样列交界的 drafter 重绑点
-(L2 拍片⑨ 的机制版下钻; 驱动机制 propose/verify 归 ch32/33, 本图止步钩子两端)。
+(L2 拍片⑨ 的机制版下钻; 驱动机制 propose/verify 归 ch33/33, 本图止步钩子两端)。
 
 claim: MTP 钩子三段接力——模型层在层尾 mhc_post 之后、hc_head 之前把多流残差 copy_
 进 _mtp_hidden_buffer(get_mtp_target_hidden_states 暴露); runner 在采样后 getattr
@@ -169,7 +169,7 @@ lc.rect(1030, NY, BXR - 1030, NH, '#ffffff', lc.C_MUTE, rx=9, sw=1.2, dash=True)
 lc.text(1044, NY + 20, '边界（本图画到哪为止）', 10.5, lc.C_TXT, 'start', True, maxw=400, tag='n3:t')
 for i, s in enumerate([
         '· 驱动机制（propose / verify / 拒绝采样）',
-        '   归 ch32/33——本图止步钩子两端',
+        '   归 ch33/33——本图止步钩子两端',
         '· draft 侧形状账：3D ↔ flat 全程 pre-hc_head，',
         '   hc_head 只在算 logits 的那一刻出现',
         '· 采样位切片策略仍归 runner（ch23 契约）']):
@@ -186,7 +186,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', lc.DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch28-fig-mtp-hook-fork.svg'
+out = HERE / 'ch29-fig-mtp-hook-fork.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

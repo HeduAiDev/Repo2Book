@@ -188,7 +188,7 @@ for i, (t, s1, s2, hot) in enumerate(LADDER):
 BB_Y = LB_Y + LB_H + 10
 lc.rect(MX, BB_Y, BXR - MX, 52, '#ffffff', lc.C_MUTE, rx=6, sw=1.1, dash=True)
 lc.text(MX + 16, BB_Y + 17, '深讲边界（均为预告）：584 B 槽特形与 compress_ratio 数学 → 第 24 章（原理章）· '
-        '索引器/压缩器/滑窗缓存三件套与打包张量布局 → 第 25/26 章 · MTP 草稿层混进滑窗组（is_eagle_group）→ 第 28 章',
+        '索引器/压缩器/滑窗缓存三件套与打包张量布局 → 第 25/26 章 · MTP 草稿层混进滑窗组（is_eagle_group）→ 第 29 章',
         8.8, lc.C_MUTE, 'start', maxw=BXR - MX - 32, tag='bb:1')
 lc.text(MX + 16, BB_Y + 36, '等页组化（④ 两位前辈 Gemma3 / gpt-oss 走的路）到 V4 为止——元组打包的完整拆解归后续专章展开',
         8.4, lc.C_MUTE, 'start', maxw=BXR - MX - 32, tag='bb:2')

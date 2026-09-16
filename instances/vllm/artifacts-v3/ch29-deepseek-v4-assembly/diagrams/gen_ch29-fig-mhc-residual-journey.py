@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch28 机制图 · mHC 多流残差的主视图(ch28-fig-mhc-residual-journey, 模板 tensor-flow)
+"""ch29 机制图 · mHC 多流残差的主视图(ch29-fig-mhc-residual-journey, 模板 tensor-flow)
 
 放大自 L0『GPU 执行臂·模型层 forward + 编译』块里的 DecoderLayer 残差通道——
 L2 拍片⑦(单层两半)的机制版下钻: ch23 的 LlamaDecoderLayer 在同一位置画的是
@@ -243,7 +243,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', lc.DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch28-fig-mhc-residual-journey.svg'
+out = HERE / 'ch29-fig-mhc-residual-journey.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

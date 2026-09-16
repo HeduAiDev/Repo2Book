@@ -1,4 +1,4 @@
-# impl-notes — v3 ch31《约束解码 II：bitmask 落地》(Part VII)
+# impl-notes — v3 ch32《约束解码 II：bitmask 落地》(Part VII)
 
 标准代码章（非 primer）：对 vLLM **v0.27.1（6e448d0ea）** 的只做减法精简版——
 同名、同结构、同控制流；只删 dossier `subtraction_plan.delete` 批准的 8 项，
@@ -12,7 +12,7 @@ kernel 测试，host 无 xgrammar）；GPU 容器（vllm/vllm-omni:latest，xgra
 
 **载体注意**：真实 StructuredOutputManager 住在 vllm/v1/structured_output/
 __init__.py；镜像将类体放在同包 `manager.py`、`__init__.py` 退化为同款
-re-export（fidelity lint 不扫 __init__.py；v2 ch31/ch32 的
+re-export（fidelity lint 不扫 __init__.py；v2 ch32/ch33 的
 structured_output_manager.py 同款处理）。类内全部 # SOURCE 锚点仍指向真实
 __init__.py 的 v0.27.1 行号。
 
@@ -24,7 +24,7 @@ __init__.py 的 v0.27.1 行号。
 |---|---|---|
 | `vllm/v1/structured_output/manager.py`（__init__.py re-export） | structured_output/__init__.py | StructuredOutputManager 全部批装配面：L57-L68 缓冲+填充线程池、L99-L112 _get_reasoner、L194-L210 单行语义、L212-L359 grammar_bitmask 主函数（预算/并行/串行 spec 窗口/裁剪/.numpy()）、L361-L486 思考门控三件套、L488-L490 clear_backend |
 | `vllm/v1/structured_output/utils.py` | structured_output/utils.py | L86-L175 apply_grammar_bitmask（V1 payoff：重排→pinned H2D→xgr） |
-| `vllm/v1/structured_output/backend_types.py` | 同名 | **整文件逐字**（六方法契约，ch30 已立本章消费；仅插入 13 处 # SOURCE 标记：3 个类型/类 + 9 个方法 + 文件头） |
+| `vllm/v1/structured_output/backend_types.py` | 同名 | **整文件逐字**（六方法契约，ch31 已立本章消费；仅插入 13 处 # SOURCE 标记：3 个类型/类 + 9 个方法 + 文件头） |
 | `vllm/v1/core/sched/scheduler.py` | core/sched/scheduler.py | L1317-L1343 _update_after_schedule（置位门控）、L1646-L1668 get_grammar_bitmask、update_from_output 切面（L1761-L1791 spec 统计 + L1817-L1843 真推进逐字）、L2147-L2166 update_draft_token_ids、L2168-L2203 update_draft_token_ids_in_output、L2533-L2550 make_spec_decoding_stats |
 | `vllm/v1/core/sched/async_scheduler.py` | 同名 | L13-L17 __init__ + L19-L49 _update_after_schedule（延后采样信号源） |
 | `vllm/v1/core/sched/output.py` | 同名 | L286-L291 GrammarOutput 逐字 + SchedulerOutput 本章消费字段切面 |
@@ -45,7 +45,7 @@ __init__.py 的 v0.27.1 行号。
 - `vllm/platforms/__init__.py` + `vllm/utils/platform_utils.py`（PIN_MEMORY 派生链）
 - `vllm/utils/torch_utils.py`（PIN_MEMORY + async_tensor_h2d 逐字——m11 搬运工）
 - `vllm/utils/math_utils.py`（cdiv）/ `vllm/utils/import_utils.py`（LazyLoader 逐字）
-- `vllm/triton_utils/__init__.py`（HAS_TRITON + tl/triton——ch29 同款 seam）
+- `vllm/triton_utils/__init__.py`（HAS_TRITON + tl/triton——ch30 同款 seam）
 - `vllm/config/__init__.py`（六子配置消费字段 dataclass + VllmConfig re-export）
 - `vllm/v1/utils.py`（record_function_or_nullcontext 逐字）
 - `vllm/v1/outputs.py`（SamplerOutput/ModelRunnerOutput 消费切片/DraftTokenIds 逐字）
@@ -87,7 +87,7 @@ __init__.py 的 v0.27.1 行号。
    logits_indices/sampling_metadata 消费面）。
 2. **grammar 注入**（dossier 口径『直接注入已构造的 grammar 对象』）：
    `manager.backend = FakeBackend(...)` 承载 allocate_token_bitmask；请求挂
-   `structured_output_request.grammar`。编译链归 ch30。
+   `structured_output_request.grammar`。编译链归 ch31。
 3. **reasoner 注入**（delete[0] 连带）：reasoning parser 装配（L81-L93）删除后，
    思考门控（m14/m15）消费的 `manager.reasoner_cls` / `manager.tokenizer` 两属性
    按 grammar 同口径外部注入（`_get_reasoner` L104-L111 惰性构造位原样保留）。

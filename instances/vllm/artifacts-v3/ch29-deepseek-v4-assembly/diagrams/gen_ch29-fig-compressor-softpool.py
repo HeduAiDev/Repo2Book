@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch28 原理图 · 压缩器怎么把 4 个 token 合成 1 条（ch28-fig-compressor-softpool）
+"""ch29 原理图 · 压缩器怎么把 4 个 token 合成 1 条（ch29-fig-compressor-softpool）
 
 原理示意图（论文级概念图）：不解释代码、不出现任何 vLLM 类名/文件名/行号/章号/
 内部产物名。只回答「这一步的合成方式是什么」。
@@ -218,7 +218,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', lc.DEFS, EXTRA_DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch28-fig-compressor-softpool.svg'
+out = HERE / 'ch29-fig-compressor-softpool.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

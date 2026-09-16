@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ch30 机制图 · m5 两层 ABC 契约（figure_spec ch30-fig-two-layer-contract，模板 layout）
+"""ch31 机制图 · m5 两层 ABC 契约（figure_spec ch31-fig-two-layer-contract，模板 layout）
 
 放大自 L0 采样列·结构化输出组的类型骨架——引擎级 Backend 与请求级 Grammar 两层 ABC
 的展开（L2 章图站 3-4 之间的类型层），架构归属回指 L2 章图，不另立第二种架构画法
@@ -163,7 +163,7 @@ svg = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}">',
        f'<rect width="{W}" height="{H}" fill="white"/>', DEFS]
 svg += [s for _, s in lc.ELEMS]
 svg.append('</svg>')
-out = HERE / 'ch30-fig-two-layer-contract.svg'
+out = HERE / 'ch31-fig-two-layer-contract.svg'
 out.write_bytes('\n'.join(svg).encode('utf-8'))
 print(f'wrote {out}  ({W}x{H}, {len(lc.ELEMS)} elems)')
 if lc.WARN:

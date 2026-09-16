@@ -183,7 +183,7 @@ DPY = 774
 lc.rect(110, DPY, 280, 46, 'none', lc.C_FAINT, rx=7, sw=1.1, dash=True)
 lc.text(250, DPY + 19, 'DP>1 → DPAsyncMPClient / DPLBAsyncMPClient', 8.5,
         lc.C_MUTE, 'middle', maxw=268, tag='dp1')
-lc.text(250, DPY + 36, '（ch34 预告 · core_client.py:L116-L139 再分流）', 8.5,
+lc.text(250, DPY + 36, '（ch35 预告 · core_client.py:L116-L139 再分流）', 8.5,
         lc.C_FAINT, 'middle', maxw=268, tag='dp2')
 lc.seg(250, LY + LH, 250, DPY, lc.C_FAINT, 1.1, dash=True)
 
@@ -207,7 +207,7 @@ for kind, color, name in items:
     lc.text(lx + 40, LEG_Y + 1, name, 9.5, lc.C_TXT, 'start', maxw=240,
             tag='leg:' + name[:8])
     lx += 40 + lc.tw(name, 9.5) + 24
-lc.text(MX, LEG_Y + 26, '框内灰字 = 规范源码路径 · 行号基线 vLLM v0.27.1 · DP 分叉与 ch34 为预告（虚线）',
+lc.text(MX, LEG_Y + 26, '框内灰字 = 规范源码路径 · 行号基线 vLLM v0.27.1 · DP 分叉与 ch35 为预告（虚线）',
         9, lc.C_MUTE, 'start', maxw=1120, tag='footer')
 
 # ---------------- 装配输出 ----------------
