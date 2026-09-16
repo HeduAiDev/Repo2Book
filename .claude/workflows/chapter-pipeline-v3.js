@@ -216,7 +216,7 @@ const dv = await agent(
   '④ mechanisms 完整性（有无漏掉读者必须懂的机制）、needs_figure/needs_worked_example/difficulty 标得对吗？\n' +
   '⑤ subtraction_plan.delete 都安全吗、must_keep 完整吗（有无遗漏读者要学的关键符号）？\n' +
   (PRIMER ? '⑥（PRIMER）确认 dossier.json 顶层有 "kind":"primer"——没有则 sound=false。\n' : '') +
-  '返回 sound（是否可放行）与 problems（具体问题列表）。（rev2 注记：若 dossier 曾按首轮 problems 修订落盘，本轮为修订后重验——逐条独立复核修订处与其波及面，仍按上述全项扫，不复述首轮。rev3：同前，适用任何轮次的修订后重验。rev4：同前。rev5：同前。rev6：同前。rev7：同前。rev8：同前。rev9：同前。rev10：同前。rev11：同前。rev12：同前。rev13：同前。rev14：同前。rev15：同前。）',
+  '返回 sound（是否可放行）与 problems（具体问题列表）。（rev2 注记：若 dossier 曾按首轮 problems 修订落盘，本轮为修订后重验——逐条独立复核修订处与其波及面，仍按上述全项扫，不复述首轮。rev3：同前，适用任何轮次的修订后重验。rev4：同前。rev5：同前。rev6：同前。rev7：同前。rev8：同前。rev9：同前。rev10：同前。rev11：同前。rev12：同前。rev13：同前。rev14：同前。rev15：同前。rev16：同前。）',
   mo({ schema: VERIFY_SCHEMA, label: 'dossier-verify', phase: 'Dossier', agentType: 'general-purpose' }, 'verify', false)
 )
 if (!dv) return { chapter: CHID, escalated: 'dossier-verify-failed', stage: 'Dossier', note: 'dossier 对抗性自核 agent 失败（限流/崩溃），未核对不得放行' }
@@ -375,7 +375,7 @@ for (let b = 1; b <= 3; b++) {
     '你是插图盲审员。**只准看**：' + CH + '/diagrams/figure-manifest.json 里**机制图条目**的 PNG（用 Read 打开）+ ' + CH + '/explainer/explainer.json 里对应的 figure_spec（开篇图 L2/L1/L0 条目已有独立盲审，跳过）。**禁止**看 gen_*.py 生成代码、禁止看正文章节。\n' +
     '逐张图做四步：① 只看图，用自己的话复述这张图的论点；② 与 spec.claim 对照——复述对不上 = FAIL；③ 图上每个数字与 spec.numbers 逐个核对——对不上 = FAIL；④ 明显不可读（文字重叠/箭头悬空/不知从哪看起）= FAIL。\n' +
     '把每张图的 verdict（PASS/FAIL）与 notes 用 Edit 回填 figure-manifest.json 的 blind_review 字段。\n' +
-    '返回 all_pass 与 failures（每条 figure_id + problem + suggested_fix）。',
+    '返回 all_pass 与 failures（每条 figure_id + problem + suggested_fix）。（rev2 注记：若本轮对象中某图曾 FAIL 后由 Lead 组织修复重渲落盘（manifest notes 有修复记录可考），按当前盘上 PNG 重新四步判定，历史 FAIL 判词与坐标不复述——一切以本轮亲验为准。）',
     mo({ schema: BLIND_SCHEMA, label: 'blind-review r' + b, phase: 'Illustrate', agentType: 'general-purpose' }, 'blind', true)
   )
   blindHistory.push({ round: b, failures: (blindV && blindV.failures) || [] })
