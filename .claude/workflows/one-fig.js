@@ -1,6 +1,6 @@
 export const meta = {
   name: 'one-fig',
-  description: '单图任务：illustrator 按 dossier supplement 画一张图（model 经 opts 指定，当前=deepseek-flash，用户 2026-09-13 定）。',
+  description: '单图任务：illustrator 按 dossier supplement 画一张图（model 经 args.model 指定，默认 claude-haiku-4-5——2026-09-17 网关换代 fable/deepseek-flash 双下线）。',
   phases: [{ title: 'Fig' }],
 }
 // args: { prompt: string }（完整任务提示词）+ CFG 兜底
@@ -10,6 +10,6 @@ if (!A.prompt) { return { error: 'no prompt' } }
 const r = await agent(
   A.prompt,
   { schema: { type: 'object', additionalProperties: false, required: ['status', 'note'], properties: { status: { type: 'string', enum: ['OK', 'BLOCKED'] }, note: { type: 'string' }, blocker_reason: { type: 'string' } } },
-    label: 'fig:' + (A.label || 'one'), phase: 'Fig', agentType: 'illustrator', model: 'deepseek-flash' }
+    label: 'fig:' + (A.label || 'one'), phase: 'Fig', agentType: 'illustrator', model: A.model || 'claude-haiku-4-5' }
 )
 return r

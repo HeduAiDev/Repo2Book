@@ -51,10 +51,11 @@ const BIBLE = REPO + '/instances/vllm/book/bible'
 // A.models.<role> 可显式覆盖（含把视觉 agent 拉回主模型）。
 function mo(base, role, visual) {
   const o = Object.assign({}, base)
-  // 画图/读图（视觉作业）模型（用户 2026-09-13 定：「使用 deepseek-flash」——网关上
-  // fable 短名 404、claude-fable-5* 实际映射到 deepseek-flash，经探针实测）。单图任务
-  // 走 one-fig workflow；A.models.<role> 显式覆盖仍最高优先。
-  const m = (A.models && A.models[role]) || (visual ? 'deepseek-flash' : null)
+  // 画图/读图（视觉作业）模型（2026-09-17 网关换代：fable 与 deepseek-flash 双双下线，
+  // /v1/models 实测仅 haiku-4-5/opus-4-8/opus-5/sonnet-5/glm-5.3/qwen3.8-27b 在列。
+  // 按用户「视觉=专用廉价模型」的分工意图选 claude-haiku-4-5；盲审质量不足可
+  // A.models.blind='claude-opus-5' 拉回主模型）。A.models.<role> 显式覆盖仍最高优先。
+  const m = (A.models && A.models[role]) || (visual ? 'claude-haiku-4-5' : null)
   if (m) o.model = m
   return o
 }
