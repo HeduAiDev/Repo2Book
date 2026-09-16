@@ -465,7 +465,7 @@ writeV = await agent(
   (SKIP_IMPL
     ? '本章无精简版——以真实源码 + 开篇图为主线，不要提"精简版"。\n'
     : '精简版只作"运行看数值"的交叉验证，不是主角。\n若发现精简版缺了你要讲清的细节 → 用逃生舱拉闸（status=BLOCKED）让 implementer 补回，别将就。\n') +
-  (PRIMER ? '本章四段式必达物：动机 → 数学推导（每个关键公式给论文锚 §/Eq + arXiv id）→ 小参数数值推演（explainer 素材）→ 落地（v0.27.1 真实代码锚点 + 链接对应码章）。开篇地图用 L1（Part 图），顿悟头图按 ch21 样板。\n' : '') +
+  (PRIMER ? '本章四段式必达物：动机 → 数学推导（每个关键公式给论文锚 §/Eq + arXiv id）→ 小参数数值推演（explainer 素材）→ 落地（v0.27.1 真实代码锚点 + 链接对应码章）。开篇地图用 L1（Part 图），顿悟头图按 ch21 样板。**每模块配一段伪码**（用户 2026-09-16 定，ch28 样板：每个机制在数学讲完后用一段 pseudocode 代码块把细节钉死——张量形状/掩码/迭代轮数/边界条件级别的伪码，语言近似 Python、不追求可运行；伪码块后一两句点出它钉住了哪几个不变量）。\n' : '') +
   '**零脚手架泄漏**：规范 vllm/ 路径、自然标题（无 Cell N）、不提内部文件（dossier/impl-notes/L2-spec 等）。\n' +
   '完成后自跑' + (PRIMER ? '五个 linter（chapter_structure/formulas/source_grounding/trace_consistency/paper_grounding --expect-primer，primer 章不跑 fidelity）' : (SKIP_IMPL ? '四个 linter（chapter_structure/formulas/source_grounding/trace_consistency，本章无精简版故不跑 fidelity）' : '五个 linter（chapter_structure/formulas/source_grounding/fidelity/trace_consistency）')) + '均无 BLOCKING（图的 linter 归 illustrator，不用你跑）。返回 status/note/figure_requests。' + ESC,
   mo({ schema: WRITE_STATUS_SCHEMA, label: 'write r' + w, phase: 'Write', agentType: 'general-purpose' }, 'write', false)
