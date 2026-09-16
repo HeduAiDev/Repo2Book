@@ -184,7 +184,7 @@ function head(role) {
     'v3 真相源目录：' + CART + '/（pedagogy-plan.json · ARCHITECTURE.md · FIGURE-SYSTEM.md · WRITING-CONTRACT-v3.md · deepread/ 六域卡 · l2-specs/）',
     PRIMER ? '本章为 **primer 原理章**：论文包在 ' + PAPERS + '/paper.md（先读它）。硬规则 2 豁免仅限本章 kind——实现是**论文忠实的小型参考实现**（非 subtract-only），替代门禁为 lint_paper_grounding。' : '',
     'vLLM 相关运行进容器：' + REPO + '/scripts/vllm_docker.sh ...（host 无 CUDA/vLLM）。',
-    (CHNO === 28 ? '**本章专属参考实现（用户 2026-09-16 指定，只读；项目外路径的唯一豁免）**：E:/Laboratory/transformers/src/transformers/models/deepseek_v4/ —— HF transformers 的 DeepSeek-V4 实现（modular_deepseek_v4.py 是手写源、modeling_deepseek_v4.py 是其生成物、configuration_deepseek_v4.py 是配置类）。它是**外部参考实现**（非本仓 pin 源码）：用来做公式↔代码对照、伪码蓝本、机制细节核对（CSA/HCA 压缩、滑窗、mHC、MoE/hash、MTP 在这里都有可读的 Python 落法）。**只许读**；引用时标注「参考实现（HF transformers，路径）」并给行号，**绝不**写成本仓 vllm/ 路径；与 vllm pin 冲突处以 pin 为准并报出差异。' : '')
+    (CHNO === 28 ? '**本章专属参考实现（用户 2026-09-16 指定；DeepSeek 官方代码）**：' + REPO + '/instances/vllm/book/papers/ch28-deepseek-v4-principles/official/ —— `model.py`（827 行：Compressor/Indexer/Attention/Gate/Expert/MoE/Block/MTPBlock/Transformer 的官方 Python 实现，七件套全在）、`kernel.py`（sparse_attn / hc_split_sinkhorn / fp4_gemm 等算子）、`generate.py`（推理脚本）。来源：huggingface.co/deepseek-ai/DeepSeek-V4-Pro（inference/）。它就是论文的官方参考实现：用来做**公式↔官方代码**逐行对照、伪码蓝本、机制细节核对。引用时标注「官方参考实现（DeepSeek-V4-Pro inference/model.py:Lxxx）」——**绝不**写成本仓 vllm/ 路径；与 vllm pin 的落地差异要显式点出（两边都要读）。**注意**：用户明确要求以官方代码为准（不要用 HF transformers 的改写版）。' : '')
     ,
     '',
   ].join('\n')
