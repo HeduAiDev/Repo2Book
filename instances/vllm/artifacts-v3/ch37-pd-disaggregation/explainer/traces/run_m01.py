@@ -81,6 +81,14 @@ def main() -> None:
         kv_config = make_kv_config()
         sched = NixlPullConnector(cfg, KVConnectorRole.SCHEDULER, kv_config)
         worker = NixlPullConnector(cfg, KVConnectorRole.WORKER, kv_config)
+        # 对 P/D 两台引擎真建的 4 个 facade 逐一数非空半边（全局口径），
+        # ad-hoc 的 sched/worker 两个演示对象只作 role 分支展示。
+        objs = [
+            p.scheduler_connector,
+            p.worker_connector,
+            d.scheduler_connector,
+            d.worker_connector,
+        ]
         doc["facade_halves"] = {
             "per_engine_connector_copies": 2,
             "SCHEDULER_role": {
@@ -91,8 +99,13 @@ def main() -> None:
                 "connector_scheduler": None,
                 "connector_worker": type(worker.connector_worker).__name__,
             },
-            "total_connector_objects": 4,
-            "non_none_halves": 2,
+            "total_connector_objects": len(objs),
+            "non_none_halves": sum(
+                1
+                for o in objs
+                for half in (o.connector_scheduler, o.connector_worker)
+                if half is not None
+            ),
         }
 
         doc["engines"] = {
