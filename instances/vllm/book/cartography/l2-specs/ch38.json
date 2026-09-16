@@ -1,0 +1,423 @@
+{
+ "schema": "l2-spec/1",
+ "chapter": 38,
+ "part": "VIII",
+ "title": "KV 池化",
+ "hook": "HBM 快而小、DRAM 慢而大、SSD 更慢但巨大——KV 块凭什么不能像 OS 页一样『换出去、要用再换回来』？满块怎么不打扰 GPU 就搬走？异步搬运中被复用的块谁拦住？SSD 的命中怎么到 GPU？共享池的哈希怎么对上？",
+ "l0_zoom": "KV 边界+外部池",
+ "l0_region": {
+  "anchors": [
+   "kv_column",
+   "gpu_column"
+  ]
+ },
+ "depends_on": [
+  16,
+  37
+ ],
+ "reading": "读图：上排 = 请求进出条（新请求查池 · 块复用/终局信号触发围栏）；中排 ①-⑨ = 一个块进出池的一生（池的构成→CPU 池开张→满块采集→池准入驱逐→延迟提交+DMA→四态查询→加载接 ch16→完成回收+flush 围栏→分层池）；下排 = P2P 跨实例层、生态对照与 why 注；站号 = 块/请求流经顺序（第 8 站查询 · 存储每步滚动）；『外部池』在 L0 之外、挂在 KV 边界上；框内方法与 file:line 均为 v0.27.1 已核锚点。",
+ "frame": {
+  "title": "单引擎（kv_role=kv_both）· OffloadingConnector + kv_offload 池引擎 —— 外部池（CPU 主层 + FS/OBJ/P2P 副层）挂在 ch16 的 KV 边界上",
+  "file": "vllm/v1/kv_offload/ + vllm/distributed/kv_transfer/kv_connector/v1/offloading/"
+ },
+ "center": {
+  "name": "pool_cycle",
+  "title": "块的一生进出池：满块 DMA 存出（每步滚动）→ 新请求查询命中 → 异步加载回 GPU → 完成回收",
+  "where": "offloading/scheduler.py:L1023"
+ },
+ "components": [
+  {
+   "name": "新请求入场（链式哈希随 token 算好）",
+   "role": "plain",
+   "zone": "north",
+   "methods": [
+    "· get_num_new_matched_tokens 查池（第 8 站）",
+    "· ch16 站3 双查：本地前缀缓存之后问池",
+    "· None=『稍后再问』→ 进 skipped 队列"
+   ],
+   "stations": [
+    8
+   ]
+  },
+  {
+   "name": "本步信号（块复用/抢占/终局）",
+   "role": "plain",
+   "zone": "north",
+   "methods": [
+    "· scheduler_output 每步过线：新分配块号+抢占集+终局集",
+    "· 与 store 引用块相交 → jobs_to_flush（第 10 站）"
+   ],
+   "stations": [
+    10
+   ]
+  },
+  {
+   "name": "① 池的构成 · 契约再嵌套",
+   "role": "beat",
+   "zone": "center",
+   "methods": [
+    "OffloadingConnector facade（L49-L80）",
+    "best-effort：requires_kv_delivery=False",
+    "『丢一次 save 只是未来一次 miss』",
+    "OffloadingSpecFactory 选引擎（spec_name）",
+    "（kv_offload/factory.py:L38-L52）",
+    "spec 双面：get_manager / get_worker",
+    "（kv_offload/base.py:L162-L186）"
+   ],
+   "stations": [
+    1
+   ]
+  },
+  {
+   "name": "② CPU 池开张 · 钉页 mmap",
+   "role": "kv",
+   "zone": "center",
+   "methods": [
+    "num_blocks = cpu_bytes_to_use",
+    "÷ 对齐后 kv_bytes_per_chunk",
+    "（cpu/spec.py:L77-L110，全 worker 分摊）",
+    "/dev/shm/vllm_offload_",
+    "{engine_id}.mmap（共享 mmap）",
+    "（shared_offload_region.py:L28）",
+    "cudaHostRegister 钉页 + canonical 视图"
+   ],
+   "stations": [
+    2
+   ]
+  },
+  {
+   "name": "③ 满块采集 · 每步增量",
+   "role": "beat",
+   "zone": "center",
+   "methods": [
+    "_build_store_jobs（scheduler.py:L1023）",
+    "offload_prompt_only / max_offload_tokens 封顶",
+    "『每 chunk 取最后一个 GPU 块』（L1063-L1073）",
+    "eagle 尾块剔除 · SWA 不可达跳过"
+   ],
+   "stations": [
+    4
+   ]
+  },
+  {
+   "name": "④ 池准入与驱逐 · prepare_store",
+   "role": "kv",
+   "zone": "center",
+   "methods": [
+    "已存去重 → 需逐数 vs 可逐数",
+    "不足即 None 拒收（best-effort）",
+    "CachePolicy.evict(n, protected)",
+    "（cpu/manager.py:L166-L236，LRU/ARC）",
+    "新块 ref_cnt=-1 → complete_store 转可读"
+   ],
+   "stations": [
+    5
+   ]
+  },
+  {
+   "name": "⑤ 延迟一步提交 + DMA",
+   "role": "gpu",
+   "zone": "center",
+   "methods": [
+    "store 只入 _unsubmitted_store_jobs",
+    "（worker.py:L332-L344，NOTE(orozery)）",
+    "下一步 start_kv_transfers 才 submit_store",
+    "DMA 三戒（gpu_worker.py:L362-L400）：",
+    "store 等计算流 · 同向保序 ·",
+    "load 才开 SRC_ACCESS_ORDER_ANY"
+   ],
+   "stations": [
+    6,
+    7
+   ]
+  },
+  {
+   "name": "⑥ 查询 · 四态与收敛",
+   "role": "beat",
+   "zone": "center",
+   "methods": [
+    "_lookup：full 组前缀 + SWA 组尾扫",
+    "（scheduler.py:L816-L871 + L545-L610）",
+    "HIT / HIT_PENDING / RETRY / MISS",
+    "RETRY→None 接 ch16 skipped",
+    "touch 刷新鲜（含 GPU 命中块）"
+   ],
+   "stations": [
+    3,
+    8
+   ]
+  },
+  {
+   "name": "⑦ 加载 · 接 ch16 异步路径",
+   "role": "beat",
+   "zone": "center",
+   "methods": [
+    "prepare_load（ref_cnt 防逐）+ dst GPU 块",
+    "（scheduler.py:L873-L970）",
+    "load job → submit_load DMA CPU→GPU",
+    "WAITING_FOR_REMOTE_KVS（ch16 站6 复用）"
+   ],
+   "stations": [
+    9
+   ]
+  },
+  {
+   "name": "⑧ 完成回收 · flush 围栏",
+   "role": "beat",
+   "zone": "center",
+   "methods": [
+    "completed_jobs {job:count} 聚满 world_size",
+    "（scheduler.py:L1280-L1358）",
+    "store 不发 finished_sending",
+    "块将复用/抢占/终局 → jobs_to_flush",
+    "→ handle_preemptions 抢先提交+wait",
+    "（worker.py:L292-L317）"
+   ],
+   "stations": [
+    10
+   ]
+  },
+  {
+   "name": "⑨ 分层池 · cascade/promotion",
+   "role": "kv",
+   "zone": "center",
+   "methods": [
+    "CPU primary = 唯一 GPU 网关（五原则）",
+    "（tiering/manager.py:L4-L21）",
+    "complete_store 即 cascade 全层（L586-L630）",
+    "secondary 命中 → promotion 占位 → RETRY",
+    "（L310-L350 · on_schedule_end 批量提交）",
+    "调度器进程经 memoryview 直读写 /dev/shm"
+   ],
+   "stations": [
+    11
+   ]
+  },
+  {
+   "name": "P2P 层 · 实例间共享 CPU 池",
+   "role": "zmq",
+   "zone": "south",
+   "methods": [
+    "· 对称 peer：无固定 P/D 角色（对照 ch37）",
+    "· 三角色键 remote_prefiller/decoder/kv_source",
+    "· Lookup→Resp→Fetch→NIXL WRITE→TransferDone",
+    "（p2p/manager.py:L188 + session/protocol.py:L178）",
+    "· PYTHONHASHSEED 强制固定+握手核验"
+   ],
+   "stations": [
+    12
+   ],
+   "file": "vllm/v1/kv_offload/tiering/p2p/"
+  },
+  {
+   "name": "生态对照 · MooncakeStore/LMCache/MultiConnector",
+   "role": "io",
+   "zone": "south",
+   "methods": [
+    "· MooncakeStore：master 协调分布式池+SSD 层",
+    "  lookup_async 后台查询 None=稍后再问",
+    "  （store/scheduler.py:L81-L134）",
+    "  I/O 全在 get_finished 发（worker.py:L1538-L1562）",
+    "· LMCacheConnectorV1：use_native 双路 lazy import",
+    "· MultiConnector：P/D+池化组合，列表首个命中者加载"
+   ],
+   "stations": [
+    13
+   ],
+   "file": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/ + lmcache_connector.py + multi_connector.py"
+  },
+  {
+   "name": "why · best-effort 分水岭",
+   "role": "plain",
+   "zone": "south",
+   "methods": [
+    "· P/D（ch37）：可靠交接·租约钉住·drop_stale_output",
+    "· 池化：丢一次 save=未来一次 miss——不接管块释放",
+    "· 围栏改『被复用时才抢救』：jobs_to_flush+wait"
+   ],
+   "kind": "note"
+  },
+  {
+   "name": "why · store 避开采样关键路径",
+   "role": "plain",
+   "zone": "south",
+   "methods": [
+    "· decode 每步几十 ms，SSD 写 chunk 是 ms 级",
+    "· 延迟一步提交：get_finished 入队→下步头发",
+    "· MooncakeStore 同型：start_load_kv/wait_for_save 双 no-op"
+   ],
+   "kind": "note"
+  },
+  {
+   "name": "why · CPU primary 唯一网关",
+   "role": "plain",
+   "zone": "south",
+   "methods": [
+    "· 只有 CPU 层能 DMA GPU 显存（pinned）",
+    "· secondary 全部经 CPU 中转：cascade 下推/promotion 升回",
+    "· 代价：secondary 命中要两跳+RETRY 往返；主层满=MISS"
+   ],
+   "kind": "note"
+  },
+  {
+   "name": "why · 共享前提是哈希一致",
+   "role": "plain",
+   "zone": "south",
+   "methods": [
+    "· PYTHONHASHSEED 未设 → NONE_HASH=os.urandom（L88-L115）",
+    "· 两个进程同一前缀不同哈希 = 共享池静默全 miss",
+    "· p2p 启动断言+握手互验把静默错升级为硬门"
+   ],
+   "kind": "note"
+  },
+  {
+   "name": "邻章分界 · F8 收官",
+   "role": "plain",
+   "zone": "south",
+   "methods": [
+    "· ch16 立契约 → ch37 跨引擎腿（P/D）→ 本章分层腿（池化）",
+    "· 池化块的跨引擎迁移协议 → ch40 弹性 scale_up 底座",
+    "· 多轮双向回拉 → ch39 · P2P 编排层（router/EPP）→ ch39 服务面"
+   ],
+   "kind": "note"
+  }
+ ],
+ "flows": [
+  {
+   "from": "新请求入场（链式哈希随 token 算好）",
+   "to": "⑥ 查询 · 四态与收敛",
+   "label": "block_aligned_local 呈上（接 ch16 站3 双查）"
+  },
+  {
+   "from": "⑥ 查询 · 四态与收敛",
+   "to": "⑦ 加载 · 接 ch16 异步路径",
+   "label": "命中 keys → prepare_load ref_cnt 防逐"
+  },
+  {
+   "from": "⑦ 加载 · 接 ch16 异步路径",
+   "to": "⑧ 完成回收 · flush 围栏",
+   "label": "finished_recving → ch16 提升"
+  },
+  {
+   "from": "③ 满块采集 · 每步增量",
+   "to": "④ 池准入与驱逐 · prepare_store",
+   "label": "new_offload_keys"
+  },
+  {
+   "from": "④ 池准入与驱逐 · prepare_store",
+   "to": "⑤ 延迟一步提交 + DMA",
+   "label": "store_jobs 随 meta 过线（job_id 键）"
+  },
+  {
+   "from": "⑤ 延迟一步提交 + DMA",
+   "to": "⑧ 完成回收 · flush 围栏",
+   "label": "completed_jobs 计数"
+  },
+  {
+   "from": "本步信号（块复用/抢占/终局）",
+   "to": "⑧ 完成回收 · flush 围栏",
+   "label": "jobs_to_flush → 抢先提交+wait",
+   "dash": true
+  },
+  {
+   "from": "⑨ 分层池 · cascade/promotion",
+   "to": "④ 池准入与驱逐 · prepare_store",
+   "label": "complete_store 后 cascade 全层下推",
+   "dash": true
+  },
+  {
+   "from": "⑨ 分层池 · cascade/promotion",
+   "to": "⑥ 查询 · 四态与收敛",
+   "label": "secondary 命中 → promotion → RETRY",
+   "dash": true
+  },
+  {
+   "from": "P2P 层 · 实例间共享 CPU 池",
+   "to": "⑨ 分层池 · cascade/promotion",
+   "label": "对端 CPU 池 = 一个 secondary tier",
+   "dash": true
+  },
+  {
+   "from": "生态对照 · MooncakeStore/LMCache/MultiConnector",
+   "to": "① 池的构成 · 契约再嵌套",
+   "label": "同一契约的另三种填法",
+   "dash": true
+  },
+  {
+   "from": "① 池的构成 · 契约再嵌套",
+   "to": "② CPU 池开张 · 钉页 mmap",
+   "label": "spec.get_manager / get_worker"
+  }
+ ],
+ "loop": {
+  "label": "下一个引擎步——每步都有满块存出与新请求查询；池在 HBM/DRAM(/SSD) 间流动，命中即省一段 prefill；F8 双面契约两半至此收官（ch37 跨引擎腿 + 本章分层腿）"
+ },
+ "rail_header": "站号 = 块/请求在池化引擎中的流经顺序（查询在第 8 站 · 存储每步滚动）",
+ "stations": [
+  {
+   "n": 1,
+   "where": "offloading_connector.py:L49-L80 + kv_offload/factory.py:L38-L52",
+   "what": "池的构成与契约再嵌套：OffloadingConnector facade（best-effort：requires_kv_delivery=False，『丢一次 save 只是未来一次 miss』）+ OffloadingSpecFactory 按 spec_name 选引擎（CPUOffloadingSpec 单层 / TieringOffloadingSpec 分层）；OffloadingSpec 自己又是一份双面契约——get_manager 住调度器进程、get_worker 住 worker 进程【F8 回收②】"
+  },
+  {
+   "n": 2,
+   "where": "cpu/spec.py:L77-L110 + shared_offload_region.py:L28-L56 + cpu/gpu_worker.py:L123-L149",
+   "what": "CPU 池开张：cpu_bytes_to_use ÷ (worker_kv_bytes_per_block×world_size×blocks_per_chunk 按 PAGESIZE 对齐) = num_blocks——跨全部 worker 分摊一份池；worker 侧 /dev/shm/vllm_offload_{engine_id}.mmap 共享 mmap + cudaHostRegister 钉页；任意 attention 布局先规范化成 (num_blocks, page) canonical 张量"
+  },
+  {
+   "n": 3,
+   "where": "offloading/scheduler.py:L804-L814 + L431-L442 + kv_offload/base.py:L90-L98",
+   "what": "入场登记：on_new_request 建 ReqContext（带 kv_transfer_params——per-request 旋钮 max_offload_tokens / kv_load_tiers 层过滤器）+ RequestOffloadState（逐组 offload_keys/block_ids 游标）；tiering 管理器顺访各 secondary 的 policy（BLOCK_LEVEL/REQUEST_LEVEL）"
+  },
+  {
+   "n": 4,
+   "where": "offloading/scheduler.py:L1023-L1099",
+   "what": "存储路径① 满块采集：每步 build_connector_meta→_build_store_jobs——offload_prompt_only/max_offload_tokens 封顶可卸 token 数；storable_chunks 推进游标（eagle 尾块易变剔除）；『每 chunk 取最后一个 GPU 块』采块；block_id=0（null/陈旧）与 SWA 不可达 chunk 跳过"
+  },
+  {
+   "n": 5,
+   "where": "cpu/manager.py:L166-L236 + offloading/scheduler.py:L1097-L1117",
+   "what": "存储路径② 池准入：prepare_store——已存块过滤（去重）、可逐块不足直接 None 拒收（best-effort：记 ALLOCATION_FAILURE 放弃本批）、CachePolicy(LRU/ARC) 驱逐保护集外块、_allocate_blocks 落位；新块 ref_cnt=-1『写入中』，complete_store 才转 0 可读"
+  },
+  {
+   "n": 6,
+   "where": "offloading/worker.py:L319-L344 + offloading_connector.py:L103-L134",
+   "what": "存储路径③ 延迟提交：store job 只入 _unsubmitted_store_jobs（get_finished 里 prepare_store_kv 入队），下一步 start_kv_transfers 开头才 submit_store——卸载避开本步 token 采样关键路径（NOTE(orozery) 原话）；wait_for_layer_load/save_kv_layer/wait_for_save 全空实现——ch16 逐层契约的『不逐层』填法"
+  },
+  {
+   "n": 7,
+   "where": "cpu/gpu_worker.py:L166-L172 + L240-L441",
+   "what": "DMA 引擎：SingleDirectionOffloadingHandler 双向各一（store/load）——描述符三缓冲（src ptr/dst ptr/size）+ 专用 CUDA stream 池/事件池；GPU→CPU 先 wait_stream(计算流) 且同向串行（wait_event 前一 transfer）；CPU→GPU 开 SRC_ACCESS_ORDER_ANY（pinned host 不被 GPU 流写）；完成=事件轮询非回调"
+  },
+  {
+   "n": 8,
+   "where": "offloading/scheduler.py:L816-L871 + L545-L610",
+   "what": "查询路径：新请求 get_num_new_matched_tokens→_lookup——full 组沿链前缀逐块查（LookupResult 四态：HIT/HIT_PENDING/RETRY/MISS）+SWA 组从尾数连续窗口+多组收敛循环；任一 RETRY→None『稍后再问』接 ch16 skipped 队列；在飞 job 占用或命中块正被加载也 None 延后"
+  },
+  {
+   "n": 9,
+   "where": "offloading/scheduler.py:L873-L970 + offloading/worker.py:L326-L330",
+   "what": "加载路径：update_state_after_alloc——命中 keys_to_load→manager.prepare_load（ref_cnt 防驱逐）+ dst GPU 块打 GPULoadStoreSpec（group_sizes/block_indices 支持 offload 块大于 GPU 块的半块对齐）→load job 随 meta 过线→worker submit_load DMA CPU→GPU→finished_recving 接 ch16 提升路径"
+  },
+  {
+   "n": 10,
+   "where": "offloading/scheduler.py:L1280-L1358 + L1228-L1255 + offloading/worker.py:L292-L317",
+   "what": "完成回收与 flush 围栏：completed_jobs {job_id:count} 逐 worker 计数、聚满 world_size 才 complete_store/complete_load；store 永不发 finished_sending（completed_jobs+jobs_to_flush 语义）；GPU 块将被复用/请求被抢占/终局前 store 未完→jobs_to_flush→handle_preemptions 抢先提交+wait 同步围栏——块复用与异步搬运竞态的 best-effort 答案"
+  },
+  {
+   "n": 11,
+   "where": "tiering/manager.py:L282-L451 + L586-L630 + tiering/spec.py:L170-L215 + tiering/factory.py:L57-L77",
+   "what": "分层池：TieringOffloadingManager 五原则——CPU primary 是唯一能 DMA GPU 的层；secondary（fs/obj/p2p）只能经 primary 中转：store 完成即 cascade 全层下推、查询命中 secondary 先 promotion（prepare_write 占位→on_schedule_end 批量 submit_load）、期间 RETRY；调度器进程经 primary 的 kv memoryview 直读写 /dev/shm 池"
+  },
+  {
+   "n": 12,
+   "where": "tiering/p2p/manager.py:L188-L231 + p2p/session/protocol.py:L178-L218 + docs/features/kv_offloading_usage.md:L187-L273",
+   "what": "P2P 层：实例间共享 CPU 池——每实例对称 peer（无固定 P/D 角色，同一实例对不同请求可当 consumer 也可当 producer）；kv_transfer_params 三角色键（remote_prefiller/remote_decoder/remote_kv_source）由编排层（router/EPP）驱动 LookupMsg→LookupRespMsg→FetchMsg→NIXL WRITE→TransferDone 协议；PYTHONHASHSEED 强制固定且握手核验"
+  },
+  {
+   "n": 13,
+   "where": "mooncake/store/connector.py:L88-L96 + store/scheduler.py:L81-L134 + store/worker.py:L1538-L1562 + lmcache_connector.py:L83-L113 + multi_connector.py:L128-L247 + factory.py:L152-L243",
+   "what": "生态对照（同一双面契约的另三种填法）：MooncakeStoreConnector——MooncakeDistributedStore 分布式池（mooncake_master 元数据协调、embedded 各 rank 出内存凑池 / standalone-store 外置进程持池+SSD 层；lookup_async 后台 ZMQ RPC 查询、None=稍后再问；start_load_kv/wait_for_save 双 no-op，I/O 全在 get_finished 发）vs LMCacheConnectorV1（外部包/原生适配器双路 lazy import）vs MultiConnector（P/D+池化组合：列表顺序首个命中数>0 者获加载权）"
+  }
+ ]
+}
