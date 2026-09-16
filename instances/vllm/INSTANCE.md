@@ -24,9 +24,9 @@
 - **🔄 Phase 2 图系三层缩放**（已完成：L0+L1×8 minimap 模式+L2 渲染器样板）：L0 唯一 → L1 Part 图（L0 局部放大）→ L2 章图；
   同一数据源分层渲染；改造 v2 arch-model 渲染器。
 - Phase 3 逐章重写：pipeline 复用 + 新写作契约（hook 开篇/先地图后细节/阶梯展开）。
-- **⏸ 生产暂停（2026-09-15，用户指示「先不开新章节」；2026-09-16 重编号后为 41 章制）**：已定稿 **31/41**，全部已提交推送（分支 `vllm-book-v3-rewrite`）。
+- **生产状态（2026-09-16 重编号后为 41 章制）**：已定稿 **32/41**（2026-09-17 新增 ch28【primer】DeepSeek-V4 原理，全部已提交推送，分支 `vllm-book-v3-rewrite`）。
   - **2026-09-16 重编号（用户定：原理独立成章）**：新 **ch28=【primer】DeepSeek-V4 原理**（七件套怎么还两本账；公式完整拆解+每模块伪码；素材 `artifacts-v3/ch29-*/research/concepts-v4-principles.json`）；原 ch28 拼装 →**ch29**、ch29 Sampler→ch30、ch30 语法→ch31、ch31 bitmask→ch32、ch34 分布式→ch35、ch36 P/D→ch37、ch37 KV 池化→ch38、ch38 服务面→ch39；Parts：VI=23-29、VII=30-34、VIII=35-41。映射与引擎：`scripts/renumber_v3.py`，存档 `book/cartography/renumber-2026-09-16.json`。
-  - 待写 10 章：**ch37**（P/D 分离，原 ch36 断点——dossier 已修+r续跑前确认 dossier-verify rev16 在位）；就绪待发 ch32/ch33/ch36/ch39/ch40；依赖链尾 ch34（等 ch33）/ch38（等 ch37）/ch41 终章；**ch28 原理章待发（原理素材已就绪、架构图与两张原理图已随原 ch28 迁至 ch29）**。
+  - 待写 9 章：**ch37**（P/D 分离，原 ch36 断点，`wf_89b2562d-1c9` 可 resume）；就绪待发 ch32/ch33/ch36/ch39/ch40；依赖链尾 ch34（等 ch33）/ch38（等 ch37）/ch41 终章。ch28 已定稿（官方参考代码+论文包+密集小图规范+每模块伪码全落地）。
   - ch14 四轮读者反馈 + 一轮独立验收已全数闭环（断链重排/密度阶梯/雅词清剿/DeepSeek 嵌入去生硬，验收报告 `artifacts-v3/ch14-memory-ledger/reviews/reader-acceptance-round4.md`）；契约 §7.5 已固化「断链出口≠断点」诊断纪律。
   - ch28 定稿后遗留的 negotiable 小项与 ch14 的 census claim 元数据口径（「六类缓存自报四族 spec」→「四类缓存/六种形态」）留批次收尾处理。
 - v3 方法论/大纲：`docs/superpowers/specs/2026-08-15-v3-pedagogy-rewrite.md` +
