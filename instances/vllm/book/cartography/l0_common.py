@@ -582,8 +582,14 @@ def build_l0():
     # block_ids：A3 → B2（折线经 A/B 间隙）
     bt_x = GAP_AB + COL_GAP / 2
     parrow([(GAP_AB, A3Y + 40), (bt_x, A3Y + 40), (bt_x, B2Y + 60), (BX, B2Y + 60)], C_KV_S, 1.8, 'std')
-    text(bt_x, (A3Y + 40 + B2Y + 60) / 2 - 8, 'block_ids', 9, C_KV_S, 'middle')
-    text(bt_x, (A3Y + 40 + B2Y + 60) / 2 + 6, '→ 块表', 9, C_KV_S, 'middle')
+    # 折线竖直段就在 bt_x 上穿过本标签自身两行文字（ch28 开篇图视觉自查抓到：
+    # 字与线同色、无衬底 → 一行被劈在 '_'、一行被劈在『塊』，方法名不可读）。
+    # 右侧空间不足（BX=822，'block_ids' 宽 47 → 右移会压 Executor 左框线），
+    # 故不改锚点、就地加白 halo（同 gen_L2 2026-08-27 同款）：竖线在字形处断开。
+    # ⚠️ 两行须在 parrow **之后**发射（SVG 文档序=绘制序），间距 18px 防下线
+    # halo 吃掉上线 '_' 的墨迹（原 14px 偏紧）。
+    text(bt_x, (A3Y + 40 + B2Y + 60) / 2 - 9, 'block_ids', 9, C_KV_S, 'middle', halo=True)
+    text(bt_x, (A3Y + 40 + B2Y + 60) / 2 + 9, '→ 块表', 9, C_KV_S, 'middle', halo=True)
     # hidden_states：B2 → C1（折线经 B/C 间隙；切片细节写在 C1 框内）
     hs_x = GAP_BC + 20
     hs_y = B2Y + 80
