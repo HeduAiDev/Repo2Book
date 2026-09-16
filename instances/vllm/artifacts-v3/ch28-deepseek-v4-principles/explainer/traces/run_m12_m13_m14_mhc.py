@@ -56,15 +56,10 @@ P("      第二个奇异值才是真在收缩的那部分（B2 的 0.4、B3 的 
 P("")
 P("    反例（同样非负、行和也 = 1，但列和 ≠ 1）：M = [[0.9,0.1],[0.2,0.8]]")
 P(f"        行和 = {R(M_bad.sum(axis=1))}；列和 = {R(M_bad.sum(axis=0))} ⇒ 双随机判定 = {mhc.is_doubly_stochastic(M_bad)}")
-P(f"        谱范数 = {F(mhc.spectral_norm(M_bad))} > 1 ⇒ 每次混合都放大 1.009583 倍：")
-Pk = M_bad.copy()
-for k in (1, 2, 4, 8, 16, 32):
-    while True:
-        Pk_ = M_bad.copy()
-        for _ in range(k):
-            Pk_ = Pk_ @ M_bad
-        P(f"            M^{k} 的谱范数 = {F(mhc.spectral_norm(Pk_))}")
-        break
+P(f"        谱范数 = {F(mhc.spectral_norm(M_bad))} > 1 ⇒ 最坏方向上最多放大 1.009583 倍（不是每个方向都被放大）：")
+for k in (2, 3, 5, 9, 17, 33):
+    Mk = np.linalg.matrix_power(M_bad, k)
+    P(f"            M^{k} 的谱范数 = {F(mhc.spectral_norm(Mk))}")
 P(f"        ⇒ 深堆叠 L 层后放大约 1.009583^L 倍（32 层 = {round(1.009583 ** 32, 6)} 倍、64 层 = {round(1.009583 ** 64, 6)} 倍）——")
 P(f"          这就是 mHC 摘要里 severe training instability 的算术形态；把 B 关进双随机集合（列和也 = 1）就没了这个放大源。")
 P("")
@@ -132,8 +127,8 @@ P("== ch28 m14 · Sinkhorn-Knopp 迭代与 t_max=20 ==")
 raw = np.array([[4.0, 1.0], [1.0, 3.0]])
 tr = mhc.sinkhorn_trace(raw, iters=20, start="raw", order="row-first")
 P(f"    raw = {[R(r) for r in raw]}（非负）；起点 = raw（教科书式交替归一，便于手算）")
-P(f"    逐轮（row-first：先行使和=1 再列使和=1）：")
-for i, rec in enumerate(tr[:4] + tr[-1:], start=1):
+P(f"    逐轮（row-first：先行使和=1 再列使和=1；这里逐条打印真实的第 1–5 轮，第 20 轮另起一行）：")
+for i, rec in enumerate(tr[:5], start=1):
     P(f"        第 {i:2d} 轮: 行和(行归一后) = {R(rec['row_sums_after_row'])}，"
       f"列和(行归一后) = {R(rec['col_sums_after_row'])}，列和(列归一后) = {R(rec['col_sums_after_col'])}"
       f" ⇒ row_dev = {F(rec['row_dev'], 8)}、col_dev = {F(rec['col_dev'], 8)}")
@@ -192,6 +187,7 @@ out = {
         "C_tilde": C_t.tolist(), "C": C.tolist(),
         "X1": X1.tolist(),
         "sinkhorn_trace_4": [{"row_dev": r["row_dev"], "col_dev": r["col_dev"]} for r in tr[:4]],
+        "sinkhorn_trace_5": [{"row_dev": r["row_dev"], "col_dev": r["col_dev"]} for r in tr[:5]],
         "sinkhorn_trace_last": {"row_dev": tr[-1]["row_dev"], "col_dev": tr[-1]["col_dev"]},
         "worst_matrix": worst[0], "worst_dev20": worst[1],
     },
