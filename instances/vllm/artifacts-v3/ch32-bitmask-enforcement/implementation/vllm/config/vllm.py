@@ -1,5 +1,5 @@
 # SOURCE: vllm/config/vllm.py
-# v3 ch31 脊柱切面：VllmConfig 的两个 property——num_speculative_tokens
+# v3 ch32 脊柱切面：VllmConfig 的两个 property——num_speculative_tokens
 # （L564-L575，掩码行数预算的 spec 维来源）与 use_v2_model_runner
 # （L577-L658，V1/V2 两条落地路径的真实选择器，m18 诚实性落点），
 # 连同三个判据 helper 逐字承载。装配面（真实 VllmConfig 是 ~700 行 dataclass
@@ -71,7 +71,7 @@ def default_v2_model_runner_architectures() -> frozenset[str]:
 
 # SOURCE: vllm/config/vllm.py VllmConfig —— 本章切面（HOST SEAM 装配）
 class VllmConfig:
-    """VllmConfig 的 ch31 切面：两个 property 逐字 + 消费字段承载。
+    """VllmConfig 的 ch32 切面：两个 property 逐字 + 消费字段承载。
 
     真实 VllmConfig（config/vllm.py，ch03 全文已立）是装配一切子配置的
     dataclass；本章只消费六个子配置的字段面（见文件头注）。

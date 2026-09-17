@@ -1,5 +1,5 @@
 # SOURCE: vllm/v1/core/sched/scheduler.py
-# v3 ch31 脊柱④：Scheduler 的掩码账本切面——_update_after_schedule 的
+# v3 ch32 脊柱④：Scheduler 的掩码账本切面——_update_after_schedule 的
 # has_structured_output_requests 置位（L1317-L1343，m05）、get_grammar_bitmask
 # （L1646-L1668，m03 行序账本）、update_from_output 的 spec 接受率统计 +
 # 语法真推进段（L1746-L1843 切面：should_advance → trim_reasoning_for_advance
@@ -140,7 +140,16 @@ class Scheduler:
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             # SUBTRACTED: 扣在途 num_in_flight_tokens / stale 锁步 drain /
-            #   KV 失败重排（L1728-L1767——ch11/ch12/ch16）。
+            #   KV 失败重排（L1735-L1751——ch11/ch12/ch16）。
+            if request is None or request.is_finished():
+                # SOURCE: vllm/v1/core/sched/scheduler.py:L1752-L1763 —— 逐字
+                #   （abort 期完成/已下线请求跳过：保留段的正确性前置——
+                #   不定位采样行、不进 should_advance/accept_tokens）
+                # The request is already finished. This can happen if the
+                # request is aborted while the model is executing it (e.g.,
+                # in pipeline parallelism or in async scheduling).
+                continue
+
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []

@@ -181,7 +181,12 @@ def _spans_missing_source(pyfile: Path):
 # 背景:此前只验「引文出现在所指文件中」,不验 [a,b] 精确性,vLLM ch31 三处区间错全部漏过
 # (L94-98 应 L72-74 / L286-295 应 L286-296 / L1358-1369 应 L1359-1372,起点还落在空行上)。
 # 与 lint_dossier 的 embed_verbatim 同款口径:空白归一 + 省略号感知 + 有序子序列。
-_CITE_RE = re.compile(r'^#\s*([\w./-]+\.\w+):L(\d+)(?:\s*-\s*L?(\d+))?\s*$')
+# 行尾锚放宽(exp-2026-09-18 ch32 评审⑤):v3 各章头部普遍带 ` · 描述` 后缀(如
+# `# vllm/v1/engine/core.py:L593-L614 · EngineCore.step(四段排布)`),旧 `\s*$` 锚使
+# citation_range 对 v3 章静默空转(ch32 33 块 0 检查;ch32 L617 越界一处正是失效期漏入)。
+# 后缀只认 `·`(U+00B7 描述符)与 `（`(U+FF08 括注)起头——逗号多段(`L42-L44, L49-L61`)
+# 仍不匹配,避免只取首段区间产生假警告。
+_CITE_RE = re.compile(r'^#\s*([\w./-]+\.\w+):L(\d+)(?:\s*-\s*L?(\d+))?\s*(?:[·（].*)?$')
 _FENCE_RE = re.compile(r'```(?:python|py)\n(.*?)```', re.S)
 # 省略标记行:①`# …` / `// …` 注释式;②**整行只有一个 `…`**(docstring 中段常这么省)。
 # ② 只认 U+2026,不认裸 `...`——后者是合法 Python(Ellipsis,`def f(): ...`),豁免它会掩盖真实不符。

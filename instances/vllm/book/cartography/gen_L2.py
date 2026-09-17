@@ -264,7 +264,9 @@ def badge_text(ns):
         return f'第{ns[0]}站'
     if ns == list(range(ns[0], ns[-1] + 1)):
         return f'第{ns[0]}-{ns[-1]}站'
-    return '第' + '/'.join(str(n) for n in ns) + '站'
+    # 非连续站号=枚举：用间隔号「·」——斜杠「5/7」可误读为分数（exp-2026-09-18 ch32 评审；
+    # 连字符保留给连续区间「第5-7站」，两态语义分开：区间=连字符、枚举=间隔号）。
+    return '第' + '·'.join(str(n) for n in ns) + '站'
 
 
 # ---------- 组件绘制（原语全部来自 l0_common；高度=wrap 纯函数，可先算后排） ----------

@@ -1,5 +1,5 @@
 # SOURCE: vllm/v1/worker/gpu/structured_outputs.py
-# v3 ch31 脊柱⑨：V2 落地主体——StructuredOutputsWorker（GPU 常驻掩码缓冲 +
+# v3 ch32 脊柱⑨：V2 落地主体——StructuredOutputsWorker（GPU 常驻掩码缓冲 +
 # 独立 copy_stream 双异步 H2D + cu_num_logits 前缀和行映射）与自写 Triton
 # kernel _apply_grammar_bitmask_kernel（改编自 xgrammar：解包 32 位、
 # (bit&1)==0 → tl.store(-inf)——『语法最终变成一次 kernel 上的位运算』的

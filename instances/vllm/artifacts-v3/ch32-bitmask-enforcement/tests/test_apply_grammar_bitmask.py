@@ -1,4 +1,4 @@
-# ch31 主电池四：apply_grammar_bitmask（V1 正典落地，本章 payoff）
+# ch32 主电池四：apply_grammar_bitmask（V1 正典落地，本章 payoff）
 # 基准：vllm/v1/structured_output/utils.py:L86-L175。
 # 覆盖：行序重排算术（m10，dossier worked example）→ pinned sorted_bitmask →
 # H2D 链 + xgr.apply_token_bitmask_inplace（m11）→ skip_out_indices 快路径 →

@@ -1,12 +1,13 @@
 # SOURCE: vllm/v1/worker/gpu/spec_decode/utils.py
-# v3 ch31 脊柱⑪：DraftTokensHandler（L11-L52——spec+结构化输出时草稿的 D2H
+# v3 ch32 脊柱⑪：DraftTokensHandler（L11-L52——spec+结构化输出时草稿的 D2H
 # 回传通道：has_structured_output_reqs 门控整批跳过；为真在独立 copy_stream 上
 # async_copy_to_np，copy_event(blocking) 防忙轮询 CUDA 驱动锁、record_stream
 # 防缓存分配器提前复用——异步内存安全两面）。get_parallel_drafting_token_id
 # 原样保留（不在批准删除清单）。
-# SUBTRACTED（delete[5]）：get_draft_tokens 的 async 关闭分支（[-1] 占位列表）
-#   ——精简版固定演示 async 开启路径（v0.27 默认）；set_draft_tokens 的
-#   record_stream 之外的注释性代码删。
+# SUBTRACTED（delete[5]）：set_draft_tokens 的 record_stream 之外的注释性
+#   代码。get_draft_tokens 的 [-1] 占位 else 位**保留**（见就地注记：它同时
+#   是 has_structured_output_reqs 门控跳过路径的返回值，删除即破坏 m17 门控
+#   的可观察行为）。
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -61,14 +62,18 @@ class DraftTokensHandler:
             draft_tokens.record_stream(self.copy_stream)
             self.copy_event.record()
 
-    #   逐字（仅删 else 分支）
-    # SOURCE: vllm/v1/worker/gpu/spec_decode/utils.py:L45-L52 get_draft_tokens
+    #   （else 位**保留**：[-1] 占位列表同时服务两条真实路径——async 关闭、
+    #   以及 has_structured_output_reqs=False 的门控跳过（set_draft_tokens
+    #   早退置 None）；删掉它则门控跳过路径 UnboundLocalError，delete[5]
+    #   『只影响草稿 id 来源』的前提不成立）
+    # SOURCE: vllm/v1/worker/gpu/spec_decode/utils.py:L45-L52 get_draft_tokens —— 逐字
     def get_draft_tokens(self) -> DraftTokenIds | None:
         if self.draft_tokens_np is not None:
             self.copy_event.synchronize()
             draft_token_ids = self.draft_tokens_np.tolist()
-        # SUBTRACTED: vllm/v1/worker/gpu/spec_decode/utils.py:L49-L51 else 分支
-        #   （async 关闭时的 [-1] 占位列表——delete[5]，v0.27 默认 async 开）。
+        else:
+            # This case only happens when async scheduling is disabled.
+            draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
         return DraftTokenIds(self.req_ids, draft_token_ids)
 
 

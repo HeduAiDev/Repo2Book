@@ -1,10 +1,10 @@
 # SOURCE: vllm/v1/structured_output/__init__.py
-# v3 ch31 脊柱①：StructuredOutputManager 的批装配切面——掩码缓冲/填充线程池
+# v3 ch32 脊柱①：StructuredOutputManager 的批装配切面——掩码缓冲/填充线程池
 # （L57-L68）、单行语义 _fill_bitmasks（L194-L205）、批装配主函数 grammar_bitmask
 # （L212-L359：预算/并行分支/串行 spec 窗口/裁剪/.numpy() 出发）、思考门控三件套
 # （L361-L486）。编译侧全部删除（grammar_init/_create_grammar/四后端构造分支
 # L114-L192、编译线程池+tokenizer+reasoning parser 装配 L70-L97、
-# external_launcher 判定 L46-L55——dossier.delete[0]，ch30 主题）：
+# external_launcher 判定 L46-L55——dossier.delete[0]，ch31 主题）：
 # 本章从『grammar 已就绪（StructuredOutputGrammar 成品挂在请求上）』起步，
 # grammar 对象直接注入；reasoner_cls/tokenizer 同口径经属性注入
 # （_get_reasoner 的惰性构造消费这两个属性，见 impl-notes 注入面说明）。
@@ -50,7 +50,7 @@ class StructuredOutputManager:
 
         # SUBTRACTED: vllm/v1/structured_output/__init__.py:L46-L55
         #   _use_async_grammar_compilation（external_launcher 判定）——delete[0]
-        #   编译侧装配（异步编译流归 ch30；本章 grammar 均已就绪）。
+        #   编译侧装配（异步编译流归 ch31；本章 grammar 均已就绪）。
 
         # SOURCE: vllm/v1/structured_output/__init__.py:L57-L68 掩码缓冲 +
         #   填充线程池 —— 逐字
@@ -99,7 +99,7 @@ class StructuredOutputManager:
 
     # SUBTRACTED: vllm/v1/structured_output/__init__.py:L114-L192 grammar_init +
     #   _create_grammar（四后端构造分支/异步编译 Future/异常载具）——delete[0]
-    #   编译侧全部，ch30 主题。
+    #   编译侧全部，ch31 主题。
 
     # SOURCE: vllm/v1/structured_output/__init__.py:L194-L205 _fill_bitmasks —— 逐字
     def _fill_bitmasks(

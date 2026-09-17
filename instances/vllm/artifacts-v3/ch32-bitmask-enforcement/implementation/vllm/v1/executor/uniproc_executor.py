@@ -1,5 +1,5 @@
 # SOURCE: vllm/v1/executor/uniproc_executor.py
-# v3 ch31 脊柱⑫：UniProcExecutor 的三方法转发面——AsyncOutputFuture
+# v3 ch32 脊柱⑫：UniProcExecutor 的三方法转发面——AsyncOutputFuture
 # （L26-L42，只在 result() 才等 D2H 事件——重叠编排成立的前提之一）、
 # collective_rpc（L85-L106）、execute_model/sample_tokens/take_draft_token_ids
 # （L108-L137，EngineCore 两段式调用的真实受话端）。

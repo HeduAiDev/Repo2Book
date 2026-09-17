@@ -1,5 +1,5 @@
 # SOURCE: vllm/v1/worker/worker_base.py
-# v3 ch31 脊柱⑦：WorkerBase 的两方法契约（L142-L157，全硬件后端统一）——
+# v3 ch32 脊柱⑦：WorkerBase 的两方法契约（L142-L157，全硬件后端统一）——
 # execute_model 返回 None ⇒ 必须紧跟 sample_tokens；docstring 自注技术债
 # （L147-L149 'may be changed in future if/when structured outputs parallelism
 # is re-architected'——两段式 API 形态就是为结构化输出位掩码的并行而生的物证）。

@@ -1,4 +1,4 @@
-# ch31 主电池八：spec 草稿回传通道（m17）+ UniProc 转发面。
+# ch32 主电池八：spec 草稿回传通道（m17）+ UniProc 转发面。
 # 基准：vllm/v1/worker/gpu/spec_decode/utils.py:L11-L70 /
 # vllm/v1/executor/uniproc_executor.py:L26-L137。
 from __future__ import annotations
@@ -25,6 +25,11 @@ class TestDraftTokensHandler:
         h.set_draft_tokens(ib, drafts)
         assert h.draft_tokens_np is None  # 无语法约束 → 整批跳过回传
         assert h.num_draft_tokens == 3
+        # 门控跳过后 get_draft_tokens 仍须可答：[-1] 占位列表（真实 L49-L51
+        # 的 else 位——同时服务 async 关闭与门控跳过两条路径）
+        got = h.get_draft_tokens()
+        assert got.req_ids == ["r1"]
+        assert got.draft_token_ids == [[-1, -1, -1]]
 
     def test_d2h_roundtrip_with_structured_reqs(self):
         from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler

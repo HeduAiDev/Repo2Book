@@ -1,5 +1,5 @@
 # SOURCE: vllm/v1/worker/gpu/model_runner.py
-# v3 ch31 脊柱⑩：V2 runner 的 sample() 调用点（L1143-L1175——与 V1 同一落点
+# v3 ch32 脊柱⑩：V2 runner 的 sample() 调用点（L1143-L1175——与 V1 同一落点
 # 次序：hidden_states[logits_indices] 切片 → compute_logits →
 # grammar_output 非空先 structured_outputs_worker.apply_grammar_bitmask 原地改
 # logits → 才进 sampler/rejection_sampler 分派）。

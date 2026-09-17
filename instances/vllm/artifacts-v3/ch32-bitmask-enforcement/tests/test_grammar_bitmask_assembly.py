@@ -1,4 +1,4 @@
-# ch31 主电池一：StructuredOutputManager.grammar_bitmask 批装配
+# ch32 主电池一：StructuredOutputManager.grammar_bitmask 批装配
 # （vllm/v1/structured_output/__init__.py:L212-L359）的真实可观察行为。
 # 覆盖：预算分配（m04）/并行分支（m06）/串行 spec 窗口（m07）/整行 -1 语义
 # （m08）/裁剪与 .numpy() 出发（m09）/跨步复用残留清理。

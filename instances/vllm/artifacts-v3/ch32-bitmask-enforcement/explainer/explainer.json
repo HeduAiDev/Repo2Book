@@ -1,0 +1,584 @@
+{
+  "chapter_id": "ch32-bitmask-enforcement",
+  "chapter_title": "约束解码 II：bitmask 落地",
+  "pin": "vLLM v0.27.1 (6e448d0ea)",
+  "kind": "code",
+  "trace_environment": "12 个驱动脚本全部 host 运行（trace_source=run），脚本与原始输出在 explainer/traces/。host：Miniconda CPython 3.11.11、torch 2.11.0+cu128、NVIDIA RTX PRO 6000 Blackwell Workstation Edition（sm_120）、xgrammar 0.2.6、triton 3.7.1、gpt2 词表 50257（HF 本地缓存，无网络）。取证环境与 pin 的差异（writer 须就近挑明，exp-0718-1）：① tokenizer=gpt2(50257) 非 13 万级生产词表——128k 词表的 16KB/行账引 dossier theory[0]（源码公式 __init__.py:L232-L234），本仓实测行宽一律 1571 int32=6284B；② xgrammar 0.2.6 是 tvm-ffi 绑定（非 pybind11）——DLL 零 gil_scoped_release 符号、fill_next_token_bitmask 持有 GIL：m06 并行填充实测不回本（speedup 0.39x/0.61x、放大 40 倍仍 0.51x），源码并行分支的『行间独写=结构许可』真实成立、收益依赖后端释放 GIL 与单行成本，正文不得把并行写成已验证加速；③ grammar 对象按减法计划注入：XgrGrammar 是 pin backend_xgrammar.py XgrammarGrammar 的六方法复刻（编译侧归 ch31 已删），m07/m15/m17 的行内容/accept/rollback 全部来自真 GrammarMatcher；reasoner 是可编程替身（装配链按计划删除，m14/m15 消费的四方法本体逐字）；④ 计时全部为 host 单次运行中位数（次数与口径逐 trace 注明），只作数量级证据，正文不得引为生产毫秒数；⑤ m01/m02 的『GPU 前向窗口 50ms』为 spy 后台线程模拟（真实前向时长 host 未测；deepread engine-loop 卡口径『一步 forward 只有几十毫秒』），掩码填充时长为真 xgrammar 实测；⑥ spy executor/scheduler 只承载 EngineCore 消费面（schedule/execute_model/sample_tokens/take_draft_token_ids/update_from_output/update_draft_token_ids_in_output），被驱动的 step/step_with_batch_queue/_update_after_schedule 均为实现树真代码。",
+  "figure_policy": "本章 L0 缩放位置 = 采样列+bitmask（l0_zoom；L0 循环框 ③④ 拍）。全部 figure-spec 均可回答「它是 L0 哪一块的放大」：m01/m02/m16 = L0 循环框『③ 掩码装配/④ 采样』两拍跨进程时序的展开；m03/m10 = 采样列结构化输出组里『表跨进程→重排→对齐 logits』段的行算术展开；m06/m07 = 同组『批装配』两个分支（并行/串行 spec 窗口）的算法展开；m11 = 同组 worker 侧 H2D 落地段；m14 = 调度列与采样列之间思考门控的决策展开；m18 = 采样列双路径（V1/V2）的选择器决策表。架构性框图回指 L2 章图（cartography/l2-specs/ch32.json stations），机制图按 FIGURE-SYSTEM 正文插图规则存在、不另立架构画法。",
+  "mechanisms": [
+    {
+      "mechanism_id": "m01-two-stage-execute-window",
+      "figure_specs": [
+        {
+          "figure_id": "ch32-fig-two-act-state",
+          "template": "state-machine",
+          "l0_zoom": "L0 循环框②④两拍的 worker 侧展开——采样列『execute→sample』之间的一次状态寄存（gpu_model_runner.py 两幕；L2 章图站 10 的机制放大）。",
+          "claim": "execute_model 返回 None 不是失败而是契约：第一幕前向完成即把十元组暂存进单槽、谢幕，第二幕 sample_tokens 解包即清、先掩码后采样，配对错乱由双向 RuntimeError 防御。",
+          "numbers": [
+            {"value": "execute_model 返回 None；暂存态 10 个字段（scheduler_output/logits/spec×2/hidden_states/sample_hidden_states/aux/ec_connector/cudagraph_stats/slot_mappings）", "provenance": "traces/trace_m01_m02_window.json two_act_contract.act1（execute_model_returns=null / state_field_count=10 / state_fields）"},
+            {"value": "状态防御原文：State error: sample_tokens() must be called after execute_model() returns None.", "provenance": "traces/trace_m01_m02_window.json two_act_contract.act2.state_error_message（真 RuntimeError 捕获）"},
+            {"value": "第二幕次序 [apply, sample]；解包即清 state_cleared=true", "provenance": "traces/trace_m01_m02_window.json two_act_contract.act2.order / state_cleared_after_sample"},
+            {"value": "logits [1, 50257] CUDA 冻结在暂存态里被原位改写（4242 位 5.0 → -inf，8505 位 2.0 不变）", "provenance": "traces/trace_m01_m02_window.json two_act_contract.act1.logits_shape / act2.logit_off_grammar_after_mask"},
+            {"value": "契约出处：worker_base.py:L142-L157 docstring 原话 + L147-L149 技术债自注 may be changed", "provenance": "dossier embed_excerpts[1]（vllm/v1/worker/worker_base.py:L142-L157）"}
+          ],
+          "caption_draft": "两段式窗口的 worker 面：execute_model 干完前向不交付结果——把 logits 等十个字段打包进 execute_model_state 单槽、返回 None；EngineCore 见 None 才调 sample_tokens（第二幕）解包暂存态、先应用语法掩码再进采样器，解包即清槽。防御是双向的：上一幕的 sample_tokens 没来就再发车，worker 自己抛 State error。读 execute_model 签名看不到 logits 去了哪——答案在这个 NamedTuple 里（隐藏的隐式参数传递）。这套 API 形态的出生证明是 worker_base docstring 自注的技术债：为结构化输出位掩码的并行而生、结构化输出并行重构时可能改掉。",
+          "illustrator_notes": "state-machine 两节点两幕：节点一『execute_model 第一幕』（内嵌打包十元组→单槽的小图示，出口 return None），节点二『sample_tokens 第二幕』（解包即清→apply→_sample）；非法转移边（第一幕→第一幕）标 RuntimeError 原文；旁注 worker_base 契约 docstring 与技术债引文。数字全取 numbers.provenance；角色色 worker/GPU 侧恒 C_GPU_S 绿（图系角色色铁律）。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m02-bitmask-in-forward-shadow",
+      "figure_specs": [
+        {
+          "figure_id": "ch32-fig-forward-shadow",
+          "template": "swimlane",
+          "l0_zoom": "L0 循环框②③两拍的时序展开——调度列（CPU 算表）与 GPU 列（前向）的并行窗口（engine-loop 卡 why_chains[4] 的结构化输出具体化；L2 章图站 1 的机制放大）。",
+          "claim": "execute_model(non_block=True) 发车即返后，CPU 在 GPU 前向的执行窗口内完成整批掩码装配——future.result() 之前掩码活已干完，一步的等待里不含填表时间。",
+          "numbers": [
+            {"value": "时间线（ms）：dispatch 0.0 → 掩码装配 0.797 起、3.309ms 完成（4.106 止）→ future.result 51.138 → sample_tokens 51.138 → update_from_output 51.165", "provenance": "traces/trace_m01_m02_window.json step_timeline（64 行真 xgrammar 填充实测；前向窗口 50ms 为 spy 模拟，见 trace env.note）"},
+            {"value": "重叠验证 overlap_verified=true：掩码 4.106ms 返回时前向窗口（50ms）尚未结束", "provenance": "traces/trace_m01_m02_window.json step_timeline.bitmask_end_at_ms / overlap_verified"},
+            {"value": "行 0 允许集 [77, 88, 3919, 5948, 8505]（choice yes|no 位置 0 前缀闭包，64 行同构）", "provenance": "traces/trace_m01_m02_window.json step_timeline.bitmask_row0_allowed"},
+            {"value": "编排面锚：core.py:L596-L604 四行（发车→算表→result→sample_tokens）", "provenance": "dossier embed_excerpts[0]（vllm/v1/engine/core.py:L593-L614）"}
+          ],
+          "caption_draft": "CPU 活藏进 GPU 前向影子里：step() 在 L596 发车（non_block=True，立即返回 Future）之后、L602 future.result() 之前只有一段 CPU 空闲——L597 的 get_grammar_bitmask 就塞在这里。实测 64 行掩码装配 3.309ms，全程落在前向窗口内（前向时长为模拟 50ms，真实量级几十毫秒）；若串行排在采样前，这 3.309ms 就是每步白加的 CPU 时间——两段式 API 形变买的正是这段重叠。图注须注明前向窗口为模拟值、掩码时长为真 xgrammar 实测（取证环境差异条目⑤）。",
+          "illustrator_notes": "swimlane 双轨（UML 文法：生命线竖直、共享时间轴、消息水平直线）：左轨 CPU/EngineCore（dispatch→算表 3.309ms 活动条→等 result），右轨 GPU/worker（前向 50ms 活动条，标『模拟窗口』角标）；水平消息线：execute_model(non_block) t=0、sample_tokens t=51.138。掩码活动条填真实时长，前向活动条加虚线纹理示意模拟。时间轴 ms 刻度同源两轨。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m03-row-order-invariant",
+      "intuition": "快递单号随包裹走。掩码第 k 行属于 ids[k]——GrammarOutput 把单号列表（structured_output_request_ids）和包裹（掩码 ndarray）捆在一起过进程；到了 worker 仓库按自家货架号（批序）重新摆位。没有单号会怎样：包裹摆错货架就是把 A 的约束戴到 B 的 logits 头上——而且不报任何错。",
+      "worked_example": {
+        "params": {
+          "调度序（掩码行序）": "[A, B]：A 无草稿占 1 行、B 带 3 草稿占 4 行（3 spec+bonus）= 5 行",
+          "worker 批序": "[B, A]（≠调度序——两侧批序被允许不一致的前提正是行序随行同传）",
+          "玩具词表": "V=64（2 int32/行），行 i 只允许 token i*3（行 0..4 → token 0,3,6,9,12）——每行一个可分辨指纹",
+          "真路径": "真 utils.apply_grammar_bitmask + 真 xgr.apply_token_bitmask_inplace（CUDA）"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/trace_m03_m10_reorder.json",
+        "table": {
+          "columns": ["时刻", "动作", "关键量", "判定", "结果"],
+          "rows": [
+            ["出发（调度侧）", "grammar_bitmask 装配", "紧凑掩码 5 行：行 0=A、行 1..4=B；ids=[A,B] 随掩码同传", "行序=调度序（num_scheduled_tokens 迭代序）", "GrammarOutput(ids=[A,B], ndarray 5×2 int32)"],
+            ["到达（worker 侧）", "批序走表算 logit_index", "B：batch_index 0、offset 0 → logit_index 0；A：batch_index 1、offset 3 → logit_index 4", "批序≠调度序是常态", "B 的 4 行 logits=0..3、A 的 1 行 logits=4"],
+            ["重排", "按 ids 序展开进 sorted_bitmask", "A 的掩码行 0 → sorted 行 4；B 的行 1..4 → sorted 行 0..3（post-apply 实测逐行核验）", "掩码行数 5 == logits 行数 5", "skip 快路径：xgr 调用 indices=None 免传"],
+            ["对照（部分覆盖）", "批里混入非语法请求 C", "worker 批序 [B,C,A]、logits 6 行、掩码 5 行；C 所在行 4 保持 -1 全允许", "行数对不上账", "indices=[5,0,1,2,3] 显式传（async_tensor_h2d spy 实录）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "掩码第 k 行属于 structured_output_request_ids[k]；经 worker 重排后，每个受约束请求的约束恰好落在它自己的 1+num_spec 个连续 logits 行上。",
+        "argument": "归属由 req_id 键控：worker 侧 struct_out_req_batch_indices 是 req_id→logit_index 的字典，批序漂移只改变展开位置、不改变归属。对账有机器可查形态：调度侧 Σ(1+spec_i)=cumulative_index=掩码行数；worker 侧 V1 的 skip_out_indices 判定（len(out_indices)==logits.shape[0]）与 V2 的 assert num_masks==len(mapping) 是同一不变式的两种检查（本例实测：全覆盖 5==5 走 skip、部分覆盖 5<6 必传 indices）。反例论证错位为何静默：若无 ids 随行同传、按批序直填，行 0（A 的约束）会加到批序 0（B 的第一个采样位）头上——xgr 只管逐行写 -inf，无从知道行主是谁。"
+      },
+      "quantified": "本例 5 行掩码对 5 行 logits，重排把 A 的约束从调度序位置（行 0）正确移到 worker 批序位置（行 4）；错位不重排的后果可在 64 位玩具词表上逐 token 人工复核（每行只 1 个允许位）。生产 vocab=152064 时一行 4752 个 int32（dossier theory[0]）——错一行=18.6KiB 的约束整行戴错请求。",
+      "figure_specs": [
+        {
+          "figure_id": "ch32-fig-row-order",
+          "template": "tensor-flow",
+          "l0_zoom": "采样列结构化输出组『表跨进程』段的展开——GrammarOutput 从调度列过 ZMQ/IPC 到采样列 worker 侧重排（L2 站 2→12 的行算术放大）。",
+          "claim": "一张 5 行紧凑掩码（调度序 A,B）过进程后按 worker 批序（B,A）+spec 偏移重排成 sorted_bitmask：A 的行 0 落到 logits 行 4、B 的行 1..4 落到行 0..3——行序权威是随掩码同传的 ids 列表。",
+          "numbers": [
+            {"value": "紧凑掩码 5 行（A 1 行 + B 4 行）→ sorted 5 行；out_indices=[5,0,1,2,3]（部分覆盖场景 async_tensor_h2d 实录）", "provenance": "traces/trace_m03_m10_reorder.json scene2_partial_coverage.xgr_call_indices / async_tensor_h2d_recorded"},
+            {"value": "批序走表：B(bi 0, offset 0)→logit_index 0；A(bi 1, offset 3)→logit_index 4", "provenance": "traces/trace_m03_m10_reorder.json scene1_full_coverage.batch_walk"},
+            {"value": "全覆盖 5==5 → skip 快路径 indices=None；非语法行（C）保持 -1 全允许（实测 row 4 full_allow=true）", "provenance": "traces/trace_m03_m10_reorder.json scene1_full_coverage.xgr_call.indices_is_none / scene2_partial_coverage.non_grammar_row_C_full_allow"},
+            {"value": "行序权威载体：GrammarOutput(structured_output_request_ids, grammar_bitmask)（output.py:L286-L291 逐字）", "provenance": "dossier embed_excerpts[7]（vllm/v1/core/sched/output.py:L286-L291）"}
+          ],
+          "caption_draft": "错行防御的主体是这张重排图：调度器按自己的迭代序装配紧凑掩码（只含结构化请求的行），worker 批序几乎注定不同——掩码行 0 属于谁？答案随包裹走：ids 列表与掩码同传。worker 逐自己批序累计 spec 偏移算出每请求的 logit_index 起点再按 ids 序展开。行数恰好对满 logits 时走 skip 快路径（免传 indices 张量）；差一行都得传。错位不重排的后果：约束加到别人 logits 上且无任何报错——静默出错正是必须显式传 ids 的原因。",
+          "illustrator_notes": "tensor-flow 三段：左『调度侧紧凑掩码』5 个行块（标 A / B×4，各画允许 token 指纹 0,3,6,9,12）；中『跨进程』 GrammarOutput 双件套（ids 列表+ndarray）；右『worker sorted_bitmask』6 行（含 C 的 -1 全允许行）——连线按重排映射（A 行 0→行 4 等），out_indices=[5,0,1,2,3] 标注在展开箭头上。数字全取 numbers.provenance。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m04-bitmask-budget",
+      "intuition": "停车场按最大车位一次画线。掩码缓冲按 max_num_seqs*(1+num_spec) 行一次性画好、跨步复用——每步只用前缀、用几行裁几行再出发；画线的尺寸公式把投机与 diffusion 画布都盖住了（num_speculative_tokens 是 property）。",
+      "worked_example": {
+        "params": {
+          "配置": "max_num_seqs=8、num_speculative_tokens=3（grammar 'root ::= \"a\" \"b\" \"c\"，真 xgrammar backend）",
+          "对比": "同配置连装两步——观察分配次数与裁剪行数"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/trace_m07_m08_serial_window.json",
+        "table": {
+          "columns": ["步", "动作", "关键量", "判定", "结果"],
+          "rows": [
+            ["首次装配", "allocate_token_bitmask", "8 × (1+3) = 32 行 × 1571 int32（50257 词表）", "首次惰性分配", "backend.alloc_calls=[32]，只此一次"],
+            ["第二步（复用）", "同一缓冲再装", "本步行数 = 1 请求 × (3 草稿 + 1 bonus) = 4 行", "不重新分配", "alloc_calls 仍 [32]；返回裁剪到 4 行（只传活跃前缀）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "缓冲行数 max_num_seqs*(1+num_spec) 恒 ≥ 任意一步的 Σ(1+spec_i)：装填永不越界、跨步复用无需重分配。",
+        "argument": "上界论证：调度器给单请求排的草稿位 ≤ num_spec（超过 num_spec 的草稿根本不会被排进 scheduled_spec_decode_tokens），且进账本的请求数 ≤ max_num_seqs（批上限）；两上界相乘即预算。基例是首次装配前的惰性分配，之后每步行数都在预算内（trace 两步实测 alloc_calls 长度不变）。"
+      },
+      "quantified": "本例 32 行 × 1571 int32 × 4B = 201088B 常驻调度器进程；每步实际出发的只有活跃前缀 4 行（10064B）——裁剪让 IPC 字节数跟随实际批形而非最大预算。v0.27 的 num_speculative_tokens 是 property（config/vllm.py:L564-L575）：diffusion 的 canvas_length 也走同一预算公式（注释原话：每个 speculative position 一行、再加 bonus/非投机一行）。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m05-schedule-gate",
+      "intuition": "只给本步要发言的人发话筒。prefill 还没算完的请求这一步根本没有采样位——不产 logits 的请求占一行掩码，既白填一张 18KB 的表，也把『掩码行数=logits 行数』的账对不上。门控在调度记账时就把它挡在账本外。",
+      "worked_example": {
+        "params": {
+          "批": "P（结构化输出、100-token prompt 的 chunked prefill，每步排 32）＋ A（结构化输出 decode）＋ N（无结构化输出 decode）",
+          "真路径": "真 Scheduler._update_after_schedule 置位 + 真 get_grammar_bitmask 行序账本（num_scheduled_tokens 迭代序 {P,A,N}）"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/trace_m05_gate.json",
+        "table": {
+          "columns": ["步", "num_scheduled_tokens", "P 的状态", "门控判定", "掩码账本"],
+          "rows": [
+            ["步 1", "P:32 A:1 N:1", "P 已算 32 < 100 → is_prefill_chunk=True", "has_structured_output_requests 由 A 置位 True；P 被排除、N 因 use_structured_output=False 永不进", "ids=[A]，1 行"],
+            ["步 2", "P:32 A:1 N:1", "P 已算 64 < 100 → 仍是中段 chunk", "P 仍被排除（判定先于加账、每步重判）", "ids=[A]，1 行"],
+            ["步 3", "P:36 A:1 N:1", "P 算满 100 → is_prefill_chunk=False", "P 首次进账本；行序=迭代序（P 先排 → P 行 0）", "ids=[P,A]，2 行"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "进掩码账本的请求 ⇔（本步产 logits）∧ use_structured_output——掩码行数与受约束的 logits 行数恒对账。",
+        "argument": "两个方向：prefill chunk 的 num_scheduled_tokens 全是 prompt token、无采样位（num_computed < num_tokens+placeholders 的定义），排除它才使 ids ⊆ 有采样位的请求；反向，decode 中的结构化请求每步恰有 1+spec 个采样位、恰占 1+spec 行。对账的机器可查形态就是 m03 的 skip_out_indices 判定与 V2 assert——若把 P 记进来，行数凭空多出、skip 判定失效。门控是 or 累计（has_structured_output_requests |= ...），单个结构化请求即可点亮整批。"
+      },
+      "quantified": "3 请求批里账本 1→1→2 行随 P 的 prefill 完成而扩张；若不排除 P，步 1 就会多填 1 行掩码、裁剪行数与 logits 行数失配。对照：批内全部无结构化输出时 has_structured_output_requests 恒 False，get_grammar_bitmask 在入口快返 None——manager 完全不被触碰（trace contrast_all_plain）。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m06-parallel-fill",
+      "intuition": "阅卷分工。129 份卷子互不批注（每行只写自己的行区间）——这是『能并行』的全部理由：16 份一摞、最多 8 位阅卷员。但发卷收卷本身有成本：卷子太少或批改太快时，一个人全改完反而更快。",
+      "worked_example": {
+        "params": {
+          "结构场景": "129 个请求（>128 且无 spec）走真线程池；每个 FakeGrammar 行 i 只允许 token i%64（行内容逐行核验）",
+          "计时场景": "256 个真 xgrammar matcher × 50257 词表，串行 vs 线程池（16 行/任务、8 workers）；另做 40 倍放大对照判 GIL 行为"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/trace_m06_parallel.json",
+        "table": {
+          "columns": ["段", "配置", "观测", "判定", "结果"],
+          "rows": [
+            ["结构", "129 请求 > 128 且无 spec", "任务切分 9 份 = 8 满批×16 行 + 1 尾批 1 行；行 i 允许 i%64 逐行核验全对", "行间各写各行、无共享可变状态", "129 行全部正确；workers=max(1,min(cpu//2,8)) 本机=8"],
+            ["边界", "恰 128 / max_num_seqs≤128", "128 请求不触线程池（走串行）；max_num_seqs=128 不建池、129 才建", "结构性前提：阈值是 max_num_seqs 不是本步批", "小部署该分支是死代码"],
+            ["计时·轻语法", "256 行 × 50257 词表（yes|no）", "串行 0.824ms vs 并行 2.138ms（speedup 0.39）", "整批不足 1ms：线程池提交/收割开销反超", "单行仅 3.22µs——回本需单行成本×行数够大"],
+            ["计时·GIL 判定", "同批放大 40 倍工作量", "串行 34.656ms vs 并行 67.964ms（speedup 0.51）；DLL 零 gil_scoped_release 符号", "本机 xgrammar 0.2.6（tvm-ffi 绑定）持有 GIL", "并行分支收益依赖后端释放 GIL——取证环境实测未回本（writer 须挑明）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "并行填行的正确性边界=行区间划分：每个任务写 [16i, 16i+16) 的不相交行区间，无锁线程安全。",
+        "argument": "区间两两不相交（划分直接给出）；唯一共享对象 _grammar_bitmask 是行主序连续张量、不同行在内存上不相交，torch 行写无跨行伪共享语义——正确性不需要锁。但『线程安全』≠『有真并行』：GIL 是否释放由后端实现决定（本机 0.2.6 的 tvm-ffi 绑定持有 GIL——DLL 符号扫描 0 命中 + 40 倍放大仍 0.51x 双证），所以源码分支的存在理由只能说『结构许可』，不能说『实测加速』。"
+      },
+      "quantified": "129=8×16+1：8 摞满批加 1 摞尾批；阈值 128 是『本步请求数 >128 且无 spec』才进并行，而池的建造前提是『max_num_seqs>128』——两个 128 含义不同（一步的批 vs 部署上限）。串行分支独占 spec 场景的原因是跨行顺序依赖：同 grammar 的推进/回滚必须按草稿序（m07）。",
+      "figure_specs": [
+        {
+          "figure_id": "ch32-fig-parallel-fill",
+          "template": "tiling",
+          "l0_zoom": "采样列结构化输出组『批装配』段的并行分支展开（L2 站 3→4 之间的算法放大；串行分支归 m07 图）。",
+          "claim": "129 行按 16 行一任务切成 8 摞满批+1 摞尾批、提交最多 8 线程的专用池——行间各写各行是可并行的全部结构性理由，阈值 128 与建池前提 max_num_seqs>128 是两个不同的 128。",
+          "numbers": [
+            {"value": "129 请求 → 9 任务（8×16 + 1 尾批），129 行逐行核验全对", "provenance": "traces/trace_m06_parallel.json structure.task_sizes / task_row_ranges / row_content_verified"},
+            {"value": "恰 128 请求不触池（串行）；max_num_seqs=128 不建池、129 建池", "provenance": "traces/trace_m06_parallel.json boundaries"},
+            {"value": "计时（本机）：串行 0.824ms vs 并行 2.138ms（GIL 持有，tvm-ffi DLL 零释放符号）——并行未回本，须按取证环境挑明", "provenance": "traces/trace_m06_parallel.json timing_real_xgrammar / gil_probe.binary_evidence"},
+            {"value": "workers=max(1, min(cpu//2, 8))，本机 8；构造锚 __init__.py:L60-L68", "provenance": "traces/trace_m06_parallel.json structure.pool_workers_on_host；dossier embed_excerpts[8]（vllm/v1/structured_output/__init__.py:L57-L68）"}
+          ],
+          "caption_draft": "并行填行的任务几何：每请求恰一行（无 spec 时），16 行一摞提交给 executor_for_fillmask（与编译线程池是两个池）；行区间互不相交=无锁可并行。但要诚实：本机实测（xgrammar 0.2.6 tvm-ffi 绑定持有 GIL）填 256 行串行只要 0.824ms、并行反而 2.138ms——并行的存在理由是结构许可（行间独写），实际收益取决于后端是否释放 GIL 与单行成本。图注建议以『为什么允许并行/什么时候才值得』双问收尾。",
+          "illustrator_notes": "tiling：129 个小行块排成长条（行 i 染不同色阶），按 16 行分组框出 9 个任务框（8 满+1 尾），右侧 8 个线程槽框用箭头接任务框；旁挂两个小注：『128 的两义』（批阈值 vs 建池前提）与计时数字（含未回本警示）。数字全取 numbers.provenance。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m07-serial-fill-spec-window",
+      "intuition": "棋谱推演。填第 j 行前先在心里替对方把前 j-1 步走完（accept_tokens 试探推进），看清第 j 步的合法着法，再把棋子全部收回（rollback）——真走棋只发生在赛后（update_from_output 的 accept_tokens）。-1 哨兵是『这步没走』的占位：当行按旧旗填、当行即停、后面的行全放行。",
+      "worked_example": {
+        "params": {
+          "语法": "root ::= \"a\" \"b\" \"c\"（真 xgrammar matcher；gpt2：a=64 b=65 c=66 EOS=50256；a 系 token=[64,397,39305]、b 系=[65,15630]）",
+          "窗口": "3 个草稿位 + 1 个 bonus 位（num_spec=3）；对照窗口把草稿 2 换成 -1 哨兵"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/trace_m07_m08_serial_window.json",
+        "table": {
+          "columns": ["行", "草稿位", "apply_bitmask", "advance_grammar", "行内容（允许集，实测）"],
+          "rows": [
+            ["行 0", "a（草稿 1）", "True", "True（试探接受 a）", "a 系 [64, 397, 39305]"],
+            ["行 1", "b（草稿 2）", "True", "True（试探接受 b）", "b 系 [65, 15630]"],
+            ["行 2", "c（草稿 3）", "True", "True（试探接受 c）", "[66]（只收精确 c——串已到尾，c 开头的多字 token 会越界）"],
+            ["行 3（bonus）", "（采样位、无草稿）", "True", "—（bonus 行不推进）", "[50256]（EOS）"],
+            ["窗口收尾", "rollback(3)", "—", "3 次试探全部撤销", "复检：再填一行回到 a 系 [64, 397, 39305]（FSM 复位实证）"],
+            ["哨兵对照·行 1", "-1（草稿被过滤的补齐位）", "True（按旧标志填）", "False（当行即停）", "[65, 15630]（a 之后的状态——填行发生在翻转之前）"],
+            ["哨兵对照·行 2", "c", "False（自次行起放行）", "False", "整行 -1（全允许）"],
+            ["哨兵收尾", "rollback(1)", "—", "只回退接受的 a", "accepts=[[64]]、rollbacks=[1]"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "第 j 行掩码 = FSM 在『已接受 d_1..d_{j-1}』状态下的合法集；整个窗口填完后 FSM 精确回到本步开始状态。",
+        "argument": "单调量 state_advancements：每次成功试探 +1；窗口末尾 rollback(state_advancements) 回退恰相同步数（trace 实测 accepts=[[64],[65],[66]] 后 rollbacks=[3]，且复检再填回到行 0 允许集=a 系——复位不是断言而是行为实测）。真推进的唯一写者是下一步 update_from_output 的 accept_tokens（m14 场景验证拒绝即 FINISHED_ERROR），试探与真走严格分离。哨兵行的时序保证：填行（旧标志）发生在 token==-1 的标志翻转之前——L206 填、L208-L210 翻，次行起才放行。"
+      },
+      "quantified": "合法窗口 3 草稿+bonus=4 行、试探 3 次、回退 3 次；哨兵窗口同为 4 行但试探只 1 次、回退 1 次。非法草稿（绕过 validate 直塞 999）当场 AssertionError((999, 'r1', ...))——语义断言守护的是『进窗口的草稿必已过滤』（m17 兜底），只有 post_reasoning_end 场景容忍拒绝（m15）。",
+      "figure_specs": [
+        {
+          "figure_id": "ch32-fig-spec-window",
+          "template": "state-table",
+          "l0_zoom": "采样列结构化输出组『批装配』段串行分支的 spec 窗口展开（L2 站 5-7 的算法放大——本章算法主体的逐行走表）。",
+          "claim": "spec 窗口的每行都是『先试探接受前序草稿、再取当前状态的合法集』：a/b/c 窗口 4 行允许集逐行演化（a 系→b 系→精确 c→EOS），填完 rollback 复位——真推进只留给 update_from_output。",
+          "numbers": [
+            {"value": "行 0..3 允许集实测：a 系 [64,397,39305] → b 系 [65,15630] → [66] → [50256]（EOS）", "provenance": "traces/trace_m07_m08_serial_window.json scene1_valid_drafts.rows"},
+            {"value": "试探/复位账：accepts=[[64],[65],[66]]、rollbacks=[3]；复检再填回到 a 系（FSM 复位）", "provenance": "traces/trace_m07_m08_serial_window.json scene1_valid_drafts.accept_ledger / rollback_ledger / post_rollback_refill_allowed"},
+            {"value": "-1 哨兵窗口：行 1 按旧标志填 [65,15630]、行 2 整行 -1、bonus 行 [65,15630]；accepts=[[64]]、rollbacks=[1]", "provenance": "traces/trace_m07_m08_serial_window.json scene2_sentinel"},
+            {"value": "非法草稿断言原文 AssertionError((999, 'r1', {'r1': [999]}))", "provenance": "traces/trace_m07_m08_serial_window.json scene3_invalid_draft.assertion_error"},
+            {"value": "diffusion 对照：有草稿位时无 bonus 行（mask_rows 2 < 常规 3）", "provenance": "traces/trace_m07_m08_serial_window.json scene4_diffusion"}
+          ],
+          "caption_draft": "本章算法主体的逐行走表：草稿窗口里每一行回答『接受前序草稿后这一位哪些 token 合法』——行 0 允许 a 开头的一切 token（含多字的 a 系）、行 1 只允许 b 系、行 2 只允许精确 c（c 开头的多字 token 会越过串尾）、bonus 行只留 EOS。填表用的推进全是试探：accept 三次、rollback 一次回退三步，FSM 回到本步开始处；真推进只发生在下一步 update_from_output。-1 哨兵行的三层语义（旧标志填/当行即停/次行放行）与 diffusion 无 bonus 行的变体同表可见。",
+          "illustrator_notes": "state-table：行=窗口 4+2 列（草稿 token / apply_bitmask / advance_grammar / 允许集指纹（小位条图示）/ 试探后 FSM 状态）；窗口底部 rollback 弧线从状态 3 拉回状态 0；旁挂哨兵窗口小表与断言原文小框。允许集用位条可视化（64 位里亮的位）。数字全取 numbers.provenance。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m08-full-row-allow-all",
+      "intuition": "白名单的反面不是黑名单，是『全绿』。整行填 -1（int32 补码=32 位全 1）不是全禁而是全允许——思考段、终态、非语法行都靠它放行；复用缓冲里上一步残留的位表才是隐形杀手：不清零，上一拍的禁位会误杀本拍的合法 token。",
+      "worked_example": {
+        "params": {
+          "两步走": "步 1 请求受约束（无 reasoner）→ 行 0 写位表（a 系 3 位=1）；步 2 注入 reasoner 且思考未结束 → 同一行必须显式 fill_(-1) 重置",
+          "真语法": "root ::= \"a\" \"b\" \"c\"，行 0 位表允许集 [64, 397, 39305]"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/trace_m07_m08_serial_window.json",
+        "table": {
+          "columns": ["步", "请求状态", "动作", "行 0 实测", "含义"],
+          "rows": [
+            ["步 1", "受约束（无 reasoner）", "grammar.fill_bitmask 写位表", "允许集 [64, 397, 39305]", "位表已写入跨步复用缓冲——这就是残留源"],
+            ["步 2", "思考未结束（should_fill_bitmask=False）", "整行 fill_(_full_mask=-1)", "整行 -1；首个 int32 的位串 32 个 1", "放行是正确性必需：若不重置，残留行只允许 a 系（反事实实测 [64, 397, 39305]），其余全被误打成 -inf"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "每一行每一拍都被显式写入（fill_bitmask 写合法表，或 fill_(-1) 全允许）——复用缓冲不存在『沿用上一拍』的行。",
+        "argument": "_fill_bitmasks 的 if/else 恰有一支执行且整行覆盖：写位表支整行先写后置位（matcher 语义）、else 支整行 fill_(-1)——两支都不留旧行残位。-1 的位语义推导链：_full_mask=-1 ⇒ 补码 32 位全 1 ⇒ bit=1=允许 ⇒ 全允许（实测位串 32 个 1）；V2 kernel 的谓词 (bit&1)==0→-inf 与 xgr.apply_token_bitmask_inplace 同语义（m19 交叉核验）。若 else 支缺失，步 2 的行 0 仍是步 1 的位表——trace 反事实验证：残留行允许集只有 [64, 397, 39305]。"
+      },
+      "quantified": "-1 的补码 0xFFFFFFFF=32 位全 1；步 2 若沿用残留，50257 词表里只放行 3 个 token、其余全误禁。is_terminated 的请求同样走整行放行（终态无『下一步合法集』可言）。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m09-ndarray-serialization",
+      "intuition": "出关走简易通道。ndarray 过进程边界是『裸 buffer+一次 frombuffer 重建』；tensor 要整个海关仓库——重建 storage 对象。这张表每步过一次境，通道差一个量级就是吞吐差。",
+      "worked_example": {
+        "params": {
+          "载荷": "同一张表 [5, 1571] int32（5 行生产行宽），pickle.dumps/loads 往返计时与字节数",
+          "对照": "ndarray vs torch.Tensor 同数据"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/trace_m03_m10_reorder.json",
+        "table": {
+          "columns": ["度量", "ndarray", "tensor", "判读"],
+          "rows": [
+            ["pickle 字节数", "31573", "31820", "几乎相同（同为裸 buffer）——差异不在体积"],
+            ["往返时长（dumps+loads 取中位）", "22.2µs", "216.8µs", "9.8 倍：tensor 反序列化要重建 storage 对象——注释『serialization and deserialization』的主要差异项"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "GrammarOutput.grammar_bitmask 恒为 np.int32 ndarray、行序权威 ids 随行同传——掩码跨进程载荷的类型契约两端钉死。",
+        "argument": "出发端 .numpy()（__init__.py:L356-L359 注释原话：ndarray 序列化/反序列化高效得多）钉死类型；接收端 utils.py:L100-L102 注释同款口径（『Serialization of np.ndarray is much more efficient』）。实测把『高效得多』落到可比较的数：字节数持平（1.01 倍）、往返时长 9.8 倍——差异全部来自反序列化路径。"
+      },
+      "quantified": "5 行小表往返 22.2µs vs 216.8µs（9.8x）；掩码行数=每步 IPC 字节数的物理上限来源——生产批 256 行×1571 int32≈1.53MiB/步（trace h2d_timing.payload_mib 同源数据）。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m10-worker-reorder",
+      "intuition": "相邻座位号重排。调度序发的表、worker 按自家座位表收；spec 草稿像占座外套——一个请求每带一个草稿，就把批里坐在它后面的所有人往后顶一位（cumulative_offset）。",
+      "worked_example": {
+        "params": {
+          "场景": "worker 批序 [B, C, A]（B 带 3 草稿、C 非语法、A 无草稿）；调度序掩码 ids=[A, B] 共 5 行",
+          "走表": "逐 worker 批序位算 logit_index=batch_index+cumulative_offset（真 utils.apply_grammar_bitmask 的重排循环）"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/trace_m03_m10_reorder.json",
+        "table": {
+          "columns": ["批序位", "请求", "batch_index", "offset_before", "num_spec", "logit_index", "掩码行展开"],
+          "rows": [
+            ["0", "B", "0", "0", "3", "0", "B 的 4 行（3 spec+bonus）→ logits 行 0..3"],
+            ["1", "C（非语法）", "1", "3", "0", "4", "无行；sorted 行 4 保持初始 -1（全允许，实测未被动过）"],
+            ["2", "A", "2", "3", "0", "5", "A 的 1 行 → logits 行 5"],
+            ["收拢", "按 ids 序 [A,B] 追加", "—", "—", "—", "—", "out_indices=[5,0,1,2,3]（async_tensor_h2d spy 实录；5<6 → indices 必传）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "logit_index = batch_index + cumulative_offset，且 cumulative_offset 随批序遍历单调不减——每个受约束请求的 1+num_spec 行恰连续落在 [logit_index, logit_index+num_spec]，互不重叠。",
+        "argument": "归纳：遍历批序时 offset 只加不减（加上已遍历请求的 spec 数）；请求 r 的行区间起点=其在批序前的全部 spec 数之和+自身批位（恰是前缀和结构），区间长度=1+num_spec——前缀和区间天然两两不相交，故 sorted_bitmask 每行恰被写一次、无竞写。非语法请求占位不占行（不进 ids），其行保持初始 -1。"
+      },
+      "quantified": "本例 3 spec 使 A 的行从批序直觉位 1 顶到 5；k 个草稿最多把后面请求顶 k 位。行数相等（5==5）时 skip 免传 indices；差一行（5<6）就得传——indices 张量是快路径与慢路径的唯一分界（trace 两场景对照实录）。",
+      "figure_specs": [
+        {
+          "figure_id": "ch32-fig-reorder-walk",
+          "template": "state-table",
+          "l0_zoom": "采样列结构化输出组 worker 侧『重排』段的行算术展开（L2 站 12 的算法放大——logit_index 前缀和走表）。",
+          "claim": "worker 逐自己批序累计 spec 偏移算 logit_index：B(0+0)=0 占 4 行、C(1+3)=4 不占行、A(2+3)=5——前缀和区间两两不相交，重排每行恰写一次。",
+          "numbers": [
+            {"value": "批序走表：B[bi0,off0,spec3,li0] / C[bi1,off3,spec0,li4] / A[bi2,off3,spec0,li5]", "provenance": "traces/trace_m03_m10_reorder.json scene2_partial_coverage.batch_walk"},
+            {"value": "out_indices=[5,0,1,2,3]（ids 序 A 先追加）；indices 张量 int32 必传（5 行掩码 < 6 行 logits）", "provenance": "traces/trace_m03_m10_reorder.json scene2_partial_coverage.xgr_call_indices / async_tensor_h2d_recorded"},
+            {"value": "非语法行 C 实测 full_allow=true（保持初始 -1 全允许、未被触碰）", "provenance": "traces/trace_m03_m10_reorder.json scene2_partial_coverage.non_grammar_row_C_full_allow"},
+            {"value": "全覆盖对照 5==5 → indices=None 免传（skip 快路径）", "provenance": "traces/trace_m03_m10_reorder.json scene1_full_coverage.xgr_call.indices_is_none"}
+          ],
+          "caption_draft": "重排的行算术走表：spec 草稿像占座外套——B 的 3 个草稿把后面所有人顶后 3 位，A 因此从批序直觉位 1 落到 logit_index 5。掩码按 ids 序（调度序）展开进 sorted_bitmask 的连续行区间，前缀和保证区间不相交、无竞写；非语法请求（C）占 logits 位不占掩码行，行保持 -1 全允许。行数恰对满时免传 indices（快路径），差一行都得传。",
+          "illustrator_notes": "state-table 走表：行=批序位（含收拢行），列=batch_index/offset_before/num_spec/logit_index/展开去向；每行右端小位图示 sorted_bitmask 落位（B 四格、C 灰格、A 一格）；out_indices 箭头标 [5,0,1,2,3]。数字全取 numbers.provenance。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m11-h2d-apply-chain",
+      "figure_specs": [
+        {
+          "figure_id": "ch32-fig-h2d-chain",
+          "template": "flow",
+          "l0_zoom": "采样列结构化输出组 worker 侧『H2D 落地』段展开（L2 站 13 的机制放大——本章 payoff 函数的搬运链）。",
+          "claim": "sorted_bitmask 先在 CPU 上以 pinned 内存成型，再 non_blocking 异步 DMA 上卡，xgr.apply_token_bitmask_inplace 原地把 bit=0 的 logits 写 -inf；indices 需要时自己经 async_tensor_h2d 搬（免 xgrammar 内 cpu sync）。",
+          "numbers": [
+            {"value": "批 256 取证载荷 [256, 1571] int32（1.534MiB，行数取生产批形、列数取本仓词表）pinned H2D 中位 78.1µs vs pageable 132.2µs（1.69 倍）", "provenance": "traces/trace_m03_m10_reorder.json h2d_timing（host 实测中位，数量级证据）"},
+            {"value": "skip 快路径实测：行数对满时 async_tensor_h2d 未被调用（indices=None 直进 xgr）", "provenance": "traces/trace_m03_m10_reorder.json scene1_full_coverage.async_tensor_h2d_called=false"},
+            {"value": "部分覆盖实测：out_indices=[5,0,1,2,3] 经 async_tensor_h2d 以 int32 张量上卡", "provenance": "traces/trace_m03_m10_reorder.json scene2_partial_coverage.async_tensor_h2d_recorded"},
+            {"value": "链路锚：utils.py:L143-L161（pinned .to(non_blocking) → async_tensor_h2d → apply_token_bitmask_inplace）+ torch_utils.py:L573-L588 搬运工", "provenance": "dossier embed_excerpts[17]（vllm/v1/structured_output/utils.py:L143-L175）"}
+          ],
+          "caption_draft": "payoff 函数的搬运链：重排产物 sorted_bitmask 生来 pinned（torch.full(pin_memory=PIN_MEMORY)），.to(device, non_blocking=True) 走异步 DMA——同载荷 pinned 比 pageable 快 1.69 倍（host 实测 78.1µs vs 132.2µs）。indices 的处理是本链的巧劲：xgrammar 名义要 python list，但实际吃 tensor——自己搬就能 non_blocking 且 xgrammar 内无 cpu sync。最终 xgr.apply_token_bitmask_inplace 原地写 -inf：bit=0 的 token 概率归零。",
+          "illustrator_notes": "flow 四站横排：sorted_bitmask（pinned CPU，标 PIN_MEMORY 派生链）→ PCIe/DMA 异步箭头（标 78.1µs/1.534MiB）→ GPU bitmask 张量 → xgr kernel 块（bit=0→-inf）；下挂支线：out_indices → async_tensor_h2d → int32 张量（skip 路径标『免传』）。数字全取 numbers.provenance。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m12-inf-orthogonality",
+      "intuition": "门卫改分数、不改规则。掩码在采样器进场之前把非法座位的分数改成负无穷——softmax 眼里它的概率精确为零：温度调多高、top-k 截多狠都救不回来，采样器一行代码不用改。",
+      "worked_example": {
+        "params": {
+          "语法": "root ::= \"yes\" | \"no\"（位置 0 允许集 [77, 88, 3919, 5948, 8505]）",
+          "logits": "手工构造：4242('####')=5.0 最高、8505('yes')=2.0、3919('no')=1.0、其余 -10——自由采样必踩非法位",
+          "落地": "真 xgr.apply_token_bitmask_inplace（CUDA kernel）"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/trace_m12_inf.json",
+        "table": {
+          "columns": ["阶段", "动作", "关键量（实测）", "判定", "结果"],
+          "rows": [
+            ["掩码前", "argmax(logits)", "4242 位 5.0 最高、8505 位 2.0", "自由 argmax", "选中 4242（语法外 token 当选）"],
+            ["掩码后", "apply_token_bitmask_inplace", "4242 位变 -inf；softmax 后概率 0.0（T=1.0 / 0.5 / 0.01 / 10.0 四档全部 0.0）", "非法位概率精确归零（位级）", "argmax 翻到 8505；top-3=[8505, 3919, 77]"],
+            ["有限负值对照", "同样三行 logit [5.0, 2.0, -100.0]", "T=1.0 时 -100 位概率 0.0（exp 下溢侥幸）；T=10.0 时残留 1.5817857274669223e-05 非零", "高温撕开有限掩码", "-inf 在任何温度下都精确 0.0——『必须是 -inf』的数值答案"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "掩码位概率恒为精确 0.0：对任意正温度与任意 top-k/top-p 组合，被 -inf 的 token 不可能被采中——掩码与 ch30 九步采样变换完全正交。",
+        "argument": "IEEE754 位级论证：exp(-inf)=0 且 -inf/T=-inf（T 有限正）、0×任何有限值=0——softmax 各步保持 0 权重，无需归纳、单点恒等即得全链正交；argmax 取不到 -inf 位同理。有限负值没有此性质：-100 在 T=10 下概率 1.58e-05（实测非零）——保护随温度变宽而失效，这就是必须写 -inf 而不是『一个很大的负数』。写入次序的隐式契约：掩码最先写（sample_tokens 里 apply 在 _sample 之前，m01 实测 order=[apply, sample]），惩罚/bad_words 等 ch30 变换全部叠在其后。"
+      },
+      "quantified": "50257 维里位置 0 合法仅 5 个 token（允许集 [77, 88, 3919, 5948, 8505]，约万分之一）；本例构造非法位得分最高，掩码一步翻正。greedy 与随机路径同构：argmax 取不到 -inf、multinomial 的 0 权重位永不入选。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m13-inplace-ownership",
+      "intuition": "后厨改菜不出盘。logits 冻结在暂存态那块张量上，掩码就地改写、采样器端上桌的就是同一盘——想留原始分数，调用方必须自己先 clone。",
+      "worked_example": {
+        "params": {
+          "两幕": "真 GPUModelRunner：第一幕 execute_model 打包 [1, 50257] CUDA logits 进十元组；第二幕 sample_tokens 里 apply 原位改写后交给 sampler 替身",
+          "验证": "id 相等 + 值已改（同一对象）"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/trace_m01_m02_window.json",
+        "table": {
+          "columns": ["幕", "动作", "关键量（实测）", "判定", "结果"],
+          "rows": [
+            ["第一幕", "execute_model 打包", "logits [1, 50257] CUDA 进 execute_model_state（10 元组之一）；4242 位 5.0", "冻结在单槽、return None", "暂存态持有张量引用（非拷贝）"],
+            ["第二幕", "apply_grammar_bitmask → sampler", "sampler 收到的 is state.logits=True、id 相同；4242 位变 -inf、8505 位 2.0 不变", "同一块张量被原位改写", "ch30『全程原地改写』契约的第一棒：想保 raw 必须 clone（rejection_sampler.py:L152-L160 同款证据）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "第二幕消费的 logits 与第一幕产出的是同一对象——掩码的 -inf 写入对所有下游（采样器、logprobs、top-k）可见。",
+        "argument": "ExecuteModelState 存张量引用（NamedTuple 字段直接持引用，无拷贝语义）；trace 实测 sampler 替身收到的张量 id 与暂存态里相等、且被掩码改写后的值（4242=-inf）已生效。这条所有权链向上交棒 ch30（Sampler 全程原地改写 logits），向下要求任何想保留 raw 分数的调用方显式 clone——spec decode 分支的 clone 是显式在树证据。"
+      },
+      "quantified": "保 raw 的代价 = clone 一份 [1, 50257] fp32 ≈ 197KB/请求行；不 clone 就没有『掩码前』视角可看（raw logprobs 的留底在 ch30 管线第①步、掩码之前）。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m14-thinking-gates",
+      "intuition": "先看完思考再开工。should_fill 问『这一步要不要挂约束』、should_advance 问『这一步的产出能不能喂 FSM』、trim 问『喂之前要不要先撕掉思考页』——三问共享同一门轴：思考内容不是语法内容，结束标记本身也是思考。",
+      "worked_example": {
+        "params": {
+          "序列": "all=[p1,p2,p3, t1,t2,M,g1]（本步 new=[t1,t2,M,g1]；M=结束标记在 idx 5；t 系思考、g 系语法内容）",
+          "对照三路": "prompt 级缓存 / new_token_ids 精确窗口 vs 占位数推导（坑）/ trim 与不 trim 的生死对照"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/trace_m14_gates.json",
+        "table": {
+          "columns": ["场景", "调用", "关键量（实测）", "判定", "结果"],
+          "rows": [
+            ["prompt 级缓存", "should_fill_bitmask 连调两次", "首次对 prompt 判 is_reasoning_end → False 并缓存进请求", "第二次不再判（prompt 级调用恰 1 次）", "两次都返回 False"],
+            ["精确窗口（v0.27 新）", "should_advance(req, new_token_ids=[t1,t2,M,g1])", "start = 3（all 长 7 减 new 长 4）→ delta 覆盖标记（idx 5）", "检出结束", "reasoning_ended=True、边界 idx=5"],
+            ["占位数推导（旧坑）", "should_advance(req)（无 new_token_ids）", "computed 8 - placeholders 2 → start=6，越过标记位 5", "delta=[g1] 错过标记", "返回 False——语法永不生效（async+spec 草稿被拒时占位数残留未清零所致）"],
+            ["trim（修复）", "trim_reasoning_for_advance", "end_idx 5、first_idx 3 → 裁掉 3 个思考 token（含标记）", "只喂 [g1] 给 accept_tokens", "接受成功、请求存活（status=None）"],
+            ["不 trim（对照）", "整块直喂 accept_tokens", "accept([t1,t2,M,g1]) 被真语法拒收", "混块杀死请求", "status=FINISHED_ERROR、resumable=False"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "喂给语法的序列不含任何思考 token：检出的结束边界 idx 恰是标记位，trim 裁掉 [first_idx, idx] 闭区间。",
+        "argument": "边界定位的单调论证：_find_reasoning_end_index 从 start 起逐 token 扩展 prefix、首个触发 streaming 判定的 idx 即返回（未触发则继续——扩展有限步必停，回退末位是保守兜底）；trim 的 num_reasoning=idx+1-first_idx 恰覆盖闭区间 [first_idx, idx]。窗口正确性：new_token_ids 路径 start=len(all)-len(new) 是精确本步窗口；占位数路径假设 num_output_placeholders==len(new_token_ids)，async+spec 草稿被拒时假设破裂（实测 start=6 越过标记）——v0.27 改精确窗口的动机。"
+      },
+      "quantified": "一步 4 token 的混块里 3 个是思考（含标记）：不 trim 的接受率必为零（真语法拒收）、请求直接 FINISHED_ERROR；trim 后只剩 1 个语法 token、接受成功。prompt 级判定每请求恰 1 次（缓存幂等）。",
+      "figure_specs": [
+        {
+          "figure_id": "ch32-fig-thinking-gates",
+          "template": "flow",
+          "l0_zoom": "调度列与采样列之间的思考门控决策展开（L2 站 14 的机制放大——⑤ 拍 update_from_output 侧的三问流程）。",
+          "claim": "三问一门轴：should_fill（这步填不填）/should_advance（这步推不推进，v0.27 用 new_token_ids 精确窗口）/trim（喂之前裁掉思考页）——思考标记本身也是思考内容，混块直喂会杀死请求。",
+          "numbers": [
+            {"value": "精确窗口 vs 占位数坑：start=7-4=3（delta 覆盖标记 idx 5 → 检出） vs start=8-2=6（delta=[g1] 错过 → False）", "provenance": "traces/trace_m14_gates.json should_advance_new_window / should_advance_fallback_window"},
+            {"value": "trim 生死对照：裁 3 个思考 token 后 accept([g1]) 存活（status=None）；不 trim 直喂 accept([t1,t2,M,g1]) → FINISHED_ERROR、resumable=False", "provenance": "traces/trace_m14_gates.json trim_and_advance / no_trim_kills_request"},
+            {"value": "prompt 级判定恰 1 次（缓存进请求，第二次调用不再判）", "provenance": "traces/trace_m14_gates.json should_fill_bitmask.prompt_end_calls_total"},
+            {"value": "源码锚：__init__.py:L361-L379 / L381-L439 / L442-L486（#43388/#44006 修复物）", "provenance": "dossier embed_excerpts[12]/[13]/[14]（vllm/v1/structured_output/__init__.py:L361-L486）"}
+          ],
+          "caption_draft": "思考门控三件套的决策流：reasoning_ended 未定时先对 prompt 判一次并缓存；每步 should_advance 拿本步刚追加的 new_token_ids 当精确 delta 窗口（旧占位数推导在 async+spec 草稿被拒时窗口算错——start 越过结束标记、语法永远不生效）；检出结束→逐 token 定位边界→trim 把边界前的思考内容（含标记本身）裁掉再喂 accept_tokens。不 trim 的混块直喂会被语法拒收、请求判 FINISHED_ERROR——一步之内『思考+语法』混块是这套门控存在的全部理由。",
+          "illustrator_notes": "flow 三菱形决策链（should_fill → should_advance → trim）+ 底部生死对照双支（trim 后 accept 存活 / 不 trim FINISHED_ERROR）；窗口对照小条：同一序列上画两个 delta 窗口（start 3 覆盖标记 vs start 6 越过）。数字全取 numbers.provenance。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m15-mid-window-reasoning-end",
+      "intuition": "窗口里现场换届。草稿窗口正逐位走着，检测器在『历史+草稿』拼出的假想序列上逐位试探——标记一出现，本窗口剩余行当场从放行翻成约束；但换届文书（reasoning_ended 持久化）要等散会（⑤ 拍 should_advance）才补办，翻转变量只活在这一次函数调用里。",
+      "worked_example": {
+        "params": {
+          "窗口": "草稿 [r3, 999标记, a, b]（4 spec 位 + bonus = 5 行）；历史=prompt 3 token+已生成思考 2 token；真 xgrammar 'a b c' 文法",
+          "对照": "标记后草稿非法（888）→ 容忍拒绝；无 reasoner → 全程约束"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/trace_m15_midwindow.json",
+        "table": {
+          "columns": ["行", "草稿", "检测/翻转", "行内容（实测）", "推进"],
+          "rows": [
+            ["行 0", "r3（思考内容）", "simulated_buf 逐位试探：未触发", "整行 -1（放行）", "无"],
+            ["行 1", "999（结束标记）", "is_reasoning_end_streaming 触发 → apply_bitmask 翻 True", "整行 -1（标记行按翻转前旧标志填——标记是思考内容）", "不推进（advance_grammar=False）"],
+            ["行 2", "a", "受约束（已翻转）", "a 系 [64, 397, 39305]", "试探接受 a"],
+            ["行 3", "b", "受约束", "b 系 [65, 15630]", "试探接受 b"],
+            ["行 4（bonus）", "（采样位）", "should_fill 仍 False（未持久化）→ bonus_apply=should_fill or apply 双触发兜住", "[66]（受约束）", "bonus 行不推进"],
+            ["窗口收尾", "—", "调用返回后 reasoning_ended 仍是 False（时序坑物证）；rollback(2) 复位", "—", "真推进留给 ⑤ 拍"],
+            ["容忍拒绝对照", "草稿 888（标记后非法）", "post_reasoning_end_in_window=True", "行 2..4 全是 a 系 [64, 397, 39305]（FSM 卡在位置 0）", "accept(888)/accept(b) 均被拒但不抛 AssertionError——草稿先于掩码存在、不保证合法"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "窗口内翻转只影响本窗口的剩余行与 bonus 行；持久化状态 reasoning_ended 在本函数内不改变——两个时间尺度（本次填表的局部翻转 vs 请求生命周期的状态位）严格解耦。",
+        "argument": "翻转只写局部变量 apply_bitmask；reasoning_ended 的唯一写者是 should_advance（m14 实测其缓存 False 不被窗口内检测改写，本 trace 调用返回后仍 False）。解耦的兜底是 bonus_apply=should_fill_bitmask(request) or apply_bitmask：窗口内刚翻转的场合 should_fill 还是 False，靠 or 的第二支把 bonus 行拉回受约束——注释 L336-L345 讲透的时序坑。容忍拒绝的边界同样精确：仅 post_reasoning_end_in_window=True 时 accept 被拒不炸（其余场景是 m07 的 AssertionError——调度与语法状态失配是 bug 不是运行态）。"
+      },
+      "quantified": "4 草稿+bonus=5 行、翻转点在行 1（标记位）、试探 2 次、回退 2 次；容忍场景 0 次成功推进也安全返回。对照：无 reasoner 时同一语法全程约束（合法草稿 a/b/c 窗口与 m07 场景一同构），未过滤的思考型草稿则当场 AssertionError((7, 'r1', ...))——窗口内检测与草稿过滤（m17）是配套防线。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m16-async-deferred-sampling",
+      "intuition": "等米下锅。异步调度下一拍已经排好、GPU 在跑，可上一拍的 token 还没回来——掩码要吃的『到目前为止的真实历史』缺一口，这拍只能先把采样挂起：先收上批输出、把草稿从 GPU 拉回来过滤补齐，米到了才开火算表。",
+      "worked_example": {
+        "params": {
+          "两拍信号": "真 AsyncScheduler._update_after_schedule：占位判定先于加账（+1 AR bonus + 2 spec）；拍 2 排 2 个 token=真实调度公式的 deficit 回填（num_tokens_with_spec + placeholders - computed——排不够会把请求误判回 prefill chunk）",
+          "三拍心跳": "真 EngineCore.step_with_batch_queue + spy executor/scheduler（batch_queue_size=2），事件账逐拍记录"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/trace_m16_deferred.json",
+        "table": {
+          "columns": ["拍", "进门时 placeholders", "pending 判定", "加账", "采样路径（事件账实测）"],
+          "rows": [
+            ["拍 1", "0", "False（0>0 不成立）→ 不延后", "+1+2=3（AR bonus 1 + spec 2）", "schedule → dispatch(non_block) → bitmask(immediate) → sample_tokens(non_block=True) → 入队早退（队 1<2 未满）"],
+            ["拍 2", "3", "True（3>0：上拍 token 没回来）→ 本拍挂起 deferred", "+1+2 → 6", "schedule → dispatch → pop 拍 1 批收输出 update_from_output → take_draft_token_ids → update_draft_in_output → bitmask(deferred) → sample_tokens → 重新入队"],
+            ["拍 3", "6", "True → 挂起", "—", "pop 拍 2 批收输出 → 同一兑现链再走一轮"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "兑现链的因果序不可换：草稿必须先 D2H 回调度器、过 validate 过滤与 -1 补齐，掩码才算得出来、采样才能补——deferred 批的 bitmask 永远晚于 update_draft_token_ids_in_output。",
+        "argument": "因果骨架由数据依赖给出：grammar_bitmask 逐草稿位填行（m07）要求草稿 token 已知且已过滤——pending 置位条件（num_output_placeholders>0）恰是『本拍历史不完整』的机器判定；step_with_batch_queue 的代码序（take_draft → update_draft_in_output → get_grammar_bitmask → sample_tokens，trace 事件账逐条实录）把这个依赖钉死。队列不变式：填管道优先于收输出（队未满即早退），首个 deferred 拍必有上一批可 pop——删掉早退则空队列 IndexError（impl-notes 复核账 [2] 的回归测试守护）。"
+      },
+      "quantified": "占位账每拍 +3（1 AR + 2 spec）：拍 2 起每拍都 pending（稳态流水线里 deferred 是常态而非例外）；三拍事件账 13 个事件把『挂起-兑现』闭环走全。v0.27 异步调度默认开（engine-loop 卡），这条链就是服务默认心跳里结构化输出的真实路径。",
+      "figure_specs": [
+        {
+          "figure_id": "ch32-fig-deferred-chain",
+          "template": "swimlane",
+          "l0_zoom": "L0 循环框③④两拍在异步调度（v0.27 默认心跳）下的展开——批队列两批重叠、掩码与采样被 defer 一拍（L2 站 15 的时序放大）。",
+          "claim": "pending 置位当拍不采样：掩码要吃上拍真实 token——deferred 批挂起，先收上批输出、草稿 D2H 回调度器过滤补齐（take_draft→update_draft→bitmask→sample_tokens），米到了才开火。",
+          "numbers": [
+            {"value": "占位信号两拍：进门 0 → pending=False、加账 +1+2=3；进门 3 → pending=True", "provenance": "traces/trace_m16_deferred.json pending_signal.step1/step2"},
+            {"value": "拍 2 事件账：schedule → dispatch(non_block) → update_from_output(拍1批) → take_draft_token_ids → update_draft_in_output → bitmask(deferred) → sample_tokens(non_block=True)", "provenance": "traces/trace_m16_deferred.json three_calls.call2.new_events"},
+            {"value": "拍 1 立即路径对照：bitmask(immediate) → sample_tokens → 入队早退（队 1<2 未满）", "provenance": "traces/trace_m16_deferred.json three_calls.call1.events"},
+            {"value": "草稿过滤物证（同链上一步）：[a,b,999,77777,a] → validate 前缀过滤 → [64,65,-1,-1]", "provenance": "traces/trace_m17_draft_return.json round1_filtered"}
+          ],
+          "caption_draft": "异步心跳下掩码的因果时序：调度器提前一拍组批（GPU 不等 CPU），但结构化输出的表要吃『上拍真实 token』——上拍输出没回来，这拍的 pending_structured_output_tokens 就置位、采样整拍挂起。兑现链的顺序是刚性的：先收上批输出、草稿从 worker 的 copy_stream D2H 回来、过语法 validate 过滤并 -1 补齐，然后才算表、补采样重新入队。稳态下每拍都 pending——deferred 不是异常路径，是 v0.27 服务默认心跳里结构化输出的常态。",
+          "illustrator_notes": "swimlane 三轨（CPU 调度 / GPU worker / 时间轴两批上下错开）共享时间轴：批 A 与批 B 的活动条错位重叠，deferred 标记挂在批 B 的采样位上、由批 A 的 D2H 草稿回来后补上；兑现链四步箭头水平跨轨。事件名逐条取 numbers.provenance。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m17-spec-draft-return",
+      "intuition": "草稿先过安检再上机。worker 生成的草稿在 GPU 上，语法检查官在调度器进程里——草稿必须先 D2H 回程过 validate 安检：不合格的撕票、补 -1 站票；思考段里的草稿免检（本来就不归语法管）。",
+      "worked_example": {
+        "params": {
+          "安检": "真 Scheduler.update_draft_token_ids_in_output + 真 xgrammar validate（'a b c' 文法：a,b 合法前缀、999 断链）",
+          "回程": "真 DraftTokensHandler（CUDA copy_stream）门控开/关对照"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/trace_m17_draft_return.json",
+        "table": {
+          "columns": ["场景", "通道", "关键量（实测）", "判定", "结果"],
+          "rows": [
+            ["round 1·语法已生效", "update_draft_token_ids_in_output", "回传 [a,b,999,77777,a] 先截断到已排 4；真 validate 前缀过滤", "a,b 合法、999 起断链（77777 连带）", "sched_spec=[64,65,-1,-1]；num_invalid={r1:2} 进接受率统计"],
+            ["round 2·思考未结束", "同函数", "should_advance=False → validate 根本不调用", "草稿原样保留（思考内容不受语法管）", "sched_spec=[999,888,777]；num_invalid 空"],
+            ["门控关", "DraftTokensHandler（CUDA）", "has_structured_output_reqs=False → D2H 整批跳过", "无结构化请求时回传零成本", "get 返回 [[-1,-1,-1],[-1,-1,-1]] 占位"],
+            ["门控开", "copy_stream D2H 往返", "GPU 草稿 [[64,65,999],[1,2,3]] 经 async_copy_to_np", "copy_event(blocking) 同步后 tolist", "roundtrip 逐值相等；纯 Python 列表交 deferred 链第一步"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "进入掩码窗口的草稿要么合法、要么是 -1 哨兵——串行分支的 AssertionError（非 post_reasoning_end 场景）因此不可达。",
+        "argument": "唯一入口论证：草稿进 scheduled_spec_decode_tokens 只经 update_draft_token_ids_in_output（deferred 链）或 update_draft_token_ids（同步链），两处都先过 should_advance 门控、再 validate_tokens 前缀过滤（滤掉首个非法位起的一切）、-1 补齐保长度——窗口侧把 -1 当『停约束停推进』处理（m07 哨兵行），故『非法草稿进窗口』没有通路；m15 场景四的反证（绕过入口直塞 → 当场 AssertionError）从反面封死。门控保证无结构化请求时整批跳过 D2H——回程通道自身零浪费。"
+      },
+      "quantified": "5 条回传草稿截到已排 4、2 条被滤成 -1（num_invalid 记账进 update_from_output 的接受率统计分母抵扣）；门控跳过时 2 请求×3 草稿全部 -1 占位。D2H 回程的两个异步内存安全细节：copy_event(blocking=True) 防忙轮询 CUDA 驱动锁、record_stream 防缓存分配器提前复用显存。",
+      "figure_specs": []
+    },
+    {
+      "mechanism_id": "m18-v2-runner-path",
+      "figure_specs": [
+        {
+          "figure_id": "ch32-fig-v1v2-selector",
+          "template": "state-table",
+          "l0_zoom": "采样列的双路径分岔——worker 侧落地实现（V1 utils.py→xgr / V2 StructuredOutputsWorker+Triton）由 use_v2_model_runner 选择（L2 站 16 的决策放大）。",
+          "claim": "v0.27.1 里 Llama 这类稠密生成模型默认走 V2（非 MoE 即 V2），与 v0.21『V2 opt-in』完全反转；env/PCP/dspark/diffusion 强制 V2，pooling/attention-free/无 Triton/ngram 回退 V1——同一掩码契约的两种落地。",
+          "numbers": [
+            {"value": "13 路判定实录：V2=[env=1, PCP=2, dspark, diffusion, Llama 稠密默认, Qwen2Moe, eagle]；V1=[env=0, Mixtral MoE 不在名单, pooling, attention-free, 无 Triton 回退, ngram 回退]", "provenance": "traces/trace_m18_selector.json decision_table（真 use_v2_model_runner property 逐路实测）"},
+            {"value": "回退警告原文（真 warning_once 捕获）：Model Runner V2 requires Triton; using the V1 model runner instead. / does not yet support ngram/ngram_gpu speculative decoding", "provenance": "traces/trace_m18_selector.json decision_table[10]/[11] 运行日志"},
+            {"value": "默认 V2 架构名单 7 项（DeepseekV2/GraniteMoe/Inkling×2/KimiK3/LongcatFlashNgram/Qwen2Moe）", "provenance": "traces/trace_m18_selector.json default_v2_architectures"},
+            {"value": "选择器源码锚：config/vllm.py:L578-L616（env 优先 → PCP/dspark/DFlash 混合 KV/diffusion 强制 → 名单或非 MoE → Triton/特性回退）", "provenance": "dossier embed_excerpts[20]（vllm/config/vllm.py:L578-L616）"}
+          ],
+          "caption_draft": "V1/V2 不是用户开关而是模型清单：env 显式设置最优先；PCP/dspark/DFlash 混合 KV/diffusion 这些只在 V2 实现的特性直接强制 V2；然后看模型——默认 V2 名单（MoE 七家）或『非 MoE 生成模型』都上 V2，这意味着 v0.27.1 里 Llama 默认走 V2（v2 旧书『V2 opt-in 默认关』的结论在本 pin 已失效）；Triton 缺失或不支持的 spec 方法（ngram）带警告回退 V1。两条路径落地的是同一个掩码契约（先掩码后采样、bit=0→-inf），差别只在搬运与 kernel（V1 重排整表、V2 kernel 间接寻址——m19）。",
+          "illustrator_notes": "state-table 决策表：行=13 路配置（列：配置/V1V2/理由），V2 行绿系徽标、V1 行灰系；顶部决策阶梯小流程图（env→强制项→名单/非 MoE→回退项）；醒目标注『Llama 默认 V2=与 v0.21 反转』。数字全取 numbers.provenance。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "m19-triton-kernel-geometry",
+      "intuition": "一格一行的储物柜编程。grid 第一维=掩码行——每个 program 认领一行 logits，行号从索引张量间接寻址（重排搬进了 kernel）；第二维=词表切块——每块 8192 个 token=256 个打包 int32 拆成 32 位。(bit&1)==0 就写 -inf：语法最终落成一次 kernel 上的位运算。",
+      "worked_example": {
+        "params": {
+          "场景": "真 StructuredOutputsWorker + 真 Triton kernel（CUDA）：4 请求 cu_num_logits=[0,2,5,7,8]，受约束 r1（3 行）+r3（1 行）→ 紧凑掩码 4 行，各行允许一个指纹 token（100/200/300/50256——最后一个是词表尾，检验尾块谓词）",
+          "spy": "kernel 发射 spy 实录 grid 与 BLOCK_SIZE"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/trace_m19_v2_kernel.json",
+        "table": {
+          "columns": ["对象", "实测值", "含义"],
+          "rows": [
+            ["grid", "[4, 7]", "4 个掩码行 × 7 个词表块（cdiv(50257, 8192)）"],
+            ["第二维覆盖", "7×8192=57344 token", "超出词表 7087 位由双谓词（位=0 且 block_offset<vocab_size）遮蔽——词表尾 token 50256 实测正确命中"],
+            ["解包几何", "256 个 int32 → [256,32] 广播 → 8192 布尔", "(bit&1)==0 → store(-inf)；BLOCK_SIZE=8192"],
+            ["行映射", "mapping=[2,3,4,7]", "cu_num_logits=[0,2,5,7,8] 前缀和展开；logits 行 2/3/4/7 受掩、行 0/1/5/6 全零未触碰（非语法行 kernel 根本不访）"],
+            ["交叉核验", "V1 xgr vs V2 kernel 同行掩码", "允许集逐元素一致——同一 bit 语义（1=允许/0=禁→-inf）的两条落地路径"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "num_masks == len(mapping)（源码 assert）：紧凑掩码行数与 cu_num_logits 前缀和展开的行索引数严格相等——m03 对账不变式在 V2 的机器可查形态。",
+        "argument": "前缀和给每请求的行区间长度恰为其 1+spec 数（cu_num_logits[r+1]-cu_num_logits[r]），对受约束请求求和=紧凑掩码行数——两侧账本同源（调度侧 Σ、worker 侧前缀和），assert 把失配变成即时异常而非静默错行。kernel 内的正确性双谓词：位=0（非法才写）∧ block_offset<vocab_size（尾块不越界）——57344 覆盖 50257 的余量 7087 位全部被遮蔽（词表尾 token 50256 正确命中即尾块谓词的行为证据）。"
+      },
+      "quantified": "4 行×1571 int32=6284B 紧凑表 + 4×4B 行索引张量，对照 V1 重排整表 8 行×1571×4B 再全量 H2D——V2 把重排化为 kernel 内间接寻址（logits_indices_ptr），CPU 侧零重排拷贝。生产 vocab=152064 时第二维=19（dossier theory[6]）；本仓 vocab=50257 实测 7。",
+      "figure_specs": []
+    }
+  ]
+}

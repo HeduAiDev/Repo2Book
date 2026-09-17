@@ -46,7 +46,7 @@ class ParallelConfig:
 class SpeculativeConfig:
     method: str | None = None
     num_speculative_tokens: int | None = None
-    # SUBTRACTED: draft model 装配面（ch32/33）
+    # SUBTRACTED: draft model 装配面（ch33/34）
 
 
 # SOURCE: vllm/config/diffusion.py DiffusionConfig —— 消费字段承载

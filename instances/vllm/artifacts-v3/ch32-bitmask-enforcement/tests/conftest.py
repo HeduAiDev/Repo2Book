@@ -1,4 +1,4 @@
-# ch31《约束解码 II：bitmask 落地》测试配置与共用替身。
+# ch32《约束解码 II：bitmask 落地》测试配置与共用替身。
 # 行为基准 = 真实 vLLM v0.27.1（6e448d0ea，instances/vllm/source 现核行号）：
 #   - vllm/v1/structured_output/__init__.py（批装配/思考门控/出发）
 #   - vllm/v1/structured_output/utils.py:L86-L175（worker 侧重排+H2D+apply）
@@ -26,13 +26,13 @@ def cdiv(a: int, b: int) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# grammar / backend 替身：实现 ch30 已立的六方法契约
+# grammar / backend 替身：实现 ch31 已立的六方法契约
 # （vllm/v1/structured_output/backend_types.py:L31-L95 StructuredOutputGrammar）。
 # fill_bitmask 写真实位语义：allowed 集内 token 位=1（允许）、其余位=0（禁→-inf），
 # 与 xgrammar fill_next_token_bitmask 的位语义一致（m08：位语义 1=允许/0=禁）。
 # ─────────────────────────────────────────────────────────────────────────────
 class FakeGrammar(StructuredOutputGrammar):
-    """六方法契约的可编程替身（编译归 ch30——本章直接注入成品 grammar）。
+    """六方法契约的可编程替身（编译归 ch31——本章直接注入成品 grammar）。
     继承真实 ABC：scheduler.update_from_output L1823 的
     isinstance(grammar, StructuredOutputGrammar) 语义断言要求替身履约。"""
 

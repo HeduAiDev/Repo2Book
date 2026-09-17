@@ -1,13 +1,16 @@
 # SOURCE: vllm/v1/engine/core.py
-# v3 ch31 脊柱⑥：EngineCore 的两段式窗口编排面——step()（L584-L614，四段排布）
+# v3 ch32 脊柱⑥：EngineCore 的两段式窗口编排面——step()（L584-L614，四段排布）
 # 与 step_with_batch_queue（L625-L739，v0.27 服务默认心跳：延后分流 + deferred
 # 兑现链 L719-L737）+ post_step（L616-L623）+ _should_throttle_prefills
 # （L579-L582）。
 # SUBTRACTED（delete[2] 掩码无关分支）：EC consumer 记账（is_ec_consumer）、
-#   pooling 快路、批队列长度调度（队未满即早退 L682-L687）、可观测性外壳
-#   （capture_iteration_details/log_error_detail with 块/_attach_iteration_details）、
-#   abort 队列处理（_process_aborts_queue 及其调用位）；忙循环/ZMQ/IO 线程/
-#   启动握手/DGCO/DP 面归 ch9/ch12 全文已立。
+#   pooling 快路、可观测性外壳（capture_iteration_details/log_error_detail
+#   with 块/_attach_iteration_details）、abort 队列处理（_process_aborts_queue
+#   及其调用位）。批队列长度调度（L682-L687 队未满即早退）**保留**：该早退
+#   是 deferred 拍『有上一批可 pop』的流水线不变式前提，删除即断 m16 链
+#   （首个 deferred 拍 pop 空队列）；delete[2] 的『批队列长度调度』以不破坏
+#   deferred 骨架为界（why_safe 原文：保留 deferred 链骨架即可复现两段式
+#   窗口的全部时序）。忙循环/ZMQ/IO 线程/启动握手/DGCO/DP 面归 ch9/ch12。
 from __future__ import annotations
 
 from collections import deque
@@ -168,12 +171,20 @@ class EngineCore:
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
 
-                if not deferred_scheduler_output:
-                    # Add this step's future to the queue.
-                    batch_queue.appendleft((future, scheduler_output, exec_future))
-                    # SUBTRACTED: L682-L687 队未满即早退的批队列长度调度
-                    #   （delete[2]——吞吐优化；删后每次调用都走到 pop 收输出，
-                    #   deferred 链时序不受影响）。
+            if not deferred_scheduler_output:
+                # Add this step's future to the queue.
+                batch_queue.appendleft((future, scheduler_output, exec_future))
+                # SOURCE: vllm/v1/engine/core.py:L682-L687 队未满即早退 —— 逐字
+                #   保留（delete[2]『批队列长度调度』不覆盖此处：这个早退是
+                #   deferred 拍『有上一批可 pop』的前提——删掉它则第一个
+                #   deferred 拍从空队列 pop 直接 IndexError，m16 链断裂；
+                #   『填管道优先于收输出』的吞吐语义归 ch12 m21）
+                if len(batch_queue) < self.batch_queue_size and (
+                    model_executed or self.scheduler.has_requests()
+                ):
+                    # Don't block on next worker response unless the queue is full
+                    # or there are no more requests to schedule.
+                    return None, model_executed
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should

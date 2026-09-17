@@ -1,4 +1,4 @@
-# ch31 主电池五：两段式 execute GPU 窗口（m01/m02/m13）——
+# ch32 主电池五：两段式 execute GPU 窗口（m01/m02/m13）——
 # worker 两方法契约 + ExecuteModelState 暂存态 + step 编排 + UniProc 转发。
 # 基准：vllm/v1/worker/worker_base.py:L142-L157 / gpu_model_runner.py:L437-L450
 # / L4165-L4175 / L4484-L4485 / L4516-L4535 / L4552-L4589 / engine/core.py:L584-L614

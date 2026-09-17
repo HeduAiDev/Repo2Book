@@ -1,4 +1,4 @@
-# ch31 主电池七：V2 落地路径（m18/m19）——use_v2_model_runner 真实选择器 +
+# ch32 主电池七：V2 落地路径（m18/m19）——use_v2_model_runner 真实选择器 +
 # StructuredOutputsWorker（copy_stream 双 H2D + cu_num_logits 行映射）+
 # 自写 Triton kernel（(bit&1)==0 → tl.store(-inf)）+ V2 sample() 调用点。
 # 基准：vllm/config/vllm.py:L564-L658 / vllm/v1/worker/gpu/structured_outputs.py

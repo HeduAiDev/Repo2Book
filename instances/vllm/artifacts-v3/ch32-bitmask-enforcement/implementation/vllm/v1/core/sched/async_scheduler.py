@@ -1,5 +1,5 @@
 # SOURCE: vllm/v1/core/sched/async_scheduler.py
-# v3 ch31 脊柱⑤：AsyncScheduler._update_after_schedule（L19-L49——
+# v3 ch32 脊柱⑤：AsyncScheduler._update_after_schedule（L19-L49——
 # pending_structured_output_tokens 置位 + 占位记账 + spec_token_ids 的 -1
 # 占位数组，延后采样的信号源 m16）。V2+PP 的 next_decode_eligible_step
 # 微批步距删（L46-L49，dossier 摘录 elide 注明归 PP 微批调度）。

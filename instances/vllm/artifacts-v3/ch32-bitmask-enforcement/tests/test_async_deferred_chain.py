@@ -1,4 +1,4 @@
-# ch31 主电池六：异步调度下的延后采样链（m16）+ AsyncScheduler 置位
+# ch32 主电池六：异步调度下的延后采样链（m16）+ AsyncScheduler 置位
 # （vllm/v1/core/sched/async_scheduler.py:L13-L49 / engine/core.py:L625-L739）。
 # 因果骨架：pending 置位 → 挂起 deferred → take_draft_token_ids →
 # update_draft_token_ids_in_output（草稿先过语法）→ get_grammar_bitmask →
@@ -124,12 +124,50 @@ class TestStepWithBatchQueue:
         return core
 
     def test_immediate_path_when_not_pending(self):
-        # pending 为假 → 与 step() 同序：立即算掩码 + sample_tokens(non_block)
+        # pending 为假 → 与 step() 同序：立即算掩码 + sample_tokens(non_block)。
+        # 真实管道语义（core.py:L681-L687）：非 deferred 拍 appendleft 后若队列
+        # 未满且还有请求要排 → 早退（None, True），**不**在本拍收输出；
+        # 队列填满后的下一拍才 pop 最老批走 update_from_output。
         core = self._make_core(pending=False)
-        core.step_with_batch_queue()
+        core.batch_queue_size = 2
+        out, executed = core.step_with_batch_queue()
+        assert (out, executed) == (None, True)  # 填管道优先：早退不收输出
+        assert core.scheduler.log == ["dispatch", "bitmask", "sample_tokens"]
+        assert len(core.batch_queue) == 1
+
+        # 队列已满（appendleft 后 len==size）→ 不早退，pop 最老批收输出
+        out, executed = core.step_with_batch_queue()
+        assert out == {}
         assert core.scheduler.log == [
-            "dispatch", "bitmask", "sample_tokens", "update_from_output",
+            "dispatch", "bitmask", "sample_tokens",           # 第 1 拍（早退）
+            "dispatch", "bitmask", "sample_tokens",           # 第 2 拍（填满）
+            "update_from_output",                             # pop 第 1 拍收输出
         ]
+        assert len(core.batch_queue) == 1
+
+    def test_pipeline_fills_then_deferred_without_seeding(self):
+        # 真实两拍序列（不手工 seed 队列）：第 1 拍 pending=False 早退把管道
+        # 填上；第 2 拍 pending=True 挂起 deferred——pop 到的是第 1 拍的条目，
+        # 不是空队列（L682-L687 的早退正是 deferred 拍『有上一批可收』的前提）。
+        core = self._make_core(pending=False)
+        out, executed = core.step_with_batch_queue()
+        assert (out, executed) == (None, True)
+        assert len(core.batch_queue) == 1
+
+        core.scheduler.pending = True  # 第 2 拍：掩码要吃上拍真实 token
+        out, executed = core.step_with_batch_queue()
+        assert core.scheduler.log == [
+            "dispatch",              # 第 1 拍发车（早退）
+            "bitmask",
+            "sample_tokens",
+            "dispatch",              # 第 2 拍发车（挂起为 deferred）
+            "update_from_output",    # pop 第 1 拍条目先收输出
+            "take_draft",            # 兑现链：草稿 D2H 回调度器
+            "update_draft",          # 草稿先过语法 validate
+            "bitmask",               # 然后才轮到掩码
+            "sample_tokens",         # 最后补采样
+        ]
+        assert len(core.batch_queue) == 1  # deferred 条目重新入队
 
     def test_deferred_path_causal_order(self):
         # pending 为真 → 本拍挂起；先收上批输出，再走兑现链：take_draft →
@@ -189,8 +227,10 @@ class DeferredSpyScheduler:
 
     def update_draft_token_ids_in_output(self, draft_token_ids, scheduler_output):
         self.log.append("update_draft")
-        # 因序断言：草稿过滤必须发生在掩码计算之前
-        assert "bitmask" not in self.log
+        # 因序断言：草稿过滤必须发生在**本拍**（最后一个 dispatch 起）掩码
+        # 计算之前——多拍流程里更早拍的 bitmask 是合法历史
+        last_dispatch = len(self.log) - 1 - self.log[::-1].index("dispatch")
+        assert "bitmask" not in self.log[last_dispatch:]
 
 
 class FakeBitmask:

@@ -1,5 +1,5 @@
 # SOURCE: vllm/v1/core/sched/output.py
-# v3 ch31 脊柱③（调度输出切面）：GrammarOutput（L286-L291，逐字——掩码行序
+# v3 ch32 脊柱③（调度输出切面）：GrammarOutput（L286-L291，逐字——掩码行序
 # 权威 + ndarray 掩码同传的载体）+ SchedulerOutput 的本章消费字段
 # （num_scheduled_tokens/scheduled_spec_decode_tokens/
 # has_structured_output_requests/pending_structured_output_tokens/

@@ -1,4 +1,4 @@
-# ch31 主电池三：调度侧——门控置位（m05）/行序账本（m03）/草稿语法过滤
+# ch32 主电池三：调度侧——门控置位（m05）/行序账本（m03）/草稿语法过滤
 # （m17）/update_from_output 真推进（m14 的 scheduler 面）。
 # 基准：vllm/v1/core/sched/scheduler.py:L1317-L1343 / L1646-L1668 / L1746-L1791 /
 # L1817-L1843 / L2147-L2166 / L2168-L2203。
@@ -282,6 +282,25 @@ class TestUpdateFromOutputTrueAdvance:
         assert r1.is_finished() is True
         assert r1.status.name == "FINISHED_ERROR"
         assert r1.resumable is False
+
+    def test_finished_request_skipped_not_advanced(self):
+        # 真实 update_from_output L1752-L1763：abort 期已完成的请求在 num_
+        # scheduled_tokens 里时先 continue——不进定位采样行、更不进 should_
+        # advance/accept_tokens（本切面扣在途段已删，但该守卫是保留段的前置）
+        sched = make_scheduler()
+        g = FakeGrammar(V, allowed={1})
+        r1 = FakeRequest("r1", grammar=g, num_tokens=1, is_finished=True)
+        sched.requests["r1"] = r1
+        so = FakeSchedulerOutput(num_scheduled_tokens={"r1": 3})
+        sched.update_from_output(so, self._mro())
+        assert g.accepts == []  # 已完成请求不被推进
+        assert r1.is_finished() is True
+
+    def test_missing_request_skipped(self):
+        # req_id 已从 requests 字典消失（下线/清账后残留的调度条目）→ None 守卫
+        sched = make_scheduler()
+        so = FakeSchedulerOutput(num_scheduled_tokens={"ghost": 3})
+        sched.update_from_output(so, self._mro())  # 不抛 KeyError
 
     def test_no_new_tokens_no_advance(self):
         sched = make_scheduler()

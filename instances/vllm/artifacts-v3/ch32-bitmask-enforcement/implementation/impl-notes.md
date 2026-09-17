@@ -5,10 +5,11 @@
 `must_keep` 53 个符号全保留；每 def/class 标 `# SOURCE: vllm/...:Lxxx`（行号
 全部对 v0.27.1 现核，未沿用 v2 资产旧行号），删除处标 `# SUBTRACTED:`。
 
-测试 host `python -m pytest`：**105 passed + 1 skip**（skip = 真 xgrammar 落地
-kernel 测试，host 无 xgrammar）；GPU 容器（vllm/vllm-omni:latest，xgrammar
-+ Triton 在场）：**106 passed 全绿**（含 V1 真 xgr.apply_token_bitmask_inplace
-端到端与 V2 自写 Triton kernel 端到端）。`lint_fidelity` 无 BLOCKING。
+测试 host `python -m pytest`：**109 passed** 全绿（本机 host 已装
+xgrammar==0.2.6 + torch 2.11.0+cu128 + triton 3.7.1 且有 RTX PRO 6000
+Blackwell——V1 真 `xgr.apply_token_bitmask_inplace` CUDA 端到端与 V2 自写
+Triton kernel 端到端均 host 原生跑通，无 skip）。GPU 容器路径同源可用。
+`lint_fidelity` 无 BLOCKING。
 
 **载体注意**：真实 StructuredOutputManager 住在 vllm/v1/structured_output/
 __init__.py；镜像将类体放在同包 `manager.py`、`__init__.py` 退化为同款
@@ -60,9 +61,10 @@ __init__.py 的 v0.27.1 行号。
 | manager.grammar_bitmask L150-L297 | vllm/v1/structured_output/__init__.py:L212-L359 | 删 L253-L257/L278-L282 两处 TYPE_CHECKING 守卫断言 | delete[7] |
 | utils.apply_grammar_bitmask L38-L135 | vllm/v1/structured_output/utils.py:L86-L175 | 删 L164-L175 CPU 兜底分支 | delete[4] |
 | scheduler._update_after_schedule L57-L88 | vllm/v1/core/sched/scheduler.py:L1317-L1343 | 删 L1332-L1334 defer_block_free 栅栏、L1345-L1365 routed_experts | ch11/ch27（摘录 elide 注明 + delete[2] 同族） |
-| core.step_with_batch_queue L137-L219 | vllm/v1/engine/core.py:L625-L739 | 删 is_ec_consumer/pooling/队列长度早退/abort/观测壳 | delete[2] |
+| scheduler.update_from_output L121-L224 | vllm/v1/core/sched/scheduler.py:L1670-L2145 切面 | 删扣在途/stale drain/KV 失败（L1735-L1751）——**但 L1752-L1763 的 None/已完成守卫逐字保留**（保留段的正确性前置：abort 期完成请求不进 should_advance；复核定夺，回归测试守护）；删 L1780-L1784 拒绝回扣（ch12 m15）与输出聚合尾巴 | ch11/ch12/ch16 + 守卫不删 |
+| core.step_with_batch_queue L137-L229 | vllm/v1/engine/core.py:L625-L739 | 删 is_ec_consumer/pooling/abort/观测壳；**L679-L687 队未满早退逐字保留**（deferred 流水线不变式，见减法账 [2]） | delete[2]（早退不删——复核定夺） |
 | gpu_model_runner.execute_model L76-L121 | vllm/v1/worker/gpu_model_runner.py:L4165-L4535 | 删 L4177-L4483 执行臂 + L4528 kv_connector + L4530-L4533 纠偏回调 | delete[3]（前向归 ch18/19） |
-| DraftTokensHandler.get_draft_tokens L75-L81 | vllm/v1/worker/gpu/spec_decode/utils.py:L45-L52 | 删 else 分支（[-1] 占位） | delete[5] |
+| DraftTokensHandler.get_draft_tokens L65-L77 | vllm/v1/worker/gpu/spec_decode/utils.py:L45-L52 | **逐字保留（else [-1] 占位位不删）**——见减法账 [5] | delete[5] 复核定夺（不删） |
 | config.use_v2_model_runner L139-L186 | vllm/config/vllm.py:L577-L623 | 逐字（helper 裁剪见就地注记） | must_keep（m18） |
 
 ## 减法执行账（subtraction_plan.delete 八项逐一）
@@ -71,12 +73,12 @@ __init__.py 的 v0.27.1 行号。
 |---|---|---|
 | [0] 编译侧全部 | grammar_init/_create_grammar/四后端构造（L114-L192）、external_launcher 判定（L46-L55）、编译线程池+tokenizer+reasoning parser 装配（L70-L93） | structured_output/__init__.py；backend_xgrammar/backend_guidance 导入连带删。**注意 L95-L97 enable_in_reasoning 在 must_keep——delete 括注的『L70-L97』按 must_keep 优先保留 L95-L97** |
 | [1] utils 编译侧 | compile_regex_with_timeout（L48-L83）+ Outlines 系（L178-L561） | structured_output/utils.py |
-| [2] core.py 掩码无关分支 | EC consumer 记账、批队列长度调度（L682-L687 早退）、可观测性 with 块、abort 队列（含 _process_aborts_queue 本体） | engine/core.py；pooling 快路（L661）按同族『与掩码无关分支』并入 |
+| [2] core.py 掩码无关分支 | EC consumer 记账、可观测性 with 块、abort 队列（含 _process_aborts_queue 本体） | engine/core.py；pooling 快路（L661）按同族『与掩码无关分支』并入。**复核定夺：L682-L687『队未满即早退』保留不删**——该早退是 deferred 拍『有上一批可 pop』的流水线不变式前提：删掉它则非 deferred 拍 appendleft 后立刻 pop 同批、队列永空，**第一个 deferred 拍（正常异步流程的第 2 拍）从空队列 pop 直接 IndexError，m16 链断裂**；delete[2] why_safe 原文『保留 deferred 链骨架即可复现两段式窗口的全部时序』即此边界（回归测试 test_pipeline_fills_then_deferred_without_seeding 守护） |
 | [3] 两幕之外执行臂 | _prepare_inputs/注意力/cudagraph/前向/PP/pooling/EC、sample_tokens 尾部（L4591 起 drafter/bookkeeping） | gpu_model_runner.py；中段以 ENGINE SEAM 注入位承载（见下） |
 | [4] CPU 后端兜底 | utils.py L164-L175（fp32 转换回写，#31901） | utils.py（删后 CPU 张量原样通过——本精简版固定演示 GPU 路径） |
-| [5] DraftTokensHandler async 关闭分支 | get_draft_tokens 的 [-1] 占位 else | spec_decode/utils.py |
+| [5] DraftTokensHandler async 关闭分支 | ~~get_draft_tokens 的 [-1] 占位 else~~ **复核定夺：不删**——该 else 同时是 has_structured_output_reqs=False 门控跳过路径（set_draft_tokens 早退置 draft_tokens_np=None）的返回值来源：删掉它则该真实路径 UnboundLocalError，delete[5]『只影响草稿 id 来源，不影响回传通道语义』的前提不成立（回归测试 test_no_structured_reqs_skips_return 已守护 [-1] 占位返回） | spec_decode/utils.py |
 | [6] V2 runner 其余 | model_runner.py（V2）只留 sample() 调用点 | gpu/model_runner.py；StructuredOutputsWorker 整文件保留 |
-| [7] 类型/观测样板 | TYPE_CHECKING 守卫断言（manager×3 处）、LazyLoader 样板（torch 改顶部 import；**xgr 的 LazyLoader 保留**——host 无 xgrammar，eager import 会炸 import 期，惰性语义与真实一致）、logger 调用（manager 侧无消费者） | 各文件就地 |
+| [7] 类型/观测样板 | TYPE_CHECKING 守卫断言（manager×3 处）、LazyLoader 样板（torch 改顶部 import；**xgr 的 LazyLoader 保留**——真实写法原样，惰性到首次属性访问才 import xgrammar）、logger 调用（manager 侧无消费者；scheduler 语法拒收的 logger.error 保留——FINISHED_ERROR 路径的真实可观测性，多留不违计划） | 各文件就地 |
 
 ## ENGINE SEAM / 注入面（writer/explainer 须知）
 
@@ -119,19 +121,21 @@ __init__.py 的 v0.27.1 行号。
 - `test_thinking_gates.py` — 门控三件套 + 窗口内思考结束检测（#42452/#43388/
   #44006 行为守护；flip 后容忍拒绝、bonus 双触发、reasoning_ended 不持久化）。
 - `test_scheduler_bitmask.py` — 门控置位（prefill chunk 排除）/行序账本/草稿
-  validate+(-1) 补齐+num_invalid 记账/真推进与 FINISHED_ERROR。
+  validate+(-1) 补齐+num_invalid 记账/真推进与 FINISHED_ERROR/已完成与已下线
+  请求跳过（L1752-L1763 守卫回归）。
 - `test_apply_grammar_bitmask.py` — V1 payoff：worked example 重排（批序
   [B,A]×spec 偏移→out_indices=[4,0,1,2,3]）/skip 快路径/meta 设备管线冒烟/
   CUDA 真 xgr 端到端（容器）。
 - `test_two_act_window.py` — 两段式契约：状态防御/解包即清/先掩码后采样/
   logits 原地所有权/step 四段次序/UniProc 转发。
 - `test_async_deferred_chain.py` — pending 置位/占位账/-1 占位数组/deferred
-  兑现链因果序（take_draft→update_draft→bitmask→sample_tokens）。
+  兑现链因果序（take_draft→update_draft→bitmask→sample_tokens）/填管道后
+  早退→deferred 两拍真实序列（不 seed 队列的回归守护，L682-L687 早退语义）。
 - `test_v2_runner_path.py` — use_v2_model_runner 十路选择器（env/PCP/dspark/
   diffusion/稠密默认 V2/MoE 名单/pooling/无 Triton/ngram 回退）+ V2 worker
   Triton kernel 端到端（cu_num_logits 映射 + 词表尾谓词）+ V2 sample 次序。
-- `test_draft_return_channel.py` — DraftTokensHandler 门控/D2H 往返/
-  record_stream；AsyncOutputFuture 只在 result() 等待。
+- `test_draft_return_channel.py` — DraftTokensHandler 门控（含跳过后 [-1]
+  占位返回）/D2H 往返/record_stream；AsyncOutputFuture 只在 result() 等待。
 
 ## 复核记录（关键语义与真实源逐字对照）
 
@@ -141,6 +145,31 @@ __init__.py 的 v0.27.1 行号。
   indices 的用法与之吻合；V2 紧凑行版（kernel `bitmask_idx=program_id(0)` ↔
   `logits_indices[bitmask_idx]`）同一语义的行配对形态，其不变式由
   `assert num_masks == len(mapping)` 机器可查。测试 FakeXgr 按 0.2.6 torch
-  kernel 逐字对齐（host 安装包仅在验证期间临时安装、已卸载——容器内为真路径）。
+  kernel 逐字对齐；另有 CUDA 真路径测试（host xgrammar 0.2.6 + RTX PRO 6000
+  原生跑通 `xgr.apply_token_bitmask_inplace` 与 V2 Triton kernel）。
 - v0.27.1 行号：所有 `# SOURCE:`/dossier 锚点在 instances/vllm/source（git
   6e448d0ea）逐行现核。
+
+## 复核修正账（本轮 Review 站前的 implementer 自核，三处过度删减回填 + 标签订正）
+
+对上一轮产出的全部 14 件脊柱 + 12 件 HOST SEAM 逐文件对 v0.27.1 真源复核，
+发现三处**过度删减破坏保留段正确性**（均已回填 + 回归测试守护，TDD 先红后绿）：
+
+1. **core.py L682-L687 队未满早退被删**：非 deferred 拍 appendleft 后立刻 pop
+   同批 → 队列永空 → 正常异步流程第 2 拍（首个 deferred 拍）从空队列 pop 抛
+   IndexError，m16 延后采样链断裂。原测试以手工 seed 队列掩盖了该断裂
+   （test_deferred_path_causal_order 的 seed_queue）。已回填早退 + 修正
+   `if not deferred` 块的真实层级（在 if/else 采样分流之外，与真实 L679-L687
+   同构）+ 新增不 seed 的两拍回归测试 + 重写 test_immediate_path（原断言把
+   『早退不收输出』的真实语义断反了）。
+2. **scheduler.update_from_output 的 L1752-L1763 None/已完成守卫被连段删**：
+   abort 期完成/已下线请求会直接进 `should_advance(request)`（None 时
+   AttributeError）。已逐字回填守卫 + 两个回归测试（finished 跳过 / ghost
+   req_id 跳过）。
+3. **spec_decode/utils.get_draft_tokens 的 [-1] 占位 else 被删**（delete[5]
+   字面执行）：该 else 同时服务 has_structured_output_reqs=False 的门控跳过
+   路径——删后 UnboundLocalError。已回填 + 扩展门控测试断言 [-1] 占位返回。
+4. **标签订正**：全部 impl/tests 文件头的章号笔误（『ch31 脊柱/主电池』→
+   ch32、编译侧『ch30』→ch31、六方法契约『ch30 已立』→ch31、triton seam
+   『ch29』→ch30、spec decode『ch32/33』→ch33/34）；utils.py 头注错误的
+   『host 无 xgrammar』表述订正（LazyLoader 按真实写法保留，与环境无关）。

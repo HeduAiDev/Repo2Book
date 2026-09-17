@@ -1,12 +1,12 @@
 # SOURCE: vllm/v1/worker/gpu_model_runner.py
-# v3 ch31 脊柱⑧：两段式窗口的 worker 面——ExecuteModelState（L437-L450 十元组
+# v3 ch32 脊柱⑧：两段式窗口的 worker 面——ExecuteModelState（L437-L450 十元组
 # 暂存态）、execute_model（L4165-L4175 状态防御 + L4484-L4485 logits 产出 +
 # L4516-L4535 打包 return None 第一幕）、sample_tokens（L4553-L4589 解包即清
 # → apply_grammar_bitmask → _sample 第二幕，『先掩码后采样』钉死的六行）、
 # _sample 头段（L3692-L3706）。
 # SUBTRACTED（delete[3]）：两幕之外的执行臂——_prepare_inputs/注意力元数据/
 #   cudagraph/模型前向/PP 广播/pooling/EC 分支、sample_tokens 尾部 drafter 与
-#   bookkeeping（L4591 起——归 ch12/ch18/ch19/ch32/ch33）。头注加
+#   bookkeeping（L4591 起——归 ch12/ch18/ch19/ch33/ch34）。头注加
 #   from __future__ import annotations 使中段类型名（SpecDecodeMetadata 等）
 #   可 TYPE_CHECKING 化（真实文件顶部全量 import，ch18/ch19 的域）。
 from __future__ import annotations
@@ -122,7 +122,7 @@ class GPUModelRunner:
         #   self.kv_connector_output = kv_connector_output（ch16）。
         # SUBTRACTED: vllm/v1/worker/gpu_model_runner.py:L4530-L4533
         #   deferred_state_corrections_fn()（spec decode 乐观纠偏回调——归
-        #   ch32/33；dossier 摘录 elide 注明）。
+        #   ch33/34；dossier 摘录 elide 注明）。
 
         # SOURCE: vllm/v1/worker/gpu_model_runner.py:L4535 —— 逐字
         return None
@@ -166,7 +166,7 @@ class GPUModelRunner:
 
         # SUBTRACTED: vllm/v1/worker/gpu_model_runner.py:L4591-L4700
         #   _update_states_after_model_execute/PP 广播/drafter 草稿与概率暂存/
-        #   bookkeeping/AsyncModelRunnerOutput 组装（delete[3]——归 ch12/ch32/33；
+        #   bookkeeping/AsyncModelRunnerOutput 组装（delete[3]——归 ch12/ch33/34；
         #   删后本函数直接返回 _sample 的 SamplerOutput，EngineCore 面的
         #   ModelRunnerOutput 组装在真实代码属已删的 bookkeeping 段）。
         return sampler_output
@@ -189,5 +189,5 @@ class GPUModelRunner:
             )
 
         # SUBTRACTED: vllm/v1/worker/gpu_model_runner.py:L3708-L3726 async spec
-        #   草稿回填 + rejection sampling（ch32/33 的域；本章两段式流程恒
+        #   草稿回填 + rejection sampling（ch33/34 的域；本章两段式流程恒
         #   spec_decode_metadata=None）

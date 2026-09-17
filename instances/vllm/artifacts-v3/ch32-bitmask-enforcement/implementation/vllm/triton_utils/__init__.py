@@ -1,5 +1,5 @@
 # SOURCE: vllm/triton_utils/__init__.py
-# HOST SEAM：Triton 可用性承载（ch29 同款 seam）。本章消费面 =
+# HOST SEAM：Triton 可用性承载（ch30 同款 seam）。本章消费面 =
 # `from vllm.triton_utils import tl, triton`（gpu/structured_outputs.py:L6 的
 # kernel 语言面）与 HAS_TRITON（config/vllm.py use_v2_model_runner 的
 # 『Triton 缺失回退 V1』判据）。真实包按 find_spec + 活跃驱动数裁决并给出

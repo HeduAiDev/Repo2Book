@@ -1,18 +1,18 @@
 # SOURCE: vllm/v1/structured_output/utils.py
-# v3 ch31 脊柱②：apply_grammar_bitmask（L86-L175，V1 正典落地，本章 payoff）——
+# v3 ch32 脊柱②：apply_grammar_bitmask（L86-L175，V1 正典落地，本章 payoff）——
 # 紧凑掩码按 worker 批序+spec 偏移重排进 pinned sorted_bitmask → 非阻塞 H2D →
 # xgr.apply_token_bitmask_inplace 原地 -inf。
 # SUBTRACTED（delete[1]）：compile_regex_with_timeout（L48-L83，ReDoS 超时）与
 #   OutlinesVocabulary/OutlinesDiskCache/get_outlines_cache/词表归约/lark↔EBNF
-#   转换/choice_as_grammar（L178-L561）——全部归 ch30（m23/m24 编译侧）。
+#   转换/choice_as_grammar（L178-L561）——全部归 ch31（m19/m10——dossier delete[1] 口径）。
 # SUBTRACTED（delete[4]）：apply_grammar_bitmask 的 CPU 后端兜底分支
 #   （L164-L175：indices 用 python list + 老版 xgrammar CPU 核的 fp32 转换
 #   回写，#31901）——只在 CPU 设备+老版本 xgrammar 核触发，与 GPU 主路径
 #   正确性无关（正文以对照形式一句话带过）。
 # SUBTRACTED（delete[7]）：LazyLoader 样板中除 xgr 外的全部（oc/file_utils/
-#   convert_slow_tokenizer——其消费方已删）；xgr 的 LazyLoader 保留（host 无
-#   xgrammar，eager import 会炸 import 期——LazyLoader 延迟到首次属性访问，
-#   与真实运行时语义一致）。
+#   convert_slow_tokenizer——其消费方已删）；xgr 的 LazyLoader 按真实写法
+#   保留（延迟到首次属性访问才 import xgrammar——与真实运行时语义一致，
+#   无论 host 是否装 xgrammar 行为等价）。
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -126,4 +126,4 @@ def apply_grammar_bitmask(
 #   （ReDoS 超时防护）与 L178-L561 OutlinesVocabulary/OutlinesDiskCache/
 #   get_outlines_cache/re_llama_byte_token 正则/_reduced_vocabulary/
 #   get_outlines_vocabulary/grammar_is_likely_lark/convert_lark_to_ebnf/
-#   choice_as_grammar —— delete[1]，全部归 ch30 编译侧（m23/m24）。
+#   choice_as_grammar —— delete[1]，全部归 ch31 编译侧（m19/m10）。

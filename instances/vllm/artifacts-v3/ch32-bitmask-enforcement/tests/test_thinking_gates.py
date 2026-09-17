@@ -1,4 +1,4 @@
-# ch31 主电池二：思考门控三件套（m14）+ 窗口内思考结束检测（m15）
+# ch32 主电池二：思考门控三件套（m14）+ 窗口内思考结束检测（m15）
 # （vllm/v1/structured_output/__init__.py:L285-L323/L361-L486，
 #  #42452/#43388/#44006 修复行为的守护测试）。
 from __future__ import annotations

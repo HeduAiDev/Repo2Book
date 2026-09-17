@@ -1,5 +1,5 @@
 # SOURCE: vllm/v1/structured_output/backend_types.py
-# 整文件逐字保留（ch30 已立的六方法契约：accept_tokens/validate_tokens/
+# 整文件逐字保留（ch31 已立的六方法契约：accept_tokens/validate_tokens/
 # rollback/fill_bitmask/is_terminated/reset + allocate_token_bitmask/destroy
 # ——本章 must_keep 的 fill_bitmask/is_terminated/accept_tokens/rollback 所在），
 # 仅插入本行与各定义上方的 # SOURCE 标记。
