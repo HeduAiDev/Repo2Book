@@ -18,11 +18,19 @@ if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', 
 from pathlib import Path
 
 NUM = re.compile(r'-?\d+(?:\.\d+)?')
+# 编号形态（m16/ch16/L2-ch38/x264/utf8 类「字母紧贴数字」）不是量值——提取前剔除，
+# 否则跨表指路的机制/章号会被当数字白名单卡死（ch38 实锤：判定文案引用 m16 → 假阳性 16）
+IDLIKE = re.compile(r'[A-Za-z]-?\d+(?:\.\d+)?')
 TEMPLATES = {"state-table", "swimlane", "layout", "tensor-flow",
              "before-after", "state-machine", "flow", "tiling"}
 
 
 def _nums(text: str) -> set:
+    scrubbed = IDLIKE.sub(' ', text)
+    return {float(t) for t in NUM.findall(scrubbed)}
+
+
+def _nums_raw(text: str) -> set:
     return {float(t) for t in NUM.findall(text)}
 
 
@@ -72,7 +80,10 @@ def lint_explainer(chapter_dir: str) -> dict:
                 if not we.get("trace_ref") or not tr.exists():
                     res["trace"].append(f"  {mid}: trace_source=run 但 trace_ref 缺失/文件不存在")
                 else:
-                    have = _nums(tr.read_text(encoding="utf-8", errors="replace"))
+                    # trace 侧数字集不 scrub（机器产 JSON，旧宽松口径保持——表内独立数字
+                    # 允许命中 trace 键名里的数字成分，如 tp4 之于 4；只对表侧 scrub：
+                    # m16/ch38 类编号引用不算表格数字，否则跨表指路全卡死（ch38 实锤））
+                    have = _nums_raw(tr.read_text(encoding="utf-8", errors="replace"))
                     for row in rows:
                         for cell in row:
                             for v in _nums(str(cell)):

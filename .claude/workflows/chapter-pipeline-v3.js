@@ -719,7 +719,7 @@ if (reviewV && reviewV.verdict !== 'APPROVED') {
   const reverify = await agent(
     '你是终局复验员（轻量：只核清单、不开新维度全审）。对下面每条上轮 blocking 项，逐条对照**当前最新**文件核实是否已解决：正文 ' + CH + '/narrative/chapter.md、图 ' + CH + '/diagrams/（PNG 用 Read 打开亲眼看、manifest 的 blind_review 状态），必要时跑对应 linter（' + REPO + '/scripts/lint_*.py）。清单：\n' +
     JSON.stringify(lastBlocking) +
-    '\n已解决=从清单去掉；未解决=进 uncleared（problem + evidence 引最新稿/最新图证据）。全部解决 → all_cleared=true。宁严勿宽：拿不准的算未解决。（rev2 注记：若本清单曾升级后由 Lead 组织修复落盘，本轮为修复后重验——一切以你本轮对盘上文件的亲验为准，清单里携带的旧 evidence（时间戳/旧文件内容摘录）是修复前的历史快照，不代表当前实况，不复述。rev3：同前——图侧项本轮按**新渲染时间戳的 PNG** 亲验（manifest blind_review 应已 PASS），旧判词里的旧时间戳不再作为「未重渲」的证据。rev4：同前——上一轮你新发现的同类残留（图侧标签/曲线点与素材串）已由 Lead 组织修复并重渲重盲审；同样按当前盘上 PNG/文件的亲验为准。）',
+    '\n已解决=从清单去掉；未解决=进 uncleared（problem + evidence 引最新稿/最新图证据）。全部解决 → all_cleared=true。宁严勿宽：拿不准的算未解决。（rev2 注记：若本清单曾升级后由 Lead 组织修复落盘，本轮为修复后重验——一切以你本轮对盘上文件的亲验为准，清单里携带的旧 evidence（时间戳/旧文件内容摘录）是修复前的历史快照，不代表当前实况，不复述。rev3：同前——图侧项本轮按**新渲染时间戳的 PNG** 亲验（manifest blind_review 应已 PASS），旧判词里的旧时间戳不再作为「未重渲」的证据。rev4：同前——上一轮你新发现的同类残留（图侧标签/曲线点与素材串）已由 Lead 组织修复并重渲重盲审；同样按当前盘上 PNG/文件的亲验为准。rev5：同前——lint 类项本轮按「当前 linter 重跑结果」为准，linter 本身的假阳性已由 Lead 修复。）',
     mo({ schema: FINAL_VERIFY_SCHEMA, label: 'review-final-verify', phase: 'Review', agentType: 'general-purpose' }, 'review', false)
   )
   const fdec = finalReviewDecision(reverify, lastBlocking)

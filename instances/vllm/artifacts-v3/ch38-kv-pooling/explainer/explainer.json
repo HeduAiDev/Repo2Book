@@ -1,0 +1,1032 @@
+{
+ "chapter_id": "ch38-kv-pooling",
+ "chapter_title": "KV 池化",
+ "pin": "vLLM v0.27.1 (6e448d0ea)",
+ "kind": "code",
+ "trace_environment": "14 个 trace 全部 host 运行（trace_source=run）：驱动脚本与原始输出在 explainer/traces/（run_m01…m16.py 除 m08/m15 外逐机制一份 + _driver_common 脚手架；复用 tests/_kv_harness 的「调度器半边+worker 半边同进程」装配件，跑的是 implementation/ 精简版——测试基线 69 passed）。host：Windows conda CPython 3.11.11、torch 2.11.0+cu128（CPU 执行）、numpy 1.26.4、zmq 25.1.0、无 CUDA/无 vllm 包安装（精简版自包含）。取证环境与 pin 的差异（exp-0718-1，writer 须就近挑明）：① DMA 三戒的 stream/event 时序 host 不可观察——HostStream 替身 wait_stream/wait_event no-op、torch.Event 即记即完，三戒论证锚 gpu_worker.py:L362-L400 注释原文（控制流与字节流不变，描述符数学经 HostOffloadingWorker 全覆盖）；② swap_blocks_batch 为 host SEAM（ctypes.memmove 逐描述符搬运，真源 C++ cache_kernels.cu 批量拷贝 kernel）；③ /dev/shm 共享 mmap 在 Windows 不存在——spec 走源码自带的 no-mmap 张量回退分支，tiering trace 以 numpy 池替身承载 create_kv_memoryview 位；fs 层 O_DIRECT 不支持自动回退 buffered I/O（源码自带回退）；④ MooncakeStore 查询走真 ZMQ REQ（LookupKeyClient 真身）对脚本化 REP 服务，worker 双传输线程/MooncakeDistributedStore 实现体须外部包（get_finished 骨架 NotImplementedError）；⑤ P2P session 机器（ZMQ 控制面/NIXL 数据面实现体）不进精简版——协议消息类/三角色键/PYTHONHASHSEED 硬门 host 全覆盖；⑥ m07 的 RETRY 态由脚本化假账本回放（CPU 单层池真实只产 HIT/HIT_PENDING/MISS；RETRY 的真源在 tiering 层，m11 trace 以真 TieringOffloadingManager+真 fs 层产出）。其余全部为真源码路径真跑。",
+ "figure_policy": "本章 L0 缩放位置 = 「KV 边界+外部池」（pedagogy-plan l0_zoom；l2-specs/ch38.json l0_region=[kv_column, gpu_column]——池挂在 ch16 已立的 KV 边界上、池本体在 L0 之外）。全部 figure-spec 均可回答「它是 L0 哪一块的放大」：m1=外部池本体的契约嵌套（L2 站 1）；m2=/dev/shm 池几何（L2 站 2）；m3=满块采集切片（L2 站 4）；m4=池准入驱逐（L2 站 5）；m6=DMA 引擎时序（L2 站 7）；m7=四态查询（L2 站 8）；m8=加载路径接 ch16 提升（L2 站 9）；m10=flush 围栏（L2 站 10）；m11=分层池（L2 站 11）；m13=P2P 跨实例层（L2 站 12）；m14=生态对照（L2 站 13）。开篇图走 L2 章图（cartography/l2-specs/ch38.json，gen_L2 渲染），本文件只产正文机制图 spec——按 FIGURE-SYSTEM.md §3：架构性内容回指 L0/L2、不另立架构画法；机制小图是「L2 章图哪一拍的放大」；配色走 l0_common 角色色（EngineCore 橙 C_ENG_S/GPU 绿 C_GPU_S/KV 青 C_KV_S），图面不出现内部路径。时序类图（m6/m13）按 WRITING-CONTRACT-v3 §8 + FIGURE-SYSTEM §2 时序图种规约：UML 文法（竖直生命线+共享时间轴+水平消息直线，禁一切折线/肘形）。",
+ "mechanisms": [
+  {
+   "mechanism_id": "m1",
+   "intuition": "池化引擎不是一个新系统，是 ch16 那份 KVConnector 双面契约换了一双「搬运工的手」：契约外层照旧（调度器半边问「有没有」、worker 半边搬「字节」），内层又嵌了一份同构的小契约（OffloadingSpec 的 manager/worker 两半）——决策在调度器进程、搬运在 worker 进程，这个模式递归了一层。选择哪双手由 spec_name 决定：CPU 单层或分层。",
+   "figure_specs": [
+    {
+     "figure_id": "ch38-fig-contract-nesting",
+     "template": "layout",
+     "l0_zoom": "L0「外部池」本体（挂在 KV 边界上、L0 之外的那块）的展开；对应 L2 章图站 1「池的构成·契约再嵌套」的放大。",
+     "claim": "池化 facade 的三重身份——best-effort（requires_kv_delivery=False：丢一次 save 只是未来一次 miss）、契约再嵌套（KVConnectorBase_V1 之内 OffloadingSpec 又是一份双面契约：get_manager 住调度器进程、get_worker 住 worker 进程）、工厂选引擎（spec_name 默认 CPUOffloadingSpec，可选 TieringOffloadingSpec）。",
+     "numbers": [
+      {
+       "value": "requires_kv_delivery=False（注释原话 a dropped save is just a future cache miss，退出 producer 默认值）",
+       "provenance": "traces/m01.json facade + vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py:L55-L58"
+      },
+      {
+       "value": "role 分裂：2 个 connector 对象非空半边恰 2（每对象只活一半）",
+       "provenance": "traces/m01.json role_split（total=2、non_none_halves=2）+ offloading_connector.py:L64-L80"
+      },
+      {
+       "value": "spec_name 三选路：缺省=CPUOffloadingSpec、显式 CPU=同、Tiering=TieringOffloadingSpec、未知名 ValueError",
+       "provenance": "traces/m01.json spec_factory_choices + vllm/v1/kv_offload/factory.py:L38-L52"
+      },
+      {
+       "value": "内层契约 6+4 原语：manager{lookup/prepare_load/touch/complete_load/prepare_store/complete_store} × worker{submit_store/submit_load/get_finished/wait}",
+       "provenance": "traces/m01.json nested_contract + vllm/v1/kv_offload/base.py:L162-L186 与 L545-L566"
+      },
+      {
+       "value": "不逐层/不同步填法：wait_for_layer_load/save_kv_layer/wait_for_save 三钩子全空",
+       "provenance": "traces/m01.json noop_hooks + offloading_connector.py:L103-L134"
+      },
+      {
+       "value": "生态注册表 6 条（OffloadingConnector/MultiConnector/MooncakeConnector/MooncakeStoreConnector/LMCacheConnectorV1/NixlConnector）；已删条目（如 DecodeBenchConnector）不再注册",
+       "provenance": "traces/m01.json eco_registry + vllm/distributed/kv_transfer/kv_connector/factory.py:L152-L243"
+      }
+     ],
+     "caption_draft": "左：OffloadingConnector facade 框（EngineCore 橙，标 best-effort 三件：requires_kv_delivery=False / request_finished 返 False / 不逐层不同步）；中：ch16 KVConnectorBase_V1 外框内嵌 OffloadingSpec 框——再劈成 get_manager（调度器进程，账本原语）与 get_worker（worker 进程，搬运原语）两半；右：OffloadingSpecFactory 按 spec_name 出 CPUOffloadingSpec（单层）或 TieringOffloadingSpec（分层）。图注结论：池化 = 同一份契约的第三种世界观（ch16 立契约、ch37 填 P/D 可靠交接、本章填 best-effort 池），且『决策与搬运分离』在契约内层又递归了一次。",
+     "illustrator_notes": "架构性内容回指 L2 站 1；两半边用 ch16 已立的画法惯例（调度器侧 EngineCore 橙、worker 侧 GPU 绿）；best-effort 三件用小标签贴在 facade 框上；不要画第二种架构图——外框就是 L0 的 KV 边界+外部池。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m2",
+   "intuition": "开张先定价再铺位：CPU 池的「饼」不是按 worker 各买一份，是一整块预算按『全 worker 拼起来的一块』计价——每块池位里先排 W0 的页、再排 W1 的页、末尾补零凑整页；全体 worker 和调度器进程 mmap 同一个文件，物理上只有一份池。",
+   "worked_example": {
+    "params": "world_size=2、blocks_per_chunk=2、worker 每块 512B（垫字节主例）/1024B（对齐对照）、cpu_bytes_to_use=100MiB；另 8KiB 小池与 world=1 对照。canonical 规范化用 8 块 × 512B 页、2 层共享物理张量的引擎实配。",
+    "trace_source": "run",
+    "trace_ref": "traces/m02.json",
+    "table": {
+     "columns": [
+      "场景",
+      "定价公式代入",
+      "实测（num_blocks / 每 worker 页 / 垫字节）",
+      "判定"
+     ],
+     "rows": [
+      [
+       "主例（有垫字节）",
+       "512B × 2 worker × 2 块 = 2048B → round_up(2048, 4096) = 4096B；100MiB ÷ 4096B",
+       "num_blocks=25600、每 worker 页 1024B、垫 2048B",
+       "预算按全部 worker 计而非 per-worker；对齐垫零真实可见"
+      ],
+      [
+       "对照（恰好页对齐）",
+       "1024B × 2 × 2 = 4096B → aligned 4096B",
+       "num_blocks=25600、每 worker 页 2048B、垫 0",
+       "无 padding 时布局公式仍成立"
+      ],
+      [
+       "小池 8192B",
+       "8192 ÷ 4096",
+       "num_blocks=2",
+       "预算小到只装 2 块——整除性"
+      ],
+      [
+       "canonical 规范化",
+       "8 块 × 512B 页、2 层",
+       "1 条 canonical 张量 (8, 512)、组 1 × 引用 2（两层数据同源同 data_ptr）",
+       "任意 attention 布局先拍平成 (num_blocks, page) 视图"
+      ],
+      [
+       "缺预算参数",
+       "extra_config 无 cpu_bytes_to_use",
+       "Exception: cpu_bytes_to_use must be specified",
+       "池预算是必填项——不定价不开张"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "同一引擎的全部 TP worker 与调度器进程看到同一物理池，且每个 worker 的槽位互不重叠、总占用不超预算：num_blocks × kv_bytes_per_chunk ≤ cpu_bytes_to_use。",
+    "argument": "单一事实源：num_blocks/cpu_page_size_per_worker/kv_bytes_per_chunk 都在 spec 构造期由同一条公式算出（构造期无并发）；槽位互不重叠由线性偏移保证——worker k 的区间 = [k × cpu_page_size_per_worker, (k+1) × cpu_page_size_per_worker)，基例 rank 0 从 0 起，归纳步相邻区间端点相接不交；预算上界由整除定义 num_blocks = cpu_bytes_to_use // aligned_kv_bytes_per_chunk（整除即上界）。trace 实测 4 组参数的 check_num_blocks 与 num_blocks 逐一相等、check_page_per_worker 与 cpu_page_size_per_worker 相等。"
+   },
+   "quantified": "主例：512B/worker 块 × 2 worker × 2 块/chunk = 2048B → 对齐 4096B（垫 2048B，padding 率 50%）→ 100MiB 预算 = 25600 块池位、每 worker 页 1024B；对照（1024B/块）：4096B 恰对齐、垫 0、同样 25600 块；8192B 小池 = 2 块；world=1：512B → 对齐后垫 3584B、1MiB = 256 块。规范化：2 层共享 1 条 (8,512) canonical 张量（data_ptr 相同），组引用 2 条。",
+   "figure_specs": [
+    {
+     "figure_id": "ch38-fig-cpu-pool-geometry",
+     "template": "layout",
+     "l0_zoom": "L0「外部池」的物理本体（/dev/shm 一块）放大；对应 L2 章图站 2「CPU 池开张」。",
+     "claim": "CPU 池一块池位的物理布局是 |--- W0-B0 ---|--- W1-B0 ---| ... | maybe-pad |：全体 worker 的页拼进行内、末尾页对齐补零，num_blocks = cpu_bytes_to_use ÷ round_up(worker 每块字节 × world_size × blocks_per_chunk, PAGESIZE)。",
+     "numbers": [
+      {
+       "value": "主例代入：512B × 2 × 2 = 2048B → round_up(2048, 4096) = 4096B，垫 2048B",
+       "provenance": "traces/m02.json sizing_cases.pad_case_100MiB"
+      },
+      {
+       "value": "num_blocks = 100MiB ÷ 4096B = 25600；每 worker 页 = 2048 ÷ 2 = 1024B",
+       "provenance": "traces/m02.json sizing_cases.pad_case_100MiB（check_num_blocks=25600）"
+      },
+      {
+       "value": "对照：1024B/块 → 4096B 恰对齐、垫 0、仍 25600 块",
+       "provenance": "traces/m02.json sizing_cases.no_pad_case_100MiB"
+      },
+      {
+       "value": "布局注释原文 |--- W0-B0---|---- W1-B0---| ... | maybe-pad |",
+       "provenance": "vllm/v1/kv_offload/cpu/spec.py:L77-L110 注释 + traces/m02.json shm_region.row_layout"
+      },
+      {
+       "value": "文件路径 /dev/shm/vllm_offload_{engine_id}.mmap；worker 槽偏移 = rank × cpu_page_size；调度器进程 rank=None 也 mmap 同一文件",
+       "provenance": "vllm/v1/kv_offload/cpu/shared_offload_region.py:L28-L116 + vllm/v1/kv_offload/tiering/spec.py:L170-L215"
+      },
+      {
+       "value": "canonical 规范化：2 层 → 1 条 (8,512) 张量、组引用 2 条（同 data_ptr）",
+       "provenance": "traces/m02.json canonical_normalization + vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py:L69-L243"
+      }
+     ],
+     "caption_draft": "上半：定价公式一行 + 主例/对照两组数（512B 垫 2048B vs 1024B 垫 0，num_blocks 均 25600）；下半：一块池位的横条布局图——W0 页（绿系）| W1 页（绿系深一档）| maybe-pad（灰斜纹），左端标 /dev/shm/vllm_offload_{engine_id}.mmap，下方三条标尺线：全体 TP worker（各占一 slot）+ 调度器进程（rank=None）+ secondary tier I/O 线程（经 memoryview）——三类执行者同一物理池。图注结论：预算按全 worker 计价、池位按 worker 拼页、物理上只有一份——『共享数据、零共享状态』。",
+     "illustrator_notes": "池位横条用 KV 青系；pad 用灰斜纹与实体页区分；『三类执行者』三条引线是本图论点（同一物理池）的视觉锚；host 取证限制（Windows 无 /dev/shm，走 no-mmap 回退）由 writer 在图注外就近挑明，不画进图。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m3",
+   "intuition": "搬运行李按「箱」不按「件」：GPU 池里 blocks_per_chunk 个块并成一个 offload 块，采集时每箱只看「箱底那一件」在不在（尾块非 0 就整箱搬）；游标记到哪箱，下一步只搬新箱——已寄存的不重寄。",
+   "worked_example": {
+    "params": "block_size=4、blocks_per_chunk=3（注释原例）/1（其余例）；36 token = 9 GPU 块 [1,5,6,7,2,4,9,3,8]；decode 步 +12 token；block_id=0 占位例 [1,0,3,4]；max_offload_tokens=8 例（prompt 32 + decode 4）。",
+    "trace_source": "run",
+    "trace_ref": "traces/m03.json",
+    "table": {
+     "columns": [
+      "轮次/场景",
+      "输入",
+      "采集结果（实测）",
+      "判定"
+     ],
+     "rows": [
+      [
+       "步 1 · 注释原例",
+       "36 token = 9 GPU 块 [1,5,6,7,2,4,9,3,8]，blocks_per_chunk=3",
+       "尾块切片=[6,4,8]（3 chunk 全准入）；搬运 src=全部 9 块、group_sizes=[9]、CPU 槽 [0,1,2]；游标→3",
+       "准入看尾块、搬运走整 chunk——『每 chunk 取最后一个 GPU 块』"
+      ],
+      [
+       "步 2 · 增量游标",
+       "decode +12 token（新 GPU 块 [11,12,13]）",
+       "只采新 chunk：src=[11,12,13]、group_sizes=[3]、块起点 index 9；游标→4",
+       "已存 chunk 不重发（next_stored_chunk_idx 单调）"
+      ],
+      [
+       "block_id=0 跳过",
+       "GPU 块 [1,0,3,4]",
+       "chunk1 尾块 0 → 该 chunk 跳过；src=[1,3,4]",
+       "null/陈旧占位不入池（SWA skip 或被清零的 stale）"
+      ],
+      [
+       "max_offload_tokens 封顶",
+       "36 token（prompt 32 + decode 4）、上限 8",
+       "可卸 8 token → src=[1,2]",
+       "per-request 上限 8 先绑定；prompt-only 掐尾的对照实测在 m16 无旋钮行"
+      ],
+      [
+       "prepare_store 拒收",
+       "池 1 块且被 prepare_load 钉住（预算 4096B）",
+       "store_jobs 空、游标停在 0",
+       "best-effort：放弃本批不重试（只记指标）"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "每个 chunk 至多被采集进池一次，且游标 next_stored_chunk_idx 单调不减；拒收不丢游标（下步重试同区间）。",
+    "argument": "采集区间恒为 [next_stored_chunk_idx, storable_chunks)，storable_chunks ≤ 已分配 chunk 数（min 封顶）——区间左端单调：成功路径把游标推到 max(游标, num_chunks)（advance_stored_idx 的 max 防回退，注释原话 the index must not move backwards）；拒收/空键路径走 advance 或不动，绝不后退。基例：初始 0；归纳步：每步左端只增不减，而 chunk 总数有限 → 每 chunk 至多被扫一次。拒收路径不动游标 → 同一 chunk 下一步仍在区间内（best-effort 容忍重试）。"
+   },
+   "quantified": "9 块 3 chunk 一例：准入判定看 3 个尾块（6,4,8），搬运 9 块 × 512B = 4608B 进 3 个 CPU 槽；增量步：+12 token → 只 3 块 × 512B = 1536B、起块 index 9；封顶例：36 token 只卸 8 token（2 块 = 1024B）；SWA 对齐段不可达 chunk 与 eagle 尾块剔除是同类『采了也命中不了』的减法（dossier 删除项 4，正文散文交代）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch38-fig-tail-block-collection",
+     "template": "tiling",
+     "l0_zoom": "L0 GPU 池（gpu_column）与外部池之间『换出去』第一步的放大；对应 L2 站 4「存储路径① 满块采集」。",
+     "claim": "满块采集按 chunk 切片、每 chunk 以尾块做准入判据：GPU 块 1 5 6 7 2 4 9 3 8 在 blocks_per_chunk=3 下切 3 箱，尾块 6 4 8 非 0 → 3 箱全采，搬运时整箱逐块走（src=全部 9 块）；下步 decode +3 块只采新箱。",
+     "numbers": [
+      {
+       "value": "GPU 块序 1 5 6 7 2 4 9 3 8 → 每 chunk 取最后一个：6 4 8（源码注释原例）",
+       "provenance": "traces/m03.json nine_block_comment_example（tail_block_per_chunk_selected=[6,4,8]）+ offloading/scheduler.py:L1023-L1099 注释"
+      },
+      {
+       "value": "搬运覆盖整 chunk：src=全部 9 块、group_sizes=[9]、CPU 槽 [0,1,2]、游标→3",
+       "provenance": "traces/m03.json nine_block_comment_example.store_job"
+      },
+      {
+       "value": "增量步：新块 [11,12,13]、起块 index 9、游标 3→4",
+       "provenance": "traces/m03.json incremental_cursor"
+      },
+      {
+       "value": "block_id=0：[1,0,3,4] → 跳过 chunk1、src=[1,3,4]",
+       "provenance": "traces/m03.json zero_block_skip"
+      }
+     ],
+     "caption_draft": "左：9 个小方块按 3 个一组成箱（细框圈起），每箱末块（6,4,8）高亮 + 对应 CPU 槽 [0,1,2]；右：第二幅小图——步 2 只新增一箱 [11,12,13]，旧箱画成已寄存状态（浅色+对勾），游标尺标 3→4。图注结论：准入判据看尾块（0=占位跳过）、搬运走整箱、游标保证增量不重寄。",
+     "illustrator_notes": "tiling 模板：3×3 网格；高亮尾块与普通块用同色系两档；『已寄存』用浅色+对勾，避免引入第二种状态图例；两张小图共用图例。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m4",
+   "intuition": "池的准入像一间满员旅馆：新客进门先问『有没有空房』，没有就赶走最久没人住客人的房间（LRU）——但正在被读取的房间（ref_cnt>0）、本次名单上已有的客人（输入保护集）赶不得；赶不够人手就直接拒单（返回 None，不硬塞）。",
+   "worked_example": {
+    "params": "CPUOffloadingManager 直驱：池 4/3/2/1 块四档、LRU 策略、开事件；store_threshold=1（默认）与 =2 两档。",
+    "trace_source": "run",
+    "trace_ref": "traces/m04.json",
+    "table": {
+     "columns": [
+      "轮次",
+      "动作",
+      "账本状态（实测）",
+      "判定"
+     ],
+     "rows": [
+      [
+       "空池首存",
+       "prepare_store(k0)",
+       "MISS→写入中：ref_cnt=-1、write_pending=1、evictable=0、free=3；lookup=HIT_PENDING",
+       "ref_cnt=-1 语义=『写入中』——查得到、读不得"
+      ],
+      [
+       "complete_store",
+       "搬运完成结算",
+       "lookup=HIT、ref_cnt=0、evictable=1、write_pending=0",
+       "写入中→可读可逐的翻转点"
+      ],
+      [
+       "LRU 驱逐+touch",
+       "池 3 存 k0/k1/k2，touch(k0) 后存 k9",
+       "逐出 k1（lookup=MISS）、k0 存活（HIT）；事件 BlockRemoved(keys=[1])",
+       "touch 刷新鲜改变驱逐次序"
+      ],
+      [
+       "驱逐失败",
+       "池 2 全被 prepare_load 钉住再存 k9",
+       "需逐 1 > 可逐 0 → 返回 None",
+       "不足即拒收——best-effort 放弃"
+      ],
+      [
+       "输入保护集",
+       "输入 [k0(已存), k9]",
+       "逐出 k1、k0 留下（HIT）",
+       "已存输入块必须留下（源码注释原话）"
+      ],
+      [
+       "钉/解钉",
+       "load k0 期间存 k9→逐 k1；complete_load 后存 k10→逐 k0",
+       "while_pinned_evicted=[1]、after_complete_load_evicted=[0]",
+       "ref_cnt 防逐的两侧（加载保护期 vs 解钉后）"
+      ],
+      [
+       "store_threshold=2",
+       "lookup 1 次后 store→空；2 次后→收",
+       "seen_once=0、seen_twice=1、counts 计数=2",
+       "频次过滤：确认被复用才值得搬"
+      ],
+      [
+       "事件面",
+       "存 1 块 / 逐 1 块",
+       "BlockStored(removed=false, medium=CPU) + BlockRemoved(keys=[0])",
+       "池里有什么对外可见（外部索引消费）"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "prepare_store 要么整体成功（每新键恰占 1 块、驱逐数恰等于需逐数）要么返回 None 且无任何副作用——不存在半落位状态；池计数守恒 free + allocated ≤ num_blocks。",
+    "argument": "顺序性：先频次过滤→去重（无副作用）→算 num_blocks_to_evict = 新键数 − 空闲数；若 > 可逐数直接 return None（此时尚未动任何块）；policy.evict 失败也 return None（LRU evict 原子：要么给出足额列表、要么 None 不动状态——trace 实测 evict(10) 超 capacity 返 None 后 get 仍在）；_allocate_blocks 在驱逐完成后一次性执行。计数守恒：fresh 分配使 _num_allocated_blocks 单调增、free_list 回收只来自被逐/失败块——两个通道互斥，和恒 ≤ num_blocks。"
+   },
+   "quantified": "池 3 例：3 块存满 + touch(k0) 后第 4 键 k9 进场 → 需逐 1、LRU 次序 k1 最旧 → 逐 1 存 1（净占用不变）；池 2 钉死例：可逐 0、需逐 1 → None；threshold=2 例：同键查 2 次才收（counts LRU tracker 上限 64000 条，tiering 模式显式 raise 禁用 ≥2——cascade 要求全块上下文）；事件粒度逐批：一批驱逐合一条 BlockRemoved。",
+   "figure_specs": [
+    {
+     "figure_id": "ch38-fig-admission-eviction",
+     "template": "flow",
+     "l0_zoom": "L0 外部池内部的『门房』放大；对应 L2 站 5「存储路径② 池准入」。",
+     "claim": "prepare_store 的五道闸门按序全过才落位：频次过滤（counts ≥ threshold）→ 已存去重 → 需逐数 vs 可逐数（不足即 None 拒收）→ evict(n, protected) 只逐空闲且保护本次输入 → 落位 ref_cnt=-1 写入中，complete_store 才翻 0 可读可逐。",
+     "numbers": [
+      {
+       "value": "ref_cnt 状态机：-1 写入中（lookup=HIT_PENDING）→ complete_store 翻 0（lookup=HIT）；prepare_load +1 钉住、complete_load 归 0",
+       "provenance": "traces/m04.json lifecycle_four_states + refcnt_pin_unpin（-1/0 两态与 1 钉住实测）"
+      },
+      {
+       "value": "LRU+touch：池 3 存 k0/k1/k2、touch(k0) 后存 k9 → 逐 k1 留 k0",
+       "provenance": "traces/m04.json lru_eviction_with_touch（evicted_keys=[1]）"
+      },
+      {
+       "value": "驱逐失败：需逐 1 > 可逐 0 → None（无副作用拒收）",
+       "provenance": "traces/m04.json eviction_failure_none + vllm/v1/kv_offload/cpu/manager.py:L166-L236"
+      },
+      {
+       "value": "store_threshold=2：查 1 次不收、查 2 次才收（counts=2）",
+       "provenance": "traces/m04.json store_threshold_filter + cpu/spec.py:L94-L97"
+      },
+      {
+       "value": "策略可插拔：lru/arc 内置 + out-of-tree cache_policy_module_path",
+       "provenance": "vllm/v1/kv_offload/cpu/policies/factory.py:L12-L40（tests 同款替身加载实测）"
+      }
+     ],
+     "caption_draft": "纵向流程图五闸门（菱形判定+矩形动作）：①频次过滤 ②去重 ③需逐数 vs 可逐数（不足→None 旁路，标『best-effort 拒收，只记指标』）④evict(n, protected)（旁注两块保护牌：ref_cnt>0 钉住、输入集）⑤落位（标 ref_cnt=-1）；右下角小块状态机：-1 写入中 →(complete_store)→ 0 可读可逐 ⇄(prepare_load/complete_load)⇄ 1 被读。图注结论：全过五关才落位、任一关失败零副作用——『旅馆门房』的原子性。",
+     "illustrator_notes": "闸门主链竖排、失败旁路从菱形右侧出去标 None；状态机小图与主图之间用一条 ref_cnt 虚线连接（落位动作标 -1）；保护牌用图标克制（一处）。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m5",
+   "intuition": "店打烊前不急着把货搬进仓库：本步算完的块先挂个号（入延迟队列），等下一个引擎步一开门、采完样之后再搬——卸载是旁路生意，永远不挡『吐下一个 token』的正门生意。",
+   "worked_example": {
+    "params": "16-token prompt = 4 块 [1,2,3,4]（每块填互不相同字节 48..51）；world_size=1；随后同前缀新请求 16 token 命中 → 加载到 GPU 块 [4,5,6,7]。",
+    "trace_source": "run",
+    "trace_ref": "traces/m05.json",
+    "table": {
+     "columns": [
+      "引擎步",
+      "worker 侧动作",
+      "观测（实测）",
+      "判定"
+     ],
+     "rows": [
+      [
+       "步 N · 调度尾",
+       "build_connector_meta 产 store job 0（src GPU 块 [1,2,3,4]）",
+       "meta.store_jobs 键 0",
+       "满块采集（m3）产出待搬"
+      ],
+      [
+       "步 N · execute 收尾",
+       "get_finished → prepare_store_kv 只入队",
+       "submitted=[]、延迟队列长 1",
+       "store 不在本步提交——避开采样关键路径"
+      ],
+      [
+       "步 N+1 · forward 前",
+       "start_kv_transfers 开头 submit_store",
+       "submitted=[(0,store)]、completed_jobs={0:1}",
+       "下一步开门第一件事补搬（NOTE(orozery)）"
+      ],
+      [
+       "步 N+1 · 完成回收",
+       "get_finished 事件轮询",
+       "finished_sending 空；字节核验 4 块全等（校验和 24576/25088/25600/26112）",
+       "store 永不发 finished_sending（m9 计数通道）"
+      ],
+      [
+       "步 N+1 · 查询命中",
+       "同前缀新请求查池",
+       "num_hit=16、load_async=True",
+       "CPU 池成了『第二个前缀缓存』"
+      ],
+      [
+       "步 N+2 · 加载",
+       "load job 1 → submit_load",
+       "提交序 [(0,store),(1,load)]；finished_recving={r2}；dst=[4,5,6,7]←src CPU 槽 [0,1,2,3]",
+       "store 先于 load 提交；完成接 ch16 提升路径"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "每个 store job 从产出到提交恰延后一个引擎步且不遗漏、不重复提交。",
+    "argument": "产生即入册：_build_store_jobs 产出的 job 必进 meta.store_jobs；worker 侧唯一入口 prepare_store_kv 把它追加进 _unsubmitted_store_jobs（append-only）；队列的清空点恰两处——start_kv_transfers 开头与 handle_preemptions（flush 提前提交），两处都是『先逐条 submit_store 再 clear』，故清空后每条恰提交一次。不遗漏：get_finished 每步必被调用（ch16 kv_connector_no_forward 保证无 token 步也走到），入队动作挂在 get_finished 里。基例：空队列；归纳步：append 一次的元素必在随后的某个清空点被提交一次后移除。"
+   },
+   "quantified": "一步之差 = 本步 0 次 DMA 提交、下步开头 1 次；观测序列 submitted：步 N []→步 N+1 [(0,store)]→步 N+2 [(0,store),(1,load)]（store 恒先于 load）；字节证据：4 块 GPU→CPU 槽校验和逐块相等（24576/25088/25600/26112=512B×48..51），加载回程 dst 4 块与 CPU 槽逐字节相等；代价面：入队到提交之间 GPU 块多一步暴露窗口——由 m10 的 flush 围栏兜底。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m6",
+   "intuition": "搬运工三条纪律：搬 GPU 的货先等工头（计算流）撒手；同一方向的活一件接一件干（同向保序）；只有从 CPU 搬回去的货才许抄近道并行读源（pinned 内存没人跟它抢）。一趟活的清单是三列小抄：从哪读、写到哪、搬多少——一次内核调用整批执行。",
+   "worked_example": {
+    "params": "指针数学：200B/600B 的 int8 张量；描述符：2 条 × 32B；真实 store job：9 GPU 块 × 2 层引用（blocks_per_chunk=3）。",
+    "trace_source": "run",
+    "trace_ref": "traces/m06.json",
+    "table": {
+     "columns": [
+      "实验",
+      "输入",
+      "描述符/指针数学（实测）",
+      "判定"
+     ],
+     "rows": [
+      [
+       "1:1 快路",
+       "2 块、行距 100B",
+       "块 [0,1] → 指针偏移 [0,100]",
+       "blocks_per_chunk=1 无需子块展开"
+      ],
+      [
+       "展开+半块跳越",
+       "3 个 CPU 块、行距 200B、每块 2 子块",
+       "块 [1,2] skip=1 → 偏移 [300,400,500]；skip=0 → [200,300]",
+       "GPU 首块不对齐 offload 块边界时从块中间起读（block_indices 的用途）"
+      ],
+      [
+       "描述符三缓冲",
+       "2 条描述符 × 32B",
+       "src/dst/size 三个 int64 张量；交换搬运后 dst 两半互换、字节和 2016 守恒",
+       "批量搬运=一次内核吃整个描述符数组"
+      ],
+      [
+       "真实 store job 装配",
+       "9 GPU 块 × 组引用 2",
+       "num_copy_ops=18、每条 512B、共 9216B；CPU 槽校验和 [93696,98304,102912]=每 3 块拼接之和（逐槽相等）",
+       "描述符计数公式 = Σ group_size × 层引用数"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "一次 transfer 的描述符集覆盖全部（组 × 层）子块且两两互不重叠，搬运字节总量 = Σ group_size × page_size_bytes。",
+    "argument": "计数：num_copy_ops = Σ group_size × len(group_data_refs)——循环对每组每层引用恰生成 group_size 条描述符，无遗漏无重复；互不重叠：compute_sub_block_ptrs 的指针 = base + b × row_stride + j × block_page_size，同一块内 j 互异、跨块由 b × row_stride 严格分开（row_stride ≥ blocks_per_chunk × block_page_size，等号时连续）——二元组 (b,j) 到偏移是单射；skip 只截断首块前缀，不改变剩余映射的单射性。trace 实证：18 条 × 512B = 9216B，CPU 槽校验和与『每 3 块拼接』期望逐槽相等。"
+   },
+   "quantified": "9 块 job：描述符 18 条（9 块 × 2 层引用）、每条 512B、总量 9216B、落 3 个 CPU 槽（槽和 93696/98304/102912）；半块跳越：skip=1 时首块少搬 1 个子块（偏移从 300 起而非 200）；三戒时序 host 不可观察——以源码注释为准（gpu_worker.py:L362-L400），控制流与字节流已 host 全覆盖；流/事件/描述符缓冲全池化复用（get_finished 出队时归还三池）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch38-fig-dma-ordering",
+     "template": "swimlane",
+     "l0_zoom": "L0 GPU 池与外部池之间那条『搬运通道』的时序放大；对应 L2 站 7「DMA 引擎」。",
+     "claim": "DMA 三戒的时序：GPU→CPU 的 store 先 wait_stream(计算流)（等模型写完再搬）、同方向 transfer 逐个 wait_event(前一 transfer 的 end_event) 保序串行；CPU→GPU 的 load 才开 CU_MEMCPY_SRC_ACCESS_ORDER_ANY 让驱动流水线源读——安全性差异在源：活 GPU KV 被计算流持续写 vs pinned host 无并发 GPU 写。",
+     "numbers": [
+      {
+       "value": "三戒代码原文锚：wait_stream(计算流)/同向保序/SRC_ACCESS_ORDER_ANY 安全性论证注释",
+       "provenance": "vllm/v1/kv_offload/cpu/gpu_worker.py:L362-L400（注释原文；host 时序不可观察——HostStream SEAM，见 traces/m06.json three_ordering_rules_source_anchored）"
+      },
+      {
+       "value": "真实 store job 描述符：18 条 × 512B = 9216B（9 块 × 2 层引用）；CPU 槽和 [93696,98304,102912] 与拼接期望逐槽相等",
+       "provenance": "traces/m06.json real_store_job_descriptors"
+      },
+      {
+       "value": "半块跳越：块 [1,2] skip=1 → 偏移 [300,400,500]（从 CPU 块中部起读）",
+       "provenance": "traces/m06.json ptr_math_expansion_skip"
+      },
+      {
+       "value": "完成=事件轮询非回调：get_finished 按 query() 出队、wait()=synchronize；流/事件/描述符缓冲三池复用",
+       "provenance": "vllm/v1/kv_offload/cpu/gpu_worker.py:L419-L447 + traces/m06.json three_ordering_rules_source_anchored"
+      },
+      {
+       "value": "kernel 选择：GPU→CPU 恒用专用拷贝引擎 swap_blocks_batch（带宽受限，专用引擎胜过 Triton）",
+       "provenance": "vllm/v1/kv_offload/cpu/gpu_worker.py:L40-L42 注释"
+      }
+     ],
+     "caption_draft": "上半：两条竖直生命线（计算流 / 传输专用流）共享时间轴（UML 时序规约）——计算流一段活动条（写本步 KV），传输流先画 wait_stream 栅（水平虚线消息），随后 store1 活动条、store2 活动条之间 wait_event 栅（同向串行），每段尾部骑一个小事件标记；load 段单独画在下方标 SRC_ACCESS_ORDER_ANY（源读可流水线，双侧箭头示意并行读）。下半：描述符三列小抄（src 指针/dst 指针/size）一排 18 条示意 + 512B/条、共 9216B。图注结论：store 等工头、同向排队；load 才许抄近道——安全性押在『源有没有人并发写』上。",
+     "illustrator_notes": "时序图严格 UML 文法（竖直生命线+共享时间轴+水平消息、禁折线肘形）；栅用虚线水平消息+小圆标记；host 限制（时序不可观察）由 writer 就近挑明，图本身按源码语义画。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m7",
+   "intuition": "查池像翻一本四档评价的名册：HIT（在店且可读）记一笔继续翻；HIT_PENDING（在店、还在上架）记一笔但整趟算『没翻完』；RETRY（位置待定）不记数但继续翻——让店员顺手去后台问；MISS（确定不在）合上名册。只要后三档出现任何『没翻完』，整个查询报 None：稍后再来。",
+   "worked_example": {
+    "params": "脚本化假账本回放四态（CPU 单层池真实只产 HIT/HIT_PENDING/MISS；RETRY 真源在 tiering 层见 m11）；full 组 4 chunk；混合组 = full 4 chunk + SWA 窗口 1 chunk。",
+    "trace_source": "run",
+    "trace_ref": "traces/m07.json",
+    "table": {
+     "columns": [
+      "轮次/场景",
+      "状态序列（脚本）",
+      "返回（实测）",
+      "判定"
+     ],
+     "rows": [
+      [
+       "前缀查找",
+       "[HIT,HIT,MISS,HIT]",
+       "hit_count=2",
+       "MISS 即 break——第 4 块在池也不看（链式早停）"
+      ],
+      [
+       "HIT_PENDING",
+       "[HIT,HIT_PENDING,MISS]",
+       "None",
+       "计数继续但 defer 位为真 → 整体稍后再问"
+      ],
+      [
+       "RETRY",
+       "[RETRY,HIT,MISS]",
+       "None；扫描序=[0,1,2]（穿到 MISS 才停）",
+       "不 break：让 manager 借扫描踢异步查询"
+      ],
+      [
+       "入口层 None",
+       "首块 HIT_PENDING",
+       "(None, False)",
+       "接 ch16 skipped 队列下步重查"
+      ],
+      [
+       "在飞互斥",
+       "transfer_jobs={99}",
+       "(None, False)",
+       "单请求 load/store 不可并发（契约不变量）"
+      ],
+      [
+       "SWA 尾扫",
+       "窗口 2、尾部 [.., HIT,HIT,MISS] / 中断 [.., HIT,MISS,HIT]",
+       "end_idx=5 / 0",
+       "从尾向前数连续窗口；中断即无命中"
+      ],
+      [
+       "多组收敛",
+       "full 4 chunk 全 HIT=16 token、SWA 尾 [MISS,HIT]",
+       "12",
+       "full 组的长命中被 SWA 组收紧到 3 chunk"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "_maximal_prefix_lookup 返回值 = 键序列的最长连续 HIT 前缀长度（HIT_PENDING 计入），当且仅当扫描中出现过 HIT_PENDING 或 RETRY 时返回 None；且扫描步数 ≤ 键数（有限终止）。",
+    "argument": "循环不变量：hit_count 恒等于已扫前缀中「连续可读/在架」块的个数——HIT 与 HIT_PENDING 各 +1（后者的 defer 位单独记录，不污染计数）；RETRY 与 MISS 不 +1；MISS 分支 break（链式哈希保证 MISS 之后必 MISS——ch15 已立，跳过不损失命中）；RETRY 不 break 只是置 defer 位。终止性：每轮枚举推进一个键、键有限。SWA 版单调量：下标每轮严格减 1，consecutive_hits 达到窗口即返回。返回值判定：defer 位为真 ⇔ 返回 None（代码最后一行 hit_count if not defer_lookup else None 的双向蕴含）。"
+   },
+   "quantified": "四态一例：4 键扫 3 次出结果（2 命中 1 早停）；SWA：6 键尾扫 3 步出 end_idx=5、中断例 0；多组收敛：full 组 16 token → SWA 组收紧到 12 token（3 chunk）；RETRY 穿扫代价 = 全键数（4 键扫 4 次）；None 语义三来源：defer 位、在飞互斥、命中块正被加载（_chunks_being_loaded）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch38-fig-lookup-four-states",
+     "template": "state-machine",
+     "l0_zoom": "L0 新请求进入 KV 边界时『问外部池』那一步的放大；对应 L2 站 8「查询路径」。",
+     "claim": "单块查询四态（HIT 在池可读 / HIT_PENDING 在池写入在飞 / RETRY 位置未定 / MISS 确定不在）之上，前缀查找叠加两条聚合规则：MISS 即 break（链式早停）、任一 defer 态（HIT_PENDING/RETRY）让 get_num_new_matched_tokens 整体返回 None『稍后再问』。",
+     "numbers": [
+      {
+       "value": "四态枚举与语义（LookupResult docstring）",
+       "provenance": "vllm/v1/kv_offload/base.py:L107-L113 + traces/m07.json four_states_legend"
+      },
+      {
+       "value": "HIT,HIT,MISS,HIT → hit_count=2（第 4 块在池也不看）",
+       "provenance": "traces/m07.json prefix_hit_miss_break"
+      },
+      {
+       "value": "HIT_PENDING → None（计数但 defer）；RETRY → None 且穿扫 [0,1,2] 到 MISS",
+       "provenance": "traces/m07.json hit_pending_defers + retry_keeps_scanning"
+      },
+      {
+       "value": "SWA 从尾扫连续窗口：尾部命中 end_idx=5、中断 0",
+       "provenance": "traces/m07.json swa_tail_window + offloading/scheduler.py:L579-L610"
+      },
+      {
+       "value": "多组收敛：full 16 token 被 SWA 收紧到 12",
+       "provenance": "traces/m07.json multi_group_convergence + offloading/scheduler.py:L631-L802"
+      }
+     ],
+     "caption_draft": "上半：单块查询的状态盒（manager.lookup 出口四档，各配一句话语义）；下半：前缀扫描的键序列条（4 格），HIT/HIT_PENDING 格累积计数、MISS 格画『合册』符号（后续格灰掉）、RETRY 格画『继续翻+后台问』小标；顶端一条汇聚箭头：任一 defer → None（标『接 ch16 skipped：稍后再问』）。图注结论：四态是信息完备度分级，None 是 connector 层叠加的『这一趟没翻完』——池查询从不阻塞，只许改天再来。",
+     "illustrator_notes": "状态盒四档用同色系四档深浅；键序列条是本图叙事主角（对齐 m3 的 tiling 视觉语言）；『合册』符号克制一处。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m8",
+   "intuition": "命中之后不是『复制粘贴』而是『挂号领床位』：先把 CPU 侧的块钉住（防驱逐），再在 GPU 池按块表发床位号——offload 块比 GPU 块大时还能半块对齐地从床中间躺下；搬完才递条子（finished_recving）给 ch16 的提升通道。",
+   "figure_specs": [
+    {
+     "figure_id": "ch38-fig-load-path-handoff",
+     "template": "flow",
+     "l0_zoom": "L0「外部池 → GPU 池」回流通道的放大；对应 L2 站 9「加载路径」（接 ch16 站 6 的 WAITING_FOR_REMOTE_KVS 提升）。",
+     "claim": "加载路径五步：命中 keys → manager.prepare_load（ref_cnt+1 防逐）→ dst GPU 块打包 GPULoadStoreSpec（group_sizes/block_indices 支持半块对齐）→ load job 随 meta 过线 submit_load（CPU→GPU DMA）→ finished_recving 接 ch16 提升路径（补缓存+全命中退一 token）。",
+     "numbers": [
+      {
+       "value": "实例：16 token 命中 → load job 1：src CPU 槽 [0,1,2,3] → dst GPU 块 [4,5,6,7]，提交序 [(0,store),(1,load)]（store 先于 load），finished_recving={r2}，dst 与 CPU 槽逐字节相等",
+       "provenance": "traces/m05.json load_roundtrip + query_same_prefix"
+      },
+      {
+       "value": "GPULoadStoreSpec 契约：group_sizes 分组、block_indices 记逻辑起点——offload 块大于 GPU 块时首块可从 offload 块中部起读",
+       "provenance": "vllm/v1/kv_offload/base.py:L409-L440 docstring + traces/m06.json ptr_math_expansion_skip（skip=1 偏移 [300,400,500] 实测）"
+      },
+      {
+       "value": "prepare_load 钉 ref_cnt：lookup 后 eviction 失败的对照（可逐 0 → None）",
+       "provenance": "traces/m04.json eviction_failure_none + cpu/manager.py:L129-L146"
+      },
+      {
+       "value": "完成信号：load 发 finished_recving（store 不发 finished_sending）；提升链 = _update_waiting_for_remote_kv 补缓存 + 全命中退一 token 重算",
+       "provenance": "offloading/worker.py:L346-L381 + vllm/v1/core/sched/scheduler.py:L2635-L2676（ch16 已立，本章消费）"
+      }
+     ],
+     "caption_draft": "左→右流程带五站（各配实测量）：查命中（16 token）→ 钉块（ref_cnt+1）→ 发床位（GPULoadStoreSpec：dst [4,5,6,7]、半块对齐小图标）→ DMA 回流（[0,1,2,3]→[4,5,6,7]）→ 递条子（finished_recving → ch16 WAITING_FOR_REMOTE_KVS 轨道，虚线接出画面右缘标『ch16 站 9』）。图注结论：命中只走半程——『换回来』的另一半是 ch16 立好的异步等待与提升机器，本章只负责把货送到站台。",
+     "illustrator_notes": "末站用虚线接出画面（回指 ch16，不重画）；半块对齐用一个小标（首块从中间起读）；量化数字全部来自 traces/m05.json。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m9",
+   "intuition": "完成信号是点人头不是放礼炮：每个 worker 干完自己的那份就报到一次（{job:1}），调度器数人头——world_size 个全到齐才结算；store 的完成连礼炮都没有（不发 finished_sending），只在账本上销号。",
+   "worked_example": {
+    "params": "world_size=2 引擎（store job 0）+ world_size=1 对照；聚合语义用两个 OffloadingWorkerMetadata 直测。",
+    "trace_source": "run",
+    "trace_ref": "traces/m09.json",
+    "table": {
+     "columns": [
+      "轮次",
+      "动作",
+      "账本（实测）",
+      "判定"
+     ],
+     "rows": [
+      [
+       "聚合语义",
+       "w1 {0:1} + w2 {0:1,7:1}",
+       "aggregate → {0:2, 7:1}",
+       "跨 worker 求和——每人各报 1 次"
+      ],
+      [
+       "第 1 个 worker 报告",
+       "world_size=2、store job 0 完成",
+       "pending_count 2→1、lookup=HIT_PENDING、保活 True",
+       "未聚满不结算（块还不可读）"
+      ],
+      [
+       "第 2 个 worker 报告",
+       "同 job 再报 1 次",
+       "pending=0、lookup=HIT、job 销号、保活 False",
+       "聚满 world_size 才 complete_store"
+      ],
+      [
+       "world_size=1 对照",
+       "单 worker 一次报满",
+       "lookup=HIT、保活 False",
+       "计数门=world_size，单卡一步到位"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "每个 transfer job 恰在累计收到 world_size 次完成报告后结算一次，且结算后该 job 不再被处理。",
+    "argument": "pending_count 初始 = num_workers；update_connector_output 对每条 (job_id, count) 先减后判：>0 即 continue（唯一不动点推进），==0 恰进入一次结算分支并 del self._jobs[job_id]——删除后同 job 再报会在取 job_status 处暴露（KeyError），而正常流程中 worker 每 job 恰 mark_completed 一次（submit 成功后 get_finished 出队一次）；跨步重复回执由 _stale_job_threshold 门槛拦截（reset_cache 后旧 id 全部 < 阈值被跳过）。计数单调性：pending_count 只被减、每 job 的报告总数 ≤ world_size（每 worker 至多报一次）。"
+   },
+   "quantified": "world_size=2：2 报结算（第 1 报后 pending 1、HIT_PENDING；第 2 报后 0、HIT）；world_size=1：1 报即结算；聚合算术 {0:1}+{0:1,7:1}={0:2,7:1}；保活语义：has_pending_push_work = bool(_jobs) or manager.has_pending_work()——账未清引擎不许停步（无 token 步也滚 build_connector_meta/update_connector_output）。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m10",
+   "intuition": "异步搬运和块复用是两列相向的火车：调度器不停车，只在三种信号（块将被复用/请求被抢占/终局）出现时拉一道闸——把还在延迟队列里的搬运抢先发车，然后站在站台等它真的到站（wait 同步），才放 GPU 改写这块显存。",
+   "worked_example": {
+    "params": "终局例：请求 8 token（块 [1,2]）带在飞 store job 0 结束；复用例：新请求分到块 1；抢占例：running 请求被逐出。",
+    "trace_source": "run",
+    "trace_ref": "traces/m10.json",
+    "table": {
+     "columns": [
+      "触发",
+      "输入",
+      "调度器侧（实测）",
+      "worker 侧围栏（实测）"
+     ],
+     "rows": [
+      [
+       "终局",
+       "请求带在飞 store job 0 结束（块 [1,2]）",
+       "jobs_to_flush={0}、盯防账本 {1,2}",
+       "（此刻 store 还在延迟队列、submitted=[]）"
+      ],
+      [
+       "块复用",
+       "新请求分到块 1（与盯防账本相交）",
+       "jobs_to_flush={0}",
+       "handle_preemptions：先提交 submitted=[(0,store)]、再 wait({0})、队列清空"
+      ],
+      [
+       "抢占",
+       "running 请求被抢占（在飞 store 未完）",
+       "jobs_to_flush={0}",
+       "同款抢先提交+wait"
+      ],
+      [
+       "不接管对照",
+       "request_finished",
+       "返回 (False, None)",
+       "块释放不延迟——对照 P/D 分离章的 True 接管"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "GPU 块被 KV cache manager 重新分配（改写）之前，引用它的任何 store 必已提交且搬运已完成。",
+    "argument": "盯防登记完备：store 创建时 SWA 块入 _block_id_to_pending_jobs（可先于请求结束被释放的块）、request_finished 时补登记非 SWA 块——引用块的两类生命周期都有登记点；触发完备：build_connector_meta 每步检查三源（本步新分配块 ∩ 盯防账本、preempted_req_ids 的在飞 job、终局未完 store），命中即收进 jobs_to_flush 随 meta 过线；围栏顺序：worker.handle_preemptions 先把 flush 的 store 从延迟队列弹出 submit、再 worker.wait(job_ids)——wait 对每个 job 的 end_event synchronize，返回即 DMA 落地，之后才轮到本步任何会写这些块的前向。基例：无在飞 store 时 flush 集为空；归纳步：每次复用检查都发生在改写前的同一步 meta 构造期。"
+   },
+   "quantified": "三触发各一例：终局 {0}、复用 {0}、抢占 {0}；围栏动作序列：submitted [] → [(0,store)] → wait({0})；等待上界 = 在飞 transfer 的剩余 DMA 时间（同向串行队列深度 × 单块时间——store 延迟一步提交恰好把暴露窗口压到最短一格）；对照：ch16 wait_for_save 每拍强制等（P/D 可靠语义）vs 本章『被复用才等』（best-effort 换吞吐）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch38-fig-flush-fence",
+     "template": "before-after",
+     "l0_zoom": "L0 外部池与 GPU 池之间『块复用与异步搬运竞态』那道闸的放大；对应 L2 站 10「完成回收与 flush 围栏」。",
+     "claim": "flush 围栏三触发（GPU 块将被复用/请求被抢占/终局前 store 未完）→ jobs_to_flush → worker handle_preemptions 先抢先提交延迟队列里的 store、再 wait() 同步——GPU 改写块之前搬运必已落地。",
+     "numbers": [
+      {
+       "value": "终局例：request_finished 返回 (False, None)（不接管）；jobs_to_flush={0}、盯防账本 {1,2}",
+       "provenance": "traces/m10.json terminal_trigger + request_finished_no_takeover"
+      },
+      {
+       "value": "复用例：新请求分到块 1 → jobs_to_flush={0}；围栏序列 submitted [] → [(0,store)] → wait({0})、延迟队列清空",
+       "provenance": "traces/m10.json block_reuse_trigger + worker_fence_submit_and_wait"
+      },
+      {
+       "value": "抢占例：preempted_req_ids → jobs_to_flush={0}",
+       "provenance": "traces/m10.json preemption_trigger + offloading/scheduler.py:L1228-L1255"
+      },
+      {
+       "value": "围栏代码：先提交后 wait（wait=事件 synchronize）",
+       "provenance": "vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py:L292-L317（ch16 m7 handle_preemptions 挂点的池化填实）"
+      },
+      {
+       "value": "对照：ch16 wait_for_save 每拍强制等（P/D）vs 本章被复用才等（best-effort）",
+       "provenance": "offloading_connector.py:L103-L134 wait_for_save 空实现注释 + vllm/distributed/kv_transfer/kv_connector/v1/base.py:L337-L367"
+      }
+     ],
+     "caption_draft": "左（前）：GPU 块 1 两个所有者——延迟队列里的 store job 0（虚框）与新请求的分配箭头相向；三枚触发信号标（块复用/抢占/终局）汇到一道闸门（jobs_to_flush）。右（后）：闸门内两步——先发车（submitted=[(0,store)]）再站台上等（wait({0})，画一个时钟标记），完成后新请求的写箭头才落到块 1 上。图注结论：围栏是 best-effort 世界里唯一的同步点——只在两列火车真的要相撞时拉闸，平时谁也不等谁。",
+     "illustrator_notes": "before-after 左右对照共用了块 1 的位置锚（视觉上是同一块显存）；触发信号标三枚小旗；wait 用时钟符号一处；对照 P/D 的 wait_for_save 以图注文字带过、不画第二套。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m11",
+   "intuition": "分层池是一座中转枢纽：只有 CPU 月台能通 GPU 的轨道（primary 是唯一网关）；货要进 SSD 仓/远端库（secondary）都从月台再搬一程（cascade 下推），要从仓里取回也先搬回月台（promotion 升回）——期间查询一律答『稍后再问』（RETRY），等货上月台才答 HIT。",
+   "worked_example": {
+    "params": "真 TieringOffloadingManager + 真 FileSystemTierManager（线程池文件 I/O；host 上 numpy 池替身承载 mmap 位、O_DIRECT 自动回退 buffered）；负载 = 16 字节 0..15；secondary_tiers=[fs]。",
+    "trace_source": "run",
+    "trace_ref": "traces/m11.json",
+    "table": {
+     "columns": [
+      "轮次",
+      "动作",
+      "结果（实测）",
+      "判定"
+     ],
+     "rows": [
+      [
+       "store+cascade",
+       "primary 槽 0 存 1 块 → complete_store",
+       "lookup=HIT；fs 层落 1 个 .bin（…_r0/000/00_g0/….bin 四级路径）",
+       "Always offload to all tiers——store 完成即全层下推"
+      ],
+      [
+       "primary 清空后查",
+       "reset_cache 后 lookup（fs 文件仍在）",
+       "RETRY（fs 异步查询入队）",
+       "primary 是网关：miss 才下探 secondary"
+      ],
+      [
+       "promotion 占位",
+       "on_schedule_end 后再查",
+       "RETRY（fs HIT → prepare_write 占位 ref_cnt=-1）",
+       "升回期间请求稍后再问（RETRY 语义）"
+      ],
+      [
+       "批量提交+完成",
+       "再 on_schedule_end × 2 轮",
+       "lookup=HIT、主层槽里 16 字节负载齐",
+       "两跳：fs→CPU→GPU；primary 满则 promotion 失败=MISS"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "secondary 的块要上 GPU 必经 primary（网关不变量）：promotion 未完成前同一键的 lookup 恒 RETRY，complete_write 后恰转 HIT；cascade 期间 primary 块被 ref_cnt 钉住不可逐。",
+    "argument": "网关：worker 半边只持有 primary 的 CPUOffloadingWorker（GPU↔CPU DMA 唯一入口），secondary 只拿到 primary 的 memoryview——代码路径上不存在 secondary→GPU 的通道。RETRY→HIT 的转移恰一次：_initiate_promotion 立即 prepare_write 占位（ref_cnt=-1，同键同步重复 lookup 见占位不再重复发起）；submit_load 在 on_schedule_end 批量发出；完成回调 complete_write 把 -1 翻 0——此后 lookup 恒 HIT 直到被逐。cascade 钉住：create_store_job 先 prepare_read（ref_cnt+1），complete_read 归还——传输期间块不可逐。终止性：每步 on_schedule_end flush 一次 pending 集（集合清空后才接受新一批），fs 线程池有限任务必完成。"
+   },
+   "quantified": "promotion 节奏实测：lookup#1 RETRY（查询入队）→ lookup#2 RETRY（占位）→ 2 轮 on_schedule_end 后 HIT——最坏 3-4 个引擎步（『SSD 里的块命中了却到不了 GPU』的具体节奏）；cascade 写放大：1 块 × 全部 secondary 各 1 份（fs 层 1 个 .bin，四级路径 …_r0/000/00_g0/）；store_threshold≥2 在分层模式显式 raise（cascade 要求全块上下文）；副层工厂两条示范 fs/p2p（obj/example 已删）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch38-fig-tiering-gateway",
+     "template": "layout",
+     "l0_zoom": "L0「外部池」的分层纵深展开（HBM/DRAM/SSD 的代码形态）；对应 L2 站 11「分层池」。",
+     "claim": "分层池五原则的几何：CPU primary 是唯一能 DMA GPU 的层（网关），secondary（fs/obj/p2p）只能经它中转——store 完成即 cascade 全层下推、secondary 命中先 promotion 升回主层（期间 RETRY）、primary 满则 promotion 失败=MISS、ref_cnt 作驱逐保护。",
+     "numbers": [
+      {
+       "value": "五原则 docstring 原文锚（Always offload to all tiers / Primary tier is the gateway / Staged promotion / Transparent retry / ref_cnt as eviction protection）",
+       "provenance": "vllm/v1/kv_offload/tiering/manager.py:L4-L21 + traces/m11.json promotion_two_hop_retry.anchors"
+      },
+      {
+       "value": "promotion 节奏：RETRY 序列 RETRY→RETRY→（2 轮 on_schedule_end）→HIT；负载 16 字节回主层逐字节齐",
+       "provenance": "traces/m11.json promotion_two_hop_retry（rounds、extra_schedule_end_rounds=2、promotion_slot_has_payload=true）"
+      },
+      {
+       "value": "cascade 实测：complete_store 后 fs 层落 1 个 .bin（四级路径 model_digest_r0/000/00_g0/hash.bin）",
+       "provenance": "traces/m11.json store_then_cascade_to_fs + tiering/manager.py:L586-L630"
+      },
+      {
+       "value": "调度器进程也 mmap 同一池（rank=None）：GPU↔CPU DMA 在 worker 进程、CPU↔secondary I/O 在调度器进程",
+       "provenance": "vllm/v1/kv_offload/tiering/spec.py:L170-L215 + traces/m11.json scheduler_side_mmap"
+      },
+      {
+       "value": "primary 满 → promotion 失败 → lookup MISS（『有数据也到不了 GPU』）；store_threshold≥2 分层禁用（raise）",
+       "provenance": "tiering/manager.py:L282-L350 + spec.py get_manager 的显式 raise（traces/m11.json store_threshold_gate 实测 ValueError）"
+      }
+     ],
+     "caption_draft": "三层横带：上 GPU（绿）、中 CPU primary（青，标『唯一能 DMA GPU 的层·网关』）、下 secondary 排一行三个框（fs/obj/p2p，灰蓝，obj 标已删）；右侧两条竖直通道：下行箭头 cascade（标『store 完成 → 全层下推，prepare_read 钉 ref_cnt』）、上行箭头 promotion（标『命中 → 先升回主层，期间 RETRY』）；左侧一条 RETRY 回环虚线从 secondary 框绕回请求入口（标『稍后再问』）。图注结论：分层不是多修几条路，是把所有路都并进一座枢纽——代价是 secondary 数据必两跳（实测 RETRY×2 后 HIT）。",
+     "illustrator_notes": "三层横带 + 右侧双向竖通道是本图骨架；『网关』标签是论点锚；RETRY 回环虚线只画一条（克制）；secondary 三个框等宽，obj 加删除线小标（dossier 删除项 3）。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m12",
+   "intuition": "池里的『钥匙』是一串字节而不是元组：块哈希接 4 字节组号打包成 bytes——省掉 tuple 装箱的 GC 税，还能直接当 dict 键、文件名、网络载荷用。粒度旋钮决定『几件行李并成一箱』：CPU 页 = GPU 页 × blocks_per_chunk，箱越大簿记越省、查找粒度越粗。",
+   "worked_example": {
+    "params": "键打包：hash 32B + 组号 7；粒度：GPU 块 4 token、offload block_size=8 token；FileMapper：org/name 模型、rank 3、键种子 5/0/1/远种子。",
+    "trace_source": "run",
+    "trace_ref": "traces/m12.json",
+    "table": {
+     "columns": [
+      "项",
+      "输入",
+      "实测",
+      "判定"
+     ],
+     "rows": [
+      [
+       "键打包",
+       "hash 32B + group_idx=7",
+       "key 总长 36（尾 4B=组号）；解包往返 hash/group 皆相等",
+       "(hash, group) ↔ bytes 双射——直接当键用"
+      ],
+      [
+       "chunk 粒度",
+       "GPU 块 4 token、offload block_size=8 token",
+       "blocks_per_chunk=2、tokens_per_hash=4、hashes_per_chunk=2、worker 每块 512B",
+       "CPU 页 = GPU 页 × 2（簿记 vs 粒度的权衡）"
+      ],
+      [
+       "互斥门",
+       "block_size 与 blocks_per_chunk 同给",
+       "ValueError: Specify only one",
+       "两种说法二选一"
+      ],
+      [
+       "fs 三级分桶",
+       "键种子 5（rank 3）",
+       "…_r3/000/00_g0/<hash>.bin 共 4 级；种子 0/1 同桶 000、远种子桶 100",
+       "哈希前缀限目录扇出；完整哈希在文件名保唯一"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "OffloadKey 编码是无碰撞双射：make_offload_key ∘ (get_offload_block_hash, get_offload_group_idx) = 恒等。",
+    "argument": "hash 定长（32B）+ 组号定长 4B 的拼接是 (bytes_32 × int) → bytes_36 的单射（前 32 字节与后 4 字节按固定偏移切分，解码恰还原两个分量——trace 实测往返相等）；文件名侧把完整哈希放进文件名（<hash>.bin），前缀分桶只影响目录扇出不影响唯一性；跨进程一致由链式哈希种子保证（PYTHONHASHSEED，WC6/m13）。"
+   },
+   "quantified": "键长 36B（32+4）；粒度例：8 token offload 块 = 2 GPU 块 → CPU 页 1024B（512×2）、每 chunk 哈希 2 条；fs 路径 4 级（model_digest_r<rank>/<hhh>/<hh>_g<group>/<hash>.bin），第一级桶按哈希前 3 个十六进制字符分（种子 0/1 同桶 000、远种子 100）；每 rank 写自己的 _r<rank> 兄弟目录——多 rank 安全共享同一 root_dir。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m13",
+   "intuition": "两台引擎共享 CPU 池，像两个邻居合用一间储藏室：没有固定房东房客——同一实例对不同请求既可以当取货人也可以当发货人；钥匙（块哈希）必须完全一样，所以开门前先对暗号：PYTHONHASHSEED 不一致直接拒绝进屋。",
+   "figure_specs": [
+    {
+     "figure_id": "ch38-fig-p2p-protocol",
+     "template": "swimlane",
+     "l0_zoom": "L0 双实例形态（ch37 已立 multi 布局）+外部池的交叉放大：两台引擎各自的 CPU 池互为对方的 secondary；对应 L2 站 12「P2P 层」。",
+     "claim": "P2P 层五步线协议（Lookup→LookupResp→Fetch→NIXL WRITE→TransferDone）在无固定 P/D 角色的对称 peer 间搬运块，kv_transfer_params 三角色键（remote_prefiller/remote_decoder/remote_kv_source）由编排层驱动，PYTHONHASHSEED 未设启动即拒。",
+     "numbers": [
+      {
+       "value": "三角色键实测：remote_kv_source → peer 10.0.0.2:5710 + do_probe=True；remote_prefiller → do_probe=False（P/D 跳过 Lookup 直接 Fetch）；remote_decoder → 目标键；无键 → 无源无宿",
+       "provenance": "traces/m13.json role_keys + vllm/v1/kv_offload/tiering/p2p/manager.py:L188-L231"
+      },
+      {
+       "value": "PYTHONHASHSEED 未设 → ValueError 拒启（must be set … block hashes match across instances）；设 0 后可建",
+       "provenance": "traces/m13.json pythonhashseed_gate + docs/features/kv_offloading_usage.md:L189-L191（握手期互验）"
+      },
+      {
+       "value": "对称语义实测：PD consumer 查询 HIT（对端 prefiller 视为有全部块）、普通请求（无角色键）MISS（无对端退化分支）",
+       "provenance": "traces/m13.json lookup_symmetric_semantics"
+      },
+      {
+       "value": "线协议消息五步与字段校验（LookupMsg/LookupRespMsg/FetchMsg/TransferDoneMsg；keys/block_indexes 定长校验、负索引/类型错 ValueError）",
+       "provenance": "traces/m13.json protocol_messages + vllm/v1/kv_offload/tiering/p2p/session/protocol.py:L178-L218"
+      },
+      {
+       "value": "watchdog：_UNBOUND_STORE_TIMEOUT_S=60s 收死对端缓冲",
+       "provenance": "vllm/v1/kv_offload/tiering/p2p/manager.py（session 机器不进精简版——dossier 删除项 9，正文散文交代）"
+      }
+     ],
+     "caption_draft": "两条竖直生命线（实例 A / 实例 B，各画一小块 CPU 池在脚下，标『对称 peer：无固定 P/D 角色』）共享时间轴：①LookupMsg（B 问 A 池里有没有这些键）→②LookupRespMsg（hits 位图）→③FetchMsg（点名拉，block_indexes）→④NIXL WRITE（数据面粗箭头，A 池直写 B 池）→⑤TransferDoneMsg；顶部一条小注：启动门——PYTHONHASHSEED 对不上拒启+握手互验。图注结论：共享池的协议 = 查有什么→点名拉→单边写→回执，角色每请求可换，唯一不变的是两边的哈希必须同源。",
+     "illustrator_notes": "UML 时序规约（水平消息直线、共享时间轴、禁折线）；NIXL WRITE 数据面与 ZMQ 控制面用不同粗细/颜色区分（数据粗、控制细）；两实例框角色色对等（对称性是论点）。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m14",
+   "intuition": "同一份双面契约的另三种填法：MooncakeStore 把池搬出引擎进程（master 协调的分布式仓，查询慢就答『稍后再问』）；LMCache 是外挂引擎（薄壳按开关走内置适配器或外部包）；MultiConnector 是配电排（列表里第一个说『我有货』的子连接器获得这单，其余只管入库）。",
+   "worked_example": {
+    "params": "Mooncake：16-token prompt、脚本化 REP 服务（delay 0.35s / 即答两档、hits=12）；LMCache：sys.modules 替身注入两路实现；MultiConnector：FakePoolA/B 两腿（0/5 与 20 两档）。",
+    "trace_source": "run",
+    "trace_ref": "traces/m14.json",
+    "table": {
+     "columns": [
+      "生态",
+      "场景",
+      "实测",
+      "判定"
+     ],
+     "rows": [
+      [
+       "MooncakeStore · 异步查询",
+       "16 token、后台 ZMQ 未就绪 → 就绪",
+       "首问 (None, False) → 再问 (12, True)",
+       "None=稍后再问的第三种填法（接 ch16 skipped）"
+      ],
+      [
+       "MooncakeStore · 同步+对齐",
+       "外部命中 12、本地已算 12",
+       "need_to_allocate=0",
+       "差值语义 (N−computed) 与 OffloadingConnector 同构"
+      ],
+      [
+       "MooncakeStore · I/O 押 get_finished",
+       "start_load_kv / wait_for_save",
+       "双 no-op；get_finished 骨架 NotImplementedError（实现体须外部包）",
+       "全部 I/O 在 compute 后发——重叠窗口最大化"
+      ],
+      [
+       "LMCache 双路",
+       "use_native=True / False",
+       "分别加载 native / latest 两个实现、引擎对象不同",
+       "内置适配器 vs 外部包——同注册名两种工程形态"
+      ],
+      [
+       "MultiConnector 首命中",
+       "A=0,B=5 → (5, False)；下一请求 A=20 → (20)",
+       "分配路由：A 收 (r1,0)、B 收 (r1,5)",
+       "列表顺序首个命中数>0 者获加载权；全部子收 store"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "MultiConnector 每请求恰有一个子 connector 获得加载权（首个命中数>0 者），且 update_state_after_alloc 只喂获选者。",
+    "argument": "判据只在 to_return[0]==0 且 toks>0 时首次赋值——赋值后 to_return[0]>0 使后续子 connector 的赋值条件恒假（『后续更长命中不覆盖』，L399-L404 注释原话）；获选者记入 _requests_to_connector，分配阶段按该表路由——未选者对同请求的 alloc 调用收到 num_external_tokens=0（trace 实测 A 收 0、B 收 5）。Mooncake 侧的 None 语义：后台 future 未就绪返回 None、就绪后同请求重查命中缓存结果——查询不阻塞调度热路径。"
+   },
+   "quantified": "Mooncake 异步：未就绪 (None,False) → 0.5s 后 (12,True)（kvpool_cached_tokens=12）；同步差值：12−12=0；MultiConnector：两腿 [A,B]，round1 A=0→B=5 获胜、round2 A=20 先非零→A 获胜（每请求独立判定）；LMCache 两引擎对象互异；生态注册表 6 条里本章树内可真加载 3 个（Offloading/MultiConnector/MooncakeStore）。",
+   "figure_specs": [
+    {
+     "figure_id": "ch38-fig-eco-three-fillings",
+     "template": "layout",
+     "l0_zoom": "L0「外部池」在生态位上的三张变体脸（同一 KV 边界的不同池后端）；对应 L2 站 13「生态对照」。",
+     "claim": "同一份双面契约的三种填法对照：MooncakeStore=池出引擎进程（master 协调分布式仓+SSD 层、查询 ZMQ RPC 异步 None=稍后再问、I/O 全押 get_finished）；LMCache=外部引擎薄壳（use_native 双路 lazy import）；MultiConnector=组合器（P/D 与池化并存，列表顺序首个命中数>0 者获加载权、全子收 store）。",
+     "numbers": [
+      {
+       "value": "Mooncake 查询：未就绪 (None,False) → 就绪 (12,True)；本地已算对齐 12−12=0",
+       "provenance": "traces/m14.json mooncake_lookup_async + mooncake_lookup_sync"
+      },
+      {
+       "value": "Mooncake worker 双 no-op（I/O 全在 get_finished，docstring 原话 after model compute is launched）",
+       "provenance": "traces/m14.json mooncake_noop_contract + mooncake/store/worker.py:L1538-L1562"
+      },
+      {
+       "value": "LMCache use_native True/False 分别加载 native/latest 两实现",
+       "provenance": "traces/m14.json lmcache_dual_path + lmcache_connector.py:L83-L113"
+      },
+      {
+       "value": "MultiConnector 首命中：A=0→B=5 获胜、分配 A 收 0/B 收 5；后续更长不覆盖（注释原话）",
+       "provenance": "traces/m14.json multiconnector_first_hit + multi_connector.py:L399-L404"
+      },
+      {
+       "value": "注册表六面孔（本章树内可加载 3：OffloadingConnector/MultiConnector/MooncakeStoreConnector）",
+       "provenance": "traces/m01.json eco_registry + vllm/distributed/kv_transfer/kv_connector/factory.py:L152-L243"
+      }
+     ],
+     "caption_draft": "三栏并排、顶部共用一条『KVConnectorBase_V1 双面契约』横梁：左栏 MooncakeStore（引擎框外画分布式仓：master+各 rank 内存+SSD 层，标『查询 None=稍后再问/I-O 全押 get_finished』）；中栏 LMCache（引擎框内一个薄壳开关 use_native → 内置适配器 | 外部包）；右栏 MultiConnector（一条竖排列表 A/B/C，A 标 0、B 标 5 高亮『首个>0 获加载权』，旁注『全部子收 store』）。图注结论：契约不动、世界观随便换——分布式仓、外挂引擎、配电排，装的都是同一道 KV 边界。",
+     "illustrator_notes": "三栏等宽共用顶梁（论点=同一契约）；Mooncake 仓画在引擎框外（池出进程是它与本章正典的本质差异）；数字全部来自 traces/m14.json。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m16",
+   "intuition": "每个请求还能自带两张小票：一张写『只值得缓存前 N 个 token』（已知前缀值钱、特有尾巴不值钱）；一张写『这单只许走哪些货架』（只走 CPU 层、或冷批量才许下探磁盘层）——都是塞在 kv_transfer_params 信封里随请求进场的 per-request 旋钮。",
+   "worked_example": {
+    "params": "max_offload_tokens=8 的 36-token 请求（prompt 32 + decode 4）对照无旋钮同请求；kv_load_tiers=[{cpu},{storage,local}] 与 bogus/空表边界。",
+    "trace_source": "run",
+    "trace_ref": "traces/m16.json",
+    "table": {
+     "columns": [
+      "旋钮",
+      "输入",
+      "实测",
+      "判定"
+     ],
+     "rows": [
+      [
+       "max_offload_tokens=8",
+       "prompt 32 + decode 4 = 36 token",
+       "只卸 8 token → src=[1,2]（2 块）",
+       "上界而非目标——已知前缀值得缓存、特有尾部不值得"
+      ],
+      [
+       "对照无旋钮",
+       "同请求无参数（prompt 32 + decode 4）",
+       "卸 32 token → src=[1..8]（8 块）（offload_prompt_only 默认 True 掐掉 decode 4）",
+       "prompt-only 上限绑定：默认只卸 prompt、decode 尾不搬"
+      ],
+      [
+       "非法值",
+       "max_offload_tokens='big'",
+       "解析为 None（忽略）",
+       "type is int 才收——容错不炸请求"
+      ],
+      [
+       "kv_load_tiers",
+       "[{cpu},{storage,local}]",
+       "CPU=True、STORAGE+LOCAL=True、STORAGE+REMOTE=False",
+       "per-request 按 medium/locality 限定参与的层"
+      ],
+      [
+       "边界两极",
+       "bogus 条目 / 显式空表",
+       "bogus→回退 ALL（STORAGE=True）；空表→全拒（CPU=False）",
+       "降级语义：无效回全许、显式空=全拒"
+      ]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "max_offload_tokens 是纯上界（min 链单调收窄、非法值等价于不设），TierFilter 是白名单判定（ALL 恒真、空 matchers 恒假、其余 any 匹配）。",
+    "argument": "上界：_calc_num_offloadable_tokens 计算 num = min(num_computed, num_tokens, max_offload_tokens?, prompt_tokens?)——min 链的每一段只可能收窄，且 None 段被跳过（非法 raw 类型在 RequestOffloadState 构造期就被丢弃并打 warning）；白名单：allows = any(m.matches(medium, locality))——空 matchers 的 any 恒假（显式空表全拒），ALL 是单条空 matcher（medium/locality 均 None 恒匹配）的特例；无效条目逐条跳过、全无效回退 ALL（trace 两极实测）。"
+   },
+   "quantified": "封顶例：36 token 请求只卸 8 token（2 块 × 512B = 1024B，省 87.5% 搬运量——7/8 的尾部不搬）；对照：无旋钮卸 32 token（8 块）；过滤器：3 matcher 判定 2 真 1 假；边界：bogus→ALL（STORAGE True）、空表→CPU False。",
+   "figure_specs": []
+  }
+ ]
+}
