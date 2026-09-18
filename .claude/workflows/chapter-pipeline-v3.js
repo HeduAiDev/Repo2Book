@@ -644,7 +644,14 @@ for (let r = 1; r <= 3; r++) {
       mo({ schema: DIM_SCHEMA, label: 'review:derivation r' + r, phase: 'Review', agentType: 'general-purpose' }, 'review', false)
     )
   }
-  const all = await parallel(dimThunks.concat([readerThunk]).concat(PRIMER ? [derivationThunk] : []))
+  // 2026-09-18 网关账户池收缩：7 并发评审全 503、单请求通——改两两分批并发（批内
+  // parallel、批间串行，每批间小歇）。agent() 的 (prompt,opts) 不变 → resume 缓存不受影响。
+  const _allThunks = dimThunks.concat([readerThunk]).concat(PRIMER ? [derivationThunk] : [])
+  const all = []
+  for (let _i = 0; _i < _allThunks.length; _i += 2) {
+    all.push(...await parallel(_allThunks.slice(_i, _i + 2)))
+    if (_i + 2 < _allThunks.length) await new Promise(res => setTimeout(res, 5000))
+  }
   const dims = all.slice(0, DIMS.length)        // 门控只看 DIMS 个真维度（v3 = 5：v2 四维 + cognitive-ladder）
   const reader = all[DIMS.length]               // 读者检查失败(限流)不门控
   const derivation = PRIMER ? all[DIMS.length + 1] : null
