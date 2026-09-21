@@ -1443,7 +1443,7 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
         raise NotImplementedError(f"{speculative_config.method} is not supported yet.")
 ```
 
-五支分发：dflash、dspark、gemma4、mtp、eagle，各自一个 `*Speculator`。谁被强制送到这栋楼？dspark 与混合 KV 的 DFlash（混合 KV=混合注意力模型的多张 KV 账，[第 14 章](../../ch14-memory-ledger/narrative/chapter.md)「一个池子多张账」立过的组化）：
+五支分发：dflash、dspark、gemma4、mtp、eagle，各自一个 `*Speculator`。谁被强制送到这栋楼？dspark 与混合 KV 的 DFlash（混合 KV=混合注意力模型的多张 KV 账，[第 14 章](../../ch14-memory-ledger/narrative/chapter.md)「怎么切」立过的组化）：
 
 ```python
 # vllm/config/vllm.py:L587-L600 · use_v2_model_runner：dspark 与混合 KV DFlash 强制 V2

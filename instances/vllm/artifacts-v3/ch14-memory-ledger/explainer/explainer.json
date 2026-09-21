@@ -789,6 +789,206 @@
           "caption_draft": "时间线三段演进：①全同 spec 组——所有层页形状一模一样（Qwen2.5、DeepSeek V3.1），无需任何混合机制；②类型统一组（PR #25101）——同是注意力缓存但页宽不同（V3.2 indexer、MTP 层、MiniCPM 4.1），UniformTypeKVCacheSpecs 打包成一个分配单位；③混合 spec 组 HMA——跨类型层共享同一物理 buffer（Gemma3、Qwen3-Next full:linear 1:3），多块池方案被否因为前缀缓存让 linear 层的峰值块需求不可预测（『无法预知运行时会有多少个 block 被命中』）。底部一句前史：V0 手工补丁（Mamba 状态独立张量、按 max_num_seqs 猜并发——猜大 OOM、猜小排队）→ V1 统一分配器（前缀缓存 / KV 传输 / PD 分离三件事一起解锁）。本章 V4 的第三路 = 类型统一组的 DeepSeek 特化（装包 + 近似 GCD + packed 重叠布局）。"
         }
       ]
+    },
+    {
+      "mechanism_id": "init-call-tree",
+      "intuition": "一次交付验收动线：EngineCore 按固定顺序逐站签字——公示收费菜单（注册 spec→manager 映射）、挨户收登记表（广播收 spec）、分流特殊住户（non_causal 旁路）、量剩余面积（profile 定可用）、出平面图（分组+布局定账）、图纸抄送物业与施工队各一份（拍平喂调度器/布局喂 worker）、施工队按图浇筑（分配+切片）、最后每户领钥匙（bind_kv_cache 双写）——每站只做一件事，产物原样交给下一站。",
+      "worked_example": {
+        "params": {
+          "主线": "一次 DeepSeek V4 启动的初始化全链路（engine-core → executor 广播 → worker 三进程）",
+          "数据来源": "dossier/supplement-call-chain.json init-call-tree 机制 facts（锚点由 analyst 对 pin 逐行现核）",
+          "口径说明": "与社区蓝本（research/hybrid-v4-background.json csdn-vllm-analysis-4-init）的差异以 pin 为准：v0.27.1 把 collective_rpc(\"get_kv_cache_spec\") 广播包进 executor 方法 model_executor.get_kv_cache_specs()（abstract.py:L149-L150 的实现体就是这行广播）——语义未变、多一层命名包装，调用图按 pin 画两层"
+        },
+        "trace_source": "manual",
+        "manual_reason": "调用树为结构性事实，锚点由 analyst 对 pin 逐行核验（supplement-call-chain.json init-call-tree 机制 facts）；无逐轮运行轨迹可跑——各站跨 engine-core/executor/worker 三进程、由 collective_rpc 广播驱动，host 桩跑无法呈现全链控制流",
+        "table": {
+          "columns": ["站", "谁调谁（锚点）", "一句话职责"],
+          "rows": [
+            ["入口编排", "EngineCore._initialize_kv_caches（vllm/v1/engine/core.py:L250-L332）", "八步顺序总编排：注册→收 spec→non_causal 检查→profile→定账→拍平喂调度器→worker 落地→warm up"],
+            ["注册菜单", "register_all_kvcache_specs(vllm_config)（core.py:L254）", "engine-core 进程注册 11 项内置 spec→manager 映射（single_type_kv_cache_manager.py:L1881-L1942）+ 平台钩子"],
+            ["广播收 spec", "self.model_executor.get_kv_cache_specs()（core.py:L257 → abstract.py:L149-L150 = collective_rpc(\"get_kv_cache_spec\")）→ GPUModelRunner.get_kv_cache_spec（gpu_model_runner.py:L7800-L7837）", "广播到每个 worker，每层注意力模块自报 KVCacheSpec（收集面三分支见 spec-collection 机制）"],
+            ["non_causal 旁路", "core.py:L265-L279", "任一层 spec 带 non_causal=True（Prefix LM 双向注意力）→ 强制关 chunked prefill 与 prefix caching（两者都假设因果注意力，非因果 prefill 会腐蚀缓存）——社区蓝本没有这一站；注释明说放 engine-core 进程因为它是建 scheduler 的同一进程"],
+            ["定可用", "self.model_executor.determine_available_memory()（core.py:L293）", "worker 侧跑 profile 峰值后剩余量（→ 本章 m1/m2 三步定账）"],
+            ["定账分发", "get_kv_cache_configs(vllm_config, kv_cache_specs, available_gpu_memory)（core.py:L304-L306 → kv_cache_utils.py:L2094-L2242）", "合并全 worker spec → get_kv_cache_groups 四路分发（V4 走第三路重组）→ packed 布局 → 护栏四道 → 出 KVCacheConfig"],
+            ["拍平喂调度器", "generate_scheduler_kv_cache_config（core.py:L315）+ block_size = min(各组 spec.block_size)（core.py:L318-L321）", "调度器只拿一份解包后的代表 spec 配置；num_gpu_blocks/容量/并发写回 cache_config（→ m9 一份账喂两侧）"],
+            ["worker 落地", "self.model_executor.initialize_from_config(kv_cache_configs)（core.py:L330 → abstract.py:L118-L120 广播 → gpu_worker.py:L650-L665）", "先 ensure_kv_transfer_initialized（L662，注释：必须先于 initialize_kv_cache，后者会注入 kv sharing 层等 connector 无关组）→ self.model_runner.initialize_kv_cache(kv_cache_config)（L665）"],
+            ["runner 内部十步", "GPUModelRunner.initialize_kv_cache（gpu_model_runner.py:L7624-L7681）", "deepcopy 配置 → 补 encoder-only 层 → 并入 kv sharing 层 → 建 attn/ssu backend → prepare_kernel_block_sizes（注释举例：管理块 256 而后端只支持 64 时拆 4 块）→ metadata builders → initialize_kv_cache_tensors（L759 真正分配，双路径判据见 worker-alloc-duality）→ kv_transfer 注册"],
+            ["终点双写", "bind_kv_cache（gpu_model_runner.py:L7588-L7593 → vllm/v1/worker/utils.py:L466-L525）", "双写收尾：按层号分桶填 runner 平铺张量列表（kv connector 注册用）+ 对 forward_context 每层调 layer.bind_kv_cache（层实例把原始分配拆成它需要的视图，如 Mamba 拆 conv/ssm）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "初始化链是严格顺序的单遍直线流（无回跳、无部分初始化状态），且模型多样性被 KVCacheSpec 申报面整段挡在收集站之后——下游分组/布局/分配/切片没有任何一站读取模型专属信息。",
+        "argument": "顺序性：core.py:L253-L332 是直线控制流，任何一站抛错即中止启动（护栏 raise / assert 都在站内），不存在『定了一半的账』被消费的窗口。解耦的归纳论证：基例——收集面（gpu_model_runner.py:L7800-L7837）只调 attn_module.get_kv_cache_spec 协议方法，不认识具体模型类；归纳步——四路分发的判据全部来自 spec 自报属性（block_size/sliding_window/page_size_bytes/类型）、packed 布局只消费组页宽、layer_packing 表只消费布局输出、四步切片只消费 (offset, block_stride)——链上每站的输入都是上一站的输出或 spec 字段，全程无模型名分支（supplement 实证：整个 v1/core 里 V4 的名字只出现在分组与组布局处）。"
+      },
+      "quantified": "全链跨 3 个进程边界（engine-core → executor 广播 → worker）、两次 RPC 广播（收 spec、落地分配，abstract.py:L118-L150）；worker 侧 initialize_kv_cache 内部 10 步（gpu_model_runner.py:L7624-L7681）。61 层 V4 一次启动的实算流量：61 个注意力层自报 243 条 spec → 四桶装包 → 终五组、202 个 distinct offset 的 KVCacheTensor 声明（全部别名同一块 slab，traces/v4_cache_groups_61layer.json）。确定性记忆量锚点：profile 定账的除数在三条路下分别是 spec.page_size_bytes（单组 uniform）/ block_stride（packed）/ page_size×group_size（一般多组）——kv_cache_utils.py:L972-L990 _pool_bytes_per_block 三分支，注释明说 mirror get_kv_cache_config_from_groups 的除数。",
+      "figure_specs": [
+        {
+          "figure_id": "ch14-fig-kvcache-init-chain",
+          "template": "layout",
+          "l0_anchor": "L0 启动段全链：串起站 4（每层自报）→ 站 5（组化）→ 站 6（定账护栏）→ 站 7（一份账喂两侧）→ 站 12（worker 多组落地）的初始化主干——用户点名的『完整调用关系架构图』，章级总览（信息密度高、每站一行职责）",
+          "claim": "KV cache 初始化是一条自顶向下的直线调用链：EngineCore._initialize_kv_caches 八步编排（注册→广播收 spec→non_causal 旁路→profile→四路分发定账→拍平喂调度器→worker 双路径分配→切片绑定），每站一行职责、每站 file:line 锚——模型差异被 spec 申报面整段挡在收集站，下游零模型分支。",
+          "numbers": [
+            {"value": "EngineCore._initialize_kv_caches（入口）", "provenance": "vllm/v1/engine/core.py:L250（supplement-call-chain.json init-call-tree）"},
+            {"value": "register_all_kvcache_specs：11 项内置 spec→manager 映射", "provenance": "vllm/v1/engine/core.py:L254 + single_type_kv_cache_manager.py:L1881-L1942"},
+            {"value": "get_kv_cache_specs = collective_rpc(\"get_kv_cache_spec\")（两层包装）", "provenance": "vllm/v1/executor/abstract.py:L149-L150"},
+            {"value": "get_kv_cache_spec 三分支收集面", "provenance": "vllm/v1/worker/gpu_model_runner.py:L7800-L7837"},
+            {"value": "non_causal 旁路：关 chunked prefill + prefix caching", "provenance": "vllm/v1/engine/core.py:L265-L279"},
+            {"value": "determine_available_memory（profile 定可用）", "provenance": "vllm/v1/engine/core.py:L293"},
+            {"value": "get_kv_cache_configs（四路分发→packed 布局）", "provenance": "vllm/v1/engine/core.py:L304-L306 → kv_cache_utils.py:L2094-L2242"},
+            {"value": "generate_scheduler_kv_cache_config + block_size=min(各组)", "provenance": "vllm/v1/engine/core.py:L315-L321"},
+            {"value": "initialize_from_config：先 ensure_kv_transfer_initialized 再 initialize_kv_cache", "provenance": "vllm/v1/worker/gpu_worker.py:L650-L665"},
+            {"value": "initialize_kv_cache 内部 10 步（含 prepare_kernel_block_sizes：管理块 256 拆 4×64）", "provenance": "vllm/v1/worker/gpu_model_runner.py:L7624-L7681"},
+            {"value": "bind_kv_cache 双写（runner 列表 + forward_context 层实例）", "provenance": "vllm/v1/worker/utils.py:L466-L525"},
+            {"value": "61 层实算：243 条 spec → 五组 → 202 个 offset", "provenance": "traces/v4_cache_groups_61layer.json layer61"}
+          ],
+          "caption_draft": "自顶向下看一遍 KV cache 的诞生：EngineCore 像验收动线一样逐站签字——先在 engine-core 进程注册 11 项 spec→manager 菜单，再广播让每个 worker 的注意力层自报形状（三分支收集面），Prefix LM 的非因果层在这里被旁路（强制关 chunked prefill 与前缀缓存）；profile 量出可用显存后，get_kv_cache_configs 走四路分发（V4 走第三路重组 + packed 布局），同一份 config 拍平喂调度器、带布局喂 worker；worker 先建 kv transfer 再进 runner 十步（kernel 块细分、双路径分配、视图切片），最后 bind_kv_cache 双写——每层在 forward_context 里拿到自己的视图。注意两层 executor 包装是 v0.27.1 的形态：EngineCore 不再直接 collective_rpc，语义未变。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "spec-collection",
+      "intuition": "物业收登记表只认表格不认人：住户分三种——替隔壁楼备货的租户（EC 专职 producer，货只发走、自己不留本地仓库——整栋交白卷走人）、把仓库记在邻居名下的租户（cross-layer KV 共享层，跳过——账在目标层名下）、老实填表的租户（逐层自报缓存格式）；物业照单全收，从不打开任何户型图。",
+      "worked_example": {
+        "params": {
+          "收集面": "GPUModelRunner.get_kv_cache_spec（gpu_model_runner.py:L7800-L7837，docstring 自述：解析 static forward context 中每个 Attention 模块的 KV 格式，不需要 KV 的层不进 dict）",
+          "遍历对象": "get_layers_from_vllm_config(vllm_config, AttentionLayerBase)（L7811-L7812）——不止 Attention 类，任何 AttentionLayerBase 子类（V4 的 DeepseekV4IndexerCache / CompressorStateCache）都从这里被枚举",
+          "数据来源": "dossier/supplement-call-chain.json spec-collection 机制 facts（锚点由 analyst 对 pin 逐行现核）"
+        },
+        "trace_source": "manual",
+        "manual_reason": "调用树为结构性事实，锚点由 analyst 对 pin 逐行核验（supplement-call-chain.json spec-collection 机制 facts）；三分支是纯控制流（无逐轮数值状态可跑），逐层数字由 v4-cache-spec-census 的实跑 trace（traces/v4_cache_groups.json census_toy）另证",
+        "table": {
+          "columns": ["分支", "判据（锚点）", "动作", "一句话语义"],
+          "rows": [
+            ["分支一：EC 专职 producer 整体返空", "has_ec_transfer() and not get_ec_transfer().is_consumer（gpu_model_runner.py:L7808-L7809）——is_consumer 对 ec_consumer/ec_both 为真，非 consumer 即专职 ec_producer（ec_role 三选一，vllm/config/ec_transfer.py:L11-L13）", "return {}", "EC（encoder cache 编码缓存的跨实例传输）里专职 producer 的实例只算编码缓存发给 consumer，不进本地 KV 账本；这解释了 EngineCore 侧 has_kv_cache 可为假（core.py:L281-L297 给 available_memory=[0]*n）"],
+            ["分支二：KV 共享跳过", "attn_module.kv_sharing_target_layer_name 非空（gpu_model_runner.py:L7814-L7825）", "登记进 self.shared_kv_cache_layers[layer_name]=kv_tgt_layer 后 continue", "本层不建 spec，KV 账记在目标层名下（You-Only-Cache-Once 类省内存）；分配后由 gpu_model_runner.py:L7581-L7583 别名到目标层的张量"],
+            ["分支三：逐层自报", "其余全部层（gpu_model_runner.py:L7827-L7835）", "spec = attn_module.get_kv_cache_spec(self.vllm_config)；AttentionSpec 再补 backend.indexes_kv_by_block_stride()（L7832-L7834）", "协议核心：每个注意力模块自己申报缓存格式；indexes_kv_by_block_stride 是 packed 寻址兼容位（num_blocks 是否物理最外维）——spec-collection 在收集面预填、切片面的 assert 消费"],
+            ["上下文约束", "set_current_vllm_config 上下文（L7830-L7833 注释）", "广播必须包在配置上下文里跑", "indexes_kv_by_block_stride→get_kv_cache_stride_order→get_kv_cache_layout 调用链依赖 current vLLM config"],
+            ["V4 视角（数字例）", "c4 层枚举出 5 个 AttentionLayerBase 模块 / c128 层 3 个 / c1 层 1 个", "各报各的（census 见 v4-cache-spec-census 机制）", "一个 EAGLE draft 层与 target 共 KV → 报 0 条账；『新缓存组件只要进 forward_context 就会被收集』是这套枚举的机制保证"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "收集面完备且不重不漏：每个需要本地 KV 的 AttentionLayerBase 模块恰产生一条 spec，不需要的（EC 专职 producer 整体、KV 共享层逐层）一条也不产生——每个物理缓存张量恰有一条 spec 记账。",
+        "argument": "遍历对象是 AttentionLayerBase 全集（构造期各自注册进 static_forward_context：DeepseekV4Attention attention.py:L332、DeepseekV4SWACache sparse_swa.py:L75、DeepseekV4IndexerCache attention.py:L696、CompressorStateCache compressor.py:L171），三分支互斥完备：EC 专职 producer 判定是全局早退（先于逐层循环）、kv_sharing 判定逐层 continue、其余逐层进 dict；KV 共享层的账由目标层名下那条 spec 覆盖（别名在分配侧 L7581-L7583 完成），故『一条物理张量一条账』保持。跨 worker 的哨兵是 EngineCore 侧合并断言：同层在不同 worker 的 spec 必须相等（kv_cache_utils.py:L2138-L2141 assert）。"
+      },
+      "quantified": "V4 一次启动的收集面流量：61 个注意力层枚举出 243 条 spec（c4 层 5 条 ×30 + c128 层 3 条 ×31 = 150+93）、4 种页宽（traces/v4_cache_groups_61layer.json layer61.spec_census）；对照玩具表 [0,0,4,128,0] 5 层 → 11 条 spec（traces/v4_cache_groups.json census_toy）。分支流量对照：EC 专职 producer 实例收 0 条（consumer/both 实例正常分配）、KV 共享的 draft 层 0 条、普通层 1~5 条。"
+    },
+    {
+      "mechanism_id": "packed-layout-semantics",
+      "intuition": "先把账本抽象成一个纯数学问题（零 vLLM 标识符）：每层有一个『形状』=（每 token 字节 × 每 block token 数）→ 页宽；池子只会数块号，要求每块物理等宽。三种形状关系各对应一种归一化问题——全同（无事可做）、同型异宽且整除（调大小层的块长即可对齐）、跨型不整除（三条出路全死，唯一无损解是重叠时间复用：块号在同一时刻只属于一个组）。",
+      "note": "本机制为『先理论模型后代码』叙事的理论层（figure-only）：worked_example 与代码侧数字推演并入 packed-view-slicing 条目（lead 批准的合并），本条目只出理论模型图 ch14-fig-hybrid-theory-model。",
+      "figure_specs": [
+        {
+          "figure_id": "ch14-fig-hybrid-theory-model",
+          "template": "layout",
+          "l0_anchor": "L0 KV 账本列组化层（站 5）之前的理论铺垫：把『为什么混合形状必须特殊处理』抽象成纯形状代数——零 vLLM 标识符，作为站 5 组化与 packed 布局的先理论层（代码形态见 ch14-fig-packed-slicing）",
+          "claim": "纯理论模型（零 vLLM 标识符）：层形状=（每 token 字节×每 block token 数）→页宽，池子只认等宽块号——三种形状关系阶梯各对应一种归一化问题：全同无需归一、同型异宽且整除可调大块长无损对齐、跨型不整除（如 32 与 80：80%32=16≠0）三条出路全死，唯一无损解是重叠时间复用（一个块号同一时刻只归一组）。",
+          "numbers": [
+            {"value": "页宽公式：A 层 2B/token×16 token/块 = 32 B/块", "provenance": "theory-toy（2 层玩具示教算术，lead 图单指定的极小数值例；对应代码形态 kv_cache_interface.py:L211-L226 real_page_size_bytes=2×block_size×kv_heads×head_dim×dtype 的抽象）"},
+            {"value": "B 层 6B/token×16 = 96 B/块；96%32=0 → 整除", "provenance": "theory-toy（同上；整除路径的代码形态=调大较小层 block_size，kv_cache_utils.py:L1113-L1115）"},
+            {"value": "跨型例：32 与 80 → 80%32=16≠0 → 不整除", "provenance": "theory-toy（不整除的代码实证：37440%8640=2880、%1728=1152、%32832=4608 全不为零，traces/v4_cache_groups.json page_unify_fallback.remainders_of_max）"},
+            {"value": "调块长对齐：小层块长 16→48（×3）→ 页 32→96", "provenance": "theory-toy（×3 对应 m6 实跑例：32768 调大 block_size 16→32 页变 65536，traces/m6.json）"},
+            {"value": "重叠时间复用的所有权约定：一个块号同一时刻只归一组", "provenance": "vllm/v1/core/kv_cache_utils.py:L1286-L1289（_get_packed_kv_cache_layout docstring：A block ID is owned by one cache group at a time）"}
+          ],
+          "caption_draft": "先把混合缓存问题抽象成形状代数：横轴是池子认的块号，纵轴是每层的物理页宽——层形状=每 token 字节×每块 token 数（玩具例：A 层 2B×16=32、B 层 6B×16=96）。三种关系阶梯：①全同（32/32）——单池零调整，多数模型；②同型异宽且整除（32/96）——把小层块长调大 3 倍（16→48）页宽无损对齐，每 token 成本不变；③跨型不整除（32/80，余 16）——调块长不整除、垫 pad 浪费、拆池浪费，三条出路全死，唯一无损解是让不同组共用块号、每组在块内各占各的偏移（重叠时间复用：一个块同一时刻只借给一组）。第三格就是 V4 packed 布局的理论必然性——代码形态见下一张图。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "packed-view-slicing",
+      "intuition": "一排储物柜按最宽住户定格宽（block_stride=最宽一组的组页和），每户在格内有自己的固定抽屉位（byte offset）；住户取物隔着格宽周期只抽自己那条抽屉（view(-1,stride)[:,off:off+page]——每块的条带碎片化分布、物理不连续）；不同楼栋可以共用同一个抽屉位，因为一个柜格同一时刻只借给一栋楼。",
+      "worked_example": {
+        "params": {
+          "简化例（可心算）": "两组：A 组 2 层（各页 37440，组宽 74880）、B 组 2 层（页 8640+32832，组宽 41472）——页宽全部取 pin spec 类的真实页宽（swa=37440、indexer=8640、c128 压缩器状态=32832），层数刻意选小",
+          "示教显存": "1000000 B（刻意不整除，演示 floor 除法余数闲置）",
+          "真实 61 层行": "30 c4 + 31 c128（社区实读实发权重口径，pin 内无此算例）",
+          "布局与切片代码": "布局走 pin 真码（_get_packed_kv_cache_layout / _get_kv_cache_config_packed，kv_cache_utils.py:L1283-L1358）；切片四步链逐字复刻自 attn_utils.py:L225-L233 packing 分支（host 无法 import gpu worker 模块链，四步为纯 torch 张量操作，见 trace params.slicing_note）",
+          "取证": "pin 真码 host 桩跑（同 run_v4_cache_groups.py 桩替身），驱动脚本 traces/run_v4_cache_groups.py 场景 E，输出 traces/v4_cache_groups_61layer.json"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/v4_cache_groups_61layer.json",
+        "table": {
+          "columns": ["步", "对象", "算式/切片", "结果"],
+          "rows": [
+            ["A 组密排", "a0、a1 各页 37440", "组内 byte_offset 累进 0→37440→74880（组内不重叠）", "组宽（dense width）74880"],
+            ["B 组密排", "b0 页 8640、b1 页 32832", "byte_offset 累进 0→8640→41472", "组宽 41472"],
+            ["块格宽", "block_stride = max(74880, 41472)", "_get_packed_kv_cache_layout（kv_cache_utils.py:L1303）", "74880"],
+            ["池块数", "num_blocks = 1000000 // 74880", "_get_kv_cache_config_packed（kv_cache_utils.py:L1342；floor 余 26560 B 闲置）", "13 块；slab 总宽 total_size 973440"],
+            ["偏移桶", "layers_by_offset", "offset 0=[a0,b0]（跨组重叠）、8640=[b1]、37440=[a1]", "3 个 distinct offset；每个 offset 发一张 KVCacheTensor(size=973440, shared_by=该桶层)"],
+            ["切 a0", "A 组层 0", "view(-1,74880)[:,0:37440]", "[13,37440] uint8"],
+            ["切 b0", "B 组层 0", "view(-1,74880)[:,0:8640]——与 a0 同 offset 0，跨组物理重叠", "[13,8640] uint8"],
+            ["切 b1", "B 组层 1", "view(-1,74880)[:,8640:41472] 再 .view(float32)：条带 32832 字节 ÷ 4 字节/元素", "[13,8208] float32"],
+            ["切 a1", "A 组层 1", "view(-1,74880)[:,37440:74880]（组内 offset 37440，不与 a0 重叠）", "[13,37440] uint8"]
+          ]
+        },
+        "table2": {
+          "columns": ["对象（真实 61 层）", "数字", "出处（trace 键）"],
+          "rows": [
+            ["五组 dense width", "1435968 / 1160640 / 1123200 / 1244160 / 1017792", "layer61.per_group_dense_width"],
+            ["block_stride = max(dense)", "1435968（MLA 组 91 层最宽：31×1728 + 30×8640 + 30×37440）", "layer61.packed_layout"],
+            ["元组对齐", "[31,61,30,31] → d=31、pad=2", "layer61.approx_gcd"],
+            ["offset 规模", "202 个 distinct offset；offset 0 压 5 层（跨组重叠）", "layer61.packed_layout.num_distinct_offsets / offset0_num_layers"],
+            ["池块数（10GiB 示教）", "10737418240 // 1435968 = 7477 块（与社区文章逐一吻合）", "layer61.num_blocks_10gib + community_check"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "切片视图恰覆盖本层页字节且不越块：每个视图的字节区间是 [b×stride+off, b×stride+off+page)（b 为块号）——组内区间两两不交、跨组同 offset 区间重合但访问互斥（一个块 id 同一时刻只归一个组），四步链不跨块边界。",
+        "argument": "组内不交：layout 函数对每组沿 layer_names 顺序 byte_offset += page_size 严格递增（每层页宽为正），同组相邻层区间首尾相接不重叠（单调量：组内 offset 严格递增）。跨组互斥：重合区间的两个层分属不同组，各组持有私有块表、块一经分给某组请求即有该组 ref_cnt（不出现在其他组表里）——所有权约定（_get_packed_kv_cache_layout docstring：A block ID is owned by one cache group at a time）保证重合永不并发写。不跨块：view(-1, block_stride) 把 slab 切成 [num_blocks, stride] 块矩阵（assert inv_order[0]==0 要求 num_blocks 是物理最外维，即 spec-collection 预填的 indexes_kv_by_block_stride），列切片 [:, off:off+page] 天然限制在单块行内——page_bytes = prod(kv_cache_shape[1:])×dtype_size ≤ stride（stride 是含全部成员页的组宽，任一成员页 ≤ 组宽），切片永不越块尾。"
+      },
+      "quantified": "简化例心算链：max(2×37440, 8640+32832)=74880；1000000//74880=13 块（余 26560 B，floor 除法尾零头不给半块）；offset 桶 3 个、a0/b0 共 offset 0。真实 61 层：五组 dense 1435968/1160640/1123200/1244160/1017792，block_stride=1435968 B ≈ 1.37 MiB/块格——10GiB 显存换 7477 块；243 条 spec 的层位分布在 202 个 offset 上、offset 0 一处压 5 个组的层（五组都从 0 号偏移起步，重叠最密）。对照（analyst 独立驱动 traces/v4_61layer.json 同源同果）：五组数字、d=31、pad=2、202 offset 全部一致——两份独立 trace 互证。碎片化的直观代价：某层页 37440 只占块格 1435968 的 2.6%，其余 97.4% 是别组层位——这正是『一个块 id 同刻只归一组』换来零浪费的机制（不拆池、不 pad、按时间复用）。",
+      "figure_specs": [
+        {
+          "figure_id": "ch14-fig-packed-slicing",
+          "template": "tensor-flow",
+          "l0_anchor": "L0 KV 账本列 → GPU 列接缝的 worker 半边；L2 回指站 8（worker 落地，lead 图单口径；旧 12 站位表里同位站为站 12）——packed_backing 一次分配 + 每层条带视图的落地形态（与 ch14-fig-hybrid-theory-model 成对：那张讲理论必然性，这张讲代码实现）",
+          "claim": "packed 布局把全部组密排进同一条 slab：block_stride=最宽组组页和（简化例 74880、真实 61 层 1435968），每层在固定 offset 上以 stride 为周期抽条带 view(-1,stride)[:,off:off+page].view(dtype).view(shape)——组内不重叠、跨组同 offset 物理重叠而互不串写（一个块 id 同一时刻只归一组）。",
+          "numbers": [
+            {"value": "74880（简化例 block_stride = max(2×37440, 8640+32832)）", "provenance": "traces/v4_cache_groups_61layer.json toy_two_group_packed.block_stride"},
+            {"value": "41472（B 组 dense width）", "provenance": "traces/v4_cache_groups_61layer.json toy_two_group_packed.groups[1].dense_width"},
+            {"value": "offset 桶 {0:[a0,b0], 8640:[b1], 37440:[a1]}", "provenance": "traces/v4_cache_groups_61layer.json toy_two_group_packed.layers_by_offset"},
+            {"value": "1000000 // 74880 = 13 块（余 26560 B）", "provenance": "traces/v4_cache_groups_61layer.json toy_two_group_packed.num_blocks / floor_remainder_bytes"},
+            {"value": "切条带：a0 [:,0:37440]、b1 [:,8640:41472]→[13,8208] float32", "provenance": "traces/v4_cache_groups_61layer.json toy_two_group_packed.slicing_views"},
+            {"value": "1435968（真实 61 层 block_stride）", "provenance": "traces/v4_cache_groups_61layer.json layer61.packed_layout.block_stride"},
+            {"value": "202 offset / offset 0 压 5 层", "provenance": "traces/v4_cache_groups_61layer.json layer61.packed_layout.num_distinct_offsets / offset0_num_layers"},
+            {"value": "10GiB → 7477 块", "provenance": "traces/v4_cache_groups_61layer.json layer61.num_blocks_10gib.num_blocks"},
+            {"value": "四步链出处", "provenance": "vllm/v1/worker/gpu/attn_utils.py:L225-L233（packing 分支）"}
+          ],
+          "caption_draft": "上：一条 packed_backing slab 按 block_stride 切成 N 块（简化例 74880×13=973440 B）——A 组两层的页条带（37440+37440）密排在格内前半，B 组两层（8640+32832）另起 offset 0 密排：同一格的左端字节被 a0（A 组）与 b0（B 组）同时占用（红框标跨组重叠——安全，因为一个块号同一时刻只借给一组）。下：某层的视图切片——view(-1,74880) 先把 slab 折成 [13 块 × 74880] 的矩阵，[:,8640:41472] 每块只抽 b1 那条 32832 字节的竖带（红框标碎片化切片：条带在物理内存里隔着 74880 的周期重复、不连续），再 .view(float32) 重释为 8208 元素。角注：真实 61 层配置 block_stride=1435968（MLA 组 91 层最宽），10GiB 显存换 7477 块、202 个 offset。学社区 csdn-vllm-analysis-11 的红框表达。"
+        }
+      ]
+    },
+    {
+      "mechanism_id": "v4-61layer-config",
+      "intuition": "期末对账：61 层住户的 243 条登记分四个大桶、各桶人数 31/61/30/31 不齐还互质（61 是质数，与 31 无公因数）——宿管不找完美公约数（不存在），把候选床宽 31 到 61 全试一遍数行军床：垫 2 张床（d=31）就是全局最少；切齐后最宽那桶（MLA 全家 91 层）的宽度决定整排柜子的格宽。",
+      "worked_example": {
+        "params": {
+          "层配置": "compress_ratios 61 项 = 30 个 4 + 31 个 128（社区实读实发权重，research/hybrid-v4-background.json csdn-vllm-analysis-11-dsv4-layout；pin 内无 61 层算例——docstring 玩具 11+10 在 kv_cache_utils.py:L1693-L1697，tests 玩具 [0,0,4,128,0]）",
+          "口径": "层分布由社区五组数字反推、经 pin 算法零改动实跑复算全对上；正文引用 61 层细节必须带此口径",
+          "取证": "pin 真码 host 桩跑（驱动 traces/run_v4_cache_groups.py 场景 E），与 analyst 独立驱动 traces/v4_61layer.json 互证同果"
+        },
+        "trace_source": "run",
+        "trace_ref": "traces/v4_cache_groups_61layer.json",
+        "table": {
+          "columns": ["装包桶（group_and_unify）", "层数与页宽构成", "元组数", "dense width（组页和）"],
+          "rows": [
+            ["census", "61 层 = 30 c4 + 31 c128 → 243 条 spec（30×5 + 31×3 = 150+93）", "—", "4 种页宽 37440 / 8640 / 32832 / 1728"],
+            ["MLA 桶（第一组限定纯 MLA）", "91 层：30×37440 + 30×8640 + 31×1728", "31", "1435968"],
+            ["SWA 桶（块 64、窗 8192）", "61 层 × 37440", "61", "装包 2283840 → 按 layer_tuples[0::2]/[1::2] 拆两组：1160640（31 层）/ 1123200（30 层）"],
+            ["状态桶（块 4、窗 8）", "60 层：30×8640（indexer 状态）+ 30×32832（注意力状态）", "30", "1244160"],
+            ["状态桶（块 8、窗 128）", "31 层 × 32832", "31", "1017792"],
+            ["近似 GCD", "values [31,61,30,31]、lower_bound 31（MLA 桶元组数）", "暴力扫描 d=31..61", "d=31 pad=2 全场最小（d=32 pad=7、d=61 pad=91）——61 是质数与 31 互质，无公因数可整除，必须近似"],
+            ["对齐", "rounded_up [31,62,31,31]", "pad 明细：61→62 垫一层、30→31 垫一层、31 与 31 不垫", "终五组总层数 243（每条 spec 恰属一组）"],
+            ["packed 收尾", "block_stride = max(dense) = 1435968（MLA 组最宽）", "num_blocks = available // 1435968", "10GiB（10737418240 B）→ 7477 块；五组 dense 与 7477 均与社区文章逐一吻合（community_check match=true）"]
+          ]
+        }
+      },
+      "invariant": {
+        "claim": "第三路分组保持『每组每块 = 组内每层各一页』的打包语义：块号在组内同时发给所有成员层各一页（组页=Σ成员页）；元组数对齐取总 padding 最小的 d——[31,61,30,31] 互质（61 是质数）注定无公因数解，d=31 只垫 2 层即全局最优；五组 dense width 中只有最大者成为 block_stride，其余只是组内偏移量。",
+        "argument": "终止性：_approximate_gcd 在有限候选域 d∈[lower_bound, max(values)]（本例 31..61）暴力枚举 pad(d)=Σ(d−x%d)%d，有限整数集取 argmin（平局取更大 d）必停。最优性（本例）：pad(d) 在 d=31 处取 2、d=32 处 7、此后随 d 递增（扫描表 trace layer61.approx_gcd.scan：31→2、32→7、33→12、…、60→147，d=61 时因 61 自身整除回落到 91 但仍远大于 2）——d=31 唯一最优。打包正确性：桶内按页宽分层后 zip 成元组，桶内每页宽层数必须相等的 assert（kv_cache_utils.py:L1726-L1729）保证不错位——(4,8) 桶 30+30 恰满足；SWA 61 层桶按 layer_tuples[0::2]/[1::2] 步进切片拆 31+30（L1732-L1737，PP 同款切片理由）——步进切片对两个下标集并集恰为全集、两两不交（初等性质），每层恰落一组。"
+      },
+      "quantified": "对账四笔（全部 pin 复算 = 社区实读，community_check 三项 match）：①census 243 条 spec = 150（c4 层 5 条 ×30）+ 93（c128 层 3 条 ×31），4 种页宽；②四桶元组 [31,61,30,31]，d=31、pad=2（垫两处各一层：SWA 桶 61→62、(4,8) 桶 30→31——注意垫的是『元组』即层元组数，不是层本身）；③终五组 dense width 1435968/1160640/1123200/1244160/1017792（MLA 组 31×1728+30×8640+30×37440=1435968 最宽）；④block_stride=1435968、10GiB→7477 块。与官方算例形状（11+10，traces/v4_cache_groups.json：d=11、pad=2、stride 524160）对照：结构完全同构、只是层数放大——『同一套算法零改动吃下真实配置』本身就是适配协议的验证。互证：analyst 独立驱动 v4_61layer.json 同源同果（tuples/dense/stride/pad/offsets 全一致）。"
     }
   ]
 }

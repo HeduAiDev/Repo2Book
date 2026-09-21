@@ -1,0 +1,450 @@
+{
+  "topic": "ch14 重写二补（第三份补充档案）：初始化全链路调用树 + packed 布局与寻址 + 新模型接入面。基线 vLLM v0.27.1（源码根 instances/vllm/source，规范前缀 vllm/...，行号逐行现核于本补充成文当日）。与 supplement-hybrid-v4.json（机制事实）互不重叠、可并用。社区文章（csdn-vllm-analysis-4-init / csdn-vllm-analysis-11-dsv4-layout）仅作线索蓝本：所有行号/符号名/数字均对 pin 现核，与社区不一致处以 pin 为准（差异点在 facts 里显式标出）。61 层配置为社区实读实发权重，pin 内无算例——层分布(30 c4 + 31 c128)由社区五组数字反推、经 pin 算法零改动实跑复算全对上（traces/v4_61layer.json），档案内全程标注此推理链。",
+  "mechanisms": [
+    {
+      "id": "init-call-tree",
+      "name": "初始化全链路调用树：EngineCore._initialize_kv_caches 自顶向下到 bind_kv_cache 的每一站",
+      "source_anchors": [
+        "vllm/v1/engine/core.py:L250-L250",
+        "vllm/v1/engine/core.py:L254-L257",
+        "vllm/v1/engine/core.py:L265-L279",
+        "vllm/v1/engine/core.py:L293-L294",
+        "vllm/v1/engine/core.py:L304-L306",
+        "vllm/v1/engine/core.py:L315-L321",
+        "vllm/v1/engine/core.py:L330-L332",
+        "vllm/v1/executor/abstract.py:L118-L120",
+        "vllm/v1/executor/abstract.py:L146-L150",
+        "vllm/v1/worker/gpu_worker.py:L650-L665",
+        "vllm/v1/worker/gpu_model_runner.py:L7624-L7661"
+      ],
+      "facts": [
+        "入口 EngineCore._initialize_kv_caches（core.py:L250）。顺序：(1) register_all_kvcache_specs(vllm_config)（L254，在 engine-core 进程注册全部 spec→manager 映射）；(2) kv_cache_specs = self.model_executor.get_kv_cache_specs()（L257）；(3) non_causal 检查（L265-L279）；(4) available_gpu_memory = self.model_executor.determine_available_memory()（L293，profile 峰值后剩余量）；(5) kv_cache_configs = get_kv_cache_configs(vllm_config, kv_cache_specs, available_gpu_memory)（L304-L306）；(6) generate_scheduler_kv_cache_config（L315，调度器只拿一份解包后的配置）；(7) cache_config.block_size = min(各组 spec.block_size)（L318-L321）；(8) self.model_executor.initialize_from_config(kv_cache_configs)（L330）→ compile_or_warm_up_model（L332）。",
+        "【与社区文章的差异，以 pin 为准】社区蓝本写 collective_rpc(\"get_kv_cache_spec\") 广播——v0.27.1 里这层调用被包进 executor 方法：abstract.py:L149-L150 get_kv_cache_specs() 的实现就是 return self.collective_rpc(\"get_kv_cache_spec\")。即 EngineCore 不再直接 collective_rpc，而是经 model_executor.get_kv_cache_specs() 间接触发同一广播；worker 侧落点是 WorkerBase.initialize_from_config / determine_available_memory 同样经 collective_rpc（abstract.py:L118-L120、L146-L147）。语义未变、多了一层命名包装——画调用图时按 pin 画两层。",
+        "non_causal 旁路（core.py:L265-L279，社区蓝本没有这一站）：任一层 spec 带 non_causal=True（Prefix LM 双向注意力）→ 强制关 chunked prefill 与 prefix caching（两者都假设因果注意力，非因果 prefill 会腐蚀缓存）。注释明确说这个检查放在 engine-core 进程因为它是建 scheduler 的同一进程、multiproc-safe。",
+        "worker 侧落点链：gpu_worker.py:L650 initialize_from_config（@instrument \"Allocate KV cache\"）→ 先 ensure_kv_transfer_initialized（L662，注释：必须在 initialize_kv_cache 之前，因为后者会注入 kv connector 无关的组如 kv sharing 层）→ self.model_runner.initialize_kv_cache(kv_cache_config)（L665）。",
+        "GPUModelRunner.initialize_kv_cache（gpu_model_runner.py:L7624-L7681）内部顺序：deepcopy 配置（L7635）→ maybe_add_encoder_only_layers（L7638）→ maybe_add_kv_sharing_layers_to_kv_cache_groups（L7639，共享层并进目标层所在组，gpu_model_runner.py:L7596-L7611）→ initialize_attn_backend（L7640）→ initialize_mamba_ssu_backend（L7641-L7643）→ kernel_block_sizes = prepare_kernel_block_sizes（L7649-L7651，注释举例：管理块 256 而后端只支持 64 时返回 64 并把 256-token 块拆 4 块）→ initialize_metadata_builders（L7655）→ may_reinitialize_input_batch（L7658）→ initialize_kv_cache_tensors（L7659，真正分配）→ kv_transfer_group.register_kv_caches / register_cross_layers_kv_cache（L7672-L7680）。",
+        "确定性记忆量（worked example 用）：第 (4) 步 available_memory 除数在三条路下分别是——单组 UniformType：spec.page_size_bytes；packed（V4）：block_stride；一般多组：page_size*group_size（kv_cache_utils.py:L972-L990 _pool_bytes_per_block 三分支，注释明说它 mirror get_kv_cache_config_from_groups 的除数）。"
+      ],
+      "embed_candidates": [
+        {
+          "path": "vllm/v1/engine/core.py",
+          "lines": "L250-L332",
+          "why": "调用树主干唯一权威——建议裁剪嵌入 L250-L332 中的 L253-L306 段（保留 register→collect→non_causal→profile→get_kv_cache_configs 五站，删 elastic-ep 与 auto-fit 细节分支），这是自顶向下图的正文骨架。"
+        }
+      ],
+      "worked_example_material": "以「一次 DeepSeek V4 启动」串树：register_all_kvcache_specs 注册 11 项内置菜单 → 广播 get_kv_cache_spec 每层自报 → profile 得 available_memory → get_kv_cache_configs 走第三路分组 + packed → block_size=min(256,64,64,4,8)=4？注意：实际 L319 取 min 后另有 resolve_kv_cache_block_sizes（scheduler 256 / hash 4，见 supplement-hybrid-v4 与 traces/v4_cache_groups.json）——正文引用时以 traces 实算为准。"
+    },
+    {
+      "id": "spec-collection",
+      "name": "spec 收集面：GPUModelRunner.get_kv_cache_spec 的三个分支（EC 专职 producer 返空 / KV 共享跳过 / 逐层自报）",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_model_runner.py:L7800-L7837",
+        "vllm/v1/worker/gpu_model_runner.py:L7808-L7809",
+        "vllm/v1/worker/gpu_model_runner.py:L7814-L7825",
+        "vllm/v1/worker/gpu_model_runner.py:L7827-L7835"
+      ],
+      "facts": [
+        "get_kv_cache_spec（gpu_model_runner.py:L7800-L7837）docstring 自述：解析 static forward context 中每个 Attention 模块的 KV 格式，不需要 KV 的层不进 dict。",
+        "分支一（EC 专职 producer，L7808-L7809）：has_ec_transfer() and not get_ec_transfer().is_consumer → 直接 return {}。注意返空的是 **非 consumer** 的实例，即 ec_role=ec_producer 的专职编码缓存生产者——它只算编码缓存发给 consumer 侧，自己不做注意力推理、不分配本地 KV；ec_consumer 与 ec_both（is_consumer 均为真）正常收集 spec 分配缓存。角色判据链：ECConsumer = Literal[\"ec_consumer\",\"ec_both\"]（vllm/config/ec_transfer.py:L10-L11），is_ec_consumer = ec_connector 非空且 ec_role ∈ ECConsumer（ec_transfer.py:L104），connector 的 is_consumer property 只是转发（distributed/ec_transfer/ec_connector/base.py:L66、L79-L80）。这解释了为何 EngineCore 侧 has_kv_cache 可为假（core.py:L281-L297，专职 producer 返空后与 attention-free 同走 available_memory=[0]*n 分支）。",
+        "分支二（cross-layer KV 共享跳过，L7814-L7825）：attn_module.kv_sharing_target_layer_name 非空 → 登记进 self.shared_kv_cache_layers[layer_name]=kv_tgt_layer 后 continue，不为本层建 spec——KV 管理逻辑视此层不存在、不分配（You-Only-Cache-Once 类省内存；分配后由 L7581-L7583 别名到目标层的张量）。",
+        "分支三（逐层自报，L7827-L7835）：spec = attn_module.get_kv_cache_spec(self.vllm_config)——协议核心：每个注意力模块自己申报缓存格式。若是 AttentionSpec 再补一个 backend.indexes_kv_by_block_stride()（L7832-L7834，packed 寻址兼容位：num_blocks 是否物理最外维），注意 L7830-L7833 注释：该调用链 indexes_kv_by_block_stride→get_kv_cache_stride_order→get_kv_cache_layout 依赖 current vLLM config，所以要包在 set_current_vllm_config 上下文里。",
+        "收集的遍历对象是 get_layers_from_vllm_config(vllm_config, AttentionLayerBase)（L7811-L7812）——不止 Attention 类，任何 AttentionLayerBase 子类（如 V4 的 DeepseekV4IndexerCache / CompressorStateCache）都从这里被枚举。这就是「新缓存组件只要进 forward_context 就会被收集」的机制保证。"
+      ],
+      "embed_candidates": [
+        {
+          "path": "vllm/v1/worker/gpu_model_runner.py",
+          "lines": "L7800-L7837",
+          "why": "全链最承重的收集面：38 行完整呈现三分支，可直接整段嵌入（无需裁剪）；正文讲「谁报账、谁不报账」的唯一代码依据。"
+        }
+      ],
+      "worked_example_material": "V4 单层视角：一个 c4 层被枚举出 5 个 AttentionLayerBase 模块（attn 主层+indexer+indexer_state+attn_state+swa），各自 get_kv_cache_spec 报 5 条账（supplement-hybrid-v4 的 census）；一个 KV 共享层（如 EAGLE draft 与 target 同 KV）报 0 条账。"
+    },
+    {
+      "id": "four-way-dispatch",
+      "name": "get_kv_cache_groups 四路分发：统一/同型装包/V4 重组/一般页统一",
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L1781-L1852",
+        "vllm/v1/core/kv_cache_utils.py:L1794-L1795",
+        "vllm/v1/core/kv_cache_utils.py:L1797-L1806",
+        "vllm/v1/core/kv_cache_utils.py:L1807-L1811",
+        "vllm/v1/core/kv_cache_utils.py:L1812-L1819",
+        "vllm/v1/core/kv_cache_utils.py:L1821-L1851",
+        "vllm/v1/core/kv_cache_utils.py:L1757-L1778"
+      ],
+      "facts": [
+        "get_kv_cache_groups（kv_cache_utils.py:L1781-L1852）按优先级四路：路1 is_kv_cache_spec_uniform → _get_kv_cache_groups_uniform_spec（L1802-L1806，所有层同 spec，绝大多数单型模型）；路2 UniformTypeKVCacheSpecs.from_specs → _get_kv_cache_groups_uniform_type（L1807-L1811，全部层需要相同 token 槽位数但页宽可不同——V3.2 等，注释举例：全 full 或同窗口 SWA）；路3 group_and_unify_kv_cache_specs → _get_kv_cache_groups_uniform_groups（L1812-L1819，注释点名 DeepseekV4 case：同槽位需求但 full/SWA 多窗口混布，需要拆成多个 UniformTypeKVCacheSpecs）+ _annotate_eagle_groups_deepseek_v4（L1818）；路4 HiddenStateCacheSpec 先抽出（L1821-L1830）→ unify_kv_cache_spec_page_size（L1834-L1835，失败时 _try_get_full_allocation_fallback_groups 兜底 L1836-L1840）→ _get_kv_cache_groups_uniform_page_size（L1841），最后 hidden 层按公共页宽对齐塞回（L1843-L1850）。",
+        "前置开关（L1794-L1795）：scheduler_config.disable_hybrid_kv_cache_manager=True 时先 unify_hybrid_kv_cache_specs 强制并型——回退开关，供混合模型退化成单组管理。",
+        "attention-free 模型（L1797-L1800）：is_kv_cache_type_attention_free → 返回空组列表，让 KVCacheManager 走无 KV 路径。",
+        "_annotate_eagle_groups_deepseek_v4（L1757-L1778）：投机解码 EAGLE 时把含最后一层（MTP attention 恒为末层，L1771-L1772 注释）的组打 is_eagle_group=True。FIXME 自认 hacky check（L1773）。V4+投机解码的组标记只在这条路上发生——这是第三路的专属伴生物。",
+        "四路的判据全部来自 spec 自报的属性（block_size/sliding_window/page_size_bytes/类型），分组代码不认识任何具体模型——模型差异被 spec 申报面吸收。这正是「适配协议」叙事在分组环节的代码形态。"
+      ],
+      "embed_candidates": [
+        {
+          "path": "vllm/v1/core/kv_cache_utils.py",
+          "lines": "L1781-L1852",
+          "why": "四路分发主干 72 行：建议嵌入 L1794-L1841（含三行注释锚定的 elif 链），HiddenState 回填段（L1843-L1851）可裁；这是「协议把模型差异挡在 spec 申报面」的直接证据。"
+        }
+      ],
+      "worked_example_material": "同一函数四种模型的走向：Llama（路1 单 spec）；V3.2（路2 同型不同页宽）；V4（路3 五组）；GPT-OSS/Gemma3 混合（路4 页宽统一）。判据全部可从 traces/v4_cache_groups.json 与 v4_61layer.json 的输入侧复述。"
+    },
+    {
+      "id": "worker-alloc-duality",
+      "name": "分配双路径判据：allocate_uniform_kv_caches 优化路 vs _allocate+_reshape 通用路（V4 packed 走通用路）",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_model_runner.py:L7541-L7594",
+        "vllm/v1/worker/gpu_model_runner.py:L7556-L7569",
+        "vllm/v1/worker/kv_connector_model_runner_mixin.py:L116-L162",
+        "vllm/v1/worker/kv_connector_model_runner_mixin.py:L165-L205",
+        "vllm/v1/worker/gpu_model_runner.py:L7312-L7353",
+        "vllm/v1/worker/gpu_model_runner.py:L7383-L7407",
+        "vllm/v1/worker/gpu_model_runner.py:L7581-L7593"
+      ],
+      "facts": [
+        "判据在 initialize_kv_cache_tensors（gpu_model_runner.py:L7541-L7594）开头：if self.use_uniform_kv_cache(self.attn_groups)（L7558）→ allocate_uniform_kv_caches（L7560-L7567，返回 kv_caches+cross_layers_kv_cache+backend，存 self.cross_layers_kv_cache 供 KV connector 注册 L7568-L7569）；else 通用路径 _allocate_kv_cache_tensors（L7573）+ _reshape_kv_cache_tensors（L7576-L7578）。",
+        "use_uniform_kv_cache 的三个条件（kv_connector_model_runner_mixin.py:L125-L132 docstring + L146-L162 实现）：(1) 配置了 KV connector 且其 prefer_cross_layer_blocks()=True（L146-L149）；(2) 恰一组且组内恰一个 AttentionGroup（L151-L152）；(3) spec.indexes_kv_by_block_stride（L162，num_blocks 物理最外维使逐块全层数据连续）；外加否决项 per-token-head 量化（L158-L161，注释：inline-scale 视图假设每层连续缓冲，跨层布局会腐蚀 KV）。判据本质：优化路只服务 KV connector 的跨层整块传输（P/D 分离场景 DMA 搬运），不是为 V4 packed 准备的。",
+        "allocate_uniform_kv_caches（mixin L165-L255）：单块 total_size 连续 int8 → view(dtype).view(kv_cache_shape)，shape 前插 num_layers 维（L222）；L234 logger.info \"Allocating a cross layer KV cache of shape ...\"；每层取 permuted_kv_cache[i] 视图（L250-L253）。",
+        "通用路径 _allocate_kv_cache_tensors（gpu_model_runner.py:L7312-L7353）：遍 kv_cache_tensors，block_stride>0 的是 packed 张量——第一张时分配 packed_backing 一次（L7330-L7335 torch.zeros(size, int8)），其余 packed 张量全部 alias 同一 backing（L7336）；block_stride==0 的各自独立分配（L7337-L7340）。每张的 shared_by 层名都映射到该 tensor（L7341-L7342）。末尾断言组内层名集合==raw_tensors 键集合（L7350-L7352）。",
+        "_reshape_kv_cache_tensors（L7364-L7479）先建 layer_packing 表（L7383-L7389）：block_stride>0 的张量给其 shared_by 每层记 (offset, block_stride)。逐组逐层：packing 命中时 num_blocks = raw.numel() // block_stride（L7401-L7404，注意除数是 block_stride 而非本层 page——backing 是全组共用的整 slab）；否则 num_blocks = numel // page_size_bytes（L7405-L7407）。AttentionSpec 分支：storage_block_size != block_size 时 shape 用 storage_block_size（L7415-L7419，注释点名 MLA with compression / DeepSeek V4）；最终交 _reshape_attention_kv_cache 切视图（L7446-L7453）。",
+        "收尾两步（L7580-L7593）：共享层别名 kv_caches[layer]=kv_caches[target]（L7581-L7583，longcat_flash 双注意力模块特判 L7585-L7587）→ bind_kv_cache（L7588-L7593）。"
+      ],
+      "embed_candidates": [
+        {
+          "path": "vllm/v1/worker/gpu_model_runner.py",
+          "lines": "L7312-L7353",
+          "why": "packed backing 一次分配+别名机制（L7328-L7336 是 V4 显存省法的分配侧实现）——与 packed-view-slicing 的切片段配套讲。"
+        },
+        {
+          "path": "vllm/v1/worker/kv_connector_model_runner_mixin.py",
+          "lines": "L116-L162",
+          "why": "双路径判据的权威 docstring（三条件+目的「efficient KV transfer of per-block KV data for all layers at once」），可整段嵌入。"
+        }
+      ],
+      "worked_example_material": "对照表素材：优化路（P/D 分离部署、单组模型、connector 偏好开）vs 通用路（默认、V4 packed、混合组）各触发一次的形状差异——优化路一个 [num_layers, ...] 大张量，通用路 V4 一个 1,435,968×num_blocks 的 int8 slab 被 70 个 offset 切出别名视图（traces/v4_61layer.json num_distinct_offsets）。"
+    },
+    {
+      "id": "packed-view-slicing",
+      "name": "视图切片四步与绑定：_reshape_attention_kv_cache 的 packing 分支 + bind_kv_cache 双写",
+      "source_anchors": [
+        "vllm/v1/worker/gpu/attn_utils.py:L211-L264",
+        "vllm/v1/worker/gpu/attn_utils.py:L225-L233",
+        "vllm/v1/worker/gpu/attn_utils.py:L234-L259",
+        "vllm/v1/worker/utils.py:L466-L525",
+        "vllm/v1/worker/utils.py:L492-L518",
+        "vllm/v1/worker/utils.py:L520-L525"
+      ],
+      "facts": [
+        "_reshape_attention_kv_cache（attn_utils.py:L211-L264）三分支。packing 分支（L225-L233）四步链：kv_raw_tensor.view(-1, block_stride)（把整 slab 切成 [num_blocks, block_stride] 的块矩阵）→ [:, offset:offset+page_bytes]（切出本层页字节条带）→ .view(dtype)（int8 重释为缓存 dtype）→ .view(permuted_kv_cache_shape)（成形）。page_bytes = prod(kv_cache_shape[1:])*dtype_size（L228）；assert inv_order[0]==0（L227，要求 num_blocks 是物理最外维——这就是 spec.indexes_kv_by_block_stride 位在收集面被预填的原因）。",
+        "page_size_padded 分支（L234-L259）：as_strided 改 block 维步长跳过页间 padding（L248-L259），断言 num-blocks-first 布局（L243-L247，注释点名 ROCm 的 (2,num_blocks,...) kv-first 布局不支持）。无 padding 分支（L260-L262）直接连续 view。三分支殊途同归 permute(*inv_order) 回逻辑序（L264）。",
+        "bind_kv_cache（utils.py:L466-L525）双写：(1) 按 extract_layer_index(layer_name, num_attn_module) 分桶排序填 runner_kv_caches（L492-L518，ModelRunner 持有的平铺张量列表——kv connector 注册用）；同 layer_index 多注意力模块（encoder-decoder 如 bart）CUDA 类平台跳过（L506-L516）。(2) 对 forward_context 每层调 layer.bind_kv_cache(kv_cache)（L524-L525，注释：层的 bind_kv_cache 把原始分配拆成它需要的视图，如 Mamba 拆 conv/ssm）。",
+        "整链闭环：spec 申报的 page_size → packed 布局的 offset/block_stride → 分配侧 layer_packing 表 → 本机制切片 → forward_context 层实例拿到自己的条带视图。前向时层直接写自己的视图，与其它组的同 offset 层物理重叠——「一个 block ID 同一时刻只归一个组」（_get_packed_kv_cache_layout docstring）保证重叠安全。",
+        "attn_utils.py 里还有一套并行的 _allocate_kv_cache/_reshape_kv_cache（L183-L208、L267-L380）+ init_kv_cache（L454-L486），供非 GPUModelRunner 的 runner（worker/gpu/attn_utils.py 被多方 import）走同一 packing 切片逻辑——L343-L350 同样调 _reshape_attention_kv_cache。讲述时可只锚 gpu_model_runner 主链，脚注提及平行实现。"
+      ],
+      "embed_candidates": [
+        {
+          "path": "vllm/v1/worker/gpu/attn_utils.py",
+          "lines": "L211-L264",
+          "why": "lead 点名的承重段之一：54 行含三分支全文；建议只裁掉 page_size_padded 分支中段注释（L236-L247），保留四步链与 permute 收尾。读者不开源码即可看懂「一张 slab 如何变成每层视图」。"
+        },
+        {
+          "path": "vllm/v1/worker/utils.py",
+          "lines": "L466-L525",
+          "why": "bind_kv_cache 全文（59 行）：双写语义（runner 列表+forward_context 层实例）是调用树终点的最好注脚。"
+        }
+      ],
+      "worked_example_material": "数值例：block_stride=1,435,968、某 c4 main 层 offset=0、page_bytes=37,440 → view(-1,1435968)[:,0:37440] 每 1,435,968 字节取头 37,440 字节；另一组同 offset 的 swa 层切同一条带（跨组重叠）。"
+    },
+    {
+      "id": "packed-layout-semantics",
+      "name": "packed 布局语义：_get_packed_kv_cache_layout 的 layers_by_offset/block_stride 与开启判据",
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L1283-L1305",
+        "vllm/v1/core/kv_cache_utils.py:L1308-L1327",
+        "vllm/v1/core/kv_cache_utils.py:L1330-L1358",
+        "vllm/v1/kv_cache_interface.py:L946-L954",
+        "vllm/v1/core/kv_cache_utils.py:L972-L990"
+      ],
+      "facts": [
+        "_get_packed_kv_cache_layout（kv_cache_utils.py:L1283-L1305）逐行语义：layers_by_offset: dict[int, list[str]]（L1291）；遍每组（L1293）组内按 layer_names 顺序 byte_offset += page_size 累进（L1295-L1302，UniformTypeKVCacheSpecs 取每层各自 page_size，否则取组 spec 的）；同 offset 的层名 append 进同一桶（L1301）——跨组的层会落进同一桶（时间复用重叠）；block_stride = max(各组 byte_offset 终值)（L1303）。docstring：「A block ID is owned by one cache group at a time, so layouts from different groups may overlap. Layers within a group remain disjoint.」（L1286-L1289）——组内不重叠（同组同时活跃）、跨组可重叠（一个 block 同刻只借给一组）。",
+        "开启判据 _use_packed_kv_cache_config（L1308-L1327）：is_dsv4 = 所有组都是 UniformTypeKVCacheSpecs（L1312-L1315）即默认 V4 全走 packed；或 kv_connector_extra_config.enable_cross_layers_blocks==\"true\" 且多组（L1322-L1327，注释标 experimental、链 issue 42082——其他混合模型可 opt in）。",
+        "_get_kv_cache_config_packed（L1330-L1358）：num_blocks = available_memory // block_stride（L1342，除数是整 slab 宽而非任何单组页宽）→ may_override_num_blocks → total_size = block_stride*num_blocks（L1345）→ 每个 distinct offset 出一张 KVCacheTensor(size=total_size, shared_by=layers_by_offset[byte_offset], offset, block_stride)（L1347-L1356）。所有张量 size 相同、都是同一物理 slab 的别名声明。",
+        "KVCacheTensor（kv_cache_interface.py:L945-L954）四个字段：size / shared_by / offset（默认 0，packed 布局内字节偏移）/ block_stride（默认 0 = 非 packed）——offset/block_stride 两个字段就是为 packed 布局长出来的，老布局的 张量两者皆 0。",
+        "_pool_bytes_per_block（kv_cache_utils.py:L972-L990）三分支与 get_kv_cache_config_from_groups 的除数一一对应（注释自述 mirror），供 num_gpu_blocks_override 与容量复核用。"
+      ],
+      "embed_candidates": [
+        {
+          "path": "vllm/v1/core/kv_cache_utils.py",
+          "lines": "L1283-L1327",
+          "why": "布局函数+开启判据连排 45 行：一图讲一机制的最佳载体（offset 桶与 slab 宽的语义全在注释与五行循环里）。"
+        }
+      ],
+      "worked_example_material": "玩具 11+10（docstring 官方算例）：70 个 distinct offset、offset 0 上压 5 个组的层（traces/v4_cache_groups.json packed_layout 段）；61 层实算见 v4-61layer-verified 机制。"
+    },
+    {
+      "id": "v4-61layer-verified",
+      "name": "61 层真实配置对 pin 复算：五组 dense width 与社区数字逐一吻合（30 c4 + 31 c128）",
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L1635-L1667",
+        "vllm/v1/core/kv_cache_utils.py:L1670-L1754",
+        "vllm/v1/core/kv_cache_utils.py:L1691-L1697",
+        "vllm/v1/core/kv_cache_utils.py:L1732-L1737",
+        "vllm/v1/kv_cache_interface.py:L889-L892"
+      ],
+      "facts": [
+        "【口径声明】61 层实发权重（compress_ratios 61 项）不在 pin 内：pin 仅有 kv_cache_utils.py:L1691-L1697 docstring 玩具算例（11 C4 层 + 10 C128 层）与 tests/v1/attention/test_indexer_deepseek_v4_slot_mapping.py:L23 的 [0,0,4,128,0] 五层玩具。61 层层数分布（30 个 r=4 + 31 个 r=128）由社区实读数字反推、经 pin 算法零改动实跑验证（explainer/traces/run_v4_61layer.py → v4_61layer.json，桩替身仅配置/指标类）。正文引用 61 层细节时必须带此口径。",
+        "【实算结果，全部命中】group_and_unify 四组 num_layer_tuples = [31, 61, 30, 31]（MLA 组 91 specs / SWA(64,8192) 61 / SWA(4,8) 60 / SWA(8,128) 31）；_approximate_gcd(values=[31,61,30,31], lower_bound=31) 选 d=31、总 pad=2（61→62 补 1、30→31 补 1、31 与 31 不补）；rounded_up=[31,62,31,31]。",
+        "终五组 dense width（组内各层 page_size 之和）：[1,435,968 / 1,160,640 / 1,123,200 / 1,244,160 / 1,017,792]——与社区文章 csdn-vllm-analysis-11-dsv4-layout 的五组数字逐一吻合。构成：gid0 MLA 组 91 层（30×37,440 main-c4 + 30×8,640 indexer + 31×1,728 main-c128 = 1,123,200+259,200+53,568）；gid1 SWA(64,8192) 31 层×37,440 = 1,160,640；gid2 SWA(64,8192) 30 层×37,440 = 1,123,200（61 层按 layer_tuples[0::2]/[1::2] 拆 31+30）；gid3 SWA(4,8) 60 层（30×8,640 indexer_state + 30×32,832 attn_state-c4）= 1,244,160；gid4 SWA(8,128) 31 层×32,832 = 1,017,792。",
+        "packed block_stride = max(dense) = 1,435,968（MLA 组最宽）；num_blocks = available_memory // 1,435,968。",
+        "get_num_layer_tuples 语义（kv_cache_interface.py:L889-L892）：Counter(page_size_bytes).most_common(1)[0][1]——出现次数最多的页宽的层数（众数计数）。61 层 MLA 组 {37440:30, 8640:30, 1728:31} → 31。",
+        "_approximate_gcd（kv_cache_utils.py:L1635-L1667）：brute-force d∈[lower_bound, max(values)]，pad(d)=Σ(d−x%d)%d 最小者、平局取大 d（L1663）。SWA 组拆分（L1732-L1737）：num_tuple_groups=cdiv(num_layers_per_size, num_layer_tuples)，layer_tuples[i::num_tuple_groups] 步进切片（PP 场景同款切片理由见 L1267-L1279 注释）。",
+        "layer tuple 概念官方定义（L1691-L1697）：不同页宽的层组成一个 tuple，一个 UniformTypeKVCacheSpecs 含一列 tuple；11 C4 + 10 C128 → tuple [C4I, C4A, C128]，full_mla_group 含 11 个 tuple。"
+      ],
+      "embed_candidates": [
+        {
+          "path": "vllm/v1/core/kv_cache_utils.py",
+          "lines": "L1635-L1667",
+          "why": "_approximate_gcd 全文 33 行：pad 公式 docstring + brute-force 循环，worked example（[31,61,30,31]→d=31,pad=2 的扫描表在 v4_61layer.json）的代码依据。"
+        }
+      ],
+      "worked_example_material": "traces/v4_61layer.json 已固化：四组 tuples、gcd 扫描、五组构成与 dense width、community_check 三项 match=true。表格可直接进正文（素材真相源）。"
+    },
+    {
+      "id": "page-size-derivation",
+      "name": "页宽从哪来：584B/token → 576 对齐 → 37,440/8,640/1,728/32,832 的推导链",
+      "source_anchors": [
+        "vllm/v1/kv_cache_interface.py:L388-L426",
+        "vllm/v1/kv_cache_interface.py:L403-L405",
+        "vllm/v1/kv_cache_interface.py:L407-L416",
+        "vllm/v1/kv_cache_interface.py:L353-L359",
+        "vllm/models/deepseek_v4/attention.py:L660-L674",
+        "vllm/models/deepseek_v4/attention.py:L698-L710"
+      ],
+      "facts": [
+        "MLAAttentionSpec.real_page_size_bytes（kv_cache_interface.py:L407-L426）fp8_ds_mla + deepseek_v4 分支：storage_block_size * 584——注释给出拆账「448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token」（L411-L412），head_size 保持语义值 512、字节数由此分支决定。V3.2 main MLA 是 block_size*656（kv_lora_rank 512+qk_rope 64，L414-L416）。",
+        "storage_block_size = block_size // compress_ratio（L403-L405 property）——管理块 256 下：c4→64 槽、c128→2 槽。同式在 kernel 侧的镜像是 attn_metadata.block_size // compress_ratio（见 compressed-block-addressing）。",
+        "_apply_alignment_padding（L353-L359）：__post_init__ 里 round_up(real_page_size_bytes, alignment)。fp8_ds_mla alignment=576（attention.py:L663-L671、compressor.py:L195-L203）：37,440 = round_up(64×584=37,376, 576) = 65×576；1,728 = round_up(2×584=1,168, 576) = 3×576。页宽不是 584 的倍数而是 576 的倍数——每页为对齐多付 64/512 字节。",
+        "indexer 页 8,640 = 64×132：head_dim 132 = 128 + fp8 scale padding（attention.py:L698-L710 注释「head_dim already carries the fp8 scale padding」；132 的构成见 run_v4_cache_groups.py 引 attention.py:L787-L791）。状态页 32,832 = 57×576（fp32 压缩器状态，head_size=2*coff*512 维、coff=1+(r==4)）。",
+        "MLAAttentionSpec 的 V4 专属字段（L388-L397）：cache_dtype_str / alignment（默认 None 不 padding）/ compress_ratio（默认 1）/ model_version / non_causal_multi_token_decode——注释明说「DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults」，协议向后兼容（老 MLA 不受影响）。",
+        "模型侧申报（attention.py:L655-L674）：compress_ratio<=1 时主 KV 返回 None（SWA 部分由 DeepseekV4SWACache 另行分配，L656-L658）；否则 MLAAttentionSpec(block_size=cache_config.block_size, num_kv_heads=1, head_size=head_dim, dtype=uint8(fp8)/natural, compress_ratio, alignment=576/512, model_version=\"deepseek_v4\")。indexer 侧（L698-L710）同为 MLAAttentionSpec 但 compress_ratio 透传、512B 对齐分支注释链 issue 44577。"
+      ],
+      "embed_candidates": [
+        {
+          "path": "vllm/v1/kv_cache_interface.py",
+          "lines": "L388-L426",
+          "why": "spec 字段+storage_block_size+real_page_size_bytes 三件套连排：页宽推导链的单一出处，workded example 每一步都能对到行。"
+        }
+      ],
+      "worked_example_material": "一行算式串讲：page(37,440) = round_up((256//4)×(448+128+8), 576)。四页宽同式复算表（37,440/8,640/1,728/32,832）可由 traces 复核。"
+    },
+    {
+      "id": "slot-addressing-universal",
+      "name": "通用槽位寻址：slot_id = block_table[pos//block_size]*block_size + pos%block_size 的 kernel 出处",
+      "source_anchors": [
+        "vllm/v1/worker/block_table.py:L380-L442",
+        "vllm/v1/worker/block_table.py:L429-L441",
+        "vllm/v1/worker/block_table.py:L182-L211",
+        "vllm/v1/worker/block_table.py:L399-L408",
+        "vllm/v1/attention/backends/utils.py:L45-L45"
+      ],
+      "facts": [
+        "通用 stride 公式的代码出处是 _compute_slot_mapping_kernel（block_table.py:L379-L442）核心四行（L430-L441）：block_indices = pos//virtual_block_size 相关量 → block_numbers = load(block_table + row + block_indices)（L434-L438）→ slot_offsets = local_block_offsets % block_size（L439）→ slot_ids = block_numbers * block_size + slot_offsets（L440）。无 CP 时退化为你写的教科书式 slot = block_table[pos//bs]*bs + pos%bs。",
+        "两级块（L389-L390 constexpr）：KV_CACHE_BLOCK_SIZE（管理块）与 BLOCKS_PER_KV_BLOCK = 管理/内核（L413、L430-L433：virtual_block_indices*BLOCKS_PER_KV_BLOCK + local//block_size）——管理块 256 拆 4 个 kernel 块 64 的寻址换算就在这一行。",
+        "PAD_SLOT_ID = -1（attention/backends/utils.py:L45）。CUDA graph 兼容分支（L399-L408）：最后一个 program（req_idx==num_programs-1）把 [num_tokens, max_num_tokens) 的槽位统一填 PAD——固定形状、固定地址的图形捕获前提。CP（上下文并行）分支 L413-L428 的 interleave 拆块可裁。",
+        "host 侧 BlockTable.compute_slot_mapping（L182-L211）：SlotMappingMode.NONE 的组（Mamba/GDN 把块表当递归状态索引）直接 return（L189-L192）；否则 launch kernel，PAD_ID=PAD_SLOT_ID 传入（L209）。",
+        "commit_block_table（L213-L214）host 写完 copy_to_gpu——块表是 CPU numpy 写、批量上 GPU 的双面结构（block_table.np / .gpu）。"
+      ],
+      "embed_candidates": [
+        {
+          "path": "vllm/v1/worker/block_table.py",
+          "lines": "L410-L442",
+          "why": "kernel 主体 33 行（含 query_start_loc 循环与四行寻址）：通用公式的唯一出处，裁掉 CP interleave 两行即可嵌入。"
+        }
+      ],
+      "worked_example_material": "pos=300、block_size=64：block_table[4]*64 + (300%64=44)。对照管理块 256 的同 pos 在 kernel_block_size=256 组：block_table[1]*256+44。"
+    },
+    {
+      "id": "swa-window-addressing",
+      "name": "SWA 窗口寻址 kernel：_compute_swa_indices_and_lens 的 //64 与 %64、窗外槽位填 -1",
+      "source_anchors": [
+        "vllm/v1/attention/backends/mla/sparse_swa.py:L735-L790",
+        "vllm/v1/attention/backends/mla/sparse_swa.py:L766-L770",
+        "vllm/v1/attention/backends/mla/sparse_swa.py:L777-L785",
+        "vllm/v1/attention/backends/mla/sparse_swa.py:L567-L581",
+        "vllm/v1/attention/backends/mla/sparse_swa.py:L583-L603",
+        "vllm/v1/attention/backends/mla/sparse_swa.py:L529-L530"
+      ],
+      "facts": [
+        "kernel（sparse_swa.py:L735-L790）每 token 一 program：窗口界 start_pos = max(pos−window_size+1, 0)、end_pos = pos+1、swa_len = end_pos−start_pos（L766-L770）。pos 的来历：prefix_len = seq_len−query_len，pos = prefix_len + token_idx − query_start（L763-L766）——prefill/decode 统一坐标系。",
+        "寻址三行（L777-L783）：block_indices = pos_offset // block_size（SWA(64,8192) 组 block_size=64 即 pos//64）→ block_numbers = load(block_table + req_idx*stride + block_indices)（L778-L781，mask=pos_offset<end_pos）→ slot_ids = block_numbers*block_size + pos_offset%block_size（L782-L783，即 %64）。与通用 kernel 同构，差别在按窗口截断的 pos_offset 范围。",
+        "窗外槽位填 -1（L785 tl.where(offset < swa_len, slot_ids, -1)，与 PAD_SLOT_ID 同值）——输出 [num_tokens, 1, window_size] 的定宽索引张量，窗口不足处用 -1 占位（kernel 消费端跳过）。",
+        "两个调用点（L567-L581 decode / L586-L603 prefill）：decode 传 token_offset=0；prefill 传 token_offset=num_decode_tokens（L583-L585 注释：prefill 索引活在 paged 坐标系、token_offset 让 kernel 在绝对 prefill 位置读 is_valid/token_to_req 而从 0 写输出）。decode 与 prefill 各有定宽 buffer（L449-L474 decode_swa_indices/prefill_swa_indices 均 [max_tokens,1,window] 固定地址——注释 L523-L524 明说是 CUDA graph 兼容前提）。",
+        "入口 is_valid_token = slot_mapping >= 0（L529-L530）——复用通用槽位映射的 PAD 语义判定有效 token；无效 token 直接 swa_len=0 返回（L752-L755）。",
+        "kernel 的 self.block_size 来自构造时 mla_spec.block_size（L409-L410，assert spec 是 SlidingWindowMLASpec|MLAAttentionSpec）——每组实例各自的块尺寸，(4,8) 组同 kernel 但 block_size=4。",
+        "非 causal 变体 _compute_dspark_noncausal_swa_indices_kernel（L794-L849+）：DSpark 投机模式的块锚定窗口（start = prefix−window、end = seq_len，L832-L833），同款 ///% 寻址（L843-L849）——V4+DSpark 的专属旁路，与 ch33 相接。"
+      ],
+      "embed_candidates": [
+        {
+          "path": "vllm/v1/attention/backends/mla/sparse_swa.py",
+          "lines": "L750-L790",
+          "why": "kernel 主体 41 行：窗口界定+三行寻址+窗外 -1，一图讲一算法（kind=algorithm）的完整载体。"
+        }
+      ],
+      "worked_example_material": "pos=10,000、window=8,192：start=1,809、swa_len=8,192；block_indices 从 1809//64=28 到 10000//64=156，共 129 个块的槽位、128 个满块+两个半块拼接。"
+    },
+    {
+      "id": "compressed-block-addressing",
+      "name": "压缩块寻址：CSA/HCA 传 kernel 的 block_size = metadata.block_size // compress_ratio（三处调用点+ROCm 镜像）",
+      "source_anchors": [
+        "vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py:L327-L334",
+        "vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py:L736-L745",
+        "vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py:L832-L833",
+        "vllm/models/deepseek_v4/amd/rocm.py:L625-L625",
+        "vllm/models/deepseek_v4/amd/rocm.py:L733-L737",
+        "vllm/v1/attention/backends/mla/sparse_swa.py:L437-L441"
+      ],
+      "facts": [
+        "核心换算（flashinfer_sparse.py:L334，build 元数据时）：compressed_block_size = attn_metadata.block_size // self.compress_ratio——管理块 256 → c4 存储块 64、c128 存储块 2。swa_only 模式则直接用 swa_metadata.block_size（L327）。",
+        "L740 与 L832 两处同式（decode 全局 top-k 换算 / prefill C4A 路径），供 compute_global_topk_indices_and_lens 把「token 级 top-k 位置」翻译成「压缩块坐标」。",
+        "C4A/C128A 分支（L336-L374）：compress_ratio==4 走 topk_indices_buffer + decode_compressed_indices_are_local=True（L336-L357，C4 的 indexer 给局部 top-k）；c128 走 attn_metadata.c128a_prefill_topk_indices / c128a_global_decode_topk_indices（L358-L374）。注释术语与 kv_cache_utils.py:L1613-L1615 的分组注释同源：「C4I+C4A 层和 C128A 层」按 (block_size, sliding_window) 分三组。",
+        "ROCm 镜像（rocm.py:L625、L733-L737）：block_size = attn_metadata.block_size // self.compress_ratio 同式——平台无关的换算约定。",
+        "sparse_swa.py:L437-L441：后端构造时从 hf_config.compress_ratios 探测本模型用到哪些层型（_layer_type_for(ratio)），无 compress_ratios 的纯 SWA 模型退化 swaonly——接入面视角：同一 backend 靠配置自描述选择子模式。",
+        "与 spec.storage_block_size（kv_cache_interface.py:L403-L405）同一公式的两侧：分配/形状侧由 spec 算（storage_block_size），注意力侧由 metadata 现算（block_size//compress_ratio）——同一约定写在两处，是 V4 落地时跨层协议对齐的痕迹。"
+      ],
+      "embed_candidates": [
+        {
+          "path": "vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py",
+          "lines": "L319-L345",
+          "why": "swa_only 与压缩两分支的 compressed_block_size 现场对照（L327 vs L334）+ C4 top-k 入口：一屏看懂「管理块→存储块」换算的消费侧。"
+        }
+      ],
+      "worked_example_material": "token 300 在 c4 层：300//4=75 → 压缩块 75 落在管理块 75//64=1 内的第 11 槽；c128 层：300//128=2 → 管理块 2//2=1。同 token 在三种层型映射到不同物理槽——正是五组 block table 各自持有块表的根因。"
+    },
+    {
+      "id": "multigroup-block-table",
+      "name": "MultiGroupBlockTable：每组一张块表、行操作遍组转发、PAD_SLOT_ID 语义",
+      "source_anchors": [
+        "vllm/v1/worker/block_table.py:L270-L376",
+        "vllm/v1/worker/block_table.py:L315-L335",
+        "vllm/v1/worker/block_table.py:L337-L364",
+        "vllm/v1/worker/block_table.py:L374-L376",
+        "vllm/v1/worker/gpu_input_batch.py:L186-L196",
+        "vllm/v1/worker/block_table.py:L18-L41"
+      ],
+      "facts": [
+        "结构（block_table.py:L315-L335）：self.block_tables = [BlockTable(block_size, max_num_reqs, max_num_blocks_per_req, max_num_batched_tokens, pin_memory, device, kernel_block_size, ...) for ...zip(block_sizes, kernel_block_sizes, max_num_blocks, slot_mapping_modes)]——**每 KV 组一张独立 BlockTable**（list of BlockTable，不是单张 [num_groups,...] 张量；社区表述「block_tables [num_groups,...]」应按此修正为：每组一张 [max_num_reqs, 该组块表宽] 的表，V4 五组即五张不同宽度的表）。",
+        "全部行操作遍组转发（L337-L355）：append_row/add_row/clear_row/move_row/swap_row 都是 for block_table in self.block_tables 逐组执行——调度器视角的一次「请求落一行」在物理上是五张表各落一行、块号在各组各自的池里独立分配。",
+        "compute_slot_mapping（L357-L364）同样遍组：每组用自己的 block_size 出各自的 slot_mapping——一次 forward 的 slot_mapping 是按组的列表，正是 spec-collection/通用 kernel 一组一套参数的根源。",
+        "构造点 gpu_input_batch.py:L186-L196：block_sizes/kernel_block_sizes/max_num_blocks/slot_mapping_modes 逐组一项（V4: [256,64,64,4,8]）。__getitem__(idx) 返回第 i 组的 BlockTable（L374-L376）。",
+        "块表宽度 get_block_table_width（L18-L41）：max_num_blocks * block_size // kernel_block_size，另有 token_alignment=128 的对齐放大；kernel_block_size 必须整除 block_size（L27-L30 ValueError）。Mamba/GDN 组 slot_mapping_mode=NONE 时 token_alignment=None（L304-L313）。",
+        "BlockTable 单组实现（L56-L218）：CpuGpuBuffer 双面（.np 写/.gpu 用）、commit_block_table(num_reqs) 上卡（L213-L214）、clear 行级清零防 stale 引用（L160-L175 注释：dummy-run 批会把 stale 行当 mamba 状态槽解引用）。"
+      ],
+      "embed_candidates": [
+        {
+          "path": "vllm/v1/worker/block_table.py",
+          "lines": "L270-L376",
+          "why": "全类 107 行（构造+六个遍组方法）：「一个请求五张表」的最直观代码形态；可裁 get_block_table_width 预处理段（L285-L313）。"
+        }
+      ],
+      "worked_example_material": "同一条请求 len=1,000：五张表的行宽分别按 block_size 256/64/64/4/8 计算（4 块/16 块/16 块/250 块/125 块），slot_mapping 各算一遍——「一账多本」的直观素材。"
+    },
+    {
+      "id": "spec-registry-protocol",
+      "name": "接入协议：@register_kv_cache_spec 装饰器 + 内置注册菜单 + 未申报即报错的门禁",
+      "source_anchors": [
+        "vllm/v1/kv_cache_spec_registry.py:L7-L9",
+        "vllm/v1/kv_cache_spec_registry.py:L63-L103",
+        "vllm/v1/kv_cache_spec_registry.py:L105-L126",
+        "vllm/v1/kv_cache_spec_registry.py:L153-L173",
+        "vllm/v1/kv_cache_spec_registry.py:L176-L209",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L1881-L1942",
+        "vllm/v1/kv_cache_interface.py:L167-L184",
+        "vllm/v1/core/kv_cache_utils.py:L2143-L2145"
+      ],
+      "facts": [
+        "协议三件套（kv_cache_spec_registry.py）：(1) @register_kv_cache_spec(manager_class=..., uniform_type_base_spec=...) 装饰器（L176-L209），模块 docstring（L7-L9）明说「pluggable architecture…Out-of-tree platforms can define custom specs and managers…without modifying vLLM core code」——树外平台不改核心代码即可挂新缓存型；(2) register 的完整性约束（L63-L103）：必须带 manager_class、spec 必须 issubclass(uniform_type_base_spec)（L83-L86）、重复注册冲突断言（L88-L97）；(3) 查询沿 MRO 找最近已注册基类（get_manager_class L121-L124 / get_uniform_type_base_spec L143-L148）。",
+        "内置菜单 register_all_kvcache_specs（single_type_kv_cache_manager.py:L1881-L1942）11 项：FullAttentionSpec→FullAttentionManager；SlidingWindowSpec→SlidingWindowManager；SlidingWindowMLASpec→SlidingWindowManager（V4 的新 spec 复用既有 SWA manager）；MambaSpec→MambaManager；ChunkedLocalAttentionSpec→ChunkedLocalAttentionManager；CrossAttentionSpec→CrossAttentionManager；TQFullAttentionSpec/MLAAttentionSpec/RSWASpec/HiddenStateCacheSpec/SinkFullAttentionSpec 五个 FullAttention 家族（base=FullAttentionSpec，与全注意力同组管理）。末尾 current_platform.register_custom_kv_cache_specs(vllm_config)（L1940-L1942）平台钩子。",
+        "门禁（L153-L173 check_kv_cache_spec_registry）：每层 spec 查不到 base 或 manager 即 raise ValueError，错误信息直接教学「Please register it using @register_kv_cache_spec decorator」。调用点在 get_kv_cache_configs 合并 spec 之后（kv_cache_utils.py:L2143-L2145，注释：防止未注册 spec 的层混进来）。",
+        "分组衔接（kv_cache_interface.py:L167-L184 is_uniform_with_collection）：判同型就是查 registry 拿 uniform_type_base_spec 再 all(isinstance(spec, base))——RSWASpec 注册 base=FullAttentionSpec 后自动与 FullAttention 层同组，分组代码零改动。UniformTypeKVCacheSpecs.is_uniform_type（L858-L871）docstring 明说「Uses the registry to determine grouping base classes」。",
+        "默认申报面（Attention 基类，model_executor/layers/attention/attention.py:L621-L691）：ENCODER_ONLY/ENCODER 返回 None（注释举例 Qwen3.5/ColQwen3.5 的 GatedDeltaNet 线性注意力混合）；sliding_window 非空 → SlidingWindowSpec（自选 kernel block_size，与用户 --block-size 解耦）；turboquant_ 前缀 → TQFullAttentionSpec；默认 FullAttentionSpec。子类只需重写 get_kv_cache_spec 换申报类型。"
+      ],
+      "embed_candidates": [
+        {
+          "path": "vllm/v1/kv_cache_spec_registry.py",
+          "lines": "L176-L209",
+          "why": "装饰器 API 全文 34 行（含 docstring 里的 CustomFullAttentionSpec 示例代码）：「协议」二字最具体的形态，直接嵌入即可当接入指南讲。"
+        },
+        {
+          "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+          "lines": "L1881-L1942",
+          "why": "内置菜单 62 行：11 项注册逐条可数、平台钩子收尾——「菜单已铺好」的一屏证据。"
+        }
+      ],
+      "worked_example_material": "反例教材：一个树外平台定义 XSpec 忘注册 → get_kv_cache_configs 在 L2145 check 处 ValueError，错误信息自带修复指引。正例见 rswa-onboarding。"
+    },
+    {
+      "id": "rswa-onboarding",
+      "name": "非 V4 接入正证：DeepSeek V3.2 R-SWA 只换一层申报 + 注册一项，分组/分配零改动",
+      "source_anchors": [
+        "vllm/model_executor/layers/attention/rswa_attention.py:L9-L37",
+        "vllm/model_executor/layers/attention/rswa_attention.py:L25-L37",
+        "vllm/models/deepseek_v2.py:L196-L206",
+        "vllm/v1/kv_cache_interface.py:L479-L515",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L1923-L1925",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L832-L875",
+        "vllm/model_executor/models/config.py:L189-L195"
+      ],
+      "facts": [
+        "RSWAAttention（rswa_attention.py 全文 37 行）docstring 自述定位（L10-L18）：标准 Attention 的 drop-in replacement；掩码逻辑在 backend（FlexAttention/FA4 mask_mod），本层**只**重写 get_kv_cache_spec 使 KV manager 实例化 RSWAManager（而非 FullAttentionManager）、从而能驱逐 gap blocks 把每请求 KV 内存压到 O(prefix+window)。",
+        "实现极简（L25-L37）：先 super().get_kv_cache_spec(vllm_config)（复用基类全部推导），None 透传，否则包成 RSWASpec 多带一个 rswa_window 字段——接入面动作的全部代码就是这 13 行。",
+        "模型侧挂线（deepseek_v2.py:L196-L206）：hf_config.rswa_window 存在 → self.attn = RSWAAttention(..., rswa_window=rswa_window)（DeepSeek V3.2 家族宿主在 deepseek_v2.py；config.py:L189-L195 默认 rswa_window=128 并向 text_config 传播）。模型代码只按配置选层，不触任何 KV 管理代码。",
+        "RSWASpec（kv_cache_interface.py:L479-L515）：继承 FullAttentionSpec 加 rswa_window 字段；docstring 给语义（prefill 段全局可见、仅留最近 rswa_window 个生成 token）；merge() 委托父类合并再回挂 rswa_window（L491-L515，断言同组所有 R-SWA 层同窗宽）。",
+        "注册一项（single_type_kv_cache_manager.py:L1923-L1925）：RSWASpec → RSWAManager, uniform_type_base_spec=FullAttentionSpec——base 决定它与全注意力同组（分组路 2 自动接住，get_kv_cache_groups 零改动）。",
+        "行为差异全在 manager 子类（L832-L875）：RSWAManager(FullAttentionManager) 只重写 remove_skipped_blocks（L845-L875）——gap 区间 [cdiv(prompt_len,bs), max(prompt_len, computed−rswa_window)//bs) 整块释放、null_block 顶位保持块表合法（FA4 侧 rswa_mask_mod 把 gap 位置标不可见）。分配器/块表/槽位映射全部复用。",
+        "与 V4 对照的叙事价值：RSWA 证明「协议已铺好、按协议申报即可」；V4 反证「当申报的形态超出菜单（多页宽组共存）时协议才被迫生长第三路与 packed」。两案例并排即是「适配协议」框架的正反两面。"
+      ],
+      "embed_candidates": [
+        {
+          "path": "vllm/model_executor/layers/attention/rswa_attention.py",
+          "lines": "L9-L37",
+          "why": "全文 29 行（含 docstring）：「只重写一个方法就完成接入」的完整孤例，正文可整段嵌入当对照标本。"
+        }
+      ],
+      "worked_example_material": "gap 驱逐数值例（manager docstring 公式）：prompt=1,000、computed=2,000、rswa_window=128、bs=256 → gap 块 [cdiv(1000,256)=4, max(1000,2000-128)//256=7) = 块 4,5,6 释放，null_block 顶位。"
+    },
+    {
+      "id": "v4-protocol-growth",
+      "name": "V4 推动协议生长的证据链：新 spec 类 + 新字段 + 第三路 + packed 布局 + 分配适配，五段改动逐段锚点",
+      "source_anchors": [
+        "vllm/v1/kv_cache_interface.py:L631-L631",
+        "vllm/v1/kv_cache_interface.py:L388-L397",
+        "vllm/v1/core/kv_cache_utils.py:L1592-L1632",
+        "vllm/v1/core/kv_cache_utils.py:L1599-L1607",
+        "vllm/v1/core/kv_cache_utils.py:L1812-L1819",
+        "vllm/v1/core/kv_cache_utils.py:L1308-L1327",
+        "vllm/v1/kv_cache_utils.py:L1283-L1305",
+        "vllm/v1/worker/gpu_model_runner.py:L7328-L7336",
+        "vllm/models/deepseek_v4/compressor.py:L177-L189",
+        "vllm/models/deepseek_v4/compressor.py:L191-L203"
+      ],
+      "facts": [
+        "证据链五段（每段独立锚点，正文可按此组装「协议如何被推动」的叙事）：(1) spec 层长出新类新字段——SlidingWindowMLASpec（kv_cache_interface.py:L631）+ MLAAttentionSpec 的 compress_ratio/alignment/model_version 字段（L388-L397，注释自认「DeepseekV4 only fields」）+ storage_block_size 分离（L403-L405）+ KVCacheTensor 的 offset/block_stride 字段（L946-L954）；(2) 分组长出第三路——group_and_unify_kv_cache_specs（kv_cache_utils.py:L1592-L1632，入口判据：含 SlidingWindowMLASpec 且 page_size 多于一种，L1599-L1607；注释 L1613-L1615 自述按 (block_size, sliding_window) 把 C4I+C4A 与 C128A 分组）+ 四路分发挂接（L1812-L1819）；(3) 布局长出 packed——_use_packed_kv_cache_config/_get_packed_kv_cache_layout/_get_kv_cache_config_packed（L1308-L1358）；(4) 分配侧适配——packed backing 一次分配+别名（gpu_model_runner.py:L7328-L7336）+ layer_packing 表（L7383-L7389）+ 切片分支（attn_utils.py:L225-L233）；(5) 模型侧申报——attention.py:L655-L674 主 KV、compressor.py:L191-L203 状态缓存、attention.py:L698-L710 indexer。",
+        "compressor.py:L177-L189 的物理约束注释（难得的一手设计说明）：块尺寸被「压缩器状态与 KV 块共享同一物理张量」约束——KV 块形 [256//4, head_dim]=[64,584] 决定 C4 压缩器块 [4, 2*512*2*4]→block_size=4、C128 →[8, 512*2*4]→block_size=8，TODO 自认应自动推导。block_size 4/8 不是拍脑袋，是张量共形约束。",
+        "coff=1+(compress_ratio==4)、sliding_window=coff*compress_ratio（compressor.py:L174-L176）：c4→窗 8、c128→窗 128——SlidingWindowMLASpec(4,8)/(8,128) 的窗口就是这么来的（state1 (4,8) 60 层/state2 (8,128) 31 层的社区口径对应物）。",
+        "调度侧伴生改动：generate_scheduler_kv_cache_config 解包 UniformType 取任一内层 spec（kv_cache_utils.py:L1855-L1874）+ _annotate_eagle_groups_deepseek_v4 的 is_eagle_group 标记（L1757-L1778）+ resolve_kv_cache_block_sizes 出 scheduler 256/hash 4 双块制（traces/v4_cache_groups.json 实算；supplement-hybrid-v4 已详）。",
+        "边界诚实声明：group_and_unify docstring 自述「Currently, this is only used for DeepseekV4」（L1596-L1597）、_get_kv_cache_groups_uniform_groups 注释「restrict the first grouped_spec to be…only MLAAttentionSpec」（L1679-L1680）、_use_packed_kv_cache_config 注释「DeepSeek V4 uses the packed layout by default. Other multi-group layouts can opt in with --enable-cross-layers」（L1405-L1407）——第三路/packed 目前仍是 V4 专属通道+一个实验性 opt-in，通用化是进行时（issue 42082）。"
+      ],
+      "embed_candidates": [
+        {
+          "path": "vllm/v1/core/kv_cache_utils.py",
+          "lines": "L1592-L1632",
+          "why": "group_and_unify 全文 41 行：第三路的入口判据+三向分桶+返回 [MLA, *SWA...] 结构——「协议生长点」的正文主锚。"
+        },
+        {
+          "path": "vllm/models/deepseek_v4/compressor.py",
+          "lines": "L173-L203",
+          "why": "块尺寸物理约束注释+get_kv_cache_spec：block_size 4/8 的「为什么」唯一出处，防止读者以为参数是魔数。"
+        }
+      ],
+      "worked_example_material": "按 v4-61layer-verified 的五组数字回放证据链：申报（5 种 spec/4 种页宽）→ 第三路（[31,61,30,31]→d=31）→ packed（slab 1,435,968）→ 分配（70 个 offset 别名）→ 寻址（五张块表+两组 kernel）。"
+    }
+  ]
+}

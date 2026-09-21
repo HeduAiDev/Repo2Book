@@ -322,3 +322,207 @@ print("census_toy: total", out["census_toy"]["total_specs"], "specs, pages",
 print("groups:", [g["num_layers"] for g in final], "stride", block_stride,
       "sched/hash", scheduler_bs, hash_bs)
 print("unify raises:", unify_err is not None, "| remainders:", divis)
+
+# ===========================================================================
+# 场景 E（ch14 重写二补素材驱动）：真实 61 层配置 packed 全账 + 两组简化示教例。
+# 输出独立文件 v4_cache_groups_61layer.json。同样只桩配置/指标类——布局函数
+# _get_packed_kv_cache_layout / _get_kv_cache_config_packed / group_and_unify /
+# _approximate_gcd / _get_kv_cache_groups_uniform_groups 全部走 pin 零改动。
+# 切片四步链为 attn_utils.py:L225-L233 packing 分支的逐字复刻（host 无法
+# import gpu worker 模块链；四步为纯 torch 张量操作，数值逐位可对照）。
+# ===========================================================================
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec  # noqa: E402
+
+out61 = {"params": {
+    "pin": "vLLM v0.27.1（instances/vllm/source，行号基线）",
+    "layer_config_source": "社区实读实发权重（research/hybrid-v4-background.json "
+                           "entry csdn-vllm-analysis-11-dsv4-layout）：compress_ratios "
+                           "61 项 = 30 c4 + 31 c128；pin 内无 61 层算例（docstring 玩具 "
+                           "11+10 在 kv_cache_utils.py:L1693-L1697；tests 玩具 "
+                           "[0,0,4,128,0] 在 test_indexer_deepseek_v4_slot_mapping.py:L23）",
+    "layout": "fp8_ds_mla 默认（alignment=576、uint8）",
+    "sliding_window": SLIDING_WINDOW,
+    "state_window_formula": "状态桶窗口 = coff*compress_ratio：c4→8、c128→128"
+                            "（compressor.py:L174-L176）",
+    "stubbed_modules": ["vllm.config", "vllm.config.kv_events",
+                        "vllm.v1.metrics", "vllm.v1.metrics.stats",
+                        "vllm.v1.request", "vllm.v1.utils"],
+    "stub_note": "仅配置/指标类被替身；分组、近似 GCD、packed 布局、块尺寸解析"
+                 "全部走 pin 算法代码零改动；与 analyst 独立驱动 run_v4_61layer.py"
+                 "互证（两份独立 trace 同源同果）",
+    "slicing_note": "视图切片四步链逐字复刻自 vllm/v1/worker/gpu/attn_utils.py"
+                    ":L225-L233 packing 分支（kv_raw_tensor.view(-1, block_stride)"
+                    "[:, offset:offset+page_bytes].view(dtype).view(shape)）——"
+                    "host 无法 import gpu worker 模块链，复刻为纯 torch 张量操作",
+}}
+
+# ---------- E1. 两组简化示教例：A 组 2 层同页 37440、B 组 8640+32832 ----------
+# 页宽直接复用 pin spec 类的真实页宽（swa=37440、indexer=8640、c128 attn_state=32832），
+# 层数刻意选 2/2 让读者心算跟上——布局语义（offset 累进/跨组重叠/block_stride=max）
+# 与 61 层真实配置完全同构。
+gA = KVCacheGroupSpec(layer_names=["a0", "a1"],
+                      kv_cache_spec=UniformTypeKVCacheSpecs(
+                          block_size=64,
+                          kv_cache_specs={"a0": swa_spec(), "a1": swa_spec()}))
+gB = KVCacheGroupSpec(layer_names=["b0", "b1"],
+                      kv_cache_spec=UniformTypeKVCacheSpecs(
+                          block_size=8,
+                          kv_cache_specs={"b0": indexer_spec(),
+                                          "b1": attn_compressor_state_spec(128)}))
+toy_groups = [gA, gB]
+toy_stride, toy_offsets = kcu._get_packed_kv_cache_layout(toy_groups)
+
+AVAIL_T = 1000000  # 示教显存（字节）：刻意不整除，演示 floor 除法的余数闲置
+toy_vcfg = types.SimpleNamespace(
+    cache_config=types.SimpleNamespace(num_gpu_blocks_override=None))
+toy_num_blocks, toy_tensors = kcu._get_kv_cache_config_packed(
+    toy_vcfg, toy_groups, AVAIL_T)
+toy_total = toy_stride * toy_num_blocks
+
+# 切片四步链（attn_utils.py:L225-L233 packing 分支逐字复刻，走真实 torch 张量）
+slab = torch.zeros(toy_total, dtype=torch.int8)
+def slice_view(layer, offset, page_bytes, dtype):
+    return slab.view(-1, toy_stride)[:, offset:offset + page_bytes].view(dtype)
+toy_slice = []
+for g, gid in ((gA, "A"), (gB, "B")):
+    off = 0
+    for ln in g.layer_names:
+        spec = g.kv_cache_spec.kv_cache_specs[ln]
+        page = spec.page_size_bytes
+        v = slice_view(ln, off, page, spec.dtype)
+        toy_slice.append({
+            "layer": ln, "group": gid,
+            "offset": off, "page_bytes": page,
+            "view_expr": f"view(-1,{toy_stride})[:,{off}:{off + page}]",
+            "out_shape": list(v.shape),
+            "dtype": str(v.dtype).replace("torch.", ""),
+        })
+        off += page
+
+out61["toy_two_group_packed"] = {
+    "groups": [
+        {"gid": "A", "layer_names": ["a0", "a1"],
+         "member_pages": [37440, 37440],
+         "dense_width": gA.kv_cache_spec.page_size_bytes,
+         "formula": "2*37440"},
+        {"gid": "B", "layer_names": ["b0", "b1"],
+         "member_pages": [8640, 32832],
+         "dense_width": gB.kv_cache_spec.page_size_bytes,
+         "formula": "8640+32832"},
+    ],
+    "block_stride": toy_stride,
+    "block_stride_is_max_dense": toy_stride == max(
+        gA.kv_cache_spec.page_size_bytes, gB.kv_cache_spec.page_size_bytes),
+    "layers_by_offset": {str(o): v for o, v in sorted(toy_offsets.items())},
+    "num_distinct_offsets": len(toy_offsets),
+    "offset0_shared_by": toy_offsets[0],
+    "offset0_cross_group_overlap": True,
+    "available_memory_bytes": AVAIL_T,
+    "num_blocks": toy_num_blocks,
+    "floor_remainder_bytes": AVAIL_T - toy_total,
+    "total_size": toy_total,
+    "tensors": [{"offset": t.offset, "block_stride": t.block_stride,
+                 "size": t.size, "shared_by": t.shared_by}
+                for t in toy_tensors],
+    "slicing_views": toy_slice,
+}
+
+# ---------- E2. 真实 61 层配置：30 c4 + 31 c128 ----------
+ratios61 = [4] * 30 + [128] * 31
+specs61 = build_model(ratios61)[0]
+by_kind61 = Counter(n.rsplit(".", 1)[-1] for n in specs61)
+grouped61 = kcu.group_and_unify_kv_cache_specs(specs61)
+assert grouped61 is not None and len(grouped61) == 4
+g_info61 = []
+for g in grouped61:
+    pages = Counter(s.page_size_bytes for s in g.kv_cache_specs.values())
+    formula = " + ".join(f"{c}*{p}" for p, c in sorted(pages.items()))
+    g_info61.append({
+        "num_layers": len(g.kv_cache_specs),
+        "page_sizes": dict(pages),
+        "dense_width": g.page_size_bytes,
+        "dense_width_formula": formula,
+        "num_layer_tuples": g.get_num_layer_tuples(),
+        "block_size": g.block_size,
+    })
+
+tuples61 = [g.get_num_layer_tuples() for g in grouped61]
+scan61 = [{"d": d, "pad": sum((d - (x % d)) % d for x in tuples61)}
+          for d in range(tuples61[0], max(tuples61) + 1)]
+chosen61 = kcu._approximate_gcd(tuples61, lower_bound=tuples61[0])
+rounded61 = [((x + chosen61 - 1) // chosen61) * chosen61 for x in tuples61]
+pad_detail = [{"bucket_tuples": x, "rounded_up": rr, "pad": rr - x}
+              for x, rr in zip(tuples61, rounded61)]
+
+groups61 = kcu._get_kv_cache_groups_uniform_groups(grouped61)
+final61 = []
+for i, g in enumerate(groups61):
+    spec = g.kv_cache_spec
+    pages = (Counter(s.page_size_bytes for s in spec.kv_cache_specs.values())
+             if isinstance(spec, UniformTypeKVCacheSpecs) else Counter())
+    formula = " + ".join(f"{c}*{p}" for p, c in sorted(pages.items()))
+    final61.append({
+        "gid": i, "num_layers": len(g.layer_names),
+        "block_size": spec.block_size,
+        "member_pages": dict(pages),
+        "dense_width": spec.page_size_bytes if isinstance(
+            spec, UniformTypeKVCacheSpecs) else None,
+        "dense_width_formula": formula or None,
+    })
+
+stride61, offsets61 = kcu._get_packed_kv_cache_layout(groups61)
+dense_list61 = [g["dense_width"] for g in final61]
+AVAIL_10G = 10737418240  # 10 GiB 示教显存（社区文章 csdn-vllm-analysis-11 同口径）
+cfg61 = types.SimpleNamespace(
+    cache_config=types.SimpleNamespace(num_gpu_blocks_override=None))
+nb_10g, _ = kcu._get_kv_cache_config_packed(cfg61, groups61, AVAIL_10G)
+
+out61["layer61"] = {
+    "compress_ratios_shape": "30 c4 + 31 c128（社区实读实发权重，61 层）",
+    "spec_census": {
+        "total_specs": len(specs61),
+        "by_kind": dict(by_kind61),
+        "total_formula": "30*5 + 31*3 = 150 + 93",
+        "distinct_page_sizes": sorted({s.page_size_bytes for s in specs61.values()}),
+    },
+    "group_and_unify": g_info61,
+    "num_layer_tuples_list": tuples61,
+    "approx_gcd": {"scan": scan61, "chosen": chosen61,
+                   "pad_total": sum(rr - x for x, rr in zip(tuples61, rounded61)),
+                   "rounded_up": rounded61, "pad_detail": pad_detail},
+    "final_groups": final61,
+    "per_group_dense_width": dense_list61,
+    "packed_layout": {
+        "block_stride": stride61,
+        "block_stride_is_max_dense": stride61 == max(dense_list61),
+        "num_distinct_offsets": len(offsets61),
+        "offset0_num_layers": len(offsets61[0]),
+    },
+    "num_blocks_10gib": {
+        "available_bytes": AVAIL_10G, "available_gib": 10,
+        "num_blocks": nb_10g,
+        "note": "num_blocks = available_memory // block_stride "
+                "(kv_cache_utils.py:L1342)",
+    },
+    "community_check": {
+        "expected_dense_widths": [1435968, 1160640, 1123200, 1244160, 1017792],
+        "match": dense_list61 == [1435968, 1160640, 1123200, 1244160, 1017792],
+        "expected_num_blocks_10gib": 7477,
+        "num_blocks_match": nb_10g == 7477,
+        "source": "research/hybrid-v4-background.json csdn-vllm-analysis-11-dsv4-layout",
+    },
+}
+
+path61 = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "v4_cache_groups_61layer.json")
+with open(path61, "w", encoding="utf-8", newline="\n") as f:
+    json.dump(out61, f, ensure_ascii=False, indent=1)
+print("wrote", path61)
+print("toy: stride", toy_stride, "offsets", {o: v for o, v in sorted(toy_offsets.items())},
+      "num_blocks", toy_num_blocks, "total", toy_total)
+print("61L: tuples", tuples61, "d =", chosen61, "pad =",
+      out61["layer61"]["approx_gcd"]["pad_total"])
+print("61L: dense", dense_list61, "stride", stride61,
+      "10GiB blocks", nb_10g, "community match",
+      out61["layer61"]["community_check"]["match"],
+      out61["layer61"]["community_check"]["num_blocks_match"])
