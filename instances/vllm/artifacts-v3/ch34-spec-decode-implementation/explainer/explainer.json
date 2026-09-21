@@ -1,0 +1,442 @@
+{
+ "chapter_id": "ch34",
+ "pin": "vLLM v0.27.1 (6e448d0ea)，行号基线 instances/vllm/source 工作树",
+ "env_note": "全部 trace 于 host 真机重跑取证（NVIDIA RTX PRO 6000 Blackwell / torch 2.11.0+cu128 / triton 3.7.1 / numba 0.66.0 / Miniconda Python 3.11.11；explainer 逐脚本重跑复现）。取证环境与 pin 无已知行为差异字段。驱动脚本（explainer/traces/run_*.py）驱动本章只做减法精简版（implementation/，# SOURCE 对 v0.27.1 逐文件现核，三个 Triton kernel 真跑）；精简版范围外的算式（scheduler.py / gpu_model_runner.py 的 spec 段，dossier subtraction_plan.delete[5]）由驱动逐字复刻并逐项与源码 docstring 自带数字互核（m4 例 A 全对上）。",
+ "mechanisms": [
+  {
+   "mechanism_id": "m1",
+   "intuition": "草稿的一生绕引擎一圈：出生在 worker（采样尾部就起草）、上班要过河挂账（同步调度）或根本不出门（异步调度）、干完活（验证）还要还账（回扣）——本步的输出就是下一轮草稿的原料。",
+   "figure_specs": [
+    {
+     "figure_id": "fig_m1_spec_cycle",
+     "l0_zoom": "L0 主循环（loop_box）+ 采样列 spec 块的跨进程展开——worker/EngineCore 两臂一次一拍；同时是 L2 章图（l2-specs/ch34.json）center 拍片 ①-⑨ 的『所有权泳道』重画：不重复九拍流水（L2 已画），专画 sync/async 双轨下草稿归谁持有。",
+     "template": "swimlane",
+     "claim": "一个投机解码周期里草稿的所有权环：worker 产 k 个草稿 → 同步模式经 take_draft_token_ids 回 EngineCore 挂账、再随下一拍 SchedulerOutput 回流；异步模式草稿全程留在 worker 进程（只在语法/惩罚/bad_words 需要时才拷回）→ target 一次前向验证 → 记账回扣，环回下一轮。",
+     "numbers": [
+      {"value": "K=3", "provenance": "traces/ch34_m02_scheduler_ledger.json params（K=3，eagle 方法 lookahead=K，scheduler.py:L261-L270）"},
+      {"value": "c1 产 2 token、c2 产 4 token", "provenance": "traces/ch34_m02_scheduler_ledger.json ledger_walk（c1 output_row=[31,77,-1,-1]、c2=[41,42,43,99]）"},
+      {"value": "async 跨进程往返 0 次", "provenance": "vllm/v1/engine/core.py:L616-L623（注释原话 'we update draft token ids in the worker process'）+ vllm/v1/worker/gpu_model_runner.py:L4901-L4907（只在语法/惩罚/bad_words 时才拷）"},
+      {"value": "站 1→16", "provenance": "l2-specs/ch34.json stations（一个周期的流经顺序账本）"}
+     ],
+     "caption_draft": "一拍之内草稿的旅程：同步调度要过两次河（worker→EngineCore 挂账→随 SchedulerOutput 回 worker），异步调度草稿根本不出 worker 进程——跨进程往返归零；第 16 站记账回扣后，本步输出即刻变成下一轮 drafter 的输入，环回第 1 站。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m2",
+   "intuition": "工头只数搬了几块砖：草稿先当『计划要搬的砖』记进账（乐观推进），验完货发现哪几块是空箱（被拒），就从账上划回去——账面永远只说『还差几块没搬』，从不关心那是草稿还是正文。",
+   "worked_example": {
+    "params": {
+      "prompt_tokens": 10,
+      "K": 3,
+      "method": "eagle",
+      "scheduling": "sync（async 变体见第 3 行）",
+      "c1": "草稿 [31,32,33]，target argmax 序列使第二位即拒（greedy kernel 零 RNG 真跑）",
+      "c2": "草稿 [41,42,43]，三位全收 + bonus 99"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch34_m02_scheduler_ledger.json",
+    "table": {
+     "columns": ["拍·动作", "挂账后 num_computed / num_tokens_with_spec", "排批 num_new_tokens（token 差账）", "验证输出行", "记账：回扣后 num_computed"],
+     "rows": [
+      ["c1：挂账 spec=[31,32,33] 后 schedule()", "14 / 18", "4（=1 补喂 o5 + 3 草稿）", "[31,77,-1,-1]：接受 1、拒 2", "18−2 → 16（被拒两位退回未计算）"],
+      ["c2：挂账 spec=[41,42,43] 后 schedule()", "16 / 20", "4（=1 补喂上拍 recovered=77 + 3 草稿）", "[41,42,43,99]：全收 3 + bonus", "20−0 → 20（不回扣，差账对平）"],
+      ["async 变体：同一 c1 场景拒 2", "乐观 18（占位 3）", "—", "同上", "num_computed 18→16、num_output_placeholders 3→1（两本账共变）"],
+      ["两拍合计", "—", "—", "c1 产 2、c2 产 4 token", "11 token / 7 拍 vs 无 spec 11 拍 → 1.571429 倍"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "每拍至少产 1 个 token，且回扣后 num_computed_tokens 永不超过真实产出对应的 token 位（账不超前）；请求在有限拍内 finish。",
+    "argument": "基例：prefill 完成时 num_computed=num_tokens（prompt 位全算完）。归纳步：排批保证 num_new_tokens ≥ 1——末位非草稿采样位必排，验证输出行至少 1 个有效 token → num_tokens 每拍严格 +≥1；被拒位 num_rejected=num_draft−num_accepted 全部从 num_computed 划回（scheduler.py:L1766-L1790），num_tokens 被 max_model_len 封顶 → 有限拍 finish。async 变体多一本 num_output_placeholders 同步共变，不破坏守恒。"
+   },
+   "quantified": "本例 K=3：c1 一拍产 2 token（接受 1 + recovered 1）、c2 一拍产 4（3 收 + bonus）——一次前向的产出上限即 k+1=4；两拍合计 11 token / 7 拍，对照无 spec 的 11 拍 → 1.571429 倍。lookahead 账三态：eagle=3、dflash=4、dspark=3。回扣幅度=被拒数（c1 拒 2：18→16；async 下占位账同时 3→1）。",
+   "figure_specs": [
+    {
+     "figure_id": "fig_m2_ledger",
+     "l0_zoom": "L0 主循环 loop_box 里调度器臂的账本放大——『调度只认 token 数』在 spec 上的形态；L2 章图第④拍（schedule 排批）与第⑨拍（回扣）之间补一条账本时间线。",
+     "template": "state-table",
+     "claim": "调度器 token 账本的乐观推进与拒绝回扣：c1 拍按全收乐观记 18、验证拒 2 回扣到 16；c2 拍全收不回扣（20 对平）；async 下占位账 3→1 同步共变。",
+     "numbers": [
+      {"value": "c1：14→18（排 4）→16（拒 2 回扣）", "provenance": "traces/ch34_m02_scheduler_ledger.json ledger_walk c1（num_computed_tokens 14 / optimistic 18 / after_rollback 16）"},
+      {"value": "num_new_tokens=4=1+3", "provenance": "traces/ch34_m02_scheduler_ledger.json ledger_walk c1（note 原话）"},
+      {"value": "输出行 [31,77,-1,-1] 与 [41,42,43,99]", "provenance": "traces/ch34_m02_scheduler_ledger.json ledger_walk（rejection_sample 真跑）"},
+      {"value": "c2：20−0→20", "provenance": "traces/ch34_m02_scheduler_ledger.json ledger_walk c2"},
+      {"value": "async：占位 3→1", "provenance": "traces/ch34_m02_scheduler_ledger.json async_rollback（num_output_placeholders 3→1，scheduler.py:L1779-L1784）"},
+      {"value": "11 token / 7 拍 → 1.571429 倍", "provenance": "traces/ch34_m02_scheduler_ledger.json production_account"}
+     ],
+     "caption_draft": "排批只认 token 数：草稿先当『要算的位』记进差账（本拍 +4），验证后数 -1 算出拒绝数、从账上划回——c1 拒 2：18→16；c2 全收：20 对平不回扣；异步调度下占位账 3→1 与计算账共变。两拍 11 token / 7 拍，比无 spec 快 1.571429 倍——加速完全由接受率决定。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m3",
+   "intuition": "乐高底板孔位必须整齐：新请求要么按满规格 1+K 个孔位进批（草稿孔用 -1 空占），要么整拍不进——绝不为了塞进一个新请求把全板的孔位距打乱（cudagraph 按形状精确回放）。",
+   "worked_example": {
+    "params": {
+      "K": 3,
+      "场景": "3 个 RUNNING 请求（形状 [4,4,4]）+ 新 decode 请求 r4",
+      "dynamic_sd": "schedule=[[1,2,3],[3,4,2]]、max_batch=4、num_spec_tokens=3"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch34_m03_shape_pad_dynamic_k.json",
+    "table": {
+     "columns": ["场景", "条件 / 预算", "决策", "形状 / 结果"],
+     "rows": [
+      ["A：新请求进批（预算足）", "running 形状 [4,4,4]、新请求 num_new_tokens=1", "pad_spec_decode=True：1→4、草稿位填 [-1,-1,-1]", "批形状统一 [4,4,4,4]（full cudagraph 保住）"],
+      ["B：预算不足", "pad 后 4 > 剩余预算 2", "break：宁可不排不破形状", "新请求等下一拍；在批 3 个请求的形状保住"],
+      ["C：dynamic_sd_lookup 开启", "查表 [0,3,3,2,2]", "不 pad——K 按批大小定：batch 1→3、batch 3→2、batch 4→2", "num_spec_tokens_to_schedule 随 SchedulerOutput 下发，drafter 下一轮照办"],
+      ["占位草稿下游（greedy kernel 真跑）", "drafts=[-1,-1,-1]、target_argmax=4", "-1 ≠ 任何 argmax → 首位即拒", "输出 [4,-1,-1,-1] → parse_output 还原 [4]：本拍照常 1 token，只是零投机收益"],
+      ["查表边界：区间外顺延 / 封顶", "顺延例 [0,3,3,3,1]；封顶例区间配 K=9", "区间外顺延前段 K；K 封顶 min(vllm_num_spec, k)", "查表恒有返回值，不抛错"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "同拍进批的每个 decode 请求占位恰为 1+K（pad 后），批形状只随请求数变化、不随草稿数波动。",
+    "argument": "pad 触发条件（num_spec_tokens>0 且 dynamic 关闭 且 num_new_tokens==1 且已有 RUNNING 且本拍无 prefill，scheduler.py:L881-L898）在收请求时先置 num_new_tokens=1+K 再做预算/长度检查，超限即 break——进批者必然已 pad；[-1] 占位草稿由下游三处协同消化（拒绝 kernel 直接拒、语法窗口不推进、parse_output 过滤），形状约束不改语义。"
+   },
+   "quantified": "例 A：[4,4,4]+pad → [4,4,4,4]（无 pad 则混进一个 1，形状破）；例 B：预算 2 放弃收新请求，保住其余 3 个请求的 cudagraph 形状——『宁可不排』的显式代价。动态 K：batch 1→3、batch 3→2、batch 4→2（重载缩 K 保批容量）。-1 占位的白算账：输出 [4,-1,-1,-1]，3 格 -1 全废。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m4",
+   "intuition": "变长草稿打托盘运输：每请求 k+1 件首尾相接码成一条流水线，再发三张提货单（logits/target/bonus 三组 index）指明每件货在哪——比给每人发最大号箱子（padding 成 [B, max_spec+1]）省得多，代价是要会读提货单、还要会『错位一格』取货。",
+   "worked_example": {
+    "params": {
+      "例 B": "3 请求：req0 草稿 2 个（token 61,72 = 输入位 1,2）、req1 零草稿（ngram 猜不出）、req2 草稿 1 个（token 55 = 输入位 7）",
+      "cu_num_scheduled_tokens": [3, 5, 8],
+      "num_draft_tokens": [2, 0, 1],
+      "input_ids": [50, 61, 72, 10, 20, 30, 41, 55]
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch34_m04_index_flattening.json",
+    "table": {
+     "columns": ["请求", "k_i 草稿数", "采样位 k_i+1", "logits_indices（扁平行号）", "bonus 行号", "target 行号（+1 后）"],
+     "rows": [
+      ["req0（草稿 61,72）", "2", "3", "0, 1, 2", "2", "0, 1（→1, 2）"],
+      ["req1（零草稿）", "0", "1", "4", "3", "—（无草稿位）"],
+      ["req2（草稿 55）", "1", "2", "6, 7", "5", "4（→5）"],
+      ["二次 gather（错位一格）", "—", "—", "first_hop = input_ids[logits_indices] = [50,61,72,20,41,55]", "—", "[1,2,5] 取位 → draft_token_ids = [61,72,55]"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "logits_indices 恰好拼出每请求的连续区间 [cu_scheduled_i − num_sampled_i, cu_scheduled_i)，两两不交、总行数 = Σ(k_i+1) = num_tokens + batch。",
+    "argument": "np.repeat(cu_scheduled − num_sampled, num_sampled) 给每行段基址；_get_cumsum_and_arange（gpu_model_runner.py:L1743-L1767）的构造保证段内偏移恰为 0..num_sampled_i−1（cumsum 与 arange 相减）；基址+偏移=连续区间，而 cu_num_scheduled 严格递增 → 区间两两不交；对请求数归纳求和得总行数。bonus_logits_indices = cu_num_sampled − 1 恒为每请求最后一行。"
+   },
+   "quantified": "例 B：3 请求共 6 行扁平 logits（=3 草稿+3 请求的 +1）vs padding 方案 3×(2+1)=9 行，零浪费、省 3 行；源码 docstring 的 5 请求例（例 A，逐项互核全对上）：11 行 vs 20 行、省 9 行——零草稿请求只占 1 个 bonus 位是省算力的主力。二次 gather 两跳各 O(num_tokens)。",
+   "figure_specs": [
+    {
+     "figure_id": "fig_m4_flatten",
+     "l0_zoom": "L0 采样列+spec 块里『target 一次前向』输入侧的放大——L2 章图第⑤拍（_calc_spec_decode_metadata）的机制小图（步进图层）。",
+     "template": "tensor-flow",
+     "claim": "变长草稿摊平成一条输入流：3 请求草稿 [2,0,1] → 6 行扁平 logits，三组 index（logits/target/bonus）定位每行，draft_token_ids 由 input_ids 经 logits_indices 再经 target_logits_indices+1 二次 gather 错位一格取出 [61,72,55]。",
+     "numbers": [
+      {"value": "num_draft_tokens=[2,0,1]、cu_num_scheduled=[3,5,8]", "provenance": "traces/ch34_m04_index_flattening.json example_b_small"},
+      {"value": "input_ids 8 位 [50,61,72,10,20,30,41,55]", "provenance": "traces/ch34_m04_index_flattening.json example_b_small.input_ids"},
+      {"value": "logits_indices=[0,1,2,4,6,7]", "provenance": "traces/ch34_m04_index_flattening.json example_b_small.logits_indices"},
+      {"value": "bonus=[2,3,5]、target=[0,1,4]（+1 后 [1,2,5]）", "provenance": "traces/ch34_m04_index_flattening.json example_b_small"},
+      {"value": "draft_token_ids=[61,72,55]", "provenance": "traces/ch34_m04_index_flattening.json example_b_small.second_hop_draft_token_ids（手算互核一致）"},
+      {"value": "6 行 vs padding 9 行；docstring 例 11 vs 20", "provenance": "traces/ch34_m04_index_flattening.json counts（例 B 与例 A 的 padding_waste 对照）"}
+     ],
+     "caption_draft": "摊平不 padding：零草稿请求只占 1 个 bonus 位、满草稿请求占 k+1 位，首尾相接零浪费（本例 6 行 vs padding 的 9 行；源码 docstring 的 5 请求例 11 行 vs 20 行）——代价是三组 index 的间接定位，以及 draft_token_ids 要『错位一格』二次 gather：草稿填在输入流里，取它的下一采样位 logits 才是『预测它之后的词』。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m5",
+   "intuition": "bonus 是 spec 里唯一还能自由采样的位：RejectionSampler 把它切出来外包给隔壁的普通 Sampler（top_p/top_k 照常用），target 位自己留着做拒绝采样——一份扁平 logits、两种命运。",
+   "figure_specs": [
+    {
+     "figure_id": "fig_m5_bonus_seam",
+     "l0_zoom": "L0 采样列 spec 块内『验证期采样』的放大——L2 章图第⑦拍（RejectionSampler.forward）的机制小图。",
+     "template": "flow",
+     "claim": "v0.27 的 RejectionSampler 组合持有普通 Sampler：同一份扁平 logits 切两刀——bonus 位 logits[bonus_logits_indices] 外采（max_num_logprobs=-1、可 top_p/top_k），target 位 logits[target_logits_indices] 转 fp32、非 processed 模式 clone 保 raw 后走约束与拒绝采样；张量索引产生新存储，两条支线 in-place 互不污染。",
+     "numbers": [
+      {"value": "bonus_logits_indices=[2,3,5]", "provenance": "traces/ch34_m04_index_flattening.json example_b_small.bonus_logits_indices"},
+      {"value": "target_logits_indices=[0,1,4]", "provenance": "traces/ch34_m04_index_flattening.json example_b_small.target_logits_indices"},
+      {"value": "max_num_logprobs=-1", "provenance": "vllm/v1/sample/rejection_sampler.py:L137（replace(max_num_logprobs=-1)，logprobs 后面统一算）"},
+      {"value": "spec 主路径不支持、bonus 位可用的策略：top_p/top_k", "provenance": "vllm/v1/sample/rejection_sampler.py:L38-L59（类 docstring：'we can use top_p, top_k sampling for bonus tokens, while spec decode does not support these'）"}
+     ],
+     "caption_draft": "同一份扁平 logits 切两刀：bonus 行交给组合持有的普通 Sampler 外采（top_p/top_k 这些 spec 主路径不支持的策略在 bonus 位还能用），target 行 fp32 化+clone 保 raw 后自己消化——张量索引产生新存储，所以两边的 in-place 操作互不污染（in-place 所有权暗线的 spec 侧实证）。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m6",
+   "intuition": "采样参数天生是每请求一张卡，spec 把一个请求摊成了 k+1 行 logits——约束扩展就是把一张卡复印到每一行；『看历史』的约束（惩罚/bad_words）更麻烦：草稿算不算『已说过的话』？答案：验第 i 位时，只把前 i 个草稿当前缀——后面的草稿还没轮到，不算。",
+   "worked_example": {
+    "params": {
+      "num_draft_tokens": [2, 0, 1],
+      "temperature_batch": [0.0, 1.0, 0.7],
+      "presence_penalties": [0.5, 0.0, 0.0],
+      "bad_words": "[[70,5]]（前缀 70 + 禁词 5）",
+      "outputs": "[[5,6],[7],[8]]、spec=[[70,71],[],[90]]",
+      "MinTokens 例": "num_draft=[2,3,1] → logits 6 行、cumsum=[0,2,5,6]（源码 docstring 自带例）"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch34_m06_constraint_expansion.json",
+    "table": {
+     "columns": ["约束处理器", "per-request 参数怎么落到 per-token 行", "本例数值", "效果"],
+     "rows": [
+      ["温度（apply_sampling_constraints）", "expand_batch_to_tokens 按草稿位展开 [0.0,1.0,0.7]", "greedy 的 0 替 1 防除零 → 逐行 [1.0,1.0,0.7]", "req2 行 logits [0.7,1.4,2.1,2.8,0.7,0.7,0.7,0.7]÷0.7 = [1.0,2.0,3.0,4.0,1.0,1.0,1.0,1.0]"],
+      ["penalties（presence=0.5）", "repeat_indices=[0,0,2]（req0 两行、req1 零行、req2 一行）", "第 0 行历史含 5、6 → 各 -0.5；第 1 行历史多含 70 → 70 也 -0.5", "历史 = outputs + spec 前缀（_combine_outputs_with_spec_tokens 逐位造行——与 Sampler 同名方法语义不同）"],
+      ["bad_words（词 [70,5]）", "草稿当前缀历史：只有第 1 行历史以 70 结尾", "第 1 行 token 5 封 -inf；第 0 行不封（保持 -0.5）", "前缀不匹配就不封——验到哪位、拼到哪位"],
+      ["MinTokens.apply_with_spec_decode", "cumsum=[0,2,5,6] 给 6 行分家；req1 remaining=5 > 草稿 3 → 封 min(5,3)=3 行", "req2 已达标被 update_state 摘除", "stop token 2 在行 0 到 4 全 -inf、行 5 放行"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "对草稿位行 r（属请求 i 的第 j 位），展开后的约束效果等价于『历史 = output + spec[:j]』的普通单步约束——展开不改语义。",
+    "argument": "归纳于 j：j=0 时无草稿前缀=普通一步；j→j+1 时 _combine_outputs_with_spec_tokens（rejection_sampler.py:L376-L391）恰多拼 spec[j]（逐位前缀行）；repeat_indices 与 expand_batch_to_tokens 的行→请求反推和采样 kernel 用同一 cu_num_draft 算式——映射一致，约束不重不漏。"
+   },
+   "quantified": "[B]=3、num_draft=[2,0,1] → 3 行 target logits（零草稿请求 0 行）；repeat_indices=[0,0,2]；MinTokens 例 6 行分账 cumsum=[0,2,5,6]，req1 封 3 行=min(5,3)（封位不超本拍草稿行数）、req2 由 update_state 摘除。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m7",
+   "intuition": "调度台先看全班是不是都交标准答案（全 greedy → 只开一个窗口、一趟完事）；否则两个窗口同开——greedy 窗口见到随机请求扭头就走，random 窗口见到 greedy 请求扭头就走：分流下沉到行级，批不用拆。",
+   "worked_example": {
+    "params": {
+      "case A": "2 请求 num_draft=[2,1]、all_greedy=True、max_spec_len=2",
+      "case B": "is_greedy=[True,False]、温度 [0.0,1.0]、req1 走 NO_DRAFT_PROBS"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch34_m07_dispatch.json",
+    "table": {
+     "columns": ["场景", "批构成", "路径", "输出（buffer [2,3]）", "随机数消耗"],
+     "rows": [
+      ["A：全 greedy", "num_draft=[2,1]、all_greedy=True", "greedy kernel → 直接 return（softmax/uniform/recovered 全跳过）", "[[3,5,99],[1,98,-1]]", "0（generator 状态不变，实证）"],
+      ["B：混批", "is_greedy=[True,False]、温度 [0.0,1.0]", "双 kernel 同批 launch、各自早退：req0 走 greedy / req1 走 random", "[[3,7,-1],[3,-1,-1]]", "req1 的 u=0.958787（float64）"],
+      ["B 的判据细节", "req1 草稿 2、p_t(2)=0.128571（NO_DRAFT_PROBS：draft_prob=1）", "0.128571 >= 0.958787 不成立 → 拒、写 recovered=3、早停", "第 1 行 [3,-1,-1]", "uniform 逐草稿位一个"],
+      ["buffer 账", "batch=2、max_spec_len=2", "预填 -1：6 格中 case A 只有 1 格未写、case B 3 格", "+1 列即 bonus 槽", "—"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "输出矩阵每行至多一个『拒绝位』，其后（除 bonus 槽）全为 PLACEHOLDER=-1；每行有效位 = 该请求本拍全部产出。",
+    "argument": "greedy/random 两 kernel 的 rejected 标志单调不回（一旦 True，循环体被 if not rejected 守卫短路），pos 严格递增写出、首拒后零写入；buffer 预填 -1（L421-L433）→ 未写位保持哨兵；仅 not rejected 时在第 num_draft 位写 bonus。all_greedy 批在 greedy kernel 后直接 return——softmax/uniform/recovered 全不触发。"
+   },
+   "quantified": "case A：1 次 kernel launch、随机数 0 个；case B：2 次 kernel 同批 launch，随机数只花在 1 个随机请求上（每草稿位 1 个 float64 uniform + 每请求 1 行 q）——对照『拆批跑两遍』省一次往返；buffer [2,3] 共 6 格：case A 有效 5 格、case B 有效 3 格（-1 哨兵 3 格）。",
+   "figure_specs": [
+    {
+     "figure_id": "fig_m7_dispatch",
+     "l0_zoom": "L0 采样列 spec 块验证期的调度放大——L2 章图第⑧拍（rejection_sample 双 kernel）的机制小图。",
+     "template": "flow",
+     "claim": "rejection_sample 的调度：输出 buffer 预填 -1（第二维 max_spec_len+1，+1 即 bonus 槽）、all_greedy 一趟 greedy kernel 即返回、混批双 kernel 同批共存各自早退。",
+     "numbers": [
+      {"value": "buffer [2,3]、6 格（case A 余 1 格 -1、case B 余 3 格）", "provenance": "traces/ch34_m07_dispatch.json buffer_account"},
+      {"value": "is_greedy=[True,False]", "provenance": "traces/ch34_m07_dispatch.json case_b_mixed.params.is_greedy_mask"},
+      {"value": "req1 u=0.958787、p_t=0.128571", "provenance": "traces/ch34_m07_dispatch.json case_b_mixed（float64 uniform 重构值，与 kernel 输出反向核验一致）"},
+      {"value": "case A 随机数 0 个", "provenance": "traces/ch34_m07_dispatch.json case_a_all_greedy.generator_state_unchanged"}
+     ],
+     "caption_draft": "greedy 与随机同批共存：is_greedy mask 行级分流——greedy kernel 见随机请求早退、random kernel 见 greedy 请求早退，批不用拆；全 greedy 批连 softmax/uniform/recovered 都不跑（generator 零消耗，实证）。输出 buffer 第二维的 +1 就是 bonus 槽：全收时白嫖的那一格。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m8",
+   "intuition": "对答案：草稿与标答（target 的 argmax）逐位比，比到第一个不一样就用标答顶上、后面全部作废；全对就白捡最后一格的 bonus 答案。占位草稿（-1）永远比不中，第一位就出局。",
+   "worked_example": {
+    "params": {
+      "num_draft_tokens": [3, 2, 1, 0],
+      "drafts_flat": [3, 5, 6, 1, 0, -1],
+      "target_argmax_flat": [3, 5, 6, 1, 7, 4],
+      "max_spec_len": 3,
+      "bonus_ids": [90, 91, 92, 93]
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch34_m08_greedy_kernel.json",
+    "table": {
+     "columns": ["请求", "草稿（摊平区间）", "target argmax", "逐位判定", "输出行（4 列 buffer）"],
+     "rows": [
+      ["req0（k=3）", "[3,5,6]（区间 [0,3)）", "[3,5,6]", "三位全等 → 全收", "[3,5,6,90]：bonus 90 写第 3 位（=k 位）"],
+      ["req1（k=2）", "[1,0]（区间 [3,5)）", "[1,7]", "第 1 位草稿 0 ≠ argmax 7 → 写 7、早停", "[1,7,-1,-1]：后两格保持 -1"],
+      ["req2（k=1，pad 占位）", "[-1]（区间 [5,6)）", "[4]", "-1 ≠ 任何 argmax → 首位即拒", "[4,-1,-1,-1]"],
+      ["req3（k=0，ngram 猜不出）", "[]（无区间）", "[]", "循环 0 次、not rejected → bonus 写第 0 位", "[93,-1,-1,-1]：无草稿也有 1 token 保底"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "greedy 拒绝采样无损：每位写出的 token 恒等于该位 target argmax——输出即 greedy 解码的确定序列。",
+    "argument": "逐位归纳：接受位 draft==argmax 输出 draft（=argmax）；拒绝位输出 target_argmax；两种情况都等于该位 target 的 argmax——而 one-hot 残差分布的唯一非零 token 恰是 argmax（ch33 的 one-q 特例在 kernel 形态的兑现）；bonus 位由外采 argmax 同理。rejected 单调 → 首拒后零写入，pos 循环上界 num_draft 有限。"
+   },
+   "quantified": "4 请求一批 6 个草稿位：产出 [4,2,1,1] token（req0 到达一次前向的上限 k+1=4）；buffer [4,4] 16 格、有效 8 格、-1 哨兵 8 格——接受越多白嫖越多，拒绝越多 -1 越多。",
+   "figure_specs": [
+    {
+     "figure_id": "fig_m8_greedy_grid",
+     "l0_zoom": "L0 采样列 spec 块验证期的 greedy 路径放大——L2 章图第⑧拍内 greedy kernel 分支的机制小图（步进图层：逐格写出）。",
+     "template": "state-table",
+     "claim": "greedy kernel 的 [4, max_spec_len+1] 输出矩阵逐格写出：4 请求 [3,2,1,0] 草稿各走『对答案』路径——全收补 bonus、首拒写 argmax、-1 占位首位即拒、k=0 请求 bonus 写第 0 位。",
+     "numbers": [
+      {"value": "drafts=[3,5,6,1,0,-1]", "provenance": "traces/ch34_m08_greedy_kernel.json params.drafts_flat"},
+      {"value": "argmax=[3,5,6,1,7,4]", "provenance": "traces/ch34_m08_greedy_kernel.json params.target_argmax_flat（kernel 实算一致）"},
+      {"value": "bonus=[90,91,92,93]", "provenance": "traces/ch34_m08_greedy_kernel.json params.bonus_ids"},
+      {"value": "输出矩阵 [[3,5,6,90],[1,7,-1,-1],[4,-1,-1,-1],[93,-1,-1,-1]]", "provenance": "traces/ch34_m08_greedy_kernel.json output_matrix（Triton kernel 真跑）"},
+      {"value": "16 格 / 有效 8 / -1 哨兵 8", "provenance": "traces/ch34_m08_greedy_kernel.json account"}
+     ],
+     "caption_draft": "对答案式验证：req0 三位全对再白捡 bonus（4 token/拍，一次前向的上限）；req1 第二位错，就地用标答（argmax）改正并作废后续；req2 的 -1 占位草稿永远比不中、首位即出局；req3 一个草稿都没猜出，bonus 仍保底 1 token——16 格 buffer 只有 8 格有效，-1 哨兵同时标记了截断与浪费。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m9",
+   "intuition": "掷骰子验货：货的 target 概率不低于 draft 概率（比值≥1）就无条件收；比值只有一半，就掷一枚均匀骰子 u——落进下半段才收，否则退货、按差价分布补一件新货。",
+   "worked_example": {
+    "params": {
+      "pos0": "draft token 1：p_t(x)=0.3、p_d(x)=0.6 → 比值 0.5",
+      "pos1": "draft token 1：p_t(x)=0.8、p_d(x)=0.2 → 比值 4.0（恒接受）",
+      "vocab": 6,
+      "种子": "42/43/44/45/46/47（seeded generator，u/q 同 seed 同消耗序列重构=kernel 实际消费值）"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch34_m09_random_kernel.json",
+    "table": {
+     "columns": ["种子 / 变体", "pos0 判据（p_t/p_d=0.5 vs u）", "判定", "pos1（若到）", "输出行", "本拍产出"],
+     "rows": [
+      ["seed 42", "0.5 ≥ 0.468587", "接受", "比值 4.0 → 恒接受（u=0.12625 也过）", "[1,1,777]", "3 token（2 收 + bonus 777）"],
+      ["seed 45", "0.5 < 0.762339", "拒绝 → recovered=3、早停", "不到", "[3,-1,-1]", "1 token"],
+      ["seed 47", "0.5 < 0.718814", "拒绝 → recovered=3", "不到", "[3,-1,-1]", "1 token"],
+      ["ngram（NO_DRAFT_PROBS）", "p_t/1=0.3 vs u=0.468587", "拒绝 → recovered=0", "—", "[0,-1]", "1 token"],
+      ["统计律（20000 样本）", "比值 0.5 → 实测 0.4966；比值 4.0 → 1.0；ngram p_t=0.3 → 0.30125", "—", "—", "—", "接受率 = min(1, p_t/p_d)"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "接受概率 P(接受 x) = P(p_t(x)/p_d(x) ≥ u) = min(1, p_t(x)/p_d(x))——kernel 不显式取 min 的原因；输出分布与直接从 p_t 采样同分布（无损，ch33 已证，此处为 kernel 形态）。",
+    "argument": "u~U[0,1) 与草稿独立：对均匀 u 积分，P(ratio ≥ u)=min(1, ratio)（ratio≥1 时积分=1，被 u∈[0,1) 隐式实现）；draft_prob=0 显式拒（防 NaN，L824-L826）；早停不影响分布：首拒位从残差分布采 recovered（m10 的边缘正确性），其后位不写即不消费。float64 uniform 防 u 恰为 0.0 破坏边界判等（pytorch#16706）。"
+   },
+   "quantified": "20000 样本实测：比值 0.5 → 0.4966、比值 4.0 → 1.0、ngram（p_d=1）p_t=0.3 → 0.30125；六枚种子里 pos0 实测 4 收 2 拒（seed 42/43/44/46 收、45/47 拒）——『约半数』是统计性质，由 20000 样本的 0.4966≈0.5 承载、六枚小样本波动正常。uniform 用 float64（例 u=0.468587，6 位精度）——float32 有非平凡概率掷出精确 0.0，届时 p_t/p_d ≥ 0 恒真、坏草稿被无条件放行。",
+   "figure_specs": [
+    {
+     "figure_id": "fig_m9_random_criterion",
+     "l0_zoom": "L0 采样列 spec 块验证期的 random 路径放大——L2 章图第⑧拍内 random kernel 分支（算法心脏）的机制小图。",
+     "template": "state-table",
+     "claim": "random kernel 接受判据 p_t/p_d ≥ u：六枚骰子下比值 0.5 的草稿 4 收 2 拒（『约半数』由 20000 样本统计律 0.4966≈0.5 承载）、比值 4.0 恒通过——min(1,·) 由 u∈[0,1) 隐式实现，拒绝位写 recovered 并早停。",
+     "numbers": [
+      {"value": "u = 0.468587 / 0.284905 / 0.086889 / 0.149175（收）；0.762339 / 0.718814（拒）", "provenance": "traces/ch34_m09_random_kernel.json part_a_exact_walk（seeded generator 重构=kernel 实际消费值，输出反向核验一致）"},
+      {"value": "比值 0.5 与 4.0", "provenance": "traces/ch34_m09_random_kernel.json part_a_exact_walk.params（pos0 p_t=0.3/p_d=0.6、pos1 0.8/0.2）"},
+      {"value": "输出 [1,1,777]（收）与 [3,-1,-1]（拒）", "provenance": "traces/ch34_m09_random_kernel.json part_a_exact_walk.walks"},
+      {"value": "20000 样本：0.5→0.4966、4.0→1.0、ngram 0.3→0.30125", "provenance": "traces/ch34_m09_random_kernel.json part_c_statistical"},
+      {"value": "uniform dtype=float64", "provenance": "vllm/v1/sample/rejection_sampler.py:L629-L638（注释引 pytorch#16706）"}
+     ],
+     "caption_draft": "掷骰子验货：概率比值≥1 无条件收；比值只有 0.5 时，骰子 u 落进下半段才收——六枚骰子 4 收 2 拒、2 万样本实测接受率 0.4966≈理论 0.5；ngram（无 draft 概率）退化成『以 p_t(x) 概率接受』。u 用 float64 生成：float32 有非平凡概率掷出精确 0.0，会让坏草稿无条件放行（pytorch#16706）。拒绝位从残差分布补一个 recovered（m10），其后早停全作废。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m10",
+   "intuition": "退货补货从『差价』里挑：target 比 draft 多出来的那块概率（残差=两者之差的正部）就是补货分布；挑法是 Gumbel-max 掷骰——残差除以每词表位一份的 Exp(1) 噪声取最大，连归一化都省了；一家请求只掷一份骰全家（所有草稿位）共用，反正最多只有一个拒绝位会真来取货。",
+   "worked_example": {
+    "params": {
+      "vocab": 6,
+      "drafts": [1, 2],
+      "q 布局": "[batch=1, vocab=6] 一行、两位共享（v0.27：[batch, V] 而非 [num_tokens, V]）",
+      "q_row": [0.504695, 1.212147, 0.374887, 0.302532, 2.314894, 1.137358]
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch34_m10_recovered_residual.json",
+    "table": {
+     "columns": ["位置 / 变体", "draft token", "残差 max(p_t−p_d, 0)", "残差质量", "score = 残差×inv_q", "argmax = kernel 输出"],
+     "rows": [
+      ["pos0", "1", "[0.1,0,0.1,0,0,0]", "0.2（=两分布的 TV 距离）", "[0.19814,0,0.266747,0,0,0]", "2"],
+      ["pos1", "2", "[0,0.05,0.2,0.1,0,0]", "0.35", "[0,0.041249,0.533494,0.330543,0,0]", "2"],
+      ["ngram 变体（无 draft 概率）", "0", "p_t 屏蔽 draft 位：[0,0.3,0.2,0,0,0]", "0.5", "[0,0.373855,0.447383,0,0,0]", "2"],
+      ["统计律（20000 样本边缘）", "—", "理论 [0.5,0,0.5,0,0,0]", "—", "实测 [0.4961,0,0.5039,0,0,0]（最大偏差 0.0039）", "—"],
+      ["退化观察", "—", "p_t==p_d → 残差全 0 → argmax 取 index 0", "0", "—", "0（OOV mask+clamp 兜底不越界）"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "单看任一草稿位，argmax(残差 ⊙ inv_q) 的边缘分布 = 残差归一化分布（Gumbel-max 定理）；跨位共享 q 只造成相关，而消费位唯一（首个拒绝位）→ 无偏。",
+    "argument": "q~Exp(1) 与位置无关：条件于 q，argmax_v p_v/q_v 是 P(v)∝p_v 的 Gumbel-max 样本（arXiv:1611.01162）；argmax 不受正常数缩放影响 → 免显式归一化（kernel L931-L932 注释）；对 q 取期望得边缘=归一化残差分布。早停保证只有首个拒绝位的 recovered 进入输出，相关位无人消费——v0.27 把噪声张量从 [num_tokens, V] 降到 [batch, V] 的合法性正在于此。"
+   },
+   "quantified": "噪声账：本例 [1,6] 一行 q 对照逐位一份的 [2,6]；trace 注记真实批 B=256、num_tokens=1024 时省 4 倍。残差质量 0.2 / 0.35 → 归一化 [0.5,0.5] / [0.571429,0.285714,0.142857]。20000 样本实测边缘 [0.4961,0.5039]，最大偏差 0.0039。退化位（p_t==p_d 残差全 0）工程上到不了（此时接受判据恒真、永不拒绝），但 OOV mask −inf + clamp（L944-L952）保证到了也不越界。",
+   "figure_specs": [
+    {
+     "figure_id": "fig_m10_residual",
+     "l0_zoom": "L0 采样列 spec 块验证期的残差补货放大——L2 章图 south『sample_recovered_tokens · 残差预采』组件的机制小图（对应站 14）。",
+     "template": "before-after",
+     "claim": "recovered 从残差分布补货：残差 = max(p_t−p_d, 0)（本例质量 0.2 / 0.35，恰为两分布 TV 距离）、score = 残差×inv_q 免归一化取 argmax、每请求一份 q 全草稿位共享。",
+     "numbers": [
+      {"value": "pos0 残差 [0.1,0,0.1,0,0,0]（质量 0.2）", "provenance": "traces/ch34_m10_recovered_residual.json part_a_exact.positions[0]"},
+      {"value": "pos1 残差 [0,0.05,0.2,0.1,0,0]（质量 0.35）", "provenance": "traces/ch34_m10_recovered_residual.json part_a_exact.positions[1]"},
+      {"value": "inv_q = [1.981396, 0.824982, 2.667468, 3.305432, 0.431985, 0.879231]", "provenance": "traces/ch34_m10_recovered_residual.json part_a_exact.inv_q（两位共享同一行）"},
+      {"value": "score 0.19814 vs 0.266747 → argmax 2", "provenance": "traces/ch34_m10_recovered_residual.json part_a_exact.positions[0].score_residual_times_inv_q"},
+      {"value": "20000 样本边缘 [0.4961,0.5039] 对理论 [0.5,0.5]，最大偏差 0.0039", "provenance": "traces/ch34_m10_recovered_residual.json part_b_marginal"}
+     ],
+     "caption_draft": "拒绝之后补什么：从『target 比 draft 多出来的概率』（残差=分布差的正部，总质量恰是两分布的 TV 距离）里采一个——不先归一化，Gumbel-max 掷骰（残差×1/q 取最大）省掉全词表求和；一家请求只掷一份骰、全部草稿位共享，反正只有首个拒绝位会真来取货（2 万样本边缘分布 0.4961/0.5039 对理论 0.5/0.5，偏差 0.0039——共享噪声的『为什么可以』被实测背书）。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m12",
+   "intuition": "查重抄作业：在已经说过的全部话里找与『刚说完的几句』完全重复的最长片段，把当年接着说的话原样抄 k 个当草稿——纯字符串功夫，GPU 前向零次。",
+   "worked_example": {
+    "params": {
+      "主例": "历史 [1,2,3,4,1,2,3,4]、min_ngram=2、max_ngram=4、k=3",
+      "翻转后": "[4,3,2,1,4,3,2,1]（目标变成：找匹配前缀的最长 n-gram 于最靠右位置）",
+      "变体": "并列取最早 / 无匹配 / k 封顶 / lps 封顶"
+    },
+    "trace_source": "run",
+    "trace_ref": "traces/ch34_m12_ngram_kmp.json",
+    "table": {
+     "columns": ["i（翻转序列指针）", "比较（reversed = [4,3,2,1,4,3,2,1]）", "动作", "longest_ngram", "结果 position / 草稿"],
+     "rows": [
+      ["1", "tokens[0]=4 vs tokens[1]=3 不等", "i += 1", "0", "0 / —"],
+      ["4", "tokens[0]=4 = tokens[4]=4", "prev_lps 0→1；longest 1", "1", "4 / —"],
+      ["7", "连配 4 位（i=5、6 已各进 1：longest 2、3）", "prev_lps→4（=max_ngram 顶格）", "4", "7 / —"],
+      ["收尾回翻", "—", "start_position = 8−1−7+4 = 4；草稿 = origin[4:4+3]", "—", "草稿 [1,2,3]（真跑与镜像互核一致）"],
+      ["变体：并列取最早", "[1,2] 出现于位置 0、3、5", "position 取翻转后最靠右 = 原序列最早出现", "2", "草稿 [9,1]（最早匹配处的后续）"],
+      ["变体：k 封顶", "total=8、max_model_len=10", "k=min(3, 10−8)=2", "—", "草稿 [1,2]"]
+     ]
+    }
+   },
+   "invariant": {
+    "claim": "KMP 主循环线性：i 每轮 +1 或 prev_lps 沿 lps 链严格下降，总步数 ≤ 2n；匹配长度被 max_ngram 封顶、lps 只存前 max_ngram 项。",
+    "argument": "match 分支 i+=1（至多 n 次）；mismatch 分支 prev_lps=lps[prev_lps−1] 严格降，而 prev_lps 只在 match 时 +1、升幅总量 ≤ n → 降幅总量 ≤ n（势能法）；prev_lps==max_ngram 时回落 lps[max_ngram−1]，故匹配长度 ≤ max_ngram、lps 数组 O(max_ngram) 内存即够。"
+   },
+   "quantified": "主例 n=8：KMP 事件 7 步（i 从 1 走到 7）；lps 只存 4 个 int32（max_ngram=4）。对照 EAGLE：k=3 草稿要 3 次 draft 模型前向，ngram 0 次 GPU 前向、纯 CPU 字符串功夫；代价是无概率分布——rejection 侧走 NO_DRAFT_PROBS 退化（以 p_t(x) 概率接受，m9）。k 封顶例：k=min(3,10−8)=2。",
+   "figure_specs": []
+  },
+  {
+   "mechanism_id": "m14",
+   "intuition": "一账两制：调度器只认 token 差账——V1 Proposer 老楼（gpu_model_runner 装配）与 V2 Speculator 新楼（worker/gpu/spec_decode 树）共用同一本账，回扣/占位/动态 K 一视同仁。",
+   "figure_specs": [
+    {
+     "figure_id": "fig_m14_dual_ecosystem",
+     "l0_zoom": "L0 采样列+spec 块里 drafter 一侧的双生态放大——L2 章图 south『drafter 谱系 · V1 ↔ V2 双生态』组件的展开（对应站 1 的谱系面）。",
+     "template": "layout",
+     "claim": "同一套调度器 token 账本喂两代 spec 生态：V1 = *Proposer 谱系 + rejection_sampler.py（gpu_model_runner.py:L583-L658 装配，本章走读主线）；V2 = *Speculator 树（init_speculator 分发 dflash/dspark/gemma4/mtp/eagle 五支，dspark 与混合 KV 的 DFlash 强制 V2 runner）。",
+     "numbers": [
+      {"value": "V2 分发 5 支：dflash/dspark/gemma4/mtp/eagle", "provenance": "vllm/v1/worker/gpu/spec_decode/__init__.py:L8-L40（init_speculator 分发表）"},
+      {"value": "V1 装配锚 L583-L658", "provenance": "vllm/v1/worker/gpu_model_runner.py:L583-L658（drafter 装配 + RejectionSampler 构造）"},
+      {"value": "dspark 强制 V2（'V1 can't run dspark'）", "provenance": "vllm/config/vllm.py:L583-L600"},
+      {"value": "async 兼容子集：EAGLE/MTP/draft_model/ngram_gpu/dspark", "provenance": "vllm/config/vllm.py:L1074-L1090（硬校验）"}
+     ],
+     "caption_draft": "双生态并存：V1 Proposer 谱系活在本章走读的 gpu_model_runner 里（ngram/EAGLE/draft_model…配 rejection_sampler.py）；dspark 们住进 v1/worker/gpu/spec_decode 新楼并强制换 V2 model runner（内部结构归 ch33）。但调度器那边只认 token 差账——两代共用同一本账本，这正是『调度只认 token 数』的通用性红利。"
+    }
+   ]
+  },
+  {
+   "mechanism_id": "m15",
+   "intuition": "语法状态机对『不知道会接受几个』的办法：先假定草稿全收、逐位推出去填掩码，采样后整窗退回、只让本拍真实产出的 token（接受+补采）前进——乐观推进、回退纠偏。",
+   "figure_specs": [
+    {
+     "figure_id": "fig_m15_grammar_window",
+     "l0_zoom": "L0 主循环 loop_box 里调度器臂语法窗口的 spec 变体放大——L2 章图 south『spec×结构化输出』组件的展开（站 4 的 validate 过滤 + 站 16 的 rollback 收口）。",
+     "template": "state-table",
+     "claim": "语法 FSM 对 spec 窗口的协议：对 K=3 的窗口逐位预填 k+1=4 个掩码行（3 草稿位+1 bonus 位）并乐观预推进 state_advancements 步（-1 占位草稿既不填掩码也不推进）、采样后 grammar.rollback(state_advancements) 撤销全部预推进、本拍真实产出的 token（accepted+recovered）由 update_from_output 重新前进——净效果=推进实际产出数（c1：3 草稿收 1、补采 1，净推进 2）。",
+     "numbers": [
+      {"value": "K=3 → 每请求窗口 4 行掩码（3 草稿 + 1 bonus）", "provenance": "traces/ch34_m02_scheduler_ledger.json params.K + vllm/v1/structured_output/__init__.py:L294-L350（逐位 _fill_bitmasks + 末尾 bonus 行）"},
+      {"value": "max_rollback_tokens = num_speculative_tokens", "provenance": "vllm/v1/structured_output/backend_xgrammar.py:L119-L123"},
+      {"value": "位掩码预算 max_batch*(1+max_spec)", "provenance": "vllm/v1/structured_output/__init__.py:L228-L234"},
+      {"value": "c1 例：3 草稿位、接受 1、产出 2、FSM 净推进 2", "provenance": "traces/ch34_m02_scheduler_ledger.json ledger_walk c1（num_accepted=1、generated [31,77] 产 2）+ scheduler.py:L1817-L1834（accept_tokens 逐个吃进全部新落账 token）"},
+      {"value": "调度器前置过滤 grammar.validate_tokens", "provenance": "vllm/v1/core/sched/scheduler.py:L2163-L2166（非法草稿直接不排，接受率换正确性）"}
+     ],
+     "caption_draft": "先乐观后回退：FSM 不知道草稿会被接受几个，就先假定全收——逐位推进填出 4 行掩码（3 草稿+1 bonus），-1 占位草稿跳过；采样后 rollback 撤销预推进，本拍真实产出的 token（c1 例：3 草稿收 1、补采 1——31 与 77 各重推一步，净推进 2）由 update_from_output 重新前进。挂账前还有一道前置闸：grammar.validate_tokens 把语法不认的草稿直接过滤掉，少了就少排、不硬凑。"
+    }
+   ]
+  }
+ ]
+}

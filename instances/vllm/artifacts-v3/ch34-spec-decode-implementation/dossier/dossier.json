@@ -1,0 +1,855 @@
+{
+  "chapter_id": "ch34",
+  "chapter_kind": "code",
+  "part": "VII",
+  "title": "投机解码 vLLM 落地",
+  "pin": "vLLM v0.27.1 (6e448d0ea)，行号基线 instances/vllm/source 工作树（全部锚点本次逐行 sed/grep 现核）",
+  "note_on_kind": "标准代码章（非 primer）：走 implementer 精简版 + lint_fidelity 全链。Part VII 收官章（l0_zoom=采样列+spec，打开 L0 采样列最底部的 spec decode 块 C4）。与 ch33 严格配对：ch33=数学与论文（验证规则/无损证明/τ/drafter 谱系/DSpark 架构，走 V2 speculator 代码锚），ch34=vLLM 落地全景（draft 排批进调度器、_calc_spec_decode_metadata 三组 index、V1 RejectionSampler Triton 三 kernel、V1/V2 双生态、spec×结构化输出 rollback、互斥清单诚实账）——ch33 站 14 的全部交接项在本章兑现。前置（depends_on=33）：ch33 拒绝采样数学与谱系；ch30 的 9 步管线/换轨预告（_sample 里 spec 非 None 整体换 RejectionSampler）/Gumbel 掷骰/num_logprobs=-1 全词表分支是 bonus 外采的直接前置；ch12 异步调度（draft 留 worker/占位回扣）；ch18 持久批次（token_ids_cpu 行尾追草稿）；ch31/32 结构化输出（bitmask 与 spec 窗口）；ch20/21 注意力与 KV（draft 与 target 共池同组）。无伏笔任务（pedagogy-plan.foreshadows F1-F10 无一条 planted/paid=34）。边界：拒绝采样数学证明/τ 账/DSpark 论文细节 → ch33（回指不重讲）；普通 Sampler 9 步 → ch30；bitmask 怎么算怎么传 → ch31/32（本章只讲 spec 窗口的 k+1 布局与 rollback）；V2 speculator 内部（dspark 半自回归循环/对数空间 kernel）→ ch33（本章只对照双生态拓扑）；下章 ch35 分布式。",
+  "hook_suggestion": "「ch33 把『无损』证完了：draft 猜 γ 个、target 一次前向批改、逐位 min(1, p_t/p_d) 接受——输出分布与直接采样一字不差。但那是数学。vLLM 的引擎骨架是为『每步每请求只出 1 个 token』建的：调度器只认 token 差账、采样位只切每请求末一行、CUDA graph 按形状精确回放。现在每个请求一步要吃进 γ+1 个位置——draft 怎么排进下一拍的批？变长草稿（ngram 有的请求一个都猜不出、EAGLE 恒满 k 个）怎么和满批草稿挤进同一份扁平 logits？逐位比较 p_t/p_d 要读 13 万维概率、掷 u∈[0,1) 又不能把 GPU 拉回 CPU——拒绝采样怎么整个写成 Triton kernel？拒绝之后，调度器上一拍多记的 token 账怎么退回来？还有一个反向问题：这一切值不值——接受率低的时候，draft 前向+变长的 target 前向是不是纯亏，vLLM 把哪些采样参数直接判了互斥？」（从 Part VII hook『128000 个 logits 选谁出门，过 9 道关卡』收尾一问 + ch33 站 14 交接清单 + deepread/model-sample why_chains[7][8]、engine-loop why_chains[1] 提炼为真问题）",
+  "one_line": "投机解码的 vLLM 落地=一个跨进程闭环：worker 采样尾部 drafter 产 k 个草稿（V1 Proposer 谱系/ngram 零模型，draft 恒 greedy、正确性由拒绝采样兜底）→ 同步模式经 take_draft_token_ids 回 EngineCore（异步模式草稿留 worker 进程、下一拍 GPU scatter 免跨进程往返）→ scheduler.update_draft_token_ids 把 spec_token_ids 挂上 Request（语法请求先 validate_tokens 过滤）→ 下一拍 schedule() 把 draft 计入 num_tokens_with_spec 的 token 差账、裁成 scheduled_spec_decode_tokens 下发（新 decode 请求统一 pad 到 1+k 保 cudagraph，dynamic_sd_lookup 按 batch 动态定 K）→ runner 用 np.repeat+arange 算两组累积和+三组 index（logits/target_logits/bonus）把变长草稿摊平、draft_token_ids 由 input_ids 二次 gather → target 一次前向同时验证全部 k+1 位 → RejectionSampler（v0.27 组合持有普通 Sampler 采 bonus 位、可带 top_p/top_k）切 target 位、逐草稿位扩展约束（温度/top-k/top-p/MinTokens 特化版）→ rejection_sample 双 Triton kernel 逐位判（greedy: draft==argmax；random: p_t/p_d>=uniform，float64 uniform）+ 残差 Gumbel-max 免归一化采 recovered（每请求一份 q）→ [B, max_spec_len+1] 用 PLACEHOLDER=-1 截断、parse_output 还原变长 → scheduler 记账：num_rejected 回扣 num_computed_tokens（异步再回扣占位数）、结构化输出对 spec 窗口预填 k+1 掩码+FSM 预推进+rollback 回实际接受数。诚实账：min_p/logit_bias 与 spec 互斥（只剩 MinTokens 特化版存活）、异步调度只兼容 EAGLE/MTP/draft_model/ngram_gpu/dspark 子集、drafter 只支持 PIECEWISE cudagraph、接受率低纯亏；V1（Proposer+rejection_sampler.py）与 V2（v1/worker/gpu/spec_decode 树，dspark 强制走）双生态并存。",
+  "scope_note": "主线=一个投机解码周期的闭环走读（站 1-16 按请求流排序）+四个横切面：(A) draft 排批（introduces 之一）：所有权环（worker 产→回程→调度器挂账→排批→回流验证）、调度器 token 差账（WC4）、统一 pad 保形状/动态 K、抢占清草稿、拒绝回扣；(B) 三组 index 摊平：_calc_spec_decode_metadata 的 np.repeat+arange 算术与数值 docstring（5 请求 worked example 是现成的）、SpecDecodeMetadata 契约、二次 gather 错位一格；(C) RejectionSampler Triton 全景（introduces 之二）：组合复用 Sampler 采 bonus（v0.27 结构变化）、raw clone、逐草稿位约束扩展（expand_batch_to_tokens）、rejection_sample 调度、greedy/random 双 kernel（is_greedy mask 同批共存）、残差 recovered kernel（每请求一份 q 的 v0.27 变化+OOV mask 数值卫生）、float64 uniform、parse_output；(D) 生态与边界：V1 Proposer 谱系（ngram KMP/LPS 零模型范例+SpecDecodeBaseProposer 契约）vs V2 Speculator 树（dspark 强制 V2，内部归 ch33）、异步调度兼容子集、互斥清单、spec×结构化输出 rollback。数学（无损证明/τ/谱系论文侧）一律回指 ch33 不重讲；正文的『先理论后代码』由 ch33 充当理论层，本章开篇一段接续即可。",
+  "code_spine": [
+    "vllm/v1/worker/gpu_model_runner.py:L4611-L4625 —— sample_tokens 尾部 propose_draft_token_ids 闭包：采样完立刻起草稿（GPU-token drafter 免等 bookkeeping）",
+    "vllm/v1/worker/gpu_model_runner.py:L5010-L5290 —— propose_draft_token_ids 分发：ngram/ngram_gpu/suffix/medusa/extract_hidden_states/eagle|dflash|draft_model 统一入口（num_spec_tokens_to_schedule 随 SchedulerOutput 进来）",
+    "vllm/v1/worker/gpu_model_runner.py:L4889-L4941 —— take_draft_token_ids / _copy_draft_token_ids_to_cpu：专用 copy stream 异步 D2H；async 下只在结构化输出/惩罚/bad_words 需要时才拷",
+    "vllm/v1/engine/core.py:L616-L623 —— EngineCore.post_step：同步模式收草稿回调度器；异步注释原话『we update draft token ids in the worker process』",
+    "vllm/v1/core/sched/scheduler.py:L2146-L2167 —— update_draft_token_ids：spec_token_ids 挂 Request（语法请求先 grammar.validate_tokens 过滤；prefill chunk 忽略）",
+    "vllm/v1/core/sched/scheduler.py:L516-L520 —— num_new_tokens = num_tokens_with_spec + num_output_placeholders − num_computed_tokens：draft 计入 token 差账",
+    "vllm/v1/core/sched/scheduler.py:L640-L656 —— RUNNING 段把 spec_token_ids 裁成 scheduled_spec_decode_tokens 后清空（下拍由 update_draft_token_ids 重填）",
+    "vllm/v1/core/sched/scheduler.py:L879-L898 —— 新 decode 请求 pad 到 1+num_spec_tokens（L1076-L1078 填 [-1] 占位草稿）保统一形状/cudagraph；『Prefer to not schedule than schedule un-padded』",
+    "vllm/v1/core/sched/scheduler.py:L1192-L1197 —— dynamic_sd_lookup 按批大小查表动态定 K（num_spec_tokens_to_schedule 进 SchedulerOutput）",
+    "vllm/v1/worker/gpu_input_batch.py:L503-L532 —— InputBatch.update_req_spec_token_ids：草稿写进 token_ids_cpu 行尾（async 下是占位、_prepare_input_ids 里覆写真值）",
+    "vllm/v1/worker/gpu_model_runner.py:L2851-L2924 —— _calc_spec_decode_metadata：np.repeat+arange 算 cu_num_draft/cu_num_sampled + logits/target_logits/bonus 三组 index；draft_token_ids 由 input_ids 二次 gather（数值 docstring 即 worked example）",
+    "vllm/v1/spec_decode/metadata.py:L9-L30 —— SpecDecodeMetadata 容器（__post_init__ 算 max_spec_len；make_dummy 供 warmup/cudagraph L32-L66）",
+    "vllm/v1/worker/gpu_model_runner.py:L2246-L2262 —— _prepare_inputs 收集每请求 num_draft_tokens（chunked prefill 用 -1 掩码）、logits_indices 直取 spec 元数据",
+    "vllm/v1/worker/gpu_model_runner.py:L3692-L3721 —— _sample：spec_decode_metadata 非 None 整体换 rejection_sampler（构造于 L656-L658、组合持有普通 Sampler L68）；async 先补 spec 占位",
+    "vllm/v1/sample/rejection_sampler.py:L92-L201 —— RejectionSampler.forward：bonus 位外采（L133-L147）+ target 切片 clone 保 raw（L152-L160）+ 约束 + rejection_sample（L173-L185）",
+    "vllm/v1/sample/rejection_sampler.py:L289-L346 —— apply_logits_processors spec 特化：penalties repeat_indices 重复、bad_words_with_drafts、MinTokens.apply_with_spec_decode、thinking budget",
+    "vllm/v1/sample/rejection_sampler.py:L510-L565 —— apply_sampling_constraints：温度/top-k/top-p 从 [B] 扩到逐草稿位（expand_batch_to_tokens L568-L605，greedy 温度 0 替 1）",
+    "vllm/v1/sample/rejection_sampler.py:L394-L507 —— rejection_sample 调度：[B, max_spec_len+1] 预填 -1、greedy kernel 早退、softmax+recovered 预采+random kernel",
+    "vllm/v1/sample/rejection_sampler.py:L715-L769 —— rejection_greedy_sample_kernel：draft==argmax 接受/拒绝位写 argmax/早停/全收补 bonus",
+    "vllm/v1/sample/rejection_sampler.py:L772-L845 —— rejection_random_sample_kernel：p_t/p_d>=uniform 接受判据（L829）、NO_DRAFT_PROBS 退化、padded draft(-1) 直接拒、recovered、bonus",
+    "vllm/v1/sample/rejection_sampler.py:L872-L953 —— sample_recovered_tokens(_kernel)：残差 max(p_t−p_d,0)、score=prob·inv_q 免归一化 argmax、每请求一份 q（L678-L694）、OOV mask+clamp",
+    "vllm/v1/sample/rejection_sampler.py:L252-L287 —— parse_output：valid_mask（≠-1 且 <vocab_size）过滤，[B, max_spec+1] 还原变长 list（调用点 gpu_model_runner.py:L3791）",
+    "vllm/v1/core/sched/scheduler.py:L1766-L1790 —— update_from_output：num_accepted=len(generated)−num_sampled、num_rejected 回扣 num_computed_tokens/num_output_placeholders",
+    "vllm/v1/structured_output/__init__.py:L294-L350 —— spec 窗口逐位预填 k+1 掩码 + FSM 预推进 state_advancements 步 + grammar.rollback 回实际接受数（GrammarMatcher max_rollback_tokens=num_speculative_tokens，backend_xgrammar.py:L119-L123/L190-L193）",
+    "vllm/v1/spec_decode/ngram_proposer.py:L135-L293 —— NgramProposer：零模型 drafter（propose L135-L168 → numba 批量 → KMP/LPS 找最长匹配 n-gram L207-L293），无 draft_probs",
+    "vllm/v1/spec_decode/llm_base_proposer.py:L411-L498 —— V1 模型类 drafter契约：PIECEWISE-only cudagraph（L410-L425）、_greedy_sample（L428-L441，use_local_argmax_reduction→get_top_tokens 免全词表 gather）、可选概率化 draft_probs（L443-L498）",
+    "vllm/v1/worker/gpu/spec_decode/__init__.py:L8-L40 —— V2 init_speculator 分发（dflash/dspark/gemma4/mtp/eagle → *Speculator）——V1/V2 双生态对照",
+    "vllm/config/vllm.py:L583-L600 —— dspark/混合 KV 的 DFlash 强制 V2 model runner（『V1 can't run dspark』）",
+    "vllm/config/vllm.py:L1074-L1090 —— 异步调度兼容子集硬校验：仅 EAGLE/MTP/draft_model/ngram_gpu/dspark",
+    "vllm/v1/sample/logits_processor/__init__.py:L202-L210 —— 互斥警告：spec 下 min_p/logit_bias 不生效，LogitsProcessors 只剩 MinTokens",
+    "vllm/config/speculative.py:L53-L72 —— SpeculativeMethod 方法表：drafter 谱系注册面（ngram/medusa/draft_model/suffix/custom_class/eagle 系/ngram_gpu/dspark）"
+  ],
+  "stations": [
+    {
+      "n": 1,
+      "where": "gpu_model_runner.py:L4611-L4625 → L5010-L5290",
+      "what": "【draft 生成】sample_tokens 尾部跑 drafter：EAGLE/DFlash/draft_model/ExtractHiddenStates/Gemma4 吃 GPU 采样 token 免等 bookkeeping（L4626-L4697），ngram 等 CPU-token drafter 推迟到 bookkeeping 后（L4733-L4751）；装不下 drafter 时把草稿清零防 stale（L4703-L4716）；V1 drafter 谱系在 __init__ L583-L658 装配、draft 默认 greedy（正确性由拒绝采样兜底），可选概率化 draft_probs 缓存（take_last_draft_probs L5281-L5284）"
+    },
+    {
+      "n": 2,
+      "where": "gpu_model_runner.py:L4889-L4941",
+      "what": "【draft 回程】_copy_draft_token_ids_to_cpu 在专用 copy stream 上异步 D2H + event 记录；异步调度下只在结构化输出/惩罚/bad_words 需要时才拷——草稿默认留在 worker 进程，下一拍 _prepare_input_ids 直接 GPU scatter 进 input_ids（L1893-L1913）；同步模式经 take_draft_token_ids 打包成 DraftTokenIds 交回"
+    },
+    {
+      "n": 3,
+      "where": "core.py:L616-L623",
+      "what": "【post_step 收草稿】同步调度：EngineCore.post_step 调 executor.take_draft_token_ids → scheduler.update_draft_token_ids；异步调度注释原话『we update draft token ids in the worker process』——省掉跨进程往返；async+结构化输出的 deferred 路径走 update_draft_token_ids_in_output（core.py:L722-L733：先验草稿再算 bitmask）"
+    },
+    {
+      "n": 4,
+      "where": "scheduler.py:L2146-L2167",
+      "what": "【挂账】update_draft_token_ids：跳过已 finish 与 prefill chunk 请求；结构化输出请求先 grammar.validate_tokens 过滤非法草稿（少了就少排，不硬凑）；spec_token_ids 挂上 Request"
+    },
+    {
+      "n": 5,
+      "where": "scheduler.py:L516-L520 → L640-L656",
+      "what": "【排批】下一拍 schedule()：num_new_tokens = num_tokens_with_spec + num_output_placeholders − num_computed_tokens——draft 直接计入『只认 token 数』的差账（WC4）；RUNNING 段把 spec_token_ids 裁成 scheduled_spec_decode_tokens 并清空本拍副本"
+    },
+    {
+      "n": 6,
+      "where": "scheduler.py:L879-L898 · L1076-L1078 · L1192-L1197",
+      "what": "【形状三件事】新 decode 请求 pad 到 1+num_spec_tokens（[-1] 占位草稿）保统一 decode 形状/cudagraph——预算不够『Prefer to not schedule than schedule un-padded』整拍不收；dynamic_sd_lookup 按批大小查表动态定 K（num_spec_tokens_to_schedule 随 SchedulerOutput 下发，drafter 下一轮按它出草稿）"
+    },
+    {
+      "n": 7,
+      "where": "gpu_model_runner.py:L2851-L2924 · gpu_input_batch.py:L503-L532",
+      "what": "【摊平】InputBatch.update_req_spec_token_ids 把草稿写进 token_ids_cpu 行尾；_calc_spec_decode_metadata 用 np.repeat+arange 算 cu_num_draft/cu_num_sampled 两组累积和 + logits/target_logits/bonus 三组 index，draft_token_ids 由 input_ids 经 logits_indices 再经 target_logits_indices+1 二次 gather（草稿填在输入流里、错位一格取出）——注释里的 5 请求具体数字就是现成 worked example"
+    },
+    {
+      "n": 8,
+      "where": "gpu_model_runner.py:L2246-L2262 → L4484-L4485",
+      "what": "【target 一次前向】草稿已填进输入流（每请求 k+1 个位置），target 一次 forward 同时验证全部位；采样位 logits_indices = spec_decode_metadata.logits_indices（L2262）→ hidden_states[logits_indices] → compute_logits，产 [num_tokens+batch, vocab] 扁平 logits（前向本体=ch18/19 已立机制，本章只看 spec 布局）"
+    },
+    {
+      "n": 9,
+      "where": "rejection_sampler.py:L92-L201",
+      "what": "【切片】RejectionSampler.forward：bonus_logits = logits[bonus_logits_indices] 交给组合持有的普通 Sampler 采（replace(max_num_logprobs=-1)，可带 top_p/top_k——spec 主路径不支持的策略 bonus 位能用）；target_logits = logits[target_logits_indices] 转 fp32，非 processed 模式先 clone 保 raw（in-place 暗线的 spec 侧实证 L156-L160）"
+    },
+    {
+      "n": 10,
+      "where": "rejection_sampler.py:L289-L346 · L510-L565 · logits_processor/builtin.py:L235-L289",
+      "what": "【约束 spec 特化】apply_logits_processors：penalties 的 [B] 参数经 repeat_interleave 按草稿位数展开、bad_words 吃『草稿当已输出』的前缀历史（_combine_outputs_with_spec_tokens L376-L391 造逐位前缀行——与 Sampler 同名方法语义不同，读代码陷阱）、MinTokens.apply_with_spec_decode 逐位算还要封 stop/EOS 几位；apply_sampling_constraints 把温度/top-k/top-p 扩到逐草稿位（expand_batch_to_tokens，greedy 的温度 0 替 1 防除零）"
+    },
+    {
+      "n": 11,
+      "where": "rejection_sampler.py:L394-L507",
+      "what": "【调度】rejection_sample：输出 buffer [batch, max_spec_len+1] 预填 PLACEHOLDER=-1（+1 即 bonus 槽）；all_greedy 只跑 greedy kernel 即返回；否则 softmax 出 target_probs、先采好全部草稿位的 recovered、再 launch random kernel——greedy/随机经 is_greedy mask 同批共存、两 kernel 各自早退"
+    },
+    {
+      "n": 12,
+      "where": "rejection_sampler.py:L715-L769",
+      "what": "【greedy 判】greedy kernel：cu_num_draft_tokens 反推本请求草稿区间，draft==target_argmax 接受、首个不等处写 argmax（=greedy 语义的 recovered）并停；padded draft(-1) 直接拒；全接受补 bonus。理解『早停+bonus』最干净的版本"
+    },
+    {
+      "n": 13,
+      "where": "rejection_sampler.py:L772-L845",
+      "what": "【random 判·算法心脏】接受判据 L829：draft_prob>0 且 target_prob/draft_prob >= uniform_prob（u∈[0,1) 隐式 min(1,·)）；NO_DRAFT_PROBS（ngram）draft_prob=1 退化为以 p_t(x) 接受；拒绝位取 recovered_token、早停；全接受补 bonus；uniform 用 float64（generate_uniform_probs L639-L648 注释原话引 pytorch#16706）"
+    },
+    {
+      "n": 14,
+      "where": "rejection_sampler.py:L872-L953",
+      "what": "【recovered 残差】sample_recovered_tokens 每请求只采一份 q~Exp(1)（v0.27 布局：[batch, V] 而非 [num_tokens, V]——只有首个拒绝位的 recovered 被消费，边缘分布正确即可，噪声张量省 num_tokens/B 倍）；kernel 对 vocab 分块算 prob=max(p_t−p_d,0)（ngram: 屏蔽 draft token 的 p_t）、score=prob·inv_q 免归一化 argmax（L931-L932 注释）；OOV 位 mask −inf + clamp 防越界"
+    },
+    {
+      "n": 15,
+      "where": "rejection_sampler.py:L252-L287 → gpu_model_runner.py:L3791",
+      "what": "【还原】parse_output：valid_mask（≠PLACEHOLDER 且 <vocab_size）把 [B, max_spec+1] 还原成每请求变长 list——『摊平→还原』闭环、index 间接的对偶；_bookkeeping_sync D2H 出 ModelRunnerOutput（async 下 token 留 GPU，ch12）"
+    },
+    {
+      "n": 16,
+      "where": "scheduler.py:L1765-L1790 · structured_output/__init__.py:L294-L350",
+      "what": "【记账回扣+语法 rollback】update_from_output：num_accepted=len(generated)−num_sampled_tokens_per_step、num_rejected 回扣 num_computed_tokens（异步再回扣 num_output_placeholders，stale 输出不回扣）——上拍多记的 token 账退回来；结构化输出对 spec 窗口逐位预填 k+1 个掩码、FSM 预推进 state_advancements 步、采样后 grammar.rollback(state_advancements) 回退到实际接受数（-1 占位草稿跳过推进）；抢占时 _preempt_request 清空 spec_token_ids（L1295-L1296）。环回第 1 站：本步输出即下一轮 drafter 的输入"
+    }
+  ],
+  "stations_note": "站号=一个投机解码周期内请求流经代码的顺序（第 1 站 draft 生成 → 第 16 站记账回扣后环回）；worker/调度器/EngineCore 三处舞台在 L2 图上分泳道。正文建议编排：先立闭环总图（m1+L2 图），再按『排批（站 2-6 调度侧）→ 摊平（站 7-8）→ 验证（站 9-14）→ 还原回扣（站 15-16）』四幕走，drafter 谱系与 V1/V2 双生态（站 1 的展开）放第一幕后作插叙或收尾对照，数学全程回指 ch33。衔接：站 1 接 ch33 站 14 交接（布局算术）；站 9 的 bonus 外采回指 ch30 的 num_logprobs=-1 分支与『换轨预告』；站 15 的 async token 留 GPU 回指 ch12；站 16 的 bitmask 预填回指 ch32 的两段式窗口。",
+  "key_classes": [
+    {
+      "name": "SpecDecodeMetadata",
+      "file": "vllm/v1/spec_decode/metadata.py",
+      "responsibility": "摊平后的草稿与三组 index 的容器（runner↔rejection_sampler 的契约）：draft_token_ids [num_tokens]、num_draft_tokens list、cu_num_draft/cu_num_sampled 两组累积和（kernel 反推每请求区间）、target_logits_indices/bonus_logits_indices/logits_indices 三组定位；__post_init__ 算 max_spec_len；make_dummy 供 warmup/cudagraph 预热。"
+    },
+    {
+      "name": "RejectionSampler",
+      "file": "vllm/v1/sample/rejection_sampler.py",
+      "responsibility": "投机解码验证期采样器（V1）：v0.27 起组合持有普通 Sampler 实例（不再复制管线）——bonus 位外采可带 top_p/top_k；forward 切 target/bonus logits、spec 特化约束、rejection_sample 双 Triton kernel、parse_output 还原变长；类 docstring 立 accepted/recovered/bonus/output 四类 token 术语并自引 arXiv:2211.17192。"
+    },
+    {
+      "name": "NgramProposer",
+      "file": "vllm/v1/spec_decode/ngram_proposer.py",
+      "responsibility": "零模型 drafter：numba 在 CPU 历史 token 里批量找匹配后缀的最长 n-gram（KMP/LPS），复制其后续 k 个 token 当草稿；不产概率分布（rejection 侧走 NO_DRAFT_PROBS 分支）；num_tokens_threshold 决定 numba 线程数。最易讲的 proposer 范例。"
+    },
+    {
+      "name": "SpecDecodeBaseProposer",
+      "file": "vllm/v1/spec_decode/llm_base_proposer.py",
+      "responsibility": "V1 模型类 drafter 统一基类（EAGLE/EAGLE3/DFlash/MTP/draft_model/Gemma4 等）：propose 摆输入→跑草稿模型→采 k 个草稿；draft 默认 greedy（use_local_argmax_reduction 时 get_top_tokens 免全词表 gather）、可选概率化 draft_probs（提高接受率，_last_draft_probs 经 take_last_draft_probs 缓存）；只支持 PIECEWISE cudagraph。"
+    },
+    {
+      "name": "GPUModelRunner（spec 面）",
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "responsibility": "本章的 worker 侧舞台：drafter 装配（L583-L658）+ RejectionSampler 构造（L656-L658）；propose_draft_token_ids 分发（L5010-L5290，含 DSV4 MTP 的 get_mtp_target_hidden_states 钩子消费 L5198-L5205）；_calc_spec_decode_metadata 摊平（L2851-L2924）；_sample 换轨（L3692-L3721）；draft 回程与 async GPU scatter。runner 全貌归 ch17/18。"
+    },
+    {
+      "name": "Scheduler（spec 账本面）",
+      "file": "vllm/v1/core/sched/scheduler.py",
+      "responsibility": "本章的调度侧舞台：update_draft_token_ids 挂账（L2146）、token 差账排批（L516-L520、L640-L656）、统一 pad/动态 K（L879-L898、L1192-L1197）、拒绝回扣（L1765-L1790）、抢占清草稿（L1295-L1296）、lookahead 账（L261-L270：dflash +1 / dspark=K 的谱系差异）。调度器全貌归 ch10/11。"
+    },
+    {
+      "name": "DraftTokenIds",
+      "file": "vllm/v1/outputs.py",
+      "responsibility": "draft 回程的传输对象（req_ids + draft_token_ids 两个平行列表，L338）；executor.take_draft_token_ids 的返回类型，同步模式下 EngineCore↔Scheduler 的草稿信封。"
+    },
+    {
+      "name": "StructuredOutputManager（spec 窗口面）",
+      "file": "vllm/v1/structured_output/__init__.py",
+      "responsibility": "spec×语法的联动点：grammar_bitmask 对每请求预填 k+1 个掩码位、对 scheduled 草稿逐位 FSM 预推进、结束后 rollback 到实际接受数（L294-L350）；位掩码预算按 max_batch*(1+max_spec) 预分配（L228-L234）；worker 侧按批序+草稿偏移重排对齐 logits 行（utils.py:L113-L161）。bitmask 主线归 ch31/32。"
+    }
+  ],
+  "data_flow": [
+    "总述：本章数据流 = deepread/model-sample.json 契约【spec decode draft 的所有权环】+ 其 data_flow 末段『spec decode 变体』+ deepread/gpu-exec.json data_flow 第 7 步尾部（sample_tokens 内 drafter 分流：GPU-token 路径 L4627-L4697 / bookkeeping 后路径 L4733-L4751）+ deepread/engine-loop.json why_chains[1]（调度只认 token 数的 spec 表达）——不重挖，下面按站号账本重排成一个投机周期：",
+    "【第一幕·排批（站 1-6）】上拍采样尾部（worker）：propose_draft_token_ids 闭包（gpu_model_runner.py:L4611-L4625）调方法级分发（L5010-L5290）产下一轮草稿——ngram 吃 CPU token 列表（ngram_proposer.py:L135-L168），EAGLE 系吃 GPU 采样张量+target hidden_states（含 DSV4 MTP 的 get_mtp_target_hidden_states 钩子 L5198-L5205）。回程双轨：同步 _copy_draft_token_ids_to_cpu→take_draft_token_ids→EngineCore.post_step（core.py:L616-L623）→scheduler.update_draft_token_ids（scheduler.py:L2146-L2167，语法请求 validate_tokens 过滤）；异步草稿留 worker（下一拍 _prepare_input_ids GPU scatter L1893-L1913，_sample 里 update_async_spec_token_ids 只为惩罚/bad_words 补真值 gpu_model_runner.py:L3708-L3712、gpu_input_batch.py:L1094-L1113）。排批：num_new_tokens 把 spec 计入 token 差账（L516-L520）→ RUNNING 段裁出 scheduled_spec_decode_tokens（L640-L656）→ 新 decode 请求统一 pad 1+K（L879-L898+L1076-L1078）→ dynamic K（L1192-L1197）。SchedulerOutput.scheduled_spec_decode_tokens+num_spec_tokens_to_schedule 下发（sched/output.py:L212、L269）。",
+    "【第二幕·摊平（站 7-8）】worker _update_states 把草稿写进 token_ids_cpu 行尾（gpu_input_batch.py:L503-L532，chunked prefill 的草稿位用 -1 掩码 L2247-L2249）；_calc_spec_decode_metadata（gpu_model_runner.py:L2851-L2924）算 cu_num_sampled/logits_indices/bonus/cu_num_draft/target_logits_indices 并二次 gather 出 draft_token_ids → SpecDecodeMetadata（spec_decode/metadata.py:L9-L30）；target 一次前向验证全部 k+1 位（前向本体=ch18/19；采样位 logits_indices=L2262 → compute_logits L4484-L4485 → [num_tokens+batch, vocab] 扁平 logits）。",
+    "【第三幕·验证（站 9-14）】_sample 换轨（L3692-L3721：spec 非 None → rejection_sampler，draft_probs 从 _draft_probs 缓存按 req_id 对行拼装 L4981-L5008）；RejectionSampler.forward（rejection_sampler.py:L92-L201）：bonus 位外采（组合的普通 Sampler，max_num_logprobs=-1）→ target 位 fp32+clone 保 raw → apply_logits_processors（L289-L346：repeat_indices 展开 penalties、bad_words_with_drafts、MinTokens.apply_with_spec_decode）→ apply_sampling_constraints（L510-L565：逐位温度/top-k/top-p）→ rejection_sample（L394-L507）：[B,max_spec+1] 预填 -1 → greedy kernel（L715-L769）/ softmax+sample_recovered_tokens（L663-L710，每请求一份 q）+random kernel（L772-L845）→ _get_logprobs_tensors（L203-L250，可选）。",
+    "【第四幕·还原回扣（站 15-16）】parse_output（L252-L287，调用点 gpu_model_runner.py:L3791）valid_mask 过滤还原变长 → _bookkeeping_sync D2H → ModelRunnerOutput → scheduler.update_from_output：拒绝回扣（scheduler.py:L1765-L1790）+ token 追加/判停（ch11）+ 语法 FSM 真推进（ch32；spec 窗口的预推进+rollback 在上一拍 get_grammar_bitmask 里已完成，structured_output/__init__.py:L294-L350）→ EngineCoreOutputs 出进程。环回：本步输出即下一轮 drafter 输入（站 1）。"
+  ],
+  "why_chains": [
+    {
+      "id": "WC1",
+      "card": "deepread/model-sample.json why_chains[7]",
+      "decision": "spec decode：drafter 谱系出 draft（恒 greedy/概率化可选）→ 调度器把 draft 当预填排进下一步 → target 一次前向验证 → Triton 拒绝采样保分布不变",
+      "old_design": "无投机：每步 1 token，decode 是访存受限（每 token 读全 KV cache），小 batch 下算力大量闲置；朴素加速（beam、并行多序列）不改善单序列延迟。",
+      "pain": "端到端延迟 ∝ 串行步数 × 每步延迟；每步 GPU 大部分时间在等 HBM 而不是算。",
+      "solution": "drafter 谱系（vllm/config/speculative.py:L53-L72 方法表：eagle/eagle3/mtp 系/dflash/dspark/ngram/ngram_gpu/medusa/suffix/draft_model/custom_class/extract_hidden_states）：① EAGLE/EAGLE3 复用 target 末层 hidden_states 自回归 k 步，draft 恒 argmax（llm_base_proposer.py:L428-L441——分布正确性由拒绝采样兜底，draft 用贪心只影响接受率不影响输出分布；可选概率化 draft_probs 提高接受率 L443-L498）；② MTP 吃 target 的 pre-hc_head 残差流——DSV4 模型在 forward 尾部把 hidden_states 拷进 _mtp_hidden_buffer（vllm/models/deepseek_v4/nvidia/model.py:L1100-L1202），暴露 get_mtp_target_hidden_states 钩子，runner 消费（gpu_model_runner.py:L5198-L5205）；③ ngram 完全无模型，numba 在 CPU 历史里批量找最长 n-gram 匹配（ngram_proposer.py:L135-L293）；④ DFlash 并行 drafting 一次出 k 个 draft；⑤ DSpark 半自回归 Markov 头（ch33）。verify：调度器把 draft 作为 scheduled_spec_decode_tokens 排进下一步（update_draft_token_ids scheduler.py:L2146），target 一次前向同时验证所有位（_calc_spec_decode_metadata L2851-L2924——docstring 用具体数字示例讲 logits_indices/target_logits_indices/bonus_logits_indices 的索引算术）；RejectionSampler（rejection_sampler.py:L38-L59 文档注明严格按 arXiv:2211.17192）：bonus 位先用普通 Sampler 采（L133-L147，让 bonus 保留 top_p/top_k 能力）、随机位按 min(1, p_t/p_d) 拒绝采样（rejection_random_sample_kernel L772-L845）、拒绝位从 (p_t-p_d)+ 残差分布恢复一个 token（sample_recovered_tokens Gumbel-max L663-L710、kernel L872-L953）、greedy 位专用 kernel 早退（L715-L769）、输出 [batch, max_spec_len+1] 用 PLACEHOLDER_TOKEN_ID=-1 标记截断（L428-L433，parse_output L253-L287）。v0.27 结构变化：RejectionSampler 组合 Sampler 实例而非复制管线（L61-L70 持有 self.sampler）；synthetic 接受率模式供测试（L77-L90）；MAX_SPEC_LEN=128（L35）。",
+      "cost": "① 接受率低时纯亏：draft 前向 + target 序列变长白算（dynamic_sd_lookup 动态调 K 是部分对冲）；② 采样语义收窄：min_p/logit_bias/自定义 logits processor 与 spec decode 互斥——只剩 MinTokens 以 apply_with_spec_decode 特化版存活（vllm/v1/sample/logits_processor/__init__.py:L202-L210 警告原话 'min_p and logit_bias parameters won't work with speculative decoding'）；③ 显存：draft 模型常驻（embed/lm_head 与 target 共享省大头）；④ 结构化输出要为每个 spec 位预填 k+1 个掩码、接受后 rollback（structured_output/__init__.py:L294-L350 + backend_xgrammar.py:L190-L193，GrammarMatcher max_rollback_tokens=num_speculative_tokens L118-L122）；⑤ drafter 只支持 PIECEWISE cudagraph（llm_base_proposer.py:L410-L425 注释 'Only supports PIECEWISE cudagraphs'）；⑥ 异步调度只兼容 EAGLE/MTP/NGram-GPU/DSpark/draft_model 子集（vllm/config/vllm.py:L1074-L1090 硬校验）。",
+      "note": "本章主链=ch34 条目 introduces 两项（draft 排批+RejectionSampler Triton）。谱系各 drafter 的内部结构 ch33 已讲（V2 侧），本章讲 V1 Proposer 的对外契约+排批环+验证 kernel。"
+    },
+    {
+      "id": "WC2",
+      "card": "deepread/model-sample.json why_chains[8]",
+      "decision": "随机采样用 Gumbel/exp 技巧（probs/q 取 argmax, q~Exp(1)），spec decode 的 uniform 用 float64、recovered 噪声每请求一份",
+      "old_design": "torch.multinomial 按概率抽；v0.21 的 sample_recovered_tokens 给每个草稿位各采一份 [num_tokens, V] 的 Exp(1) 噪声。",
+      "pain": "multinomial 引发 CPU-GPU 同步——异步调度管线里这是致命的；float32 uniform 有非平凡概率采到精确 0.0（pytorch#16706），会让拒绝采样的接受判等 target_prob/draft_prob >= uniform_prob 在边界出错（rejection_sampler.py:L639-L643 注释原话 'Using float64 mitigates the issue'）；逐草稿位一份 [num_tokens, V] 噪声张量纯属浪费——投机语义下只有首个拒绝位的 recovered 会被消费。",
+      "solution": "接受判据的 uniform 用 torch.rand(dtype=float64)（generate_uniform_probs L608-L660，有 seed 的逐请求 generator 覆写、n=0 请求跳过保可复现）；recovered 的 Gumbel-max：sample_recovered_tokens（L663-L710）只建 [batch_size, vocab_size] 一份 q.exponential_()，每请求一行、其全部草稿位共享（L678 注释原话 'Create only one distribution for each request'）——单看每一位 argmax(p_pos/q) 仍是 p_pos 的合法样本，而只有首个拒绝位的结果被消费，边缘分布正确即可；kernel 里 score=prob·inv_q 免显式归一化（L931-L932 注释 'We don't need prob = prob / tl.sum(prob) here because tl.argmax will select the maximum value'），OOV 位 mask −inf、结果 clamp vocab_size-1（L944-L952）防全零 tile 产出越界 id。",
+      "cost": "q 的显存从 [num_tokens, V] 降到 [batch, V] 但多位共享噪声（理论上不同拒绝位之间相关——实际无影响因只消费一位，正文要讲清这个『为什么可以』）；float64 带宽翻倍；有 per-request seed 时 uniform 退化为逐请求循环。",
+      "note": "ch30 已立 Gumbel 掷骰（普通采样侧），本章是它的 spec 侧续章：uniform float64 的动机注释放本章代码里（ch30 只预告）。m9/m10 配 worked example。"
+    },
+    {
+      "id": "WC3",
+      "card": "deepread/gpu-exec.json why_chains[5]（异步调度）",
+      "decision": "异步调度下 draft 留在 worker 进程、不再跨进程往返；乐观调度+GPU 侧纠偏",
+      "old_design": "同步调度：draft 必须回 EngineCore 进程挂账、再随下一拍 SchedulerOutput 回 worker——一来一回两次 IPC 落在关键路径上；调度器必须等真实接受数才知道下一拍排多少。",
+      "pain": "异步调度（v0.27 默认开，config/vllm.py:L1095-L1143）要求调度器盲调度（看不到上拍真实结果）——draft 若还走『回程→挂账→下发』的同步环，每拍两次跨进程拷贝把重叠窗口吃掉；且 spec 的接受数只有在 GPU 上数 -1 才知道，CPU 等它就是同步点。",
+      "solution": "三件套（本章视角）：① draft 留 worker：_copy_draft_token_ids_to_cpu 只在结构化输出/惩罚/bad_words 需要时才拷（gpu_model_runner.py:L4901-L4907），下一拍 _prepare_input_ids 把 worker 本地 _draft_token_ids 直接 GPU scatter 进 input_ids（L1893-L1913），EngineCore.post_step 的 async 分支注释原话 'we update draft token ids in the worker process'（core.py:L617-L619）；② 乐观 seq_lens+延迟纠偏：假定上拍草稿全接受排下一拍，correct_spec_decode_token_counts 推迟到 forward 发起之后执行（入队 L1380-L1388、执行 L4530-L4533），GPU 侧 update_num_computed_tokens_for_batch_change kernel 用上拍 valid_sampled_token_count_gpu 修正 num_computed_tokens（L2152-L2173，kernel 定义 vllm/v1/spec_decode/utils.py:L566+）；③ 惩罚/bad_words 需要的『真实草稿历史』由 update_async_spec_token_ids 在采样前就地补（gpu_input_batch.py:L1094-L1113）。",
+      "cost": "调度器状态领先真实进度，一连串补偿全是账单：拒绝回扣同时要退 num_output_placeholders（scheduler.py:L1780-L1784）；被抢请求的 stale 输出仍要送出（丢会扰动 spec-decode acceptance）但不得改已清零计数器（L1295-L1308）；async+spec+结构化输出的 deferred 分支把 step_with_batch_queue 路径拉长近一倍（core.py:L719-L737）；兼容子集硬校验（config/vllm.py:L1074-L1090）。",
+      "note": "ch12 已立异步调度主体（占位/重叠/输出延迟一步），本章只讲 spec 侧的三件套增量——站 2/3 与站 16 的 async 分支。"
+    },
+    {
+      "id": "WC4",
+      "card": "deepread/engine-loop.json why_chains[1]（调度只认 token 数）",
+      "decision": "spec decode 在调度器里全部表达为 token 差账：num_tokens_with_spec/num_output_placeholders/lookahead；形状统一优先于当拍吞吐",
+      "old_design": "朴素做法给 spec 开专门相位/专门队列（『草稿批』与『验证批』分开跑）；v0 双相位调度器的既视感。",
+      "pain": "调度器的通用性恰恰来自『不认请求数只认 token 数』（scheduler.py:L441-L450 woosuk 注释：这一模型 'general enough to cover chunked prefills, prefix caching, speculative decoding'）——spec 一旦开专用相位，混相批/抢占/前缀缓存全部要再谈一遍；CUDA graph 回放要求形状精确匹配，草稿数不齐=每拍形状抖动=重编译。",
+      "solution": "三本账：① token 差账：num_tokens_with_spec = prompt+output+spec_token_ids 数（request.py 计数器），排批 num_new_tokens = num_tokens_with_spec + num_output_placeholders − num_computed_tokens（L516-L520），RUNNING 段裁 scheduled_spec_decode_tokens（L640-L656）；② lookahead 账：allocate_slots 时按方法多留槽（L261-L270：eagle/draft_model=K、dflash=K+1（in-fill 多一查）、dspark=K（anchor 是预测位））；③ 形状账：新 decode 请求 pad 到 1+K、[-1] 占位草稿（L879-L898+L1076-L1078，注释 'Preserve full cudagraph for this step'；'Prefer to not schedule than schedule un-padded'）、async 下不排 partial draft tokens（L498-L500 注释 'this prevents uniform decode optimizations'）；动态 K 用 dynamic_sd_lookup 批大小查表（L1192-L1197）。",
+      "cost": "『宁可不排』让突发新请求多等一拍；一切特性必须能表达为 token 差——草稿只能用占位数表达，复杂度转嫁给状态机与 worker；拒绝/抢占的回扣逻辑是账本共变的维护负担（L1765-L1790、L1295-L1308）。",
+      "note": "ch10 已立『只认 token 数』总纲，本章讲它在 spec 上的三本账具体形态（站 5/6/16）——introduces『draft 排批』的主体。"
+    }
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/v1/spec_decode/metadata.py",
+      "lines": "L9-L30",
+      "code": "@dataclass\nclass SpecDecodeMetadata:\n    # [num_tokens]\n    draft_token_ids: torch.Tensor\n    # [batch_size]\n    num_draft_tokens: list[int]\n    # [batch_size]\n    cu_num_draft_tokens: torch.Tensor\n    # [batch_size]\n    cu_num_sampled_tokens: torch.Tensor\n    # [num_tokens]\n    target_logits_indices: torch.Tensor\n    # [batch_size]\n    bonus_logits_indices: torch.Tensor\n    # [num_tokens + batch_size]\n    logits_indices: torch.Tensor\n\n    def __post_init__(self):\n        self.max_spec_len = max(self.num_draft_tokens)\n\n    @classmethod\n    def make_dummy(",
+      "what": "SpecDecodeMetadata 容器：摊平草稿 + 三组 index + 两组累积和。draft_token_ids 是全批变长草稿摊平成一维 [num_tokens]；cu_num_* 是含末项的累积和（Triton kernel 用 [start,end) 反推每请求区间）；target/bonus/logits 三组 index 是『间接』的核心——把 target 一次前向产出的扁平 logits 重新定位到每个草稿位与每个 bonus 位。__post_init__ 暴露 max_spec_len（输出 buffer 第二维 max_spec_len+1 的来源）。",
+      "elide": [
+        "make_dummy（L32-L66）供 warmup/cudagraph 预热，正文一句带过"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L2851-L2924",
+      "code": "    def _calc_spec_decode_metadata(\n        self,\n        num_draft_tokens: np.ndarray,\n        cu_num_scheduled_tokens: np.ndarray,\n    ) -> SpecDecodeMetadata:\n        # Inputs:\n        # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]\n        # num_draft_tokens:         [  3,   0,   2,   0,   1]\n        # Outputs:\n        # cu_num_draft_tokens:      [  3,   3,   5,   5,   6]\n        # logits_indices:           [  0,   1,   2,   3, 103, 104, 105, 106,\n        #                            206, 207, 208]\n        # target_logits_indices:    [  0,   1,   2,   5,   6,   9]\n        # bonus_logits_indices:     [  3,   4,   7,   8,  10]\n\n        # Compute the logits indices.\n        # [4, 1, 3, 1, 2]\n        num_sampled_tokens = num_draft_tokens + 1\n\n        # Step 1.\n        # cu_num_sampled_tokens: [4, 5, 8, 9, 11]\n        # _arange_scratch[:11]: [0, 1, 2, 3, 0, 0, 1, 2, 0, 0, 1]\n        cu_num_sampled_tokens = self._get_cumsum_and_arange(\n            num_sampled_tokens, self._arange_scratch, cumsum_dtype=np.int32\n        )\n        # Step 2. [0, 0, 0, 0, 103, 104, 104, 104, 206, 207, 207]\n        logits_indices = np.repeat(\n            cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens\n        )\n        # Step 3. [0, 1, 2, 3, 103, 104, 105, 106, 206, 207, 208]\n        logits_indices += self._arange_scratch[: cu_num_sampled_tokens[-1]]\n\n        # Compute the bonus logits indices.\n        bonus_logits_indices = cu_num_sampled_tokens - 1\n\n        # Compute the draft logits indices.\n        # cu_num_draft_tokens: [3, 3, 5, 5, 6]\n        # _arange_scratch[:6]: [0, 1, 2, 0, 1, 0]\n        cu_num_draft_tokens = self._get_cumsum_and_arange(\n            num_draft_tokens, self._arange_scratch, cumsum_dtype=np.int32\n        )\n        # [0, 0, 0, 5, 5, 9]\n        target_logits_indices = np.repeat(\n            cu_num_sampled_tokens - num_sampled_tokens, num_draft_tokens\n        )\n        # [0, 1, 2, 5, 6, 9]\n        target_logits_indices += self._arange_scratch[: cu_num_draft_tokens[-1]]\n\n        cu_num_draft_tokens = async_tensor_h2d(cu_num_draft_tokens, device=self.device)\n        cu_num_sampled_tokens = async_tensor_h2d(\n            cu_num_sampled_tokens, device=self.device\n        )\n        logits_indices = async_tensor_h2d(logits_indices, device=self.device)\n        target_logits_indices = async_tensor_h2d(\n            target_logits_indices, device=self.device\n        )\n        bonus_logits_indices = async_tensor_h2d(\n            bonus_logits_indices, device=self.device\n        )\n\n        # Compute the draft token ids.\n        # draft_token_indices:      [  1,   2,   3, 105, 106, 208]\n        draft_token_ids = self.input_ids.gpu[logits_indices]\n        draft_token_ids = draft_token_ids[target_logits_indices + 1]\n\n        return SpecDecodeMetadata(\n            draft_token_ids=draft_token_ids,\n            num_draft_tokens=num_draft_tokens.tolist(),\n            cu_num_draft_tokens=cu_num_draft_tokens,\n            cu_num_sampled_tokens=cu_num_sampled_tokens,\n            target_logits_indices=target_logits_indices,\n            bonus_logits_indices=bonus_logits_indices,\n            logits_indices=logits_indices,\n        )",
+      "what": "本章理解 index 间接的『真相源』（ch33 站 14 交接项的兑现）：注释里的 5 请求具体数字就是最佳 worked example。关键不变量：每请求采 num_draft+1 个位置（多出的 1 即 bonus）；bonus_logits_indices = cu_num_sampled_tokens−1（每请求最后一行）；draft_token_ids 由 input_ids 经 logits_indices 再经 target_logits_indices+1 二次 gather（草稿实际被填进输入流、错位一格取出）；np.repeat + _arange_scratch 累加是把 per-request 标量扩成 per-token 的惯用法。",
+      "elide": [
+        "L2901-L2911 五个 async_tensor_h2d——CPU→GPU non_blocking 拷贝细节，点名即可"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L3692-L3721",
+      "code": "    def _sample(\n        self,\n        logits: torch.Tensor | None,\n        spec_decode_metadata: SpecDecodeMetadata | None,\n    ) -> SamplerOutput:\n        # Sample the next token and get logprobs if needed.\n        sampling_metadata = self.input_batch.sampling_metadata\n        # Update output token ids with tokens sampled in last step\n        # if async scheduling and required by current sampling params.\n        self.input_batch.update_async_output_token_ids()\n        if spec_decode_metadata is None:\n            return self.sampler(\n                logits=logits,\n                sampling_metadata=sampling_metadata,\n            )\n\n        # Update spec_token_ids with real draft tokens from pre step only when\n        # output_token_ids is needed (penalties or bad_words are in use).\n        if self.use_async_scheduling and self._draft_token_req_ids is not None:\n            draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()\n            self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)\n\n        draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)\n        sampler_output = self.rejection_sampler(\n            spec_decode_metadata,\n            draft_probs,\n            logits,\n            sampling_metadata,\n        )\n        return sampler_output",
+      "what": "_sample 的 spec 换轨（ch30 站 2 的预告在此兑现）：spec_decode_metadata None 走普通 Sampler，非 None 整体换 rejection_sampler——替换不是叠加；draft_probs 从 drafter 缓存按 req_id 对行拼装（_get_spec_decode_draft_probs L4981-L5008，无缓存则 None=ngram 类）；async 下先把上拍真实草稿补进采样元数据的 spec_token_ids（惩罚/bad_words 要吃『草稿当已输出』的历史）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu_model_runner.py",
+      "lines": "L4611-L4625",
+      "code": "        def propose_draft_token_ids(sampled_token_ids):\n            assert spec_decode_common_attn_metadata is not None\n            with record_function_or_nullcontext(\"gpu_model_runner: draft\"):\n                self._draft_token_ids = self.propose_draft_token_ids(\n                    scheduler_output,\n                    sampled_token_ids,\n                    self.input_batch.sampling_metadata,\n                    hidden_states,\n                    sample_hidden_states,\n                    aux_hidden_states,\n                    spec_decode_metadata,\n                    spec_decode_common_attn_metadata,\n                    slot_mappings,\n                )\n                self._copy_draft_token_ids_to_cpu(scheduler_output)",
+      "what": "draft 生成的入口闭包（sample_tokens 尾部）：采样完成后立刻起草稿——把 drafter 前向塞进本拍 GPU 窗口尾部；_draft_token_ids/_draft_probs 系列是 worker 本地暂存（下一拍 _prepare_input_ids 消费或回程）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/engine/core.py",
+      "lines": "L616-L623",
+      "code": "    def post_step(self, model_executed: bool) -> None:\n        # When using async scheduling we can't get draft token ids in advance,\n        # so we update draft token ids in the worker process and don't\n        # need to update draft token ids here.\n        if self.check_for_draft_tokens and not self.async_scheduling and model_executed:\n            draft_token_ids = self.model_executor.take_draft_token_ids()\n            if draft_token_ids is not None:\n                self.scheduler.update_draft_token_ids(draft_token_ids)",
+      "what": "post_step：同步调度的草稿回程（EngineCore 收 DraftTokenIds 交 scheduler 挂账）；async 分支注释原话——草稿改在 worker 进程内更新，不再跨进程往返。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L2146-L2167",
+      "code": "    def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:\n        for req_id, spec_token_ids in zip(\n            draft_token_ids.req_ids,\n            draft_token_ids.draft_token_ids,\n        ):\n            request = self.requests.get(req_id)\n            if request is None or request.is_finished():\n                # The request may have been finished. Skip.\n                continue\n\n            if request.is_prefill_chunk:\n                # Ignore draft tokens for prefill chunks.\n                if request.spec_token_ids:\n                    request.spec_token_ids = []\n                continue\n\n            # Add newly generated spec token ids to the request.\n            if self.structured_output_manager.should_advance(request):\n                metadata = request.structured_output_request\n                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]\n            request.spec_token_ids = spec_token_ids\n",
+      "what": "update_draft_token_ids：草稿挂账。三道闸：已 finish 的请求跳过（草稿可能晚到）；prefill chunk 忽略（投机只作用于 decode）；结构化输出请求先 grammar.validate_tokens 过滤——语法不认的草稿直接不排（接受率换正确性）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L640-L656",
+      "code": "            # Speculative decode related.\n            if request.spec_token_ids:\n                num_scheduled_spec_tokens = (\n                    num_new_tokens\n                    + request.num_computed_tokens\n                    - request.num_tokens\n                    - request.num_output_placeholders\n                )\n                if num_scheduled_spec_tokens > 0:\n                    spec_token_ids = request.spec_token_ids\n                    if len(spec_token_ids) > num_scheduled_spec_tokens:\n                        spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]\n                    scheduled_spec_decode_tokens[request.request_id] = spec_token_ids\n\n                # New spec tokens will be set in `update_draft_token_ids` before the\n                # next step when applicable.\n                request.spec_token_ids = []",
+      "what": "RUNNING 段的草稿排批：num_scheduled_spec_tokens 由 token 差账算出（num_new_tokens+num_computed−num_tokens−placeholders），超出部分截断；排进 scheduled_spec_decode_tokens 后清空本拍 spec_token_ids——下一轮由 update_draft_token_ids 重填。『draft 当预填排进下一步』的调度器形态。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L881-L898",
+      "code": "                    # Pad new decode requests to uniform spec decoding size to\n                    # preserve full cudagraph for this step.\n                    # Not for diffusion where draft tokens can't be padded.\n                    if (\n                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)\n                        and self.num_sampled_tokens_per_step > 0\n                        and num_new_tokens == 1\n                        and (scheduled_running_reqs and not prefill_scheduled)\n                    ):\n                        num_new_tokens = 1 + self.num_spec_tokens\n                        if (\n                            num_new_tokens > token_budget\n                            or num_computed_tokens + num_new_tokens > self.max_model_len\n                        ):\n                            # Prefer to not schedule than schedule un-padded here.\n                            break\n                        pad_spec_decode = True\n",
+      "what": "统一 pad 保形状：新 decode 请求补到 1+num_spec_tokens（保 full cudagraph）；预算或长度不够时『Prefer to not schedule than schedule un-padded』——宁可不收也不让批形状破。pad 的草稿位填 -1（L1076-L1078），下游三处协同：RejectionSampler kernel 对 -1 直接拒、语法窗口对 -1 不推进。",
+      "elide": [
+        "L868-L878 load_kv_async/defer_prefills 上下文分支——非本章主线"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1192-L1197",
+      "code": "        # Dynamic speculative decoding: compute optimal K\n        num_spec_tokens_to_schedule = self.num_spec_tokens\n        if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:\n            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[\n                len(num_scheduled_tokens)\n            ]",
+      "what": "动态 K：dynamic_sd_lookup 按本拍批大小查表——批大（重载）时缩 K 保批容量、批小（轻载）时放大 K 多验；查出的 num_spec_tokens_to_schedule 随 SchedulerOutput 下发、drafter 下一轮按它出草稿。DSpark 论文『硬件感知调度』的工程近亲（ch33 站 12 的 vLLM 对照项）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/sample/rejection_sampler.py",
+      "lines": "L38-L59",
+      "code": "class RejectionSampler(nn.Module):\n    \"\"\"\n    The implementation strictly follows the algorithm described in\n        https://arxiv.org/abs/2211.17192.\n    However, we want to clarify the terminology used in the implementation:\n    accepted tokens: tokens that are accepted based on the relationship\n            between the \"raw\" draft and target probabilities.\n    recovered tokens: tokens that are sampled based on the adjusted probability\n        distribution, which is derived from both the draft and target\n        probabilities.\n    bonus tokens:\n        If all proposed tokens are accepted, the bonus token is added to the\n        end of the sequence. The bonus token is only sampled from the target\n        probabilities. We pass in the bonus tokens instead of sampling them\n        in the rejection sampler to allow for more flexibility in the\n        sampling process. For example, we can use top_p, top_k sampling for\n        bonus tokens, while spec decode does not support these sampling\n        strategies.\n    output tokens:\n        Tokens are finally generated with the rejection sampler.\n        output tokens = accepted tokens + recovered tokens + bonus tokens\n    \"\"\"",
+      "what": "整章术语的权威定义（ch33 站 2 已立数学侧，本章绑代码）：accepted/recovered/bonus/output 四类 token；bonus 外采的设计动机在此说清——让 bonus 位能用 top_p/top_k 这些 spec 主路径不支持的采样策略；类 docstring 自引 arXiv:2211.17192（严格按 Leviathan et al. 实现）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/sample/rejection_sampler.py",
+      "lines": "L61-L90",
+      "code": "    def __init__(\n        self,\n        sampler: Sampler,\n        spec_config: SpeculativeConfig | None = None,\n        device: torch.device | None = None,\n    ):\n        super().__init__()\n        self.sampler = sampler\n        self.use_fp64_gumbel = getattr(sampler, \"use_fp64_gumbel\", False)\n        logprobs_mode = self.sampler.logprobs_mode\n        self.is_processed_logprobs_mode = logprobs_mode in PROCESSED_LOGPROBS_MODES\n        self.is_logits_logprobs_mode = logprobs_mode in (\n            \"raw_logits\",\n            \"processed_logits\",\n        )\n\n        self.synthetic_conditional_rates: torch.Tensor | None = None\n        if (\n            spec_config is not None\n            and spec_config.rejection_sample_method == \"synthetic\"\n        ):\n            assert spec_config.synthetic_acceptance_rates is not None\n            self.synthetic_conditional_rates = torch.tensor(\n                unconditional_to_conditional_rates(\n                    spec_config.synthetic_acceptance_rates\n                ),\n                dtype=torch.float32,\n                device=device,\n            )\n        self.synthetic_mode = self.synthetic_conditional_rates is not None",
+      "what": "v0.27 结构变化：RejectionSampler 组合持有普通 Sampler 实例（不再复制采样管线）——bonus 位直接外采；use_fp64_gumbel 从组合的 Sampler 透传；synthetic 模式把无条件接受率转条件率（c_i=p_i/p_{i−1}）供测试注入（spec/utils.py:L598-L601，正文一句带过）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/sample/rejection_sampler.py",
+      "lines": "L123-L185",
+      "code": "        assert metadata.max_spec_len <= MAX_SPEC_LEN\n\n        bonus_logits_indices = metadata.bonus_logits_indices\n        target_logits_indices = metadata.target_logits_indices\n\n        # When indexing with a tensor (bonus_logits_indices), PyTorch\n        # creates a new tensor with separate storage from the original\n        # logits tensor. This means any in-place operations on bonus_logits\n        # won't affect the original logits tensor.\n        assert logits is not None\n        bonus_logits = logits[bonus_logits_indices]\n        bonus_sampler_output = self.sampler(\n            logits=bonus_logits,\n            sampling_metadata=replace(\n                sampling_metadata,\n                max_num_logprobs=-1,\n            ),\n            predict_bonus_token=True,\n            # Override the logprobs mode to return logits because they are\n            # needed later to compute the accepted token logprobs.\n            logprobs_mode_override=\"processed_logits\"\n            if self.is_processed_logprobs_mode\n            else \"raw_logits\",\n        )\n        bonus_token_ids = bonus_sampler_output.sampled_token_ids\n\n        # Just like `bonus_logits`, `target_logits` is a new tensor with\n        # separate storage from the original `logits` tensor. Therefore,\n        # it is safe to update `target_logits` in place.\n        raw_target_logits = logits[target_logits_indices]\n        # Use float32 for the target_logits.\n        raw_target_logits = raw_target_logits.to(torch.float32)\n        target_logits = raw_target_logits\n        if not self.is_processed_logprobs_mode:\n            # Clone raw_target_logits before applying processors to preserve\n            # the original raw logits for logprobs computation, since\n            # apply_logits_processors modifies the tensor in-place.\n            target_logits = target_logits.clone()\n        target_logits = self.apply_logits_processors(\n            target_logits, sampling_metadata, metadata\n        )\n        # [num_tokens, vocab_size]\n        # NOTE(woosuk): `target_logits` can be updated in place inside the\n        # `apply_sampling_constraints` function.\n        target_logits = apply_sampling_constraints(\n            target_logits,\n            metadata.cu_num_draft_tokens,\n            sampling_metadata,\n        )\n\n        output_token_ids = rejection_sample(\n            metadata.draft_token_ids,\n            metadata.num_draft_tokens,\n            metadata.max_spec_len,\n            metadata.cu_num_draft_tokens,\n            draft_probs,\n            target_logits,\n            bonus_token_ids,\n            sampling_metadata,\n            synthetic_mode=self.synthetic_mode,\n            synthetic_conditional_rates=self.synthetic_conditional_rates,\n            use_fp64_gumbel=self.use_fp64_gumbel,\n        )",
+      "what": "forward 主线：bonus_logits=logits[bonus_logits_indices]（张量索引产生新存储，in-place 不污染原 logits——L128-L131 注释）交给组合的普通 Sampler（replace(max_num_logprobs=-1)、predict_bonus_token=True、logprobs 覆写为 raw/processed logits 供后续 accepted logprobs）；target_logits=logits[target_logits_indices] fp32 化、非 processed 模式 clone 保 raw（L156-L160 注释原话——in-place 所有权暗线的 spec 侧实证）；约束后 rejection_sample。",
+      "elide": [
+        "L187-L196 logprobs 装配（_get_logprobs_tensors）——归 ch8 语境，点名即可"
+      ]
+    },
+    {
+      "path": "vllm/v1/sample/rejection_sampler.py",
+      "lines": "L289-L346",
+      "code": "    def apply_logits_processors(\n        self,\n        logits: torch.Tensor,\n        sampling_metadata: SamplingMetadata,\n        metadata: SpecDecodeMetadata,\n    ) -> torch.Tensor:\n        has_penalties = not sampling_metadata.no_penalties\n        any_penalties_or_bad_words = (\n            sampling_metadata.bad_words_token_ids or has_penalties\n        )\n        output_token_ids = sampling_metadata.output_token_ids\n        if any_penalties_or_bad_words:\n            output_token_ids = self._combine_outputs_with_spec_tokens(\n                output_token_ids,\n                sampling_metadata.spec_token_ids,\n            )\n\n        # Calculate indices of target logits.\n        repeat_indices: torch.Tensor | None = None\n        need_repeat_indices = (\n            sampling_metadata.allowed_token_ids_mask is not None or has_penalties\n        )\n        if need_repeat_indices:\n            num_requests = len(metadata.num_draft_tokens)\n            num_draft_tokens = torch.tensor(metadata.num_draft_tokens, device=\"cpu\")\n            original_indices = torch.arange(num_requests, device=\"cpu\")\n            repeat_indices_cpu = original_indices.repeat_interleave(num_draft_tokens)\n            repeat_indices = repeat_indices_cpu.to(\n                device=logits.device, non_blocking=True\n            )\n            logits = self.apply_penalties(\n                logits, sampling_metadata, metadata, repeat_indices, output_token_ids\n            )\n\n            # Apply allowed token ids.\n            if sampling_metadata.allowed_token_ids_mask is not None:\n                token_mask = sampling_metadata.allowed_token_ids_mask[repeat_indices]\n                logits.masked_fill_(token_mask, float(\"-inf\"))\n\n        # Apply bad words exclusion.\n        if bad_words_token_ids := sampling_metadata.bad_words_token_ids:\n            apply_bad_words_with_drafts(\n                logits, bad_words_token_ids, output_token_ids, metadata.num_draft_tokens\n            )\n\n        for processor in sampling_metadata.logitsprocs.non_argmax_invariant:\n            if isinstance(processor, MinTokensLogitsProcessor):\n                logits = processor.apply_with_spec_decode(\n                    logits, metadata.num_draft_tokens\n                )\n        holder = sampling_metadata.thinking_budget_state_holder\n        if holder is not None and holder.has_tracked_requests():\n            logits = holder.apply_to_logits(\n                logits,\n                predict_bonus_token=False,\n                spec_token_ids=sampling_metadata.spec_token_ids,\n            )\n        return logits",
+      "what": "apply_logits_processors 的 spec 特化：①惩罚/bad_words 的历史要把草稿当前缀拼进去（_combine_outputs_with_spec_tokens 造逐位前缀行——与 Sampler 里的同名方法语义不同，一个造前缀一个简单拼接，读代码陷阱）；②[batch] 参数经 repeat_interleave(num_draft_tokens) 展开到草稿位；③bad_words 走 apply_bad_words_with_drafts 特化版；④非 argmax 不变列只剩 MinTokens、走 apply_with_spec_decode 特化版（argmax 不变性二分在 spec 下的幸存者）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/sample/logits_processor/builtin.py",
+      "lines": "L235-L252",
+      "code": "    def apply_with_spec_decode(\n        self,\n        logits: torch.Tensor,\n        num_draft_tokens: list[int],\n    ) -> torch.Tensor:\n        \"\"\"Spec-decode version of apply().\n        Priority: ``min_tokens`` > ``stop_token_ids`` / EOS.\n        Example: ``num_draft_tokens = [2, 3, 1]``\n          → ``logits`` shape ``[6, V]``, ``cumsum = [0, 2, 5, 6]``\n          → request 0 owns rows 0‑1, request 1 rows 2‑4, request 2 row 5.\n        \"\"\"\n        if not self.min_toks:\n            return logits\n\n        num_draft_arr = np.array(num_draft_tokens, dtype=np.int64)\n        cumsum = np.concatenate([[0], np.cumsum(num_draft_arr)])\n\n        entries = [",
+      "what": "MinTokens.apply_with_spec_decode 的头部与 docstring：优先级 min_tokens > stop/EOS；docstring 自带 worked example（num_draft_tokens=[2,3,1] → logits [6,V]、cumsum=[0,2,5,6]、各请求占哪些行）——逐位算『还要封几位』的算术正文的现成例子。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/sample/rejection_sampler.py",
+      "lines": "L510-L565",
+      "code": "def apply_sampling_constraints(\n    logits: torch.Tensor,  # [num_tokens, vocab_size]\n    cu_num_draft_tokens: torch.Tensor,  # [batch_size]\n    sampling_metadata: SamplingMetadata,\n) -> torch.Tensor:\n    \"\"\"Process logits based on sampling metadata.\n\n    This function applies temperature scaling to the logits,\n    as well as top-k and top-p. For greedy decoding, it returns\n    the original logits.\n\n    Args:\n        logits: Input logits tensor to be processed.\n        cu_num_draft_tokens: Cumulative number of draft tokens.\n        sampling_metadata: Metadata containing sampling parameters such as\n            temperature and whether greedy sampling is used.\n\n    Returns:\n        torch.Tensor: Processed logits if non-greedy sampling is used,\n        otherwise returns the original logits.\n    \"\"\"\n    assert logits.ndim == 2\n    assert cu_num_draft_tokens.ndim == 1\n    if sampling_metadata.all_greedy:\n        return logits\n\n    num_tokens = logits.shape[0]\n    temperature = expand_batch_to_tokens(\n        sampling_metadata.temperature,\n        cu_num_draft_tokens,\n        num_tokens,\n        replace_from=GREEDY_TEMPERATURE,\n        replace_to=1,\n    )\n    # NOTE(woosuk): Update `logits` in place to avoid allocating a new tensor.\n    logits.div_(temperature.unsqueeze(-1))\n\n    # Get expanded top_k and top_p tensors.\n    top_k = None\n    if sampling_metadata.top_k is not None:\n        top_k = expand_batch_to_tokens(\n            sampling_metadata.top_k,\n            cu_num_draft_tokens,\n            num_tokens,\n        )\n    top_p = None\n    if sampling_metadata.top_p is not None:\n        top_p = expand_batch_to_tokens(\n            sampling_metadata.top_p,\n            cu_num_draft_tokens,\n            num_tokens,\n        )\n\n    # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,\n    # which is slow for large vocab sizes. This may cause performance issues.\n    return apply_top_k_top_p(logits, top_k, top_p)",
+      "what": "apply_sampling_constraints：把 [batch] 的温度/top-k/top-p 扩到逐草稿位——温度经 expand_batch_to_tokens（greedy 的 0 替 1 防除零）后 logits.div_ 原地除；top-k/top-p 同样扩展后交给 apply_top_k_top_p（ch30 已立的截断族）；all_greedy 直接原样返回。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/sample/rejection_sampler.py",
+      "lines": "L394-L507",
+      "code": "def rejection_sample(\n    # [num_tokens]\n    draft_token_ids: torch.Tensor,\n    # [batch_size]\n    num_draft_tokens: list[int],\n    max_spec_len: int,\n    # [batch_size]\n    cu_num_draft_tokens: torch.Tensor,\n    # [num_tokens, vocab_size]\n    draft_probs: torch.Tensor | None,\n    # [num_tokens, vocab_size]\n    target_logits: torch.Tensor,\n    # [batch_size, 1]\n    bonus_token_ids: torch.Tensor,\n    sampling_metadata: SamplingMetadata,\n    synthetic_mode: bool = False,\n    synthetic_conditional_rates: torch.Tensor | None = None,\n    use_fp64_gumbel: bool = False,\n) -> torch.Tensor:\n    assert draft_token_ids.ndim == 1\n    assert draft_probs is None or draft_probs.ndim == 2\n    assert cu_num_draft_tokens.ndim == 1\n    assert target_logits.ndim == 2\n\n    batch_size = len(num_draft_tokens)\n    num_tokens = draft_token_ids.shape[0]\n    vocab_size = target_logits.shape[-1]\n    device = target_logits.device\n    assert draft_token_ids.is_contiguous()\n    assert draft_probs is None or draft_probs.is_contiguous()\n    assert bonus_token_ids.is_contiguous()\n    assert target_logits.shape == (num_tokens, vocab_size)\n\n    # Create output buffer.\n    output_token_ids = torch.full(\n        (batch_size, max_spec_len + 1),\n        PLACEHOLDER_TOKEN_ID,\n        dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.\n        device=device,\n    )\n\n    if sampling_metadata.all_greedy:\n        is_greedy = None\n    else:\n        is_greedy = sampling_metadata.temperature == GREEDY_TEMPERATURE\n\n    # Generate uniform probabilities before either kernel because synthetic\n    # mode needs them in the greedy kernel too.  Skip only when all requests\n    # are greedy *and* synthetic mode is off (the standard fast-path).\n    # [num_tokens]\n    uniform_probs: torch.Tensor | None = None\n    if synthetic_mode or not sampling_metadata.all_greedy:\n        uniform_probs = generate_uniform_probs(\n            num_tokens,\n            num_draft_tokens,\n            sampling_metadata.generators,\n            device,\n        )\n\n    if not sampling_metadata.all_random:\n        # Rejection sampling for greedy sampling requests.\n        target_argmax = target_logits.argmax(dim=-1)\n        rejection_greedy_sample_kernel[(batch_size,)](\n            output_token_ids,\n            cu_num_draft_tokens,\n            draft_token_ids,\n            target_argmax,\n            bonus_token_ids,\n            is_greedy,\n            max_spec_len,\n            uniform_probs,\n            synthetic_conditional_rates,\n            SYNTHETIC_MODE=synthetic_mode,\n        )\n        if sampling_metadata.all_greedy:\n            return output_token_ids\n\n    # Compute probability distribution from target logits.\n    target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)\n    assert target_probs.is_contiguous()\n\n    # Sample recovered tokens for each position.\n    # [num_tokens]\n    recovered_token_ids = sample_recovered_tokens(\n        max_spec_len,\n        num_draft_tokens,\n        cu_num_draft_tokens,\n        draft_token_ids,\n        draft_probs,\n        target_probs,\n        sampling_metadata,\n        device,\n        use_fp64_gumbel,\n    )\n\n    # Rejection sampling for random sampling requests.\n    assert uniform_probs is not None\n    rejection_random_sample_kernel[(batch_size,)](\n        output_token_ids,\n        cu_num_draft_tokens,\n        draft_token_ids,\n        draft_probs,\n        target_probs,\n        bonus_token_ids,\n        recovered_token_ids,\n        uniform_probs,\n        is_greedy,\n        max_spec_len,\n        vocab_size,\n        synthetic_conditional_rates,\n        NO_DRAFT_PROBS=draft_probs is None,\n        SYNTHETIC_MODE=synthetic_mode,\n    )\n    return output_token_ids",
+      "what": "rejection_sample 的调度核心：输出 buffer [batch, max_spec_len+1] 预填 PLACEHOLDER=-1（+1 即 bonus 槽）；三件事：(1) all_greedy 走 greedy kernel 直接返回；(2) 否则 softmax 出 target_probs、先采好全部草稿位的 recovered（sample_recovered_tokens）；(3) launch random kernel。greedy 与随机经 is_greedy mask 同批共存、各自 kernel 内早退。",
+      "elide": [
+        "L413-L425 形状断言——点名即可"
+      ]
+    },
+    {
+      "path": "vllm/v1/sample/rejection_sampler.py",
+      "lines": "L639-L660",
+      "code": "    # NOTE(woosuk): We deliberately use float64 instead of float32 here\n    # because when using float32, there's a non-negligible chance that\n    # uniform_prob is sampled to be exact 0.0 as reported in\n    # https://github.com/pytorch/pytorch/issues/16706. Using float64\n    # mitigates the issue.\n    uniform_probs = torch.rand(\n        (num_tokens,),\n        dtype=torch.float64,\n        device=device,\n    )\n    start_idx = 0\n    for req_idx, n in enumerate(num_draft_tokens):\n        # Do not generate random numbers for requests with no draft tokens.\n        # This can be important for reproducibility.\n        if n == 0:\n            continue\n        end_idx = start_idx + n\n        generator = generators.get(req_idx)\n        if generator is not None:\n            uniform_probs[start_idx:end_idx].uniform_(generator=generator)\n        start_idx = end_idx\n    return uniform_probs",
+      "what": "generate_uniform_probs 的 float64 注释（ch30 预告、本章兑现）：float32 的 torch.rand 有非平凡概率采到精确 0.0（pytorch#16706），会让 p_t/p_d>=u 的边界判等出错；n=0 的请求跳过生成（可复现性）；有 seed 的逐请求 generator 覆写。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/sample/rejection_sampler.py",
+      "lines": "L663-L710",
+      "code": "def sample_recovered_tokens(\n    max_spec_len: int,\n    num_draft_tokens: list[int],\n    # [batch_size]\n    cu_num_draft_tokens: torch.Tensor,\n    # [num_tokens]\n    draft_token_ids: torch.Tensor,\n    # [num_tokens, vocab_size]\n    draft_probs: torch.Tensor | None,\n    # [num_tokens, vocab_size]\n    target_probs: torch.Tensor,\n    sampling_metadata: SamplingMetadata,\n    device: torch.device,\n    use_fp64_gumbel: bool = False,\n) -> torch.Tensor:\n    # NOTE(woosuk): Create only one distribution for each request.\n    batch_size = len(num_draft_tokens)\n    vocab_size = target_probs.shape[-1]\n    q_dtype = torch.float64 if use_fp64_gumbel else torch.float32\n    q = torch.empty(\n        (batch_size, vocab_size),\n        dtype=q_dtype,\n        device=device,\n    )\n    q.exponential_()\n    for i, generator in sampling_metadata.generators.items():\n        # Do not generate random numbers for requests with no draft tokens.\n        # This can be important for reproducibility.\n        if num_draft_tokens[i] > 0:\n            q[i].exponential_(generator=generator)\n\n    inv_q = q.reciprocal()\n\n    recovered_token_ids = torch.empty_like(draft_token_ids)\n    BLOCK_SIZE = 8192\n    sample_recovered_tokens_kernel[(batch_size, max_spec_len)](\n        recovered_token_ids,\n        cu_num_draft_tokens,\n        draft_token_ids,\n        draft_probs,\n        target_probs,\n        inv_q,\n        vocab_size,\n        BLOCK_SIZE,\n        NO_DRAFT_PROBS=draft_probs is None,\n        USE_FP64_GUMBEL=use_fp64_gumbel,\n    )\n    return recovered_token_ids",
+      "what": "sample_recovered_tokens：v0.27 布局——每请求只建一行 q~Exp(1)（[batch, vocab] 而非 [num_tokens, vocab]，L678 注释 'Create only one distribution for each request'），其全部草稿位共享：单看每一位 argmax(p_pos·inv_q) 仍是残差分布的合法样本，且只有首个拒绝位的 recovered 被消费，边缘分布正确即可；噪声张量省 num_tokens/batch 倍。kernel 以 (batch, max_spec_len) 二维 grid 启动。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/sample/rejection_sampler.py",
+      "lines": "L715-L769",
+      "code": "def rejection_greedy_sample_kernel(\n    output_token_ids_ptr,  # [batch_size, max_spec_len + 1]\n    cu_num_draft_tokens_ptr,  # [batch_size]\n    draft_token_ids_ptr,  # [num_tokens]\n    target_argmax_ptr,  # [num_tokens]\n    bonus_token_ids_ptr,  # [batch_size]\n    is_greedy_ptr,  # [batch_size] or None\n    max_spec_len,\n    uniform_probs_ptr,  # [num_tokens] or None (synthetic mode only)\n    synthetic_conditional_rates_ptr,  # [num_speculative_tokens] or None\n    SYNTHETIC_MODE: tl.constexpr,\n):\n    req_idx = tl.program_id(0)\n    # FIXME(woosuk): Because is_greedy_ptr is not None at profiling run,\n    # re-compilation may happen during runtime when is_greedy_ptr is None.\n    is_greedy = True if is_greedy_ptr is None else tl.load(is_greedy_ptr + req_idx)\n    if not is_greedy:\n        # Early exit for non-greedy sampling requests.\n        return\n\n    start_idx = (\n        tl.zeros([], dtype=cu_num_draft_tokens_ptr.dtype.element_ty)\n        if req_idx == 0\n        else tl.load(cu_num_draft_tokens_ptr + req_idx - 1)\n    )\n    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)\n    num_draft_tokens = end_idx - start_idx\n\n    rejected = False\n    for pos in range(num_draft_tokens):\n        if not rejected:\n            draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)\n            target_argmax_id = tl.load(target_argmax_ptr + start_idx + pos).to(tl.int32)\n            if SYNTHETIC_MODE:\n                uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)\n                rate = tl.load(synthetic_conditional_rates_ptr + pos)\n                # -1 is used for padded draft token ids that should be rejected.\n                accepted = (uniform_prob < rate) and draft_token_id >= 0\n                token_id = draft_token_id if accepted else target_argmax_id\n                rejected = not accepted\n            else:\n                token_id = target_argmax_id\n                rejected = draft_token_id != target_argmax_id\n            tl.store(\n                output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,\n                token_id,\n            )\n\n    if not rejected:\n        # If all tokens are accepted, append the bonus token.\n        bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)\n        tl.store(\n            output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens,\n            bonus_token_id,\n        )",
+      "what": "greedy 路径 kernel（理解『早停+bonus』最干净的版本）：每个 program 一个请求，cu_num_draft_tokens 反推区间 [start,end)；逐位 draft==target_argmax 则接受（输出 argmax）、首个不等处写 argmax（=greedy 语义的 recovered：拒绝位的输出就是 target 的 argmax）并停；rejected 后续位置不再写（保持 -1）；全接受在 num_draft_tokens 位补 bonus。SYNTHETIC_MODE 分支（L748-L754）正文一句带过。",
+      "elide": [
+        "L748-L754 SYNTHETIC_MODE 分支——测试注入用"
+      ]
+    },
+    {
+      "path": "vllm/v1/sample/rejection_sampler.py",
+      "lines": "L772-L845",
+      "code": "# NOTE(woosuk): Avoid specialization to prevent unnecessary recompilation.\n@triton.jit(do_not_specialize=[\"max_spec_len\"])\ndef rejection_random_sample_kernel(\n    output_token_ids_ptr,  # [batch_size, max_spec_len + 1]\n    cu_num_draft_tokens_ptr,  # [batch_size]\n    draft_token_ids_ptr,  # [num_tokens]\n    draft_probs_ptr,  # [num_tokens, vocab_size] or None\n    target_probs_ptr,  # [num_tokens, vocab_size]\n    bonus_token_ids_ptr,  # [batch_size]\n    recovered_token_ids_ptr,  # [num_tokens]\n    uniform_probs_ptr,  # [num_tokens]\n    is_greedy_ptr,  # [batch_size]\n    max_spec_len,\n    vocab_size,\n    synthetic_conditional_rates_ptr,  # [num_speculative_tokens] or None\n    NO_DRAFT_PROBS: tl.constexpr,\n    SYNTHETIC_MODE: tl.constexpr,\n):\n    req_idx = tl.program_id(0)\n    is_greedy = tl.load(is_greedy_ptr + req_idx)\n    if is_greedy:\n        # Early exit for greedy sampling requests.\n        return\n\n    start_idx = (\n        tl.zeros([], dtype=cu_num_draft_tokens_ptr.dtype.element_ty)\n        if req_idx == 0\n        else tl.load(cu_num_draft_tokens_ptr + req_idx - 1)\n    )\n    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)\n    num_draft_tokens = end_idx - start_idx\n\n    rejected = False\n    for pos in range(num_draft_tokens):\n        if not rejected:\n            draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)\n            uniform_prob = tl.load(uniform_probs_ptr + start_idx + pos)\n            if draft_token_id < 0:\n                # -1 is used for padded draft token ids that should be rejected.\n                accepted = False\n            elif SYNTHETIC_MODE:\n                rate = tl.load(synthetic_conditional_rates_ptr + pos)\n                accepted = uniform_prob < rate\n            else:\n                if NO_DRAFT_PROBS:\n                    draft_prob = 1\n                else:\n                    draft_prob = tl.load(\n                        draft_probs_ptr\n                        + (start_idx + pos) * vocab_size\n                        + draft_token_id\n                    )\n                target_prob = tl.load(\n                    target_probs_ptr + (start_idx + pos) * vocab_size + draft_token_id\n                )\n                # NOTE(woosuk): While the draft probability should never be 0,\n                # we check it to avoid NaNs. If it happens to be 0, we reject.\n                accepted = draft_prob > 0 and target_prob / draft_prob >= uniform_prob\n            if accepted:\n                token_id = draft_token_id\n            else:\n                rejected = True\n                token_id = tl.load(recovered_token_ids_ptr + start_idx + pos)\n            tl.store(\n                output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos, token_id\n            )\n\n    if not rejected:\n        # If all tokens are accepted, append the bonus token.\n        bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)\n        tl.store(\n            output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens,\n            bonus_token_id,\n        )",
+      "what": "random 路径 kernel——本章的算法心脏（ch33 站 3 数学侧的 kernel 形态）：接受判据 L829 `draft_prob > 0 and target_prob / draft_prob >= uniform_prob`（u∈[0,1) 隐式 min(1,·)；draft_prob=0 防 NaN 直接拒）；NO_DRAFT_PROBS（ngram）draft_prob=1 退化为以 p_t(x) 概率接受；padded draft(-1) 直接拒；拒绝位取 recovered_token_ids、早停；全接受补 bonus。",
+      "elide": [
+        "L812-L814 SYNTHETIC_MODE 分支"
+      ]
+    },
+    {
+      "path": "vllm/v1/sample/rejection_sampler.py",
+      "lines": "L872-L953",
+      "code": "@triton.jit\ndef sample_recovered_tokens_kernel(\n    output_token_ids_ptr,  # [num_tokens]\n    cu_num_draft_tokens_ptr,  # [batch_size]\n    draft_token_ids_ptr,  # [num_tokens]\n    draft_probs_ptr,  # [num_tokens, vocab_size] or None\n    target_probs_ptr,  # [num_tokens, vocab_size]\n    inv_q_ptr,  # [batch_size, vocab_size]\n    vocab_size,\n    BLOCK_SIZE: tl.constexpr,\n    NO_DRAFT_PROBS: tl.constexpr,\n    USE_FP64_GUMBEL: tl.constexpr,\n):\n    req_idx = tl.program_id(0)\n    start_idx = (\n        tl.zeros([], dtype=cu_num_draft_tokens_ptr.dtype.element_ty)\n        if req_idx == 0\n        else tl.load(cu_num_draft_tokens_ptr + req_idx - 1)\n    )\n    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)\n    num_draft_tokens = end_idx - start_idx\n\n    # Early exit for out-of-range positions.\n    pos = tl.program_id(1)\n    if pos >= num_draft_tokens:\n        return\n\n    token_idx = start_idx + pos\n\n    if NO_DRAFT_PROBS:\n        draft_token_id = tl.load(draft_token_ids_ptr + token_idx)\n\n    if USE_FP64_GUMBEL:\n        max_val = tl.full((), float(\"-inf\"), tl.float64)\n    else:\n        max_val = tl.full((), float(\"-inf\"), tl.float32)\n    recovered_id = 0\n    for v in range(0, vocab_size, BLOCK_SIZE):\n        vocab_offset = v + tl.arange(0, BLOCK_SIZE)\n        vocab_mask = vocab_offset < vocab_size\n\n        if NO_DRAFT_PROBS:\n            prob = tl.load(\n                target_probs_ptr + token_idx * vocab_size + vocab_offset,\n                mask=(vocab_mask & (vocab_offset != draft_token_id)),\n                other=0.0,\n            )\n        else:\n            draft_prob = tl.load(\n                draft_probs_ptr + token_idx * vocab_size + vocab_offset,\n                mask=vocab_mask,\n                other=0.0,\n            )\n            target_prob = tl.load(\n                target_probs_ptr + token_idx * vocab_size + vocab_offset,\n                mask=vocab_mask,\n                other=0.0,\n            )\n            prob = tl.maximum(target_prob - draft_prob, 0.0)\n            # NOTE(woosuk): We don't need `prob = prob / tl.sum(prob)` here because\n            # `tl.argmax` will select the maximum value.\n\n        inv_q = tl.load(\n            inv_q_ptr + req_idx * vocab_size + vocab_offset,\n            mask=vocab_mask,\n            other=0.0,\n        )\n\n        # Local tile reduction.\n        # Mask out-of-vocabulary entries to -inf so they can never win\n        # the argmax — prevents producing recovered_id >= vocab_size\n        # when all valid entries in the last tile have zero probability.\n        score = prob * inv_q\n        score = tl.where(vocab_mask, score, float(\"-inf\"))\n        local_max, local_id = tl.max(score, axis=0, return_indices=True)\n\n        if local_max > max_val:\n            max_val = local_max\n            recovered_id = v + local_id\n\n    recovered_id = tl.minimum(recovered_id, vocab_size - 1)\n    tl.store(output_token_ids_ptr + token_idx, recovered_id)",
+      "what": "recovered 残差 kernel：对 vocab 分块扫——有 draft_probs 时 prob=max(p_t−p_d, 0)（残差分子）、NO_DRAFT_PROBS 时屏蔽 draft token 的 p_t（退化的残差）；score=prob·inv_q 的 Gumbel-max 免显式归一化（L931-L932 注释：argmax 不需要归一化）；OOV 位 mask −inf + 结果 clamp（L940-L952）防全零 tile 产出越界 id——v0.27 新增的数值卫生。",
+      "elide": [
+        "L904-L907 USE_FP64_GUMBEL 的 max_val dtype 分支——点名即可"
+      ]
+    },
+    {
+      "path": "vllm/v1/sample/rejection_sampler.py",
+      "lines": "L252-L287",
+      "code": "    @staticmethod\n    def parse_output(\n        output_token_ids: torch.Tensor,\n        vocab_size: int,\n        discard_req_indices: Sequence[int] = (),\n        logprobs_tensors: LogprobsTensors | None = None,\n    ) -> tuple[list[list[int]], LogprobsLists | None]:\n        \"\"\"Parse the output of the rejection sampler.\n        Args:\n            output_token_ids: The sampled token IDs in shape\n                [batch_size, max_spec_len + 1]. The rejected tokens are\n                replaced with `PLACEHOLDER_TOKEN_ID` by the rejection sampler\n                and will be filtered out in this function.\n            vocab_size: The size of the vocabulary.\n            discard_req_indices: Optional row indices to discard tokens in.\n            logprobs_tensors: Optional logprobs tensors to filter.\n        Returns:\n            A list of lists of token IDs.\n        \"\"\"\n        output_token_ids_np = output_token_ids.cpu().numpy()\n        # Create mask for valid tokens.\n        valid_mask = (output_token_ids_np != PLACEHOLDER_TOKEN_ID) & (\n            output_token_ids_np < vocab_size\n        )\n        output_logprobs = None\n        if logprobs_tensors is not None:\n            cu_num_tokens = [0] + valid_mask.sum(axis=1).cumsum().tolist()\n            filtered_tensors = logprobs_tensors.filter(valid_mask.flatten())\n            output_logprobs = filtered_tensors.tolists(cu_num_tokens)\n\n        if len(discard_req_indices) > 0:\n            valid_mask[discard_req_indices] = False\n        outputs = [\n            row[valid_mask[i]].tolist() for i, row in enumerate(output_token_ids_np)\n        ]\n        return outputs, output_logprobs",
+      "what": "parse_output：valid_mask（≠PLACEHOLDER 且 <vocab_size）把 [batch, max_spec_len+1] 还原成每请求变长 list——『摊平→还原』的闭环、index 间接的对偶；logprobs 的过滤归 ch8；调用点在 _bookkeeping_sync（gpu_model_runner.py:L3791）。",
+      "elide": [
+        "L276-L280 logprobs 过滤分支——归 ch8"
+      ]
+    },
+    {
+      "path": "vllm/v1/spec_decode/ngram_proposer.py",
+      "lines": "L207-L293",
+      "code": "def _find_longest_matched_ngram_and_propose_tokens(\n    origin_tokens: np.ndarray,\n    min_ngram: int,\n    max_ngram: int,\n    max_model_len: int,\n    k: int,\n) -> np.ndarray:\n    \"\"\"\n    Find the longest n-gram which matches the suffix of the given tokens\n    whose length is within [min_ngram, max_ngram] (inclusive).\n\n    If found, we will extract k right after the matched ngram.\n    \"\"\"\n    # Do not generate draft tokens is context is shorter than minimum n-gram\n    total_token = origin_tokens.shape[0]\n    if total_token < min_ngram:\n        return np.empty((0,), dtype=origin_tokens.dtype)\n\n    # Do not generate draft tokens beyond the max model length.\n    k = min(k, max_model_len - total_token)\n    if k <= 0:\n        return np.empty((0,), dtype=origin_tokens.dtype)\n\n    # Flip tokens, and the goal become to find longest ngram\n    # on the rightmost position which matches the prefix with\n    # length [min_n, max_n] (inclusive).\n    tokens = origin_tokens[::-1]\n\n    # Longest prefix (not including itself) which is a suffix of\n    # the current position.\n    #   lps[i] = max{v, where tokens[0:v] == tokens[i+1-v:i+1]}\n    #\n    # As ngram is capped by max_ngram to save memory, we only need to\n    # store lps for the first max_ngram prefix.\n    lps = np.zeros(max_ngram, dtype=np.int32)\n\n    longest_ngram = 0\n    position = 0\n\n    # lps[0] always equal to 0, we start with index 1\n    prev_lps = 0\n    i = 1\n    while i < total_token:\n        # tokens[:prev_lps] is the longest prefix as a suffix of tokens[:i]\n        if tokens[prev_lps] == tokens[i]:\n            # Token match: tokens[:prev_lps+1] is the longest prefix as\n            # a suffix of tokens[:i+1]\n            prev_lps += 1\n            # Check if we found a longer valid ngram.\n            #\n            # Update position when longest_ngram matched prev_lps,\n            # as we want to get the target n-gram of the earliest position\n            # in the original tokens (i.e.\n            # latest position in the reversed tokens)\n            if prev_lps >= longest_ngram:\n                longest_ngram = prev_lps\n                position = i\n            if i < max_ngram:\n                # Store LPS for the first max_ngram prefix\n                lps[i] = prev_lps\n            if prev_lps == max_ngram:\n                # When prev_lps reached max_ngram, update prev_lps\n                # to lps[max_ngram-1] to avoid matching ngram\n                # longer than max_ngram\n                prev_lps = lps[max_ngram - 1]\n            i += 1\n        elif prev_lps != 0:\n            # Token mismatch: try the second-longest prefix\n            # among all suffix of tokens[:i],\n            # which is the longest prefix of tokens[:prev_lps]\n            prev_lps = lps[prev_lps - 1]\n        else:\n            # Token mismatch, and no more prefix (except empty string)\n            # as a suffix of tokens[:i]\n            i += 1\n\n    if longest_ngram < min_ngram:\n        # No valid ngram is found\n        return np.empty((0,), dtype=origin_tokens.dtype)\n\n    # Flip the position back, so in origin_tokens,\n    # origin_tokens[total_token-1-position:total_token-1-position+longest_ngram]\n    # is the matched ngram, so we should start drafting tokens from\n    # total_token-1-position+longest_ngram\n    start_position = total_token - 1 - position + longest_ngram\n    k = min(k, total_token - start_position)\n    return origin_tokens[start_position : start_position + k]",
+      "what": "零模型 drafter 的算法主体（KMP/LPS）：把 token 序列翻转后找『匹配后缀的最长 n-gram（长度∈[min,max]）』——lps 数组只存前 max_ngram 个前缀（省内存）；取『翻转后最靠右』的匹配（=原序列最早出现，注释讲清 position 更新条件）；找到后从匹配 n-gram 结束处复制 k 个 token 当草稿。无概率分布——rejection 侧走 NO_DRAFT_PROBS。numba 批量与线程自适应（L41-L66/L91-L134）正文点名即可。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/spec_decode/llm_base_proposer.py",
+      "lines": "L411-L441",
+      "code": "    def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:\n        \"\"\"Initialize cudagraph dispatcher keys for the drafter.\n\n        Only supports PIECEWISE cudagraphs (via mixed_mode).\n        This should be called after adjust_cudagraph_sizes_for_spec_decode.\n        \"\"\"\n        if (\n            not self.speculative_config.enforce_eager\n            and cudagraph_mode.mixed_mode()\n            in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]\n        ):\n            eagle_cudagraph_mode = CUDAGraphMode.PIECEWISE\n        else:\n            eagle_cudagraph_mode = CUDAGraphMode.NONE\n\n        self.cudagraph_dispatcher.initialize_cudagraph_keys(eagle_cudagraph_mode)\n\n    def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:\n        \"\"\"Greedy-sample draft tokens from hidden states.\"\"\"\n        if self.use_local_argmax_reduction:\n            return self.model.get_top_tokens(hidden_states)\n        if self.use_heterogeneous_vocab:\n            logits = self.model.compute_logits(hidden_states)\n            assert self.vocab_mapping is not None\n            logits = self.vocab_mapping.constrain_draft_logits(logits)\n            draft_token_ids = logits.argmax(dim=-1)\n            return self.vocab_mapping.map_draft_to_target_ids(draft_token_ids)\n        return self.model.compute_logits(hidden_states).argmax(dim=-1)\n\n    def _sample_from_logits(\n        self,",
+      "what": "V1 模型类 drafter 契约的两块：①只支持 PIECEWISE cudagraph（L413-L414 注释原话——drafter 的多变长前向进不了 FULL 图）；②_greedy_sample：draft 恒贪心——use_local_argmax_reduction 时走 get_top_tokens 做 vocab-parallel 局部 argmax 归约、免全词表 logits gather（ch28 站 8 的 logits 物化账延伸）；异词表 drafter 经 vocab_mapping 映射；可选概率化 draft_probs（L443-L498，提高接受率，非默认）。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/worker/gpu/spec_decode/__init__.py",
+      "lines": "L8-L40",
+      "code": "def init_speculator(vllm_config: VllmConfig, device: torch.device):\n    speculative_config = vllm_config.speculative_config\n    assert speculative_config is not None\n    if speculative_config.method == \"dflash\":\n        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (\n            DFlashSpeculator,\n        )\n\n        return DFlashSpeculator(vllm_config, device)\n    elif speculative_config.method == \"dspark\":\n        from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (\n            DSparkSpeculator,\n        )\n\n        return DSparkSpeculator(vllm_config, device)\n    elif speculative_config.use_gemma4_mtp():\n        from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import (\n            Gemma4Speculator,\n        )\n\n        return Gemma4Speculator(vllm_config, device)\n    elif speculative_config.method == \"mtp\":\n        from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator\n\n        return MTPSpeculator(vllm_config, device)\n    elif speculative_config.use_eagle():\n        from vllm.v1.worker.gpu.spec_decode.eagle.speculator import (\n            EagleSpeculator,\n        )\n\n        return EagleSpeculator(vllm_config, device)\n    else:\n        raise NotImplementedError(f\"{speculative_config.method} is not supported yet.\")",
+      "what": "V2 双生态对照：init_speculator 分发表——dflash/dspark/gemma4/mtp/eagle 各自的 *Speculator（活在 v1/worker/gpu/spec_decode/ 树、配 Model Runner V2）；与 V1 的 *Proposer（v1/spec_decode/ 树、配 gpu_model_runner）并存。dspark 强制 V2（config/vllm.py:L589-L596：V1 can't run dspark）；V2 内部结构归 ch33。",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/structured_output/__init__.py",
+      "lines": "L294-L350",
+      "code": "                state_advancements = 0\n                post_reasoning_end_in_window = False\n                req_tokens = scheduled_spec_decode_tokens.get(req_id, ())\n                for i, token in enumerate(req_tokens):\n                    self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))\n                    advance_grammar = apply_bitmask\n                    if token == -1:\n                        apply_bitmask = False\n                        advance_grammar = False\n                    elif (\n                        detect_reasoning_end\n                        and reasoner is not None\n                        and not apply_bitmask\n                    ):\n                        if simulated_buf is None:\n                            history = list(request.all_token_ids)\n                            history_len = len(history)\n                            simulated_buf = history + list(req_tokens)\n                        simulated = simulated_buf[: history_len + i + 1]\n                        if reasoner.is_reasoning_end_streaming(simulated, [token]):\n                            # Reasoning ended mid-window. Constrain the rest\n                            # of the window via bitmask. Skip grammar advance\n                            # through the marker (it is reasoning content);\n                            # try to advance through subsequent drafts so the\n                            # next bitmask row reflects the post-advance state,\n                            # but tolerate rejection since those drafts predate\n                            # the bitmask and are not guaranteed valid.\n                            apply_bitmask = True\n                            advance_grammar = False\n                            post_reasoning_end_in_window = True\n                    if advance_grammar and not grammar.is_terminated():\n                        accepted = grammar.accept_tokens(req_id, [token])\n                        if accepted:\n                            state_advancements += 1\n                        elif not post_reasoning_end_in_window:\n                            raise AssertionError(\n                                (token, req_id, scheduled_spec_decode_tokens)\n                            )\n                    cumulative_index += 1\n                # Diffusion LLMs don't sample a bonus token after the\n                # scheduled positions, so skip its bitmask in that case.\n                if not (self.vllm_config.model_config.is_diffusion and req_tokens):\n                    # bonus_apply must be True when the bonus-row position\n                    # should be grammar-constrained. Two triggers:\n                    # - should_fill_bitmask(request): reasoning was already\n                    #   over at step start (or no reasoner /\n                    #   enable_in_reasoning).\n                    # - apply_bitmask: reasoning ended mid-window in this\n                    #   call and was flipped True after the marker;\n                    #   should_fill_bitmask still returns False here because\n                    #   reasoning_ended is only persisted later by\n                    #   should_advance.\n                    bonus_apply = self.should_fill_bitmask(request) or apply_bitmask\n                    self._fill_bitmasks(((grammar, cumulative_index, bonus_apply),))\n                    cumulative_index += 1\n                if state_advancements > 0:\n                    grammar.rollback(state_advancements)",
+      "what": "spec×结构化输出的窗口协议（ch32 两段式窗口的 spec 变体）：对每请求的 scheduled 草稿逐位 fill_bitmask+accept_tokens 预推进（-1 占位草稿两样都跳过）、末尾为 bonus 位多填一行；全部完成后 grammar.rollback(state_advancements) 把 FSM 回退到实际会接受的步数——语法状态机对『不知道会接受几个』的答案就是先乐观推进、采样后回退。reasoning 联动的 mid-window 分支（L303-L317）正文点名不展开。",
+      "elide": [
+        "L303-L317 reasoning-end mid-window 分支——bug 高发区但归 ch31 语境，点名即可"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/sched/scheduler.py",
+      "lines": "L1766-L1790",
+      "code": "            scheduled_spec_token_ids = (\n                scheduler_output.scheduled_spec_decode_tokens.get(req_id)\n            )\n            if scheduled_spec_token_ids and (\n                generated_token_ids or self.num_sampled_tokens_per_step == 0\n            ):\n                num_draft_tokens = len(scheduled_spec_token_ids)\n                num_sampled = self.num_sampled_tokens_per_step\n                num_accepted = max(len(generated_token_ids) - num_sampled, 0)\n                num_rejected = num_draft_tokens - num_accepted\n                # Rejections roll back num_computed_tokens (and, under async\n                # scheduling, num_output_placeholders, which covers the spec\n                # tokens). A stale rejection count predates the preemption\n                # rollback and must not apply.\n                if not output_is_stale:\n                    if request.num_computed_tokens > 0:\n                        request.num_computed_tokens -= num_rejected\n                    if request.num_output_placeholders > 0:\n                        request.num_output_placeholders -= num_rejected\n                spec_decoding_stats = self.make_spec_decoding_stats(\n                    spec_decoding_stats,\n                    num_draft_tokens=num_draft_tokens,\n                    num_accepted_tokens=num_accepted,\n                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,\n                    request_id=req_id,",
+      "what": "拒绝回扣（update_from_output 内）：num_accepted = len(generated)−num_sampled_tokens_per_step、num_rejected = num_draft−num_accepted；非 stale 输出才回扣 num_computed_tokens（异步再回扣 num_output_placeholders——占位账与计算账共变）。上拍多记的 token 账在这一步退回来，下一拍的 num_new_tokens 才正确。",
+      "elide": []
+    }
+  ],
+  "theory": [
+    "index 摊平的算术：每请求采 num_draft+1 个位置（+1 即 bonus），全批 logits 行数 = Σ(k_i+1) = num_tokens + batch；三组 index 的构造全是 CPU numpy（np.repeat 把 per-request 标量扩成 per-token + arange 累加），O(num_tokens) 且零 padding 浪费；对照 padding 成 [batch, max_spec+1]：草稿数方差大时（ngram 多请求为 0）显著省算力/显存，且 max_spec_len 抖动不会引发 kernel 重编译——代价就是这三组 index 的间接。worked example 直接用 L2853-L2859 注释的 5 请求数字（cu_num_scheduled=[4,104,107,207,209]、num_draft=[3,0,2,0,1]）逐行走一遍。",
+    "二次 gather 错位一格：draft_token_ids = input_ids.gpu[logits_indices][target_logits_indices+1]——草稿 token 被调度器写进了输入流（token_ids_cpu 行尾），target 前向时它们是普通输入；要『验证草稿位 d_i 的下一个词分布』就要取输入流里 d_i 所在行的下一采样位 logits——错位一格正是『预测下一个词』的位置语义。",
+    "接受准则的 uniform 形式：P(接受 draft token x) = P(u < p_t(x)/p_d(x)) = min(1, p_t(x)/p_d(x))（u~U[0,1) 与判据独立）——kernel 里不显式取 min 的原因。NO_DRAFT_PROBS（ngram）：q 退化为确定 1，接受概率=p_t(x)；残差分布相应退化为『屏蔽 x 后的 p_t』（kernel L913-L918 的 mask 实现）。",
+    "greedy 拒绝采样=逐位 argmax 比对仍无损（ch33 已证 one-hot 退化的正文回指）：kernel 形态上拒绝位直接写 target_argmax——恰好是 greedy 语义下从『残差分布』采出的唯一非零概率 token；bonus 位同样 argmax。正文用 3-token 玩具分布各数值走一遍 greedy/random 两 kernel。",
+    "残差采样免归一化：argmax(prob·inv_q)（q~Exp(1)）按 Gumbel-max 定理与『按 prob/Σprob 抽样』同分布——Σprob 不影响 argmax 的胜者，省掉 vocab 维求和（kernel L931-L932 注释）；每请求一份 q 的合法性：单看任一位，argmax(p_pos·inv_q) 仍是 p_pos 的合法样本；投机语义下只有首个拒绝位的 recovered 被消费（后续位早停），边缘分布正确即够——v0.27 把噪声张量从 [num_tokens, V] 降到 [batch, V]。",
+    "float64 uniform（pytorch#16706）：float32 的 torch.rand 有非平凡概率产出精确 0.0；接受判据 p_t/p_d >= u 在 u=0 时恒真——本应大概率拒绝的坏草稿被无条件接受，分布被破坏；float64 让 P(u=0) 可忽略。与 ch30 的 use_fp64_gumbel 是同一动机的两个落点。",
+    "bonus token 与一步 token 产出账：全接受时 bonus 位白嫖一个 token（该位 logits 已在本次前向产出，无需再跑）——一次 target 前向最多产 k+1 个 token，这就是输出 buffer 第二维 max_spec_len+1 的 +1；期望 token 产出 = E[接受数]+P(全收)·1，由逐位接受率决定（τ 账回指 ch33 站 5）。",
+    "调度器回扣的守恒：排批时 num_computed_tokens 按乐观全收 +（k+1）推进；验证后 num_rejected 个位置没产出 token，回扣 num_computed_tokens（异步下 num_output_placeholders 同步回扣）——『token 差账』两边最终对平；stale 输出（抢占后）不回扣是防账本共变破坏。",
+    "混批双 kernel：is_greedy = temperature==0 的 [batch] mask；greedy kernel 对非贪心请求早退、random kernel 对贪心请求早退——同批共存免拆批（与 ch30 的 torch.where 混批合并同一哲学：分支下沉到行级）。",
+    "形状统一的经济学：pad 到 1+K 让每拍 decode 形状齐整（FULL cudagraph 回放的前提），代价是白算一些 -1 草稿位（decode 便宜所以可接受）；『Prefer to not schedule than schedule un-padded』把破坏形状的代价显式化——新请求等一拍比全批丢 cudagraph 便宜。dynamic_sd_lookup 是另一面的对冲：重载时缩 K 保批容量。",
+    "spec 的延迟账回顾与排批视角：L=(T_draft+T_verify)/τ（ch33 站 2）；本章补充系统侧——draft 前向吃 worker 窗口尾部、verify 的 k+1 位吃 token 预算（混相批里 target 序列变长会挤占别的请求）；接受率低时两笔都白花，这就是『纯亏』的账本形态，dynamic K/清零草稿（input_fits_in_drafter=false 时 L4699-L4713）是系统侧的止损阀。"
+  ],
+  "mechanisms": [
+    {
+      "id": "m1",
+      "name": "spec 一步循环与 draft 所有权环：worker 产 → 回程（async 留 worker / sync post_step）→ 调度器挂账 → 排批 → 回流验证 → 记账回扣环回",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/worker/gpu_model_runner.py:L4611-L4625",
+        "vllm/v1/worker/gpu_model_runner.py:L4889-L4941",
+        "vllm/v1/engine/core.py:L616-L623",
+        "vllm/v1/core/sched/scheduler.py:L2146-L2167",
+        "vllm/v1/outputs.py:L338"
+      ]
+    },
+    {
+      "id": "m2",
+      "name": "draft 排批的调度器三本账：token 差账（num_tokens_with_spec+placeholders−computed）、lookahead 账（dflash +1/dspark=K）、拒绝/抢占的回扣与清空",
+      "kind": "dataflow",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L516-L520",
+        "vllm/v1/core/sched/scheduler.py:L640-L656",
+        "vllm/v1/core/sched/scheduler.py:L261-L270",
+        "vllm/v1/core/sched/scheduler.py:L1766-L1790",
+        "vllm/v1/core/sched/scheduler.py:L1274-L1315"
+      ]
+    },
+    {
+      "id": "m3",
+      "name": "形状三件事：统一 pad 到 1+K（[-1] 占位草稿、宁可不排不破形状）、async 不排 partial draft、dynamic_sd_lookup 按批大小动态定 K",
+      "kind": "config",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/core/sched/scheduler.py:L879-L898",
+        "vllm/v1/core/sched/scheduler.py:L1076-L1078",
+        "vllm/v1/core/sched/scheduler.py:L498-L500",
+        "vllm/v1/core/sched/scheduler.py:L1192-L1197"
+      ]
+    },
+    {
+      "id": "m4",
+      "name": "三组 index 摊平算术：cu_num_draft/cu_num_sampled 累积和 + logits/target_logits/bonus 定位 + draft_token_ids 二次 gather（数值 docstring 即 worked example）",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/worker/gpu_model_runner.py:L2851-L2924",
+        "vllm/v1/spec_decode/metadata.py:L9-L30",
+        "vllm/v1/worker/gpu_model_runner.py:L2246-L2262"
+      ]
+    },
+    {
+      "id": "m5",
+      "name": "RejectionSampler 组合复用 Sampler：bonus 位外采（可 top_p/top_k、max_num_logprobs=-1）、target 位 fp32+clone 保 raw（in-place 暗线 spec 侧实证）、v0.27 结构变化（组合而非复制管线）",
+      "kind": "protocol",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/sample/rejection_sampler.py:L61-L70",
+        "vllm/v1/sample/rejection_sampler.py:L122-L185"
+      ]
+    },
+    {
+      "id": "m6",
+      "name": "逐草稿位约束扩展：repeat_indices 展开 penalties、bad_words_with_drafts 吃前缀历史（两个 _combine_outputs_with_spec_tokens 同名异义陷阱）、MinTokens.apply_with_spec_decode 逐位封 EOS、expand_batch_to_tokens 扩温度/top-k/top-p",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/sample/rejection_sampler.py:L289-L346",
+        "vllm/v1/sample/rejection_sampler.py:L510-L605",
+        "vllm/v1/sample/logits_processor/builtin.py:L235-L289",
+        "vllm/v1/sample/rejection_sampler.py:L376-L391"
+      ]
+    },
+    {
+      "id": "m7",
+      "name": "rejection_sample 调度：[B, max_spec_len+1] 预填 PLACEHOLDER=-1（+1 即 bonus 槽）、all_greedy 早退、recovered 预采、random kernel 收尾；is_greedy mask 双 kernel 同批共存各自早退",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/sample/rejection_sampler.py:L394-L507"
+      ]
+    },
+    {
+      "id": "m8",
+      "name": "greedy 拒绝 kernel：draft==target_argmax 接受、拒绝位写 argmax（=one-hot 残差的唯一 token）、早停截断、全收补 bonus；padded draft(-1) 直接拒",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/sample/rejection_sampler.py:L715-L769"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2211.17192",
+        "sections": [
+          "§3 Alg.3（greedy 为 one-q 特例）"
+        ],
+        "note": "Leviathan et al.——RejectionSampler docstring 自引的实现蓝本（数学侧 ch33 站 3-4 已立）"
+      }
+    },
+    {
+      "id": "m9",
+      "name": "random 拒绝 kernel（算法心脏）：target_prob/draft_prob >= uniform_prob（u∈[0,1) 隐式 min(1,·)、draft_prob>0 防 NaN）、NO_DRAFT_PROBS 退化（以 p_t(x) 接受）、拒绝位 recovered+早停、float64 uniform（pytorch#16706）",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/sample/rejection_sampler.py:L772-L845",
+        "vllm/v1/sample/rejection_sampler.py:L608-L660"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2211.17192",
+        "sections": [
+          "§2 Eq.(1)-Eq.(3)"
+        ],
+        "note": "min(1,p_t/p_d) 接受+残差恢复；float64 uniform 是工程加固（pytorch#16706），非论文内容"
+      }
+    },
+    {
+      "id": "m10",
+      "name": "recovered 残差采样：prob=max(p_t−p_d,0)（ngram：屏蔽 draft token 的 p_t）、score=prob·inv_q 免归一化 argmax（Gumbel-max）、每请求一份 q 的 v0.27 布局（只有首个拒绝位被消费）、OOV mask+clamp 数值卫生",
+      "kind": "algorithm",
+      "difficulty": "core",
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/sample/rejection_sampler.py:L663-L710",
+        "vllm/v1/sample/rejection_sampler.py:L872-L953"
+      ],
+      "paper_origin": {
+        "paper": "arXiv:2211.17192",
+        "sections": [
+          "§2 残差分布 norm(max(0,p−q))"
+        ],
+        "note": "Gumbel-max 免归一化的依据 arXiv:1611.01162（ch30 m10 已立）；『每请求一份 q』是 v0.27 工程变化"
+      }
+    },
+    {
+      "id": "m11",
+      "name": "输出还原 parse_output：valid_mask（≠-1 且 <vocab_size）过滤、[B, max_spec+1] → 变长 list；与 D2H/bookkeeping 的衔接",
+      "kind": "dataflow",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/sample/rejection_sampler.py:L252-L287",
+        "vllm/v1/worker/gpu_model_runner.py:L3791"
+      ]
+    },
+    {
+      "id": "m12",
+      "name": "ngram 零模型 drafter：翻转序列 + KMP/LPS 找匹配后缀的最长 n-gram（lps 只存 max_ngram 个）、复制后续 k token 当草稿、numba 批量与线程自适应；无 draft_probs → NO_DRAFT_PROBS 全链退化",
+      "kind": "algorithm",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "source_anchors": [
+        "vllm/v1/spec_decode/ngram_proposer.py:L135-L168",
+        "vllm/v1/spec_decode/ngram_proposer.py:L207-L293"
+      ],
+      "paper_origin": {
+        "paper": "https://github.com/apoorv-saxena/prompt-lookup-decoding",
+        "sections": [
+          "README · Prompt Lookup Decoding"
+        ],
+        "note": "非 arXiv：n-gram prompt lookup 的原始出处是 Saxena 2024 的 PLD 仓库/博客；vLLM 的 KMP/LPS 实现是工程自研"
+      }
+    },
+    {
+      "id": "m13",
+      "name": "V1 模型类 drafter 契约（SpecDecodeBaseProposer）：draft 恒 greedy（get_top_tokens 局部 argmax 归约免全词表 gather/异词表 vocab_mapping）、可选概率化 draft_probs（take_last_draft_probs 缓存→_get_spec_decode_draft_probs 对行拼装）、只支持 PIECEWISE cudagraph、MTP 钩子（get_mtp_target_hidden_states）",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/spec_decode/llm_base_proposer.py:L411-L441",
+        "vllm/v1/spec_decode/llm_base_proposer.py:L443-L498",
+        "vllm/v1/worker/gpu_model_runner.py:L5198-L5205",
+        "vllm/v1/worker/gpu_model_runner.py:L4981-L5008"
+      ]
+    },
+    {
+      "id": "m14",
+      "name": "V1/V2 双生态：V1 *Proposer+rejection_sampler.py（gpu_model_runner 装配）vs V2 *Speculator+gpu/spec_decode 树（init_speculator 分发、dspark/混合 KV DFlash 强制 V2、V2 实验性 README）；同一套调度器账本喂两代",
+      "kind": "config",
+      "difficulty": "supporting",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/worker/gpu/spec_decode/__init__.py:L8-L40",
+        "vllm/config/vllm.py:L583-L600",
+        "vllm/v1/worker/gpu_model_runner.py:L583-L658",
+        "vllm/v1/worker/gpu/README.md:L1-L3"
+      ]
+    },
+    {
+      "id": "m15",
+      "name": "spec×结构化输出：k+1 位掩码预填（位掩码预算 max_batch*(1+max_spec)）、-1 占位草稿跳过、FSM 逐位预推进+采样后 rollback（max_rollback_tokens=num_speculative_tokens）、worker 侧按批序+草稿偏移重排、调度器 validate_tokens 前置过滤",
+      "kind": "protocol",
+      "difficulty": "supporting",
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/structured_output/__init__.py:L294-L350",
+        "vllm/v1/structured_output/__init__.py:L229-L234",
+        "vllm/v1/structured_output/backend_xgrammar.py:L119-L123",
+        "vllm/v1/structured_output/utils.py:L113-L161",
+        "vllm/v1/core/sched/scheduler.py:L2163-L2166"
+      ]
+    },
+    {
+      "id": "m16",
+      "name": "互斥清单与诚实账：min_p/logit_bias 与 spec 互斥（只剩 MinTokens 特化版存活，build_logitsprocs 警告）、异步调度兼容子集硬校验、PIECEWISE-only、disable_padded_drafter_batch、接受率低纯亏（草稿清零止损 input_fits_in_drafter=false）",
+      "kind": "config",
+      "difficulty": "supporting",
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "source_anchors": [
+        "vllm/v1/sample/logits_processor/__init__.py:L202-L210",
+        "vllm/config/vllm.py:L1074-L1090",
+        "vllm/v1/spec_decode/llm_base_proposer.py:L411-L425",
+        "vllm/v1/worker/gpu_model_runner.py:L4699-L4713"
+      ]
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [
+      {
+        "what": "rejection_sampler.py 的 synthetic 模式全链：__init__ 的 synthetic_conditional_rates 构造（L77-L90）与 self.synthetic_mode、forward/rejection_sample 的 synthetic_mode/synthetic_conditional_rates 参数及传递、两 kernel 的 SYNTHETIC_MODE constexpr 分支（greedy L748-L754、random L812-L814 及签名里的 synthetic_conditional_rates_ptr）、generate_uniform_probs 的 synthetic 生成条件（L444-L445 只留 not all_greedy）、import unconditional_to_conditional_rates（L24）",
+        "why_safe": "synthetic 是测试/合成接受率基准注入（spec_config.rejection_sample_method=='synthetic' 才构造），非真实推理路径；删后两 kernel 退化为标准 greedy/random 准则，spec_config 传 None 时（生产默认）整条链本就不触发。"
+      },
+      {
+        "what": "rejection_sampler.py 的 logprobs 装配：_get_logprobs_tensors 整方法（L203-L250）、forward 尾部 logprobs_tensors 计算与 SamplerOutput 的 logprobs_tensors 传参（L187-L196、L200 改传 None）、parse_output 的 logprobs 过滤分支（L276-L280）与 logprobs_tensors 参数、_get_logprobs_tensors 相关 import（LogprobsLists L16）",
+        "why_safe": "logprobs 语义与装配归 ch8/ch30 语境；max_num_logprobs=None 的默认路径（无请求要 logprobs）不进这些分支，删后输出 token 逐位不变。须保留 forward 的返回签名（SamplerOutput(sampled_token_ids=..., logprobs_tensors=None)）。"
+      },
+      {
+        "what": "rejection_sampler.py 的 thinking budget 支路（apply_logits_processors L339-L345 的 holder 调用块）",
+        "why_safe": "thinking_token_budget 是可选推理特性：reasoning_config 未设时 holder 恒 None，整块跳过（ch30 m7 同款处理）。"
+      },
+      {
+        "what": "llm_base_proposer.py（若进精简版）：tree attention 分支、mrope/xdrope position 分支、多模态（mm_embed_inputs/supports_mm_inputs）、cudagraph padding（_determine_batch_execution_and_padding/input_batch_size）、DFlash 专属 needs_extra_input_slots/copy_and_expand_* kernel 分支",
+        "why_safe": "工程旁路，与『摆输入→前向→greedy 采草稿』主线正交；精简版固定 1D positions、input_batch_size==batch_size、走 EAGLE 主路径，行为等价（v2 ch34 同款删法，符号名以 v0.27.1 现核为准）。"
+      },
+      {
+        "what": "ngram_proposer.py 的 numba 线程自适应与 JIT 预热：__init__ 里 num_tokens_threshold/cpu_count/num_numba_thread_available 计算与 set_num_threads 调用（L41-L66）、__init__ 尾部的 JIT 预热调用（L64-L66 附近）、batch_propose 的线程数选择/恢复逻辑（L113-L126）",
+        "why_safe": "纯性能调优；单线程顺序跑 batch_propose_numba/_find_longest_matched_ngram_and_propose_tokens 得到逐字节等价的草稿。"
+      },
+      {
+        "what": "非精简范围声明：gpu_model_runner.py / scheduler.py / core.py / structured_output/* 的 spec 段（排批环、_calc_spec_decode_metadata、摊平、语法 rollback）只作正文内嵌真源码解读、不做精简版——跨进程编排+持久批依赖，单文件减法无法保持可运行性（沿 ch30 对 runner 侧的处理先例）",
+        "why_safe": "本章可测的算法核（摊平 index 算术/拒绝采样三 kernel/ngram 匹配）全在 rejection_sampler.py+metadata.py+ngram_proposer.py 三个自包含文件里；编排段以 lint_source_grounding 对正文内嵌源码把关。"
+      }
+    ],
+    "must_keep": [
+      {
+        "symbol": "SpecDecodeMetadata",
+        "why": "本章核心数据结构，writer 逐字段讲摊平与 index 间接。"
+      },
+      {
+        "symbol": "cu_num_draft_tokens",
+        "why": "三个 kernel 都靠它反推每请求草稿区间 [start,end)——『摊平』的承重符号。"
+      },
+      {
+        "symbol": "cu_num_sampled_tokens",
+        "why": "bonus_logits_indices=cu_num_sampled−1 的来源；体现每请求多采 1 个 bonus。"
+      },
+      {
+        "symbol": "target_logits_indices",
+        "why": "把扁平 target logits 定位到草稿位——间接定位核心。"
+      },
+      {
+        "symbol": "bonus_logits_indices",
+        "why": "定位每请求 bonus 位 logits，bonus token 来历。"
+      },
+      {
+        "symbol": "logits_indices",
+        "why": "草稿位+bonus 位总 index，draft_token_ids 二次 gather 的第一跳。"
+      },
+      {
+        "symbol": "max_spec_len",
+        "why": "输出 buffer 第二维 max_spec_len+1 的来源，+1 即 bonus 槽。"
+      },
+      {
+        "symbol": "draft_token_ids",
+        "why": "摊平后的草稿本体（二次 gather 产物）。"
+      },
+      {
+        "symbol": "RejectionSampler",
+        "why": "本章主类：四类 token 术语定义处 + 组合 Sampler 的 v0.27 结构变化。"
+      },
+      {
+        "symbol": "rejection_sample",
+        "why": "接受/拒绝采样调度入口。"
+      },
+      {
+        "symbol": "rejection_greedy_sample_kernel",
+        "why": "greedy 路径接受准则+早停+bonus，最易讲版本。"
+      },
+      {
+        "symbol": "rejection_random_sample_kernel",
+        "why": "随机路径 p_t/p_d>=uniform 接受准则，算法心脏。"
+      },
+      {
+        "symbol": "sample_recovered_tokens",
+        "why": "拒绝位从残差分布采 recovered——分布等价的关键（每请求一份 q 的 v0.27 布局在此）。"
+      },
+      {
+        "symbol": "sample_recovered_tokens_kernel",
+        "why": "残差 (p_t−p_d)+ 与 Gumbel-max 免归一化实现。"
+      },
+      {
+        "symbol": "generate_uniform_probs",
+        "why": "接受准则的 uniform 随机源（float64 设计点）。"
+      },
+      {
+        "symbol": "apply_sampling_constraints",
+        "why": "温度/top-k/top-p 的逐草稿位扩展。"
+      },
+      {
+        "symbol": "expand_batch_to_tokens",
+        "why": "[batch]→[num_tokens] 的 kernel 化展开（约束扩展的地基）。"
+      },
+      {
+        "symbol": "parse_output",
+        "why": "摊平输出还原变长 list 的收尾闭环。"
+      },
+      {
+        "symbol": "PLACEHOLDER_TOKEN_ID",
+        "why": "被拒/未用位哨兵值，parse_output 据此过滤。"
+      },
+      {
+        "symbol": "NO_DRAFT_PROBS",
+        "why": "ngram 无概率分支的 constexpr 开关，统一两类 drafter。"
+      },
+      {
+        "symbol": "bonus_token_ids",
+        "why": "bonus token 载体，全接受时附加。"
+      },
+      {
+        "symbol": "recovered_token_ids",
+        "why": "拒绝位替换用 token。"
+      },
+      {
+        "symbol": "apply_with_spec_decode",
+        "why": "MinTokens 的 spec 特化版——互斥清单里唯一的幸存处理器。"
+      },
+      {
+        "symbol": "apply_bad_words_with_drafts",
+        "why": "bad_words 的 spec 特化（草稿当前缀历史）。"
+      },
+      {
+        "symbol": "_combine_outputs_with_spec_tokens",
+        "why": "惩罚历史拼草稿前缀（与 Sampler 同名方法对照的读代码陷阱）。"
+      },
+      {
+        "symbol": "NgramProposer",
+        "why": "零模型 drafter 范例，writer 用它讲『草稿从哪来』。"
+      },
+      {
+        "symbol": "_find_longest_matched_ngram_and_propose_tokens",
+        "why": "ngram 草稿算法主体（KMP/LPS）。"
+      },
+      {
+        "symbol": "SpecDecodeBaseProposer",
+        "why": "V1 模型类 drafter 统一基类（对外契约：吃 hidden_states 吐 k 草稿）。"
+      },
+      {
+        "symbol": "_greedy_sample",
+        "why": "draft 恒贪心 + use_local_argmax_reduction/get_top_tokens 局部归约。"
+      },
+      {
+        "symbol": "update_draft_token_ids",
+        "why": "draft 挂账入口（grammar validate 过滤在此）——排批环的调度器侧锚点（正文内嵌）。"
+      },
+      {
+        "symbol": "scheduled_spec_decode_tokens",
+        "why": "draft 回流 worker 的通道字段（SchedulerOutput/Runner/语法窗口三处消费）。"
+      },
+      {
+        "symbol": "num_spec_tokens_to_schedule",
+        "why": "动态 K 的载体（SchedulerOutput→drafter）。"
+      },
+      {
+        "symbol": "take_draft_token_ids",
+        "why": "同步回程的 executor 接口（DraftTokenIds 信封）。"
+      },
+      {
+        "symbol": "propose_draft_token_ids",
+        "why": "drafter 统一分发入口（worker 侧站 1）。"
+      }
+    ]
+  },
+  "foreshadow_due": {
+    "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（bible.py due 是 v2 旧章号账本，不跑）",
+    "should_plant": [],
+    "should_payoff": [],
+    "note": "pedagogy-plan.foreshadows 全表 10 条（F1-F10）无一条 planted=34 或 paid=34——本章不埋不收。邻章衔接（非伏笔账本、正文点名即可）：站 1 承 ch33 站 14 的交接（『布局算术收束数学侧，排批/RejectionSampler/双生态/rollback/互斥清单全归 ch34』）；站 9 的 bonus 外采回指 ch30 站 2 的换轨预告与 num_logprobs=-1 分支；站 15 的 async token 留 GPU 回指 ch12；站 16 的 k+1 掩码预填回指 ch32 的两段式窗口；下一章 ch35（分布式）开篇预告——spec 的 TP/PP 形态（draft 模型放末 PP rank，gpu_model_runner.py:L581-L583 注释）可作收尾钩子。"
+  },
+  "l2_spec": "book/cartography/l2-specs/ch34.json（stations 与本档案 stations 同一份账本）"
+}

@@ -1,0 +1,149 @@
+{
+  "chapter": "ch34-spec-decode-implementation",
+  "pin": "vLLM v0.27.1 (6e448d0ea)，行号基线 instances/vllm/source 工作树",
+  "generated": "2026-09-18",
+  "v2_reuse_note": "v2 ch34 concepts.json 6 卡逐条核对：prompt-lookup-decoding 与 kmp-prefix-function 复用（PLD 卡 2026-09-18 重抓刷新出处、修正作者名、重锚 v0.27.1 的 ngram 方法名；KMP 卡算法与 vLLM 用法未变、保留 v2 sources）；其余 4 卡（rejection-sampling 数学、SpecInfer 树验证、Gumbel-max、proposer 家族 competing_set）全部并入 v3 ch33 primer 的 research（见 skipped）——本章只补 ch33 没有的工程生态背景。",
+  "skipped": [
+    "拒绝采样数学/无损证明/2023 双源论文（v2 卡 speculative-decoding-rejection-sampling）→ v3 ch33 已立（rejection-sampling + speculative-decoding-origin 两卡），本章只回指不重讲",
+    "drafter 谱系 competing_set 与 EAGLE 系/MTP/DFlash/Medusa（v2 卡 spec-decode-proposer-family）→ v3 ch33 已立（drafter-lineage/eagle-family/mtp/dflash/medusa 五卡）",
+    "SpecInfer 树验证（v2 卡）→ v3 ch33（eagle-family 的树验证溯源，arXiv:2305.09781）",
+    "DSpark 论文/DeepSpec 训练仓/HF checkpoints → v3 ch33 dspark-deepspec 卡；本章只补『v0.27.1 代码/文档落地状态』（本文件 vllm-spec-decode-ecosystem-v0271 卡）",
+    "Gumbel-max 技巧（v2 卡）→ ch30 introduces『Gumbel 技巧』已立（dossier WC2 明言『ch30 已立 Gumbel 掷骰，本章是 spec 侧续章』）",
+    "cu_ 前缀和记法（cu_num_draft/cu_num_sampled 同 cu_seqlens 惯用法）→ ch21 注意力变长章已立",
+    "专用 copy stream/event/pinned memory（draft D2H 回程三件套）→ ch08",
+    "PIECEWISE/FULL cudagraph（drafter 只支持 PIECEWISE 的原因）→ ch19『形状全等才能回放』",
+    "scatter/gather（二次 gather 草稿、async GPU scatter）→ ch18",
+    "CPU-GPU 同步之忌/multinomial 之死 → ch30（异步调度语境 ch12）",
+    "异步调度主体（占位数/重叠窗口/输出延迟一步）→ ch12，本章只讲 spec 三件套增量",
+    "Markov 链/NAT 多模态碰撞/置信度校准/SpecDec++/SLA-Pareto/ZOS → 全部 ch33"
+  ],
+  "concepts": [
+    {
+      "id": "triton-language",
+      "term": "Triton（GPU kernel 的 Python DSL——RejectionSampler 三个 kernel 的书写语言）",
+      "kind": "external_project",
+      "one_line": "写 GPU kernel 不用碰 CUDA C：一个长得像普通 Python 的函数，加 @triton.jit 装饰器，Triton 编译器把它直接编译成 GPU 上跑的机器码——vLLM 拒绝采样的三个 kernel 全用它写。",
+      "what_it_is": "官方 README 的自我定义：『a language and compiler for writing highly efficient custom Deep-Learning primitives』（写高效深度学习算子的语言+编译器）。它是嵌在 Python 里的 DSL：函数体像普通 Python，但 @triton.jit 让 Triton 编译器在首次调用时把它编译成 GPU 机器码（底层走 LLVM），之后每次调用就是原生速度。读 vllm/v1/sample/rejection_sampler.py 需要认识的五个构件：\n① 启动语法 kernel[(N,)](args...)——方括号里是 grid（网格），N=启动多少个程序实例；rejection_greedy_sample_kernel[(batch_size,)] 即『每个请求一个程序』（sample_recovered_tokens_kernel 用二维 grid (batch_size, max_spec_len)：第 1 维请求、第 2 维草稿位）。\n② tl.program_id(0)——本程序在网格第 0 维的编号；kernel 开头 req_idx = tl.program_id(0) 就是『我是第几个请求』。\n③ tl.load(ptr + i) / tl.store(ptr + i, v)——经裸指针显式读写显存；传进来的张量在 kernel 里就是它的首地址。\n④ tl.constexpr——编译期常量，值被烤进编译产物：换值=重新编译一个特化版本。源码里 NO_DRAFT_PROBS / SYNTHETIC_MODE / USE_FP64_GUMBEL 这些开关走它（分支在编译期定死，不是运行期 if），BLOCK_SIZE 分块大小也是它。\n⑤ do_not_specialize——默认连普通标量参数的『值』也会被特化进编译产物（值一变就重编译）；rejection_random_sample_kernel 头上那句 @triton.jit(do_not_specialize=[\"max_spec_len\"]) 配注释『Avoid specialization to prevent unnecessary recompilation』，就是不让 max_spec_len 每变一次就重编一份 kernel。",
+      "background": "学术出身是 MIT 的 Tillet、哈佛的 H.T. Kung 与 Cox 在 PLDI 2019 的 MAPL 研讨会论文《Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations》（DOI 10.1145/3315508.3329973）——核心论点：不写 CUDA 里最难的共享内存管理与线程索引，让编译器去做 tiling 与访存合并，代码量少得多还能打平手调库。2021 年 7 月 28 日 OpenAI 把现代 Python 版开源（博客《Introducing Triton: Open-source GPU programming for neural networks in Python》），项目现居 triton-lang 组织、MIT 协议。真正让它普及的是 PyTorch 2.0（2023-03-15）：torch.compile 的编译后端 TorchInductor 在 GPU 上生成的就是 Triton kernel——用过 torch.compile 的读者早就在跑 Triton 了，只是没看见。README（2026-09-18 抓）标注现支持 NVIDIA CC 8.0+（Ampere 起）与 AMD ROCm 6.2+，CPU 后端开发中，且仅支持 Linux。",
+      "example": "说明性最小例（API 与官方 tutorial 同构，逐行对照 vLLM 用法）：\n@triton.jit\ndef double_kernel(x_ptr, y_ptr, n, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)                    # 我是第几个程序\n    offs = pid * BLOCK + tl.arange(0, BLOCK)  # 我负责的下标段\n    mask = offs < n                           # 越界位不读写\n    x = tl.load(x_ptr + offs, mask=mask)      # 从显存读\n    tl.store(y_ptr + offs, x * 2.0, mask=mask)# 写回显存\n\ndouble_kernel[(8,)](x, y, n, BLOCK=1024)     # 方括号=grid：启动 8 个程序\n对照 vLLM 拒绝采样 kernel：grid 换成 (batch_size,)——一个程序管一个请求；req_idx = tl.program_id(0) 定位请求；tl.load(draft_token_ids_ptr + start_idx + pos) 按裸指针从摊平的草稿数组取第 pos 个草稿；程序内 for pos in range(num_draft_tokens) 是顺序循环（逐草稿位判收/拒）。差异只在分工：本例每程序向量化处理一块下标，vLLM 每程序串行处理一个请求的 K 个草稿位。",
+      "links": [
+        "https://github.com/triton-lang/triton",
+        "https://triton-lang.org/main/getting-started/tutorials/01-vector-add.html",
+        "https://dl.acm.org/doi/10.1145/3315508.3329973"
+      ],
+      "sources": [
+        {"url": "https://github.com/triton-lang/triton", "note": "README 一手：定义原话 'a language and compiler for writing highly efficient custom Deep-Learning primitives'、MIT 协议、NVIDIA CC 8.0+/AMD ROCm 6.2+/CPU 后端开发中/仅 Linux，访问于 2026-09-18"},
+        {"url": "vllm/v1/sample/rejection_sampler.py L715-L953（pin 源码，仓内一手）", "note": "三 kernel 的 grid/program_id/tl.load/tl.constexpr 用法；L772-L774 的 @triton.jit(do_not_specialize=[\"max_spec_len\"]) 与注释 'Avoid specialization to prevent unnecessary recompilation'，行号基线 v0.27.1"},
+        {"url": "https://dl.acm.org/doi/10.1145/3315508.3329973", "note": "Tillet/Kung/Cox MAPL@PLDI 2019 论文 DOI——搜索级核实（ACM DL 403、哈佛 PDF 在仓外不可读），标题/作者/会议多源交叉，2026-09-18"},
+        {"url": "https://openai.com/index/introducing-triton/", "note": "OpenAI 2021-07-28 开源博客的存在性与标题经搜索核实（openai.com 对抓取 403，未一手），2026-09-18"},
+        {"url": "https://pytorch.org/blog/introducing-pytorch-2-0/", "note": "PyTorch 2.0（2023-03-15）torch.compile/TorchInductor 在 GPU 生成 Triton kernel——canonical URL 经搜索确认，WebFetch 404 未一手；docs.pytorch.org 的 torch.compile 教程条目、AMD ROCm 博客（2024-07-11）等多源交叉，2026-09-18"}
+      ],
+      "confidence": "high",
+      "writer_note": "introduces『RejectionSampler Triton』的底座卡，站 11-14 读 kernel 前必须先立五个词：@triton.jit、方括号 grid、tl.program_id、tl.load/store 裸指针、tl.constexpr+do_not_specialize。正文用对照例子讲一遍（读者第一次读 kernel 不至于懵），历史一段带过+『你 torch.compile 时早就在跑 Triton』一句；论文/博客深入交链接。两条标『搜索级』的史实（OpenAI 2021 开源、Inductor 生成 Triton）正文引用按此口径，别加码细节。"
+    },
+    {
+      "id": "numba",
+      "term": "Numba（CPU 侧 JIT 编译器——NgramProposer 的批量 n-gram 匹配靠它）",
+      "kind": "external_project",
+      "one_line": "把普通 Python/NumPy 函数在首次调用时即时（JIT）编译成机器码的编译器，速度可逼近 C/FORTRAN——vLLM 用它把 n-gram 草稿匹配的 KMP 循环批量跑在 CPU 上，既不占 GPU 也不吃 Python 解释器。",
+      "what_it_is": "官方首页定义：Numba『把 Python 与 NumPy 代码的一个子集翻译成快速机器码』，编译底座是工业界标准的 LLVM。用法是装饰器：@njit（或 @jit）标在函数上，首次调用时按实际参数类型生成机器码特化版本（惰性编译），同类型后续调用直接跑机器码。关键性质（stable 文档，2026-09-18 抓）：①两种编译模式——nopython 模式（不碰 Python C API，快）与 object 模式（兜底，慢得多），自 0.59 起 @jit 默认就是 nopython；②nogil=True——编译后的代码执行期间释放 GIL，纯数值代码可以真·多线程吃满多核（vLLM 的批量 n-gram 匹配正靠它多线程跑）；③parallel=True 配 prange 自动并行化循环、cache=True 结果落盘缓存；④只支持语言子集——不支持的 Python 构造在 nopython 模式下直接报错，不是悄悄变慢。配 vLLM：NgramProposer 把『翻转序列+KMP/LPS 找最长匹配』整套包成 numba JIT 函数按请求批量跑（pin 源码 vllm/v1/spec_decode/ngram_proposer.py；线程数自适应细节归 dossier/正文）。",
+      "background": "论文是 Lam、Pitrou、Seibert 2015 年《Numba: LLVM-based Python JIT compiler》（Proc. 2nd Workshop on LLVM in HPC @SC15，Continuum Analytics 即 Anaconda 公司，DOI 10.1145/2833157.2833162）——动机是科学计算的三角困境：NumPy 快但逼你向量化、纯 Python 慢、Cython 要重写；答案是让『NumPy 风格的数组循环』直接 JIT 成机器码。此后十年它是 Python 科学栈的常青依赖（Anaconda 资助，首页鸣谢 DARPA/Moore 基金会/Intel/NVIDIA/AMD）。与本章语境的对照：Triton 把 Python DSL 编译到 GPU，numba 把 Python/NumPy 子集编译到 CPU——vLLM 的 spec decode 两个都用：验证写 Triton（GPU），n-gram 草稿写 numba（CPU、零模型零 GPU 占用）。",
+      "example": "说明性最小例：\nimport numpy as np\nfrom numba import njit\n\n@njit                                   # 首次调用时按参数类型编译成机器码\ndef count_equal(arr, x):\n    hits = 0\n    for t in arr:                       # Python 层的逐元素循环\n        if t == x:\n            hits += 1\n    return hits\n\ncount_equal(np.arange(10_000_000), 3)   # 第一次调用：编译（慢，一次性）\ncount_equal(np.arange(10_000_000), 5)   # 之后：机器码速度（同类型不再编译）\n要点逐行：@njit 是 nopython 模式 JIT；for 循环在纯 Python 里由解释器逐条执行，编译后变成机器码循环（快百倍量级）；两次同类型调用不重编译，换类型（如传 float 数组）才生成新特化。vLLM 的 n-gram 匹配正是这个形态：每个请求一个 token ndarray 进 JIT 函数做 KMP 循环，多请求靠 nogil 多线程并行。",
+      "links": [
+        "https://numba.pydata.org/",
+        "https://numba.readthedocs.io/en/stable/user/jit.html",
+        "https://dl.acm.org/doi/10.1145/2833157.2833162"
+      ],
+      "sources": [
+        {"url": "https://numba.pydata.org/", "note": "首页一手：'translates a subset of Python and NumPy code into fast machine code'、LLVM 底座、'approach the speeds of C or FORTRAN'、© 2018 Anaconda、资助方列表，访问于 2026-09-18"},
+        {"url": "https://numba.readthedocs.io/en/stable/user/jit.html", "note": "@jit 文档一手：惰性编译/按类型特化、nopython vs object 两模式、0.59 起 @jit 默认 nopython、nogil=True 释放 GIL、parallel=True 须配 nopython、cache=True，访问于 2026-09-18"},
+        {"url": "https://dl.acm.org/doi/10.1145/2833157.2833162", "note": "Lam/Pitrou/Seibert 2015（Continuum Analytics，LLVM in HPC @SC15）——搜索级核实（ACM 403），标题/作者/出处多源交叉，2026-09-18"},
+        {"url": "vllm/v1/spec_decode/ngram_proposer.py L135-L293（pin 源码，仓内一手）", "note": "NgramProposer 用 numba 批量跑 KMP/LPS 匹配（含线程自适应），行号基线 v0.27.1"}
+      ],
+      "confidence": "high",
+      "writer_note": "NgramProposer（站 1、dossier m12）开讲前的背景段：@njit 是什么、为什么 CPU 逐请求循环必须 JIT（Python 解释器/GIL 撑不起每步批匹配）。『Triton 编译 GPU、numba 编译 CPU』的对照一句带过即可；nopython/object 两模式点到，深入交链接。线程自适应（num_tokens_threshold）是 pin 细节，留给正文/dossier。"
+    },
+    {
+      "id": "pytorch-issue-16706-float32-uniform",
+      "term": "float32 均匀随机的『精确 0.0』问题（pytorch#16706）——vLLM 为什么用 float64 采拒绝采样的 u",
+      "kind": "external_concept",
+      "one_line": "PyTorch 的 float32 torch.rand 有约 2^-24≈6e-8 的概率直接返回精确的 0.0——比连续均匀分布该有的概率高了二十几个数量级；而拒绝采样判据 p_t/p_d≥u 在 u=0 时恒真，坏草稿会被无条件放行，所以 vLLM 特意用 float64 采 u。",
+      "what_it_is": "根源（issue #16706，2019 年开、至今 open/triaged）：float32 的有效尾数只有 24 位，torch.rand 生成 [0,1) 均匀数时只灌这 24 位熵——分析者 @obilaniu 原话『at most 24 (float32) or 53 (float64) bits of entropy』。后果：P(采到精确 0.0)=2^-24≈5.96e-8，而连续均匀分布下落在 0 附近最窄可表示区间本该只有 2^-149 量级——生成器在 0 附近的粒度粗了一百亿倍不止（0 与 2^-24 之间一个值都采不出来）。为什么 vLLM 在意：接受判据 target_prob/draft_prob ≥ uniform_prob 里 u∈[0,1)，u 恰为 0.0 时判据恒真——本该以 1−min(1,p_t/p_d) 概率被拒的坏草稿被无条件接受，输出分布被破坏。服务常驻、每步每草稿位都掷一次 u，撞上是迟早的事。所以 generate_uniform_probs 用 torch.rand(dtype=float64)（P(u=0)≈2^-53≈1.1e-16，再压 8 个数量级），pin 源码注释原话引此 issue：『Using float64 mitigates the issue』。与 ch30 的 use_fp64_gumbel 是同一动机的两个落点。",
+      "background": "IEEE 754 float32 = 1 符号位+8 指数位+23 尾数位（含隐含首位共 24 位有效位）。浮点格式本身在 0 附近能表示极小的数（次正规数到约 1.4e-45），但『只随机化 24 位尾数』的均匀生成器只能产出 [0,1) 里 2^24 个等距格点 k/2^24——0 附近的分辨率远低于格式的表达能力。这是生成器粒度问题，不是浮点格式问题；float64 尾数 53 位，同样构造把 P(0.0) 压到 2^-53。顺带一提：该 issue 七年未修（状态 open/triaged），下游只能自己绕——vLLM 的 float64 就是绕法。",
+      "example": "数字账（可直接核）：float32 torch.rand 只会返回 {0/2^24, 1/2^24, …, (2^24−1)/2^24} 里的值 → P(u=0.0)=1/16777216≈5.96e-8；每 10 亿次抽取平均约 60 次得到精确 0.0（float64 下平均约 0.0000001 次）。判据 p_t/p_d≥u 在 u=0 时无条件成立：设 p_t(x)=0.01、p_d(x)=0.9（比值 0.011，本该 98.9% 拒掉），u=0.0 → 该草稿被接受，分布被污染。每次命中=一个本该被拒的坏草稿混进输出。",
+      "links": [
+        "https://github.com/pytorch/pytorch/issues/16706"
+      ],
+      "sources": [
+        {"url": "https://github.com/pytorch/pytorch/issues/16706", "note": "issue 一手：标题 'Very poor Uniform() sampling near floating 0.0'、@obilaniu 2019-02-03 开、状态 open/triaged、'at most 24 (float32) or 53 (float64) bits of entropy'、float32 精确 0.0 概率 2^-24（理论应 ~2^-149）、0 与 2^-24 之间无 float32 可采出，访问于 2026-09-18"},
+        {"url": "vllm/v1/sample/rejection_sampler.py L639-L660（pin 源码，仓内一手）", "note": "generate_uniform_probs 注释原话：float32 采到精确 0.0 非平凡概率、引 pytorch#16706、'Using float64 mitigates the issue'、torch.rand(dtype=float64)，行号基线 v0.27.1"}
+      ],
+      "confidence": "high",
+      "writer_note": "站 13/WC2 的 float64 uniform 段三句讲透：①float32 只有 24 位熵→u 有 6e-8 概率恰为 0；②u=0 判据恒真→坏草稿漏网（给 p_t=0.01/p_d=0.9 的例子）；③float64 压 8 个数量级。IEEE 754 位布局放脚注或链接，别展开成浮点教程；与 ch30 use_fp64_gumbel 一句回指（同一动机两处落点）。issue 七年未修可作『PyTorch 侧没修、vLLM 只能自己绕』的一句注脚。"
+    },
+    {
+      "id": "vllm-spec-decode-ecosystem-v0271",
+      "term": "vLLM speculator 双生态与 DSpark 的 v0.27.1 落地状态（V1 Proposer vs V2 Speculator；代码先行、文档未载）",
+      "kind": "external_concept",
+      "one_line": "vLLM v0.27.1 里投机解码有两套并存实现：V1 的 *Proposer（v1/spec_decode/ 树+rejection_sampler.py，文档主推）与 V2 的 *Speculator（v1/worker/gpu/spec_decode/ 树，自标实验性）；dspark 只活在 V2 一侧，且 v0.27.1 版官方文档页完全没写它——『代码先于文档』落地。",
+      "what_it_is": "双生态的形状（pin 源码一手）：① V1（文档路径）：drafter=vllm/v1/spec_decode/ 树里的 *Proposer（NgramProposer、SpecDecodeBaseProposer 谱系），由 gpu_model_runner 装配；验证=vllm/v1/sample/rejection_sampler.py（本章主角）。② V2（实验路径）：drafter=vllm/v1/worker/gpu/spec_decode/ 树里的 *Speculator，init_speculator 分发 dflash/dspark/gemma4/mtp/eagle 五类；配套 Model Runner V2，树内 README 自标『[Experimental] Model Runner V2』（结尾还写着 Ping Woosuk Kwon——未定稿信号）。③ dspark 的位置：注册在 SpeculativeMethod 方法表（vllm/config/speculative.py L53-L72），选它就强制 V2 model runner——vllm/config/vllm.py L583-L600 注释原话『V1 can't run dspark』；异步调度的兼容子集硬校验也含 dspark（同文件 L1074-L1090）。文档侧（2026-09-18 现核）：v0.27.1 版式文档页列的方法是 EAGLE / MTP / Draft model / PARD / MLP / N-gram（+ngram_gpu）/ Suffix decoding / Hidden State Extraction / Custom Proposer Backend（实验）/ Dynamic Speculative Decoding——没有 DSpark（eagle3 与 dflash 只作为合法 method 配置值出现），页内也不提 V2；latest 文档才在『Adaptive Verification』一行提到 DSpark（『currently DSpark only』），并多出 EAGLE-3 专页。结论：v0.27.1 里 DSpark=代码已落地、文档未跟上，只读文档的人看不见它。",
+      "background": "这个分叉是 vLLM model runner 重构期的形态：V1 是文档教的主线路径，V2 树是新 runner+新 speculator 的试验田（README 的 Experimental 自标是『未定稿』的官方信号）。对本书：ch33 从论文侧讲了 DSpark 架构（DFlash 骨架+Markov 头）；本章从生态侧讲它落在哪——DSparkSpeculator 挂在 V2 树、强制 V2 runner，V1 的 RejectionSampler 管线不服务它。写『现在 vLLM 支持哪些投机方法』类断言必须锚版本：v0.27.1 与 latest 的文档方法清单已经差出 EAGLE-3 页与 Adaptive Verification 行。",
+      "example": "配置面对照（v0.27.1）：文档页给的入门命令逐字是 vllm serve <target-model> --speculative-config '{\"method\": \"draft_model\", \"model\": \"<draft-model>\", \"num_speculative_tokens\": 5}'，同页列的方法清单即上面十种；而 method 换成 \"dspark\" 在 pin 源码里合法（方法表已注册）却会在文档页查不到任何说明——它触发 config/vllm.py 里强制 V2 的分支（『V1 can't run dspark』）。读者自查姿势：方法清单以所用版本的版式文档页为准；代码真相关注 vllm/config/speculative.py 的方法表与 vllm/v1/worker/gpu/spec_decode/__init__.py 的分发表。",
+      "links": [
+        "https://docs.vllm.ai/en/v0.27.1/features/speculative_decoding/",
+        "https://docs.vllm.ai/en/latest/features/speculative_decoding/",
+        "https://github.com/vllm-project/vllm"
+      ],
+      "sources": [
+        {"url": "https://docs.vllm.ai/en/v0.27.1/features/speculative_decoding/", "note": "v0.27.1 版式文档一手：方法清单（EAGLE/MTP/Draft/PARD/MLP/N-gram+ngram_gpu/Suffix/Hidden State Extraction/Custom Backend 实验/Dynamic）、draft_model 入门命令逐字、无 DSpark/无 V2 提及，访问于 2026-09-18"},
+        {"url": "https://docs.vllm.ai/en/latest/features/speculative_decoding/", "note": "latest 文档一手：'Adaptive Verification' 行 'currently DSpark only'、EAGLE-3 专页、Per-Request Acceptance Metrics——与 v0.27.1 版的差异即本文档落地结论的证据，访问于 2026-09-18"},
+        {"url": "vllm/config/speculative.py L53-L72 + vllm/config/vllm.py L583-L600 + vllm/v1/worker/gpu/spec_decode/__init__.py L8-L40 + vllm/v1/worker/gpu/README.md（pin 源码，仓内一手）", "note": "dspark 注册于方法表、选它强制 V2（注释 'V1 can't run dspark'）、init_speculator 五类分发、V2 README '[Experimental]'，行号基线 v0.27.1"}
+      ],
+      "confidence": "high",
+      "writer_note": "章备注『v0.27.1 DSpark 落地情况现核』的兑现卡，m14 双生态/互斥清单段用。三个口径：①双树并存、V2 自标实验；②dspark 代码已注册+强制 V2，但 v0.27.1 文档页没有它（latest 才在 Adaptive Verification 一行）——『代码先于文档』一句诚实交代，正好呼应本书『以 pin 源码为真相源』的方法论；③文档方法清单随版本动，两版链接给读者自查。DSparkSpeculator 内部归 ch33，本卡不展开。"
+    },
+    {
+      "id": "prompt-lookup-decoding",
+      "term": "Prompt Lookup Decoding（PLD，n-gram 零模型草稿的原始出处）",
+      "kind": "external_project",
+      "one_line": "投机解码的『零模型』版本：不用任何神经网络当草稿器，直接在已有文本里找最近出现过的相同片段，把它后面跟的内容当草稿——对摘要、代码编辑这类『输出大量复用输入』的任务特别管用。",
+      "what_it_is": "PLD 的核心洞察：很多真实任务（摘要、检索增强问答、多轮对话、代码编辑）里模型输出会大段照抄或改写输入——与其训练草稿模型，不如直接字符串匹配。README 原话：『We modify speculative decoding where we replace the draft model with simple string matching in the prompt to generate candidate token sequences』——在上下文里找与『当前结尾』相同的片段，把它上次出现时后面跟的若干 token 复制过来当草稿，照常验证；找不到匹配就交白卷（不投机）。官方报告『2x-4x speedups in input-grounded tasks, with no effect on output quality』；CNN/Dailymail 摘要与上下文 QA 上『a relatively consistent 2.4x speedup (on average)』（实验设置：Mistral-7B-Instruct-v0.1、A100 40GB、greedy、n-gram=3、续取 10 token）。任务敏感性：多轮对话第一轮增益小（只有自己的历史输出可匹配，还没攒下），代码/抽取类最高，角色扮演最差。",
+      "background": "作者 Apoorv Saxena（GitHub 用户名 apoorvumang），2023 年 11 月开源（README 引用格式注明 2023/November；v2 卡曾记作 Apoorv Umang，以本次重抓的 README bibtex 为准）。因为零训练零模型，很快被收编：HF Transformers 集成为 model.generate 的 prompt_lookup_num_tokens=10 参数，vLLM 也进主线。vLLM 落地形态在 v0.27.1 的名字是方法表里的 ngram（NgramProposer 实现）——注意想法出处是 PLD，但 KMP/LPS 高效匹配是 vLLM 自研工程（见下一卡）。",
+      "example": null,
+      "links": [
+        "https://github.com/apoorvumang/prompt-lookup-decoding"
+      ],
+      "sources": [
+        {"url": "https://github.com/apoorvumang/prompt-lookup-decoding", "note": "README 重抓一手：动机原话、2x-4x 与 2.4x 数字及实验设置（Mistral-7B/A100/ngram=3/续取 10）、作者 bibtex Apoorv Saxena 2023 November、transformers prompt_lookup_num_tokens 集成、多轮首轮增益小与任务敏感性，访问于 2026-09-18（v2 卡 2026-07-24 抓过，本次刷新）"},
+        {"url": "vllm/v1/spec_decode/ngram_proposer.py + vllm/config/speculative.py L53-L72（pin 源码，仓内一手）", "note": "v0.27.1 方法名 ngram 与 NgramProposer 实现；KMP/LPS 为 vLLM 自研（想法出处 PLD），行号基线 v0.27.1"}
+      ],
+      "confidence": "high",
+      "writer_note": "站 1/dossier m12 讲 NgramProposer 的出处卡：一句『这就是社区俗称的 prompt lookup decoding，Saxena 2023-11 提出，vLLM 的 ngram 方法=这个想法+自研 KMP/LPS 实现』。数字必带『输入复用型任务』限定语；多轮首轮增益小的坑可点一句（做多轮场景的读者会踩）。KMP 算法本身见下一卡。"
+    },
+    {
+      "id": "kmp-prefix-function",
+      "term": "KMP 前缀函数 / LPS 数组（最长公共前后缀）",
+      "kind": "external_concept",
+      "one_line": "字符串匹配的经典算法工具：为一个串的每个前缀预算一个数字——它的最长『既是前缀又是后缀』的真子串有多长；有了它就能在失配时不回头重新扫，O(n) 找到所有匹配。",
+      "what_it_is": "给定字符串 s（长度 n），前缀函数（prefix function，也叫失配函数/failure function/LPS 数组，vLLM 代码里变量名就叫 lps）是长度为 n 的数组 pi，其中 pi[i] = 子串 s[0..i] 的『最长真前缀，同时也是它的后缀』的长度。可逐位核对的小例子（字符串 abcabcd）：pi = [0, 0, 0, 1, 2, 3, 0]——位置 3 之前的子串 abca，真前缀里最长同时也是后缀的是 a（长度 1）；位置 5 的子串 abcabc，最长前后缀重合是 abc（长度 3）；位置 6 加了 d，重合归零。这个数组是 Knuth-Morris-Pratt（KMP）字符串匹配算法的核心预处理结果：失配时不用把指针退回开头重新比，而是按 pi 直接跳到『次优候选』继续，把匹配复杂度从 O(nm) 降到 O(n+m)。",
+      "background": "KMP 由 James H. Morris 构思、Donald Knuth 独立发现，Morris 与 Vaughan Pratt 1970 年发技术报告，三人 1977 年联合发正式论文，是教材里字符串匹配的标准算法。vLLM 的 NgramProposer 用的正是这个数组，但用法有个巧妙的转向：不是拿 lps 做『模式串在文本里找子串』，而是把整个历史 token 序列翻转后对自己跑 KMP 预处理——『当前序列结尾的后缀』变成翻转串的『前缀』，lps 记录的『最长前后缀重合』直接给出『历史上出现过的、与当前结尾重合的最长片段』；且 lps 只存前 max_ngram 个前缀（省内存，匹配长度封顶）。v3 本章正文按 pin 源码 vllm/v1/spec_decode/ngram_proposer.py L207-L293 走读这个翻转技巧与 lps 数组。",
+      "example": {
+        "input": "字符串 s = \"abcabcd\"（下标从 0 开始）",
+        "notation": "pi[i] = s[0..i] 的最长『真前缀 = 后缀』长度",
+        "result": "pi = [0, 0, 0, 1, 2, 3, 0]",
+        "walkthrough": "i=0..2（a,b,c）没有任何前后缀重合，pi=0；i=3 遇到第二个 a，s[0..3]=\"abca\" 的前缀 \"a\" 和后缀 \"a\" 重合，pi[3]=1；i=4 遇到 b，s[0..4]=\"abcab\" 的前缀 \"ab\" 和后缀 \"ab\" 重合，pi[4]=2；i=5 遇到 c，s[0..5]=\"abcabc\" 的前缀 \"abc\" 和后缀 \"abc\" 重合，pi[5]=3；i=6 遇到 d，无法延续任何重合，且退回更短候选也接不上，pi[6]=0。"
+      },
+      "links": [
+        "https://en.wikipedia.org/wiki/Knuth%E2%80%93Morris%E2%80%93Pratt_algorithm",
+        "https://cp-algorithms.com/string/prefix-function.html"
+      ],
+      "sources": [
+        {"url": "https://en.wikipedia.org/wiki/Knuth%E2%80%93Morris%E2%80%93Pratt_algorithm", "note": "算法史：Morris 构思、Knuth 独立发现，Morris/Pratt 1970 技术报告，三人 1977 正式发表；『失配函数』失配时跳转而非从头重比。v2 抓取于 2026-07-24（复用，算法史不过期）"},
+        {"url": "https://cp-algorithms.com/string/prefix-function.html", "note": "前缀函数定义（π[i]=最长真前缀且是后缀的长度，π[0]=0）与官方示例：abcabcd 的前缀函数为 [0,0,0,1,2,3,0]——本条 example 直接采用该已验证数值。v2 抓取于 2026-07-24（复用）"},
+        {"url": "vllm/v1/spec_decode/ngram_proposer.py L207-L293（pin 源码，仓内一手）", "note": "v0.27.1 的翻转+KMP/LPS 实现与 lps 只存前 max_ngram 个前缀的省内存设计，行号基线 v0.27.1"}
+      ],
+      "confidence": "high",
+      "writer_note": "正文（m12/站 1 的 ngram 段）会用 pin 源码自带走读讲『翻转+KMP』，本卡给『KMP 本身是什么、从哪来』的打底+abcabcd 可核小例。正文一句『字符串匹配教材标准算法（KMP，1970 年代）』带过即可，不在正文重复第二个例子；pi 数组逐位演算放脚注或留给本卡。"
+    }
+  ]
+}

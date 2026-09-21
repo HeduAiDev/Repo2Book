@@ -1,0 +1,460 @@
+{
+  "schema": "l2-spec/1",
+  "chapter": 34,
+  "part": "VII",
+  "title": "投机解码 vLLM 落地",
+  "hook": "ch33 证完了『无损』的数学，但 vLLM 的引擎骨架是为『每步每请求 1 token』建的——draft 怎么排进只认 token 差账的批？变长草稿怎么和满批草稿挤进同一份扁平 logits？逐位 p_t/p_d 比较怎么整个写成 Triton kernel、不把 13 万维词表拉回 CPU？拒绝之后上拍多记的 token 账怎么退？",
+  "l0_zoom": "采样列+spec",
+  "l0_region": {
+    "anchors": [
+      "sample_column",
+      "loop_box"
+    ]
+  },
+  "depends_on": [
+    33
+  ],
+  "reading": "读图：上排 = 草稿进（上拍采样 token 即 drafter 输入）/ token 出（parse_output 还原变长）；中排 ①-⑨ = 一个投机周期（站号见左下轨道；⑥ 只画 spec 布局，target 前向本体是 ch18/19 的老朋友）；下排 = drafter 谱系双生态、残差预采、语法联动与 why 注；回环 = 本步输出即下一轮草稿的输入。框内方法与 file:line 均为 v0.27.1 已核锚点。",
+  "frame": {
+    "title": "采样列+spec · worker 产/验 draft ‖ EngineCore 调度器排 draft——一个投机解码周期的跨进程闭环",
+    "file": "vllm/v1/sample/rejection_sampler.py · vllm/v1/spec_decode/ · scheduler.py spec 段"
+  },
+  "center": {
+    "name": "spec_cycle",
+    "title": "投机一步 ①-⑨：drafter 产 k 草稿 → 回程挂账 → 排批 → 摊平 → target 一次前向 → RejectionSampler 逐位判 → 还原回扣",
+    "where": "spec 闭环（各拍片带 file:line）：rejection_sampler.py:L394-L507"
+  },
+  "components": [
+    {
+      "name": "进 · 上拍采样 token",
+      "role": "gpu",
+      "zone": "north",
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "methods": [
+        "· 采样完成即 drafter 的输入：EAGLE 系吃 GPU 张量（免等 bookkeeping，L4626-L4697）、ngram 吃 CPU 列表（bookkeeping 后，L4733-L4751）",
+        "· _draft_token_ids / _draft_probs：worker 本地暂存（下一拍 scatter 或回程）"
+      ],
+      "stations": [
+        1
+      ]
+    },
+    {
+      "name": "出 · 变长 output_token_ids",
+      "role": "engine",
+      "zone": "north",
+      "file": "vllm/v1/worker/gpu_model_runner.py",
+      "methods": [
+        "· parse_output 还原 list[list[int]] → D2H（L3791 调用点）",
+        "· async 下 token 留 GPU 不落 CPU（ch12 已立）"
+      ]
+    },
+    {
+      "name": "① drafter.propose",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        1
+      ],
+      "methods": [
+        "propose_draft_token_ids 分发（L5010-L5290）",
+        "gpu_model_runner.py:L4611",
+        "draft 恒 greedy（正确性由拒绝采样兜底）",
+        "可选概率化 draft_probs（L443-L498）"
+      ]
+    },
+    {
+      "name": "② draft 回程",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        2,
+        3
+      ],
+      "methods": [
+        "_copy_draft_token_ids_to_cpu（L4895-L4941）",
+        "async 只在语法/惩罚/bad_words 需要时才拷",
+        "sync：take_draft_token_ids（L4889）",
+        "→ post_step（core.py:L616-L623）"
+      ]
+    },
+    {
+      "name": "③ update_draft_token_ids",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        4
+      ],
+      "methods": [
+        "spec_token_ids 挂 Request（scheduler.py:L2146）",
+        "语法请求 validate_tokens 过滤",
+        "prefill chunk / 已 finish 跳过"
+      ]
+    },
+    {
+      "name": "④ schedule 排批",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        5,
+        6
+      ],
+      "methods": [
+        "num_tokens_with_spec 计入 token 差账（L516-L520）",
+        "裁 scheduled_spec_decode_tokens（L640-L656）",
+        "pad 到 1+K·[-1] 占位保 cudagraph（L879-L898）",
+        "dynamic_sd_lookup 动态 K（L1192-L1197）"
+      ]
+    },
+    {
+      "name": "⑤ _calc_spec_decode_metadata",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        7
+      ],
+      "methods": [
+        "np.repeat+arange 三组 index（L2851-L2924）",
+        "cu_num_draft / cu_num_sampled 累积和",
+        "draft_token_ids 二次 gather（错位一格）"
+      ]
+    },
+    {
+      "name": "⑥ target 一次前向",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        8
+      ],
+      "methods": [
+        "每请求 k+1 位一次验证（L2246-L2262）",
+        "logits_indices 直取 spec 元数据（L2262）",
+        "→ [num_tokens+batch, vocab] 扁平 logits"
+      ]
+    },
+    {
+      "name": "⑦ RejectionSampler.forward",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        9,
+        10
+      ],
+      "methods": [
+        "bonus 外采：组合的普通 Sampler（L133-L147）",
+        "target 位 fp32+clone 保 raw（L152-L160）",
+        "逐草稿位约束/温度/截断（L289 · L510-L565）"
+      ]
+    },
+    {
+      "name": "⑧ rejection_sample 双 kernel",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        11,
+        12,
+        13
+      ],
+      "methods": [
+        "[B, max_spec_len+1] 预填 -1（L428-L433）",
+        "greedy：draft==argmax（L715-L769）",
+        "random：p_t/p_d>=uniform·float64（L829）",
+        "is_greedy mask 同批共存·各自早退"
+      ]
+    },
+    {
+      "name": "⑨ 还原+回扣",
+      "role": "beat",
+      "zone": "center",
+      "stations": [
+        15,
+        16
+      ],
+      "methods": [
+        "parse_output valid_mask 过滤（L252-L287）",
+        "num_rejected 回扣 token 差账（scheduler.py:L1766）",
+        "语法 FSM 预推进+rollback（so:L294-L350）"
+      ]
+    },
+    {
+      "name": "drafter 谱系 · V1 ↔ V2 双生态",
+      "role": "gpu",
+      "zone": "south",
+      "file": "vllm/v1/spec_decode/ · vllm/v1/worker/gpu/spec_decode/",
+      "methods": [
+        "· V1：*Proposer 谱系（gpu_model_runner.py:L583-L658 装配，本章主角）",
+        "· V2：*Speculator 树（init_speculator L8-L40 分发；内部归 ch33）",
+        "· dspark/混合 KV DFlash 强制 V2 runner（config/vllm.py:L589-L596）"
+      ],
+      "stations": [
+        1
+      ]
+    },
+    {
+      "name": "ngram · 零模型 drafter",
+      "role": "plain",
+      "zone": "south",
+      "file": "vllm/v1/spec_decode/ngram_proposer.py",
+      "methods": [
+        "· 翻转序列+KMP/LPS 找最长匹配 n-gram（L207-L293）",
+        "· numba 批量·线程按 token 量自适应",
+        "· 无 draft_probs → rejection 侧 NO_DRAFT_PROBS 退化"
+      ]
+    },
+    {
+      "name": "SpecDecodeMetadata · 摊平容器",
+      "role": "sample",
+      "zone": "south",
+      "file": "vllm/v1/spec_decode/metadata.py",
+      "methods": [
+        "· draft_token_ids [num_tokens] + cu_num_* 累积和",
+        "· target/bonus/logits 三组 index（kernel 反推区间）",
+        "· max_spec_len（输出 buffer +1 槽的来源）·make_dummy 供预热"
+      ],
+      "stations": [
+        7
+      ]
+    },
+    {
+      "name": "sample_recovered_tokens · 残差预采",
+      "role": "sample",
+      "zone": "south",
+      "file": "vllm/v1/sample/rejection_sampler.py",
+      "methods": [
+        "· 每请求一份 q~Exp(1)：[batch, V] 而非 [num_tokens, V]（L663-L710）",
+        "· score=prob·inv_q 免归一化 argmax（L931-L932）",
+        "· OOV mask −inf + clamp（L944-L952）"
+      ],
+      "stations": [
+        14
+      ]
+    },
+    {
+      "name": "spec×结构化输出",
+      "role": "plain",
+      "zone": "south",
+      "file": "vllm/v1/structured_output/__init__.py · utils.py",
+      "methods": [
+        "· 位掩码预算 max_batch*(1+max_spec)（L228-L234）",
+        "· 逐位预填 k+1 掩码+FSM 预推进（L294-L350）",
+        "· grammar.rollback(state_advancements) 撤销全部预推进、采样后按实际产出数重推",
+        "· worker 侧按批序+草稿偏移重排（utils.py:L113-L161）"
+      ],
+      "stations": [
+        4,
+        16
+      ]
+    },
+    {
+      "name": "why · 摊平不 padding",
+      "role": "plain",
+      "zone": "south",
+      "kind": "note",
+      "methods": [
+        "· 变长草稿 padding 成 [B, max] 白算·max 抖动引发重编译",
+        "· 累积和+三组 index 零浪费——代价是间接定位",
+        "· logits 行数 = num_tokens + batch（每请求 +1 即 bonus 位）"
+      ]
+    },
+    {
+      "name": "why · 拒绝即截断",
+      "role": "plain",
+      "zone": "south",
+      "kind": "note",
+      "methods": [
+        "· 首个拒绝位起全填 PLACEHOLDER=-1（kernel 内不再写）",
+        "· GPU 免变长写·CPU 端单一 valid_mask 一次过滤",
+        "· -1 同字三吃：pad 占位草稿 / 截断哨兵 / 数接受数"
+      ]
+    },
+    {
+      "name": "why · 诚实账",
+      "role": "plain",
+      "zone": "south",
+      "kind": "note",
+      "methods": [
+        "· 接受率低纯亏：draft 前向+变长 target 白算（dynamic K / 草稿清零止损 L4699-L4713）",
+        "· min_p/logit_bias 与 spec 互斥·只剩 MinTokens 特化版（logits_processor/__init__.py:L202-L210）",
+        "· async 只兼容 EAGLE/MTP/draft_model/ngram_gpu/dspark（config/vllm.py:L1074-L1090）",
+        "· drafter 只支持 PIECEWISE cudagraph（llm_base_proposer.py:L413-L414）"
+      ]
+    }
+  ],
+  "flows": [
+    {
+      "from": "进 · 上拍采样 token",
+      "to": "① drafter.propose",
+      "label": "sampled_token_ids（GPU 张量 / CPU 列表）"
+    },
+    {
+      "from": "① drafter.propose",
+      "to": "② draft 回程",
+      "label": "_draft_token_ids [B, K]"
+    },
+    {
+      "from": "② draft 回程",
+      "to": "③ update_draft_token_ids",
+      "label": "sync 回程；async 留 worker",
+      "dash": true
+    },
+    {
+      "from": "③ update_draft_token_ids",
+      "to": "④ schedule 排批",
+      "label": "spec_token_ids 挂账"
+    },
+    {
+      "from": "④ schedule 排批",
+      "to": "⑤ _calc_spec_decode_metadata",
+      "label": "scheduled_spec_decode_tokens + 动态 K"
+    },
+    {
+      "from": "⑤ _calc_spec_decode_metadata",
+      "to": "⑥ target 一次前向",
+      "label": "草稿已填进输入流（每请求 k+1 位）"
+    },
+    {
+      "from": "⑥ target 一次前向",
+      "to": "⑦ RejectionSampler.forward",
+      "label": "扁平 logits [num_tokens+B, vocab]"
+    },
+    {
+      "from": "⑦ RejectionSampler.forward",
+      "to": "⑧ rejection_sample 双 kernel",
+      "label": "target_logits + bonus + draft_probs"
+    },
+    {
+      "from": "⑧ rejection_sample 双 kernel",
+      "to": "⑨ 还原+回扣",
+      "label": "[B, max_spec_len+1]（-1 截断）"
+    },
+    {
+      "from": "⑨ 还原+回扣",
+      "to": "出 · 变长 output_token_ids",
+      "label": "变长 list → D2H",
+      "up": true,
+      "color_role": "engine"
+    },
+    {
+      "from": "⑤ _calc_spec_decode_metadata",
+      "to": "SpecDecodeMetadata · 摊平容器",
+      "label": "三组 index 的载体",
+      "dash": true
+    },
+    {
+      "from": "⑧ rejection_sample 双 kernel",
+      "to": "sample_recovered_tokens · 残差预采",
+      "label": "拒绝位的残差采样（random kernel 前预采好）",
+      "dash": true
+    },
+    {
+      "from": "③ update_draft_token_ids",
+      "to": "spec×结构化输出",
+      "label": "validate_tokens 过滤非法草稿",
+      "dash": true
+    },
+    {
+      "from": "① drafter.propose",
+      "to": "drafter 谱系 · V1 ↔ V2 双生态",
+      "label": "分发到具体 drafter（谱系内部归 ch33）",
+      "dash": true,
+      "slot": true
+    },
+    {
+      "from": "⑥ target 一次前向",
+      "to": "why · 摊平不 padding",
+      "label": "扁平 logits 的行布局",
+      "dash": true
+    },
+    {
+      "from": "⑧ rejection_sample 双 kernel",
+      "to": "why · 拒绝即截断",
+      "label": "-1 哨兵的语义",
+      "dash": true
+    }
+  ],
+  "loop": {
+    "label": "下一个投机周期 · 本步输出即下一轮 drafter 的输入（async 下草稿根本没离开 worker；接受率低时 dynamic K 缩短、input_fits_in_drafter=false 时草稿清零止损）"
+  },
+  "rail_header": "站号 = 一个投机周期的流经顺序（1-6 挂账排批 · 7-14 摊平+验证 · 15-16 回扣）",
+  "stations": [
+    {
+      "n": 1,
+      "where": "gpu_model_runner.py:L4611-L4625 → L5010-L5290",
+      "what": "【draft 生成】sample_tokens 尾部跑 drafter：EAGLE/DFlash/draft_model/ExtractHiddenStates/Gemma4 吃 GPU 采样 token 免等 bookkeeping（L4626-L4697），ngram 等 CPU-token drafter 推迟到 bookkeeping 后（L4733-L4751）；装不下 drafter 时把草稿清零防 stale（L4703-L4716）；V1 drafter 谱系在 __init__ L583-L658 装配、draft 默认 greedy（正确性由拒绝采样兜底），可选概率化 draft_probs 缓存（take_last_draft_probs L5281-L5284）"
+    },
+    {
+      "n": 2,
+      "where": "gpu_model_runner.py:L4889-L4941",
+      "what": "【draft 回程】_copy_draft_token_ids_to_cpu 在专用 copy stream 上异步 D2H + event 记录；异步调度下只在结构化输出/惩罚/bad_words 需要时才拷——草稿默认留在 worker 进程，下一拍 _prepare_input_ids 直接 GPU scatter 进 input_ids（L1893-L1913）；同步模式经 take_draft_token_ids 打包成 DraftTokenIds 交回"
+    },
+    {
+      "n": 3,
+      "where": "core.py:L616-L623",
+      "what": "【post_step 收草稿】同步调度：EngineCore.post_step 调 executor.take_draft_token_ids → scheduler.update_draft_token_ids；异步调度注释原话『we update draft token ids in the worker process』——省掉跨进程往返；async+结构化输出的 deferred 路径走 update_draft_token_ids_in_output（core.py:L722-L733：先验草稿再算 bitmask）"
+    },
+    {
+      "n": 4,
+      "where": "scheduler.py:L2146-L2167",
+      "what": "【挂账】update_draft_token_ids：跳过已 finish 与 prefill chunk 请求；结构化输出请求先 grammar.validate_tokens 过滤非法草稿（少了就少排，不硬凑）；spec_token_ids 挂上 Request"
+    },
+    {
+      "n": 5,
+      "where": "scheduler.py:L516-L520 → L640-L656",
+      "what": "【排批】下一拍 schedule()：num_new_tokens = num_tokens_with_spec + num_output_placeholders − num_computed_tokens——draft 直接计入『只认 token 数』的差账（WC4）；RUNNING 段把 spec_token_ids 裁成 scheduled_spec_decode_tokens 并清空本拍副本"
+    },
+    {
+      "n": 6,
+      "where": "scheduler.py:L879-L898 · L1076-L1078 · L1192-L1197",
+      "what": "【形状三件事】新 decode 请求 pad 到 1+num_spec_tokens（[-1] 占位草稿）保统一 decode 形状/cudagraph——预算不够『Prefer to not schedule than schedule un-padded』整拍不收；dynamic_sd_lookup 按批大小查表动态定 K（num_spec_tokens_to_schedule 随 SchedulerOutput 下发，drafter 下一轮按它出草稿）"
+    },
+    {
+      "n": 7,
+      "where": "gpu_model_runner.py:L2851-L2924 · gpu_input_batch.py:L503-L532",
+      "what": "【摊平】InputBatch.update_req_spec_token_ids 把草稿写进 token_ids_cpu 行尾；_calc_spec_decode_metadata 用 np.repeat+arange 算 cu_num_draft/cu_num_sampled 两组累积和 + logits/target_logits/bonus 三组 index，draft_token_ids 由 input_ids 经 logits_indices 再经 target_logits_indices+1 二次 gather（草稿填在输入流里、错位一格取出）——注释里的 5 请求具体数字就是现成 worked example"
+    },
+    {
+      "n": 8,
+      "where": "gpu_model_runner.py:L2246-L2262 → L4484-L4485",
+      "what": "【target 一次前向】草稿已填进输入流（每请求 k+1 个位置），target 一次 forward 同时验证全部位；采样位 logits_indices = spec_decode_metadata.logits_indices（L2262）→ hidden_states[logits_indices] → compute_logits，产 [num_tokens+batch, vocab] 扁平 logits（前向本体=ch18/19 已立机制，本章只看 spec 布局）"
+    },
+    {
+      "n": 9,
+      "where": "rejection_sampler.py:L92-L201",
+      "what": "【切片】RejectionSampler.forward：bonus_logits = logits[bonus_logits_indices] 交给组合持有的普通 Sampler 采（replace(max_num_logprobs=-1)，可带 top_p/top_k——spec 主路径不支持的策略 bonus 位能用）；target_logits = logits[target_logits_indices] 转 fp32，非 processed 模式先 clone 保 raw（in-place 暗线的 spec 侧实证 L156-L160）"
+    },
+    {
+      "n": 10,
+      "where": "rejection_sampler.py:L289-L346 · L510-L565 · logits_processor/builtin.py:L235-L289",
+      "what": "【约束 spec 特化】apply_logits_processors：penalties 的 [B] 参数经 repeat_interleave 按草稿位数展开、bad_words 吃『草稿当已输出』的前缀历史（_combine_outputs_with_spec_tokens L376-L391 造逐位前缀行——与 Sampler 同名方法语义不同，读代码陷阱）、MinTokens.apply_with_spec_decode 逐位算还要封 stop/EOS 几位；apply_sampling_constraints 把温度/top-k/top-p 扩到逐草稿位（expand_batch_to_tokens，greedy 的温度 0 替 1 防除零）"
+    },
+    {
+      "n": 11,
+      "where": "rejection_sampler.py:L394-L507",
+      "what": "【调度】rejection_sample：输出 buffer [batch, max_spec_len+1] 预填 PLACEHOLDER=-1（+1 即 bonus 槽）；all_greedy 只跑 greedy kernel 即返回；否则 softmax 出 target_probs、先采好全部草稿位的 recovered、再 launch random kernel——greedy/随机经 is_greedy mask 同批共存、两 kernel 各自早退"
+    },
+    {
+      "n": 12,
+      "where": "rejection_sampler.py:L715-L769",
+      "what": "【greedy 判】greedy kernel：cu_num_draft_tokens 反推本请求草稿区间，draft==target_argmax 接受、首个不等处写 argmax（=greedy 语义的 recovered）并停；padded draft(-1) 直接拒；全接受补 bonus。理解『早停+bonus』最干净的版本"
+    },
+    {
+      "n": 13,
+      "where": "rejection_sampler.py:L772-L845",
+      "what": "【random 判·算法心脏】接受判据 L829：draft_prob>0 且 target_prob/draft_prob >= uniform_prob（u∈[0,1) 隐式 min(1,·)）；NO_DRAFT_PROBS（ngram）draft_prob=1 退化为以 p_t(x) 接受；拒绝位取 recovered_token、早停；全接受补 bonus；uniform 用 float64（generate_uniform_probs L639-L648 注释原话引 pytorch#16706）"
+    },
+    {
+      "n": 14,
+      "where": "rejection_sampler.py:L872-L953",
+      "what": "【recovered 残差】sample_recovered_tokens 每请求只采一份 q~Exp(1)（v0.27 布局：[batch, V] 而非 [num_tokens, V]——只有首个拒绝位的 recovered 被消费，边缘分布正确即可，噪声张量省 num_tokens/B 倍）；kernel 对 vocab 分块算 prob=max(p_t−p_d,0)（ngram: 屏蔽 draft token 的 p_t）、score=prob·inv_q 免归一化 argmax（L931-L932 注释）；OOV 位 mask −inf + clamp 防越界"
+    },
+    {
+      "n": 15,
+      "where": "rejection_sampler.py:L252-L287 → gpu_model_runner.py:L3791",
+      "what": "【还原】parse_output：valid_mask（≠PLACEHOLDER 且 <vocab_size）把 [B, max_spec+1] 还原成每请求变长 list——『摊平→还原』闭环、index 间接的对偶；_bookkeeping_sync D2H 出 ModelRunnerOutput（async 下 token 留 GPU，ch12）"
+    },
+    {
+      "n": 16,
+      "where": "scheduler.py:L1765-L1790 · structured_output/__init__.py:L294-L350",
+      "what": "【记账回扣+语法 rollback】update_from_output：num_accepted=len(generated)−num_sampled_tokens_per_step、num_rejected 回扣 num_computed_tokens（异步再回扣 num_output_placeholders，stale 输出不回扣）——上拍多记的 token 账退回来；结构化输出对 spec 窗口逐位预填 k+1 个掩码、FSM 预推进 state_advancements 步、掩码填完即 grammar.rollback(state_advancements) 撤销全部预推进、采样后按实际产出数重推（净推进=产出数）；抢占时 _preempt_request 清空 spec_token_ids（L1295-L1296）。环回第 1 站：本步输出即下一轮 drafter 的输入"
+    }
+  ]
+}
