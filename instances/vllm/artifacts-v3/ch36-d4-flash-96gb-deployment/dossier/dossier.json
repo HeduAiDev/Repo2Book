@@ -1,0 +1,619 @@
+{
+  "chapter_id": "ch36",
+  "part": "VIII",
+  "title": "部署实战：D4-Flash 进 96GB",
+  "pin": "vLLM v0.27.1（6e448d0ea），行号基线 = instances/vllm/source 工作树（detached at tag v0.27.1）；全部锚点对本 pin 现核（2026-09-22）",
+  "chapter_kind": "code",
+  "note_on_kind": "标准代码章（非 primer、无 primer 论文包）：实战章——把 ch14 已立的通用显存账本管线套到一台真实机器（DeepSeek-V4-Flash）与一个真实预算（96GB 档位卡）上。本章无精简版（subtraction_plan 留空）：部署章的『跑起来看数值』由 Explain 站用容器内真实启动日志（或源码公式复算）完成，不裁剪可运行子集。",
+  "hook_suggestion": "「一张 96GB 的卡要住进 DeepSeek-V4-Flash——权重这本账出生就定了半本：checkpoint 自带 FP8 块量化线性层 + 256 个 MXFP4 专家，换哪张卡都改不了一个字节；剩下半本全看旋钮怎么拨：为什么同一句 --kv-cache-dtype fp8 在 SM120 卡上从建议变成命令、indexer 缓存还藏着自己的 fp4 开关？五本页大小各不相同的 KV 账（窗口 584B、压缩 MLA 584B/4token、indexer 68B、两种 fp32 压缩器状态）怎么挤进同一个物理池？启动日志最后那行 Maximum concurrency: N.NNx，到底是怎么一步步算出来的？」（从 Part VIII hook『真实服务不止一个引擎』+ 章主题『显存账综合应用』+ memory-kv 域 why 链提炼；writer 可润色，不许降格成陈述句）",
+  "scope_note": "主线四段：(A) 档位出生（站 1-7）——checkpoint 的量化档（fp8 线性 + expert_dtype fp4/fp8）、MXFP4 字节形状、层普查（compress_ratios 43 层=2 窗口+21 C4A+20 C128+MTP）、硬件×backend×KV 档三元耦合（SM90/100 FlashMLA ↔ SM120 FlashInfer 且 KV 只放行 fp8 系）；(B) 五本 KV 账的自报（站 8-11）——SWA block64/压缩 MLA 584B 对齐 576/indexer 68B|132B/C4C128 状态 fp32/MTP eagle 组；(C) 分组与定账（站 12-15）——profile 测量三件套、DSV4 专属 (block,window) 分组+layer 元组、packed 布局 block_stride 一次除法定块数、护栏与容量/并发日志；(D) 官方配方逐旋钮（站 16 + 贯穿）——CI yaml 每个 flag 对回本章机制。边界（不讲，只回指）：通用账本管线（profile→spec→groups→configs→准入门，ch14 已立，本章只讲 DSV4 特有件与实战算术）；DSV4 模型装配与权重流入（ch29 站 1-9，含 quant_config 分发机制——本章只取操作员视角的档位合成）；indexer/compressor 的前向数学（ch26/ch28）；MLA 三代演化与两种展开（ch25/ch28）；量化格式数学 FP8/FP4/MXFP4（ch27）；MTP verify 链（ch34）；TP/EP 切法与通信税（ch35）；serving 面 parser（ch39）。模型形状数据源：deepseek-ai/DeepSeek-V4-Flash 的 config.json（HF 官方，2026-09-22 取回；数值属模型发布事实、非源码断言，正文引用时标注出处）。",
+  "code_spine": [
+    "vllm/model_executor/models/config.py:L317-L339 — DeepseekV4ForCausalLMConfig：config 装配期把 quant_method \"fp8\" 改写 \"deepseek_v4_fp8\"（量化档位分发入口，ch29 站 8 的上游半步）",
+    "vllm/models/deepseek_v4/quant_config.py:L29-L47,L57-L84,L181-L199 — DeepseekV4FP8Config：expert_dtype 惰性分档（fp4=MXFP4 专家 / fp8=块专家）；get_quant_method 按档路由 Mxfp4MoEMethod/ModelOptNvFp4FusedMoE/Fp8MoEMethod",
+    "vllm/models/deepseek_v4/nvidia/model.py:L202-L246 — DeepseekV4MegaMoEExperts 权重形状：uint8 packed（hidden//2）+ ue8m0 scale（hidden//32）——MXFP4 字节账的本证；L314-L317 SM100 门（mega_moe 硬约束）",
+    "vllm/models/deepseek_v4/attention.py:L206-L213 — 层普查：compress_ratios 逐层取 max(1,r)，MTP 层固定 1；L277-L297 仅 C4A（ratio==4）装配 indexer",
+    "vllm/models/deepseek_v4/nvidia/model.py:L771-L802 — _select_dsv4_attn_cls：backend 旋钮 + device capability → SM9/10 FlashMLA（sparse_mla.py:L92-L93）/ SM12 FlashInfer SM120",
+    "vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py:L113-L150 — supports_compute_capability（major∈[10,12]）+ supports_combination：SM10x 拒 fp8_ds_mla 走普通 fp8 行 / SM12x 只放行 fp8 系 KV",
+    "vllm/models/deepseek_v4/attention.py:L90-L120 — _resolve_dsv4_kv_cache_dtype：fp8 → 写回 fp8_ds_mla（576B 槽）/ FlashInfer SM100 普通行 bf16|fp8",
+    "vllm/v1/attention/backends/mla/sparse_swa.py:L77-L102 — DeepseekV4SWACache：block 64 被张量共享锁死、window 128、SlidingWindowMLASpec 对齐 576/512",
+    "vllm/models/deepseek_v4/attention.py:L745-L749,L781-L798 — indexer 档：use_fp4_indexer_cache → 68B vs 132B/压缩槽；L698-L710 indexer cache 的 MLAAttentionSpec（对齐 576 FlashMLA/512 FlashInfer #44577）",
+    "vllm/models/deepseek_v4/compressor.py:L155-L208 — CompressorStateCache：C4 block4/window8、C128 block8/window128、fp32 恒定",
+    "vllm/models/deepseek_v4/attention.py:L655-L674 — 压缩主账自报：MLAAttentionSpec(compress_ratio, alignment 576|512, dtype uint8|自然)",
+    "vllm/v1/kv_cache_interface.py:L353-L359,L389-L426 — _apply_alignment_padding（576 补齐）+ MLAAttentionSpec（storage_block_size=block//ratio、584B/656B 布局）",
+    "vllm/v1/worker/gpu_worker.py:L459-L548 — determine_available_memory：profile_run + cudagraph 估计 → available = requested − non_kv − cudagraph",
+    "vllm/v1/core/kv_cache_utils.py:L1592-L1632,L1670-L1754 — group_and_unify（仅 DSV4）：(block,window) 三组 + full_mla；layer 元组与 _approximate_gcd 垫整；L1757-L1778 MTP 组标 eagle",
+    "vllm/v1/core/kv_cache_utils.py:L1308-L1358 — packed 布局（DSV4 默认）：block_stride=Σ页、num_blocks=available//stride、全张量别名同一分配；落地 gpu_model_runner.py:L7312-L7353 单背衬 torch.zeros",
+    "vllm/v1/core/kv_cache_utils.py:L2094-L2242 — get_kv_cache_configs：override 折算、auto-fit、护栏（L751-L788 check_enough / L800-L851 二分估计）、min num_blocks 同步、容量/并发日志（L2225-L2240）",
+    "vllm/config/speculative.py:L344-L349 — mtp 档：deepseek_v4 → DeepSeekV4MTPModel 同 checkpoint 草稿（目标 load_weights skip \"mtp.\"，nvidia/model.py:L1541）",
+    "tests/evals/gsm8k/configs/moe-refactor/DeepSeek-V4-Flash-deepgemm-mega-moe.yaml:L1-L5 — 官方配方全文（逐旋钮的真相源之一；另见 tests/evals/gsm8k/test_gsm8k_offloading.py:L157-L173 TP4 版与 .buildkite/test_areas/disaggregated.yaml:L222-L243 P/D 版）"
+  ],
+  "stations": [
+    {
+      "n": 1,
+      "where": "vllm/model_executor/models/config.py:L317-L326",
+      "what": "checkpoint 进门第一刀：hf_config.quantization_config.quant_method \"fp8\" → \"deepseek_v4_fp8\"——量化注册表因此选中 expert_dtype 感知的 DeepseekV4FP8Config 而非通用 Fp8Config。操作员不拨任何旋钮，这一刀已经落了。"
+    },
+    {
+      "n": 2,
+      "where": "vllm/models/deepseek_v4/quant_config.py:L58-L84",
+      "what": "专家档位读表：expert_dtype 惰性解析（急读只见默认 fp4 会静默错路由 Flash-Base）——\"fp4\"（Flash）→ Mxfp4MoEMethod 或 NVFP4 变体，\"fp8\"（Flash-Base）→ Fp8MoEMethod 块专家（L181-L199）。线性/注意力层恒 FP8 块量化，无档可选。"
+    },
+    {
+      "n": 3,
+      "where": "vllm/models/deepseek_v4/nvidia/model.py:L202-L246",
+      "what": "权重账的本证形状：w13=[E,2I,H//2] uint8 + scale=[E,2I,H//32] uint8（ue8m0）——每参数 0.5B + 1/32B。Flash 专家参数 = 256×3×(4096×2048)×43 层 ≈ 6.44B/层，MXFP4 下每层 ≈ 3.42GiB（算术例，Explainer 站以容器实测/复算核对）。"
+    },
+    {
+      "n": 4,
+      "where": "vllm/models/deepseek_v4/attention.py:L206-L213",
+      "what": "层普查：compress_ratios 逐层 max(1,r)；MTP（layer_id≥43）不查表固定 1。Flash 的 44 项列表：2×0 + 21×4 + 20×128 + 1×0（MTP 占位）→ 43 层 = 2 纯窗口 + 21 C4A（带 indexer）+ 20 C128A。这一列数字决定五本账各自的层数。"
+    },
+    {
+      "n": 5,
+      "where": "vllm/models/deepseek_v4/nvidia/model.py:L771-L802",
+      "what": "硬件选 backend：显式 backend 旋钮优先；否则 SM12（96GB 档位 RTX PRO 6000 Blackwell）→ FlashInfer SM120，其余 CUDA → FlashMLA（sparse_mla.py:L92-L93 supports major∈[9,10]，H100/H20-96G 也在列）。决策树的硬件轴在这里分岔。"
+    },
+    {
+      "n": 6,
+      "where": "vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py:L130-L150",
+      "what": "SM12 的 KV 档强制：supports_combination 只放行 fp8/fp8_e4m3/fp8_ds_mla（bf16/auto 直接不支持）——96GB SM120 卡上『KV 用不用 fp8』不是操作员的自由；SM10x 反而拒 fp8_ds_mla、走普通逐张量 fp8 行。"
+    },
+    {
+      "n": 7,
+      "where": "vllm/models/deepseek_v4/attention.py:L90-L120",
+      "what": "KV 档解析：--kv-cache-dtype fp8 在 fp8_ds_mla 布局（FlashMLA/SM120 FlashInfer）被写回成 \"fp8_ds_mla\"（UE8M0 块缩放 uint8，页规格取 576B/token 槽）；FlashInfer SM100 路不写回、按普通行存。操作员只拨一个词，字节格式由 backend 布局决定。"
+    },
+    {
+      "n": 8,
+      "where": "vllm/v1/attention/backends/mla/sparse_swa.py:L77-L102",
+      "what": "窗口账（每层都有）：SlidingWindowMLASpec block 64 / window 128——block 64 被注释写死：SWA 与 C4A KV 块共享物理张量，C4A 压缩块 [256//4, head]=[64,head] 定了页形状，SWA 只能 64 token/块；对齐 576（fp8_ds_mla）/512。"
+    },
+    {
+      "n": 9,
+      "where": "vllm/models/deepseek_v4/attention.py:L781-L798",
+      "what": "indexer 档：use_fp4_indexer_cache（配方旋钮 --attention_config.use_fp4_indexer_cache）→ MXFP4 68B/压缩槽（64 packed+4 ue8m0）vs 默认 FP8 132B/压缩槽（128+4×fp32，与 V3.2 同布局）——只作用于 21 个 C4A 层，档差近一倍。"
+    },
+    {
+      "n": 10,
+      "where": "vllm/models/deepseek_v4/compressor.py:L174-L203",
+      "what": "状态账：C4 每 4 token 一份状态（block 4/window 8）、C128 每 8 token 一份（block 8/window 128）——块大小同样被『与 KV 块共享物理张量』锁死；dtype 恒 fp32（五本账里唯一不量化的账，量化它伤收敛）。"
+    },
+    {
+      "n": 11,
+      "where": "vllm/models/deepseek_v4/attention.py:L655-L674",
+      "what": "压缩主账自报：MLAAttentionSpec(num_kv_heads=1, head_size=512, compress_ratio=4|128, alignment 576|512)；纯窗口层（ratio≤1）返回 None。字节算术在 kv_cache_interface.py:L403-L426：storage=block//ratio，584B/存储 token（448 NoPE+128 RoPE+8 fp8 scale）。"
+    },
+    {
+      "n": 12,
+      "where": "vllm/v1/worker/gpu_worker.py:L498-L548",
+      "what": "测量三件套：memory_profiling 里的 profile_run（DSV4 的 eager scratch 池/indexer/compressor workspace 在 dummy 前向全占上）+ profile_cudagraph_memory 估图池（VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS 默认开）→ available = 总显存×gpu_memory_utilization − non_kv − cudagraph 估计。"
+    },
+    {
+      "n": 13,
+      "where": "vllm/v1/core/kv_cache_utils.py:L1592-L1632",
+      "what": "DSV4 专属分组（docstring：『目前只有 DeepseekV4 用』）：SlidingWindowMLASpec 按 (block,window) 分三组——(64,128) 窗口、(4,8) C4 状态、(8,128) C128 状态；全部 MLAAttentionSpec（压缩主账+indexer 账）合一 full_mla 组；L1670-L1754 layer 元组 [C4I,C4A,C128]×20 垫整；L1757-L1778 含 MTP 层的组标 eagle。"
+    },
+    {
+      "n": 14,
+      "where": "vllm/v1/core/kv_cache_utils.py:L1308-L1358",
+      "what": "packed 定账（DSV4 默认）：block_stride = Σ(逐层页大小)——一个块=全模型每层一页的『整栈』；num_blocks = available // block_stride 一次除法；落地时五组所有张量别名同一背衬 torch.zeros（gpu_model_runner.py:L7312-L7353）。"
+    },
+    {
+      "n": 15,
+      "where": "vllm/v1/core/kv_cache_utils.py:L2186-L2240",
+      "what": "护栏与收尾：check_enough（至少装下一条 max_model_len 的 KV，不够则 ValueError 附二分估计的可行长度 L751-L788/L800-L851）、auto-fit（max_model_len=-1 时 L2181-L2184）、各 rank num_blocks 取最小同步；最后日志两行——\"GPU KV cache size: N tokens\" 与 \"Maximum concurrency: N.NNx\"（get_kv_cache_capacity L1877-L1887）。"
+    },
+    {
+      "n": 16,
+      "where": "vllm/config/speculative.py:L344-L349",
+      "what": "配方里的 MTP：method=mtp + deepseek_v4 → hf_config 改写 deepseek_mtp/DeepSeekV4MTPModel，草稿层（mtp. 前缀）就在同一份 checkpoint（目标 load_weights skip_substrs=[\"mtp.\"]，nvidia/model.py:L1541-L1545）；配方 num_speculative_tokens=2。verify 链归 ch34。"
+    }
+  ],
+  "stations_note": "站号 = DSV4-Flash 启动账本的代码顺序（部署章没有『请求流』——请求要在账本立起来之后才有得跑）：1-3 权重档 → 4 层普查 → 5-7 硬件×backend×KV 档 → 8-11 五本 KV 账自报 → 12 测量 → 13-15 分组定账收尾 → 16 MTP 草稿。与 ch14 的衔接：其站 1-8（通用账本管线 profile→spec→groups→configs→两侧落账）已立，本章站 12-15 只展开 DSV4 特有件（专属分组函数、packed 布局、容量/并发日志的实战读法）；与 ch29 的衔接：其站 8（quant_config 分发机制）与站 5（backend 选择）已立机制，本章站 1-7 只取操作员视角的『档位合成』；与 ch26：indexer 前向归它、本章站 9 只讲 cache 字节账；与 ch34：MTP verify 归它、本章站 16 只讲草稿的出生与权重来源；与 ch35：TP/EP 切法归它、本章只在配方与算术里消费。",
+  "key_classes": [
+    {
+      "name": "DeepseekV4FP8Config",
+      "file": "vllm/models/deepseek_v4/quant_config.py",
+      "responsibility": "DSV4 专属量化 config（Fp8Config 子类）：线性/注意力恒 FP8 块量化；MoE 专家按 hf_config.expert_dtype 分档（fp4→Mxfp4MoEMethod/NVFP4 变体，fp8→Fp8MoEMethod）；is_scale_e8m0 随档；惰性解析避免装配期误读。量化档位决策树在权重侧的执行者。"
+    },
+    {
+      "name": "DeepseekV4MegaMoEExperts",
+      "file": "vllm/models/deepseek_v4/nvidia/model.py",
+      "responsibility": "MXFP4 专家的物理容器（SM100 DeepGEMM MegaMoE 后端）：w13/w2 以 uint8 packed + ue8m0 scale 的形状直接落卡（权重账的本证）；finalize_weights 把 scale 转 DeepGEMM 布局并丢弃原始参数。SM100 门外直接 NotImplementedError（L314-L317）。"
+    },
+    {
+      "name": "DeepseekV4Attention（ABC）",
+      "file": "vllm/models/deepseek_v4/attention.py",
+      "responsibility": "平台无关的 DSV4 注意力层基类：持 compress_ratio（层普查）、kv 档解析、SWA cache、indexer（仅 C4A）、compressor（ratio>1）；get_kv_cache_spec 自报压缩主账（ratio≤1 返回 None）。平台子类 FlashMLA/FlashInfer(SM100/SM120)/ROCm 决定布局与 kernel。"
+    },
+    {
+      "name": "DeepseekV4SWACache / DeepseekV4IndexerCache / CompressorStateCache",
+      "file": "vllm/v1/attention/backends/mla/sparse_swa.py · vllm/models/deepseek_v4/attention.py · vllm/models/deepseek_v4/compressor.py",
+      "responsibility": "五本账里的三本『旁账』载体：SWACache（每层，block 64/window 128）、IndexerCache（仅 C4A，68B|132B 档）、CompressorStateCache（C4/C128 状态，fp32）——都注册进 static_forward_context、都各自 get_kv_cache_spec 自报页大小与对齐。"
+    },
+    {
+      "name": "MLAAttentionSpec / SlidingWindowMLASpec",
+      "file": "vllm/v1/kv_cache_interface.py",
+      "responsibility": "DSV4 两种 spec 类型：MLAAttentionSpec（FullAttentionSpec 子类）带 compress_ratio/alignment/cache_dtype_str——storage_block_size=block//ratio、584B（v4）/656B（v3.2）布局；SlidingWindowMLASpec 是窗口/状态账的类型。_apply_alignment_padding 把页补到 576/512 的倍数。"
+    },
+    {
+      "name": "UniformTypeKVCacheSpecs",
+      "file": "vllm/v1/kv_cache_interface.py:L837-L898",
+      "responsibility": "『同型异页』的组内包装：允许一 group 里各层页大小不同（page_size_bytes=Σ）；get_page_sizes/get_num_layer_tuples/max_memory_usage_pages 三个工具函数注释自认『目前只有 DeepseekV4 用』——layer 元组与 packed 布局的数学基础。"
+    },
+    {
+      "name": "group_and_unify_kv_cache_specs / _get_kv_cache_groups_uniform_groups",
+      "file": "vllm/v1/core/kv_cache_utils.py",
+      "responsibility": "DSV4 专属分组：(block,window) 分三 SWA 型组 + full_mla 一组；_approximate_gcd 选元组数最小垫整；_annotate_eagle_groups_deepseek_v4 给含 MTP 的组标 eagle。五组账本的成组现场。"
+    },
+    {
+      "name": "Worker.determine_available_memory",
+      "file": "vllm/v1/worker/gpu_worker.py:L459-L548",
+      "responsibility": "账本的测量半边：profile_run 峰值 + cudagraph 估计 → available bytes（requested−non_kv−cudagraph）。kv_cache_memory_bytes 手动档可整个跳过 profile（旋钮面）。"
+    },
+    {
+      "name": "DeepSeekV4MTP",
+      "file": "vllm/models/deepseek_v4/nvidia/mtp.py:L282 起",
+      "responsibility": "MTP 草稿模型（DeepseekV4MultiTokenPredictor 包装）：吃 target 的 pre-hc_head 残差流（get_mtp_target_hidden_states 钩子）、共享 embed/head 权重映射；权重来自同一 checkpoint 的 mtp. 前缀。"
+    }
+  ],
+  "data_flow": [
+    "【引 deepread/memory-kv.json data_flow 的 [启动] 段】gpu_worker.py:L460 determine_available_memory profile 出 available_kv 字节（L544-L548）→ engine/core.py:L304 get_kv_cache_configs 分组+定 num_blocks+出张量布局 → resolve_kv_cache_block_sizes 定 (scheduler_block_size, hash_block_size) → Scheduler 内建 KVCacheManager → coordinator → BlockPool。本章在该骨架上叠 DSV4 件。",
+    "【DSV4 叠加层 · 档位出生】hf_config（含 quantization_config/expert_dtype/compress_ratios/sliding_window/index_*）进门：models/config.py:L317 改写 quant_method → DeepseekV4FP8Config 装配（expert_dtype 惰性读档）→ 模型构建期逐层 attention init：_select_dsv4_attn_cls 按 SM 选类（nvidia/model.py:L771-L802）→ _resolve_dsv4_kv_cache_dtype 解析/写回 cache_dtype（attention.py:L315-L317）→ 每层挂 SWACache；C4A 层再挂 Indexer+IndexerCache（L277-L297）、ratio>1 层挂 Compressor+StateCache（L337-L348）。",
+    "【DSV4 叠加层 · spec 收账】determine_available_memory 内部先走 _init_minimal_kv_cache_for_profiling（gpu_model_runner.py:L6508-L6532）：get_kv_cache_spec 遍历全部层收五本账的 spec → get_kv_cache_groups 即本章分组路径的最小化预演；profile_run 的 dummy 前向把 eager scratch/indexer workspace 全部占上——测量覆盖 DSV4 全部工作区。",
+    "【DSV4 叠加层 · 定账】engine/core.py:L304 get_kv_cache_configs：merge 各 worker specs → get_kv_cache_groups → group_and_unify（仅 DSV4，L1592）→ layer 元组垫整（L1670-L1754）→ _use_packed_kv_cache_config 判真（L1312-L1327）→ _get_kv_cache_config_packed：block_stride=Σ页、num_blocks=available//stride（L1340-L1345）→ 护栏 check_enough/auto-fit（L2181-L2195）→ 容量/并发日志（L2225-L2240）→ generate_scheduler_kv_cache_config 喂调度器 + initialize_kv_cache 单背衬落卡（gpu_model_runner.py:L7312-L7353）。"
+  ],
+  "why_chains": [
+    {
+      "id": "WC1",
+      "card": "deepread/memory-kv.json why_chains[1]（原样引用；本章为其实战应用现场）",
+      "decision": "显存账本：启动时 profile 一次，倒推 num_blocks，配准入护栏与 auto-fit",
+      "old_design": "无系统内账本：直觉是「权重之外全给缓存」，但没有公式回答「到底能开多大 batch/几条并发」；过量分配→中途 OOM，不足→容量浪费压吞吐。",
+      "pain": "被卡的指标是并发容量与稳定性：KV 池是全部 batch 的共享预算，预算错 = OOM 或空转。量级感受（计算例，非源码断言）：Llama-2-7B FP16 每 token KV = 2(K,V)×32 层×32 kv_head×128 head_dim×2B ≈ 0.5 MB/token——24GB 卡权重吃 14GB 后池只剩 ~8GB。",
+      "solution": "启动三步定账：① vllm/v1/worker/gpu_worker.py:L460-L548 determine_available_memory：requested = 总显存×gpu_memory_utilization，跑一次 dummy forward 记峰值，available_kv = requested − 非 KV 占用 − cudagraph 估计（L544-L548；cudagraph 估计默认开启，vllm/envs.py:L295 VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=True）；② vllm/v1/core/kv_cache_utils.py:L2094-L2242 get_kv_cache_configs 把字节换成块数：num_blocks = available // page_size // num_layers（L993-L1010 get_num_blocks），page_size/层 = 2×block_size×num_kv_heads×head_dim×dtype_bytes（vllm/v1/kv_cache_interface.py:L212-L226 AttentionSpec.real_page_size_bytes）；③ 护栏：check_enough_kv_cache_memory 保证至少装下一条 max_model_len 请求（L854-L879）、装不下时二分估计可行长度（L800-L851）、max_model_len=-1 时 auto-fit（L1988-L2049）、PP 各 rank 取最小 num_blocks 并按比例缩张量（L2210-L2223）；num_gpu_blocks_override 可人工凌驾且账本同步折算（L962-L969 + L2165-L2179）。单一事实源：engine/core.py:L304-L306 调用，同一份 config 喂调度器与全部 worker。",
+      "cost": "profile 是快照不是保证——真实负载激活峰可能超过 dummy run，只能靠 gpu_memory_utilization<1 留头寸；cudagraph 估计占账（默认 0.92 util 已含）；override 配错 = OOM（源码在 L2165-L2179 专门折算避免账本漂移，但数值本身仍靠人）。",
+      "ch36_note": "本章把该链套到 DSV4-Flash/96GB：page_size 公式换成五本账各自的（584B×storage_block、68B|132B、fp32 状态），『一次除法』换成 packed 的 block_stride；num_gpu_blocks_override/kv_cache_memory_bytes 两个旋钮在本章实战里是『96GB 装不下时先砍谁』的逃生门。"
+    },
+    {
+      "id": "WC2",
+      "card": "deepread/memory-kv.json why_chains[6]（原样引用；DSV4 五组是它的最重实例）",
+      "decision": "混合注意力模型：一个 BlockPool、每组一张块表、null_block 占位、不动点收敛的多组最长命中",
+      "old_design": "早期 v1 只有一张块表；混合模型（Gemma3 5:1 SWA:full、LLaMA4 3:1 local:full、Mamba 混合）要么不支持，要么退化为「全部按 full attention 分配」。这条退路今天仍在：--disable-hybrid-kv-cache-manager 时 unify_hybrid_kv_cache_specs 打 warning 原话「we do not enable any optimizations for saving KV cache memory (e.g., dropping the KV cache outside the sliding window)」（kv_cache_utils.py:L1568-L1589）。",
+      "pain": "SWA 层只需要窗口内 token，按 full 分配时窗口外的块全在白占显存——混合模型的可用并发被显存虚耗直接卡死。",
+      "solution": "按 KVCacheSpec 把层分成 kv_cache_groups（get_kv_cache_groups，kv_cache_utils.py:L1781-L1852），每组一个 SingleTypeKVCacheManager 子类（spec→manager 注册表 single_type_kv_cache_manager.py:L1836-L1942），各组共用一个 BlockPool（kv_cache_coordinator.py:L90-L96；硬约束=每组每块物理字节数相等，假设清单 kv_cache_utils.py:L1169-L1198）。页大小不等时先统一：调大较小层 block_size、Mamba 按状态形状 pad（unify_kv_cache_spec_page_size，L1070-L1132）。SWA 窗口外的块被释放并原地换成 null_block 占位以保持块表与 token 位置对齐（remove_skipped_blocks，single_type:L622-L659；命中表形如 [NULL, NULL, block7, block8]，docstring L588-L591）。跨类型最长命中用迭代不动点：每种注意力类型要么接受当前候选长度要么收缩之，full attention 排最前因其向下封闭（HybridKVCacheCoordinator.find_longest_cache_hit，kv_cache_coordinator.py:L685-L817；简单混合一轮即收敛 L717-L720；full 组只查一次后纯裁剪 L738-L745）。对齐粒度：scheduler_block_size = 各组块大小 LCM、hash_block_size = GCD（或 prefix_match_unit 覆盖）——resolve_kv_cache_block_sizes（kv_cache_utils.py:L626-L688）；粗块哈希用「链尾即前缀指纹」惰性重串：16 粒度的第 2 个哈希已经覆盖 0-31，可直接当 32 粒度哈希用（BlockHashListWithBlockSize，L2245-L2315，docstring 带图表）。GPU 侧 MultiGroupBlockTable 每组一张表、必要时把大块拆成 kernel 块（vllm/v1/worker/block_table.py:L270-L376、L221-L248 map_to_kernel_blocks）。",
+      "cost": "① 等量化组要加 padding 层——12 SW+13 full 补成 13/13，warning 明说「may waste at most N% KV cache memory」（L1248-L1265，1.5 启发式）；② 不动点最坏多轮往返；③ 官方承认 find_longest_cache_hit 只干净支持「full + 恰好一种其它类型」（假设 6，L1189-L1194）；④ null_block 的 ref_cnt 不维护需处处特判（block_pool.py:L187-L191）；⑤ 混合下 hash_block_size < block_size 引出细粒度命中/CoW 整套复杂度。",
+      "ch36_note": "DSV4-Flash 是这条链的最重实例（五组而非两组），且官方承认的假设 6（『full + 恰好一种其它类型』）在 DSV4 身上明显超载——v0.27.1 为它开了专属通道 group_and_unify + packed 布局（本章站 13-14），而不是走通用混合组化。"
+    },
+    {
+      "id": "WC3",
+      "card": "deepread/model-sample.json why_chains[9]（原样引用；其 DSV4 段即本章压缩账/584B 的出处）",
+      "decision": "MLA 三代演化：KV cache 只存压缩潜向量；prefill/decode 两种相反的展开策略（MHA 展开 vs MQA 吸收）；DSV4 再上上下文压缩+fp8_ds_mla 自定义布局",
+      "old_design": "MHA/GQA：每 token 缓存 K、V 各 num_kv_heads×head_dim。DSV3 若 128 头 MHA，每 token 每 layer 需 128×(192+128)=40960 元素；Llama-70B GQA（8 KV 头×128 维）也要 2048。KV cache 总量是长上下文并发的第一瓶颈——PagedAttention（分页）只解决碎片与共享，不降低每 token 总量。",
+      "pain": "长上下文批量并发的显存天花板：KV cache 装不下 → 要么砍 batch 要么砍上下文。DSV2 论文（arXiv:2405.04434，mla_attention.py:L28-L29 引用）把 KV 低秩压缩进潜空间。",
+      "solution": "DSV2/V3 世代（vllm/model_executor/layers/attention/mla_attention.py）：cache 只存 kv_lora_rank(512)+qk_rope_head_dim(64)=576 元素/token/layer（header 数学文档 L17-L100：Sq/Skv 比值决定路径、W_DQ/W_UQ/W_DKV/W_UK/W_UV 矩阵账本 L45-L70）；prefill（Sq/Skv≈1）compute-friendly MHA 路径——kv_b_proj 把潜向量上投影成完整 K/V 再标准 attention（forward_mha 调用点 L820-L838）；decode（Sq/Skv 小）data-movement-friendly MQA 路径——q 侧先乘吸收权重进潜空间、576 维当 MQA 做、输出再上投影（forward L601 内 num_mha_tokens/num_mqa_tokens 分流 L770-L770+，吸收 bmm L860+——同一前向内 prefill/decode token 混批分流，比 v0.21 的两条独立 forward 更优雅）；过程权重存重排副本 W_UK/W_UV（process_weights_after_loading L994-L1040，split 在 L1033）；get_mla_dims 兼容统一 head_dim 与分离字段两种记法（L1501+）。DSV4 第三代（vllm/models/deepseek_v4/attention.py）：统一 head_dim=512 语义、fp8_ds_mla UE8M0 块缩放 uint8 布局 584B/token（448 NoPE+128 RoPE+8 scale，vllm/v1/kv_cache_interface.py:L409-L413）、compress_ratio=4 上下文压缩（仅 C4A 层带 indexer 选 top-k，attention.py:L207-L213、L277-L297）、输出侧 o_lora_rank/o_groups 低秩（L200-L262）、alignment 576B 页对齐（L663-L674）；DSV3.2 稀疏 MLA 656B 布局（kv_cache_interface.py:L414-L416）；IndexCache 缓存 indexer 打分结果跨轮复用（attention.py:L677+ DeepseekV4IndexerCache）。",
+      "cost": "① prefill 上投影要物化 [Skv, N, P+V] 大张量 → chunked prefill workspace 分块 + LSE merge（determine_chunked_prefill_workspace_size，mla_attention.py:L590-L600；git df71917cf 'Optimize workspace reuse for eager break, 3.9% E2E TTFT improvement' 实证这块代价真实存在且有专人优化，vllm/models/deepseek_v4/eager_scratch.py 即其产物）；② 同层两条数值路径，正确性靠 merge_attn_states 对齐；③ 特形 KV 与所有通用后端不兼容 → MLA 需要独立 backend 家族（MLAAttentionSpec 的 cache_dtype_str/alignment/compress_ratio 字段就是给 KV 账本分组的）；④ 记法漂移的税由框架侧吃（get_mla_dims 双格式兼容）；⑤ compress_ratio>1 的层读写都要经过压缩器（DeepseekCompressor），cache 命中/共享语义与普通层不同。",
+      "ch36_note": "本章消费该链的账本面：584B 布局 + compress_ratio 字段正是五本账分组的依据；eager_scratch.py 的 workspace 在 profile dummy run 里被计入（测量三件套不漏账的保证）。"
+    }
+  ],
+  "embed_excerpts": [
+    {
+      "path": "vllm/model_executor/models/config.py",
+      "lines": "L317-L339",
+      "what": "量化档位的第一刀在 config 装配时就落下：DSV4 的 HF config 里 quantization_config.quant_method 本是通用的 \"fp8\"，DeepseekV4ForCausalLMConfig.verify_and_update_model_config 把它改写成 \"deepseek_v4_fp8\"——量化注册表因此选中 DeepseekV4FP8Config（expert_dtype 感知的 FP8 子类），而不是通用 Fp8Config。hf_text_config 分支是 MM 包装模型的同款处理。",
+      "code": "class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):\n    @staticmethod\n    def verify_and_update_model_config(model_config: \"ModelConfig\") -> None:\n        quant_config = getattr(model_config.hf_config, \"quantization_config\", None)\n        if quant_config is not None and quant_config.get(\"quant_method\") == \"fp8\":\n            model_type = getattr(model_config.hf_config, \"model_type\", None)\n            if model_type == \"deepseek_v4\":\n                model_config.hf_config.quantization_config[\"quant_method\"] = (\n                    \"deepseek_v4_fp8\"\n                )\n\n        hf_text_quant_config = getattr(\n            model_config.hf_text_config, \"quantization_config\", None\n        )\n        if (\n            hf_text_quant_config is not None\n            and hf_text_quant_config.get(\"quant_method\") == \"fp8\"\n        ):\n            model_type = getattr(model_config.hf_text_config, \"model_type\", None)\n            if model_type == \"deepseek_v4\":\n                model_config.hf_text_config.quantization_config[\"quant_method\"] = (\n                    \"deepseek_v4_fp8\"\n                )",
+      "elide": [
+        "hf_text_config 分支（L328-L339）是视觉/多模态包装模型才走的路径，正文一句带过。"
+      ]
+    },
+    {
+      "path": "vllm/models/deepseek_v4/quant_config.py",
+      "lines": "L29-L47",
+      "what": "同一架构、两种 checkpoint 档：线性/注意力层恒为 FP8 块量化（128×128 块 + ue8m0 scale），MoE 专家按 hf_config.expert_dtype 分档——\"fp4\"（DeepSeek-V4-Flash：MXFP4 专家 + ue8m0 FP8 线性 scale）vs \"fp8\"（DeepSeek-V4-Flash-Base：FP8 块专家 + float32 scale）。expert_dtype 惰性解析：本 config 在 VllmConfig 装配期构造，set_current_vllm_config 还没生效，急读永远看到默认 \"fp4\" 会静默错路由 Flash-Base。",
+      "code": "class DeepseekV4FP8Config(Fp8Config):\n    \"\"\"FP8 config for DeepSeek V4 with expert-dtype-aware MoE dispatch.\n\n    DeepSeek V4 checkpoints always use FP8 block quantization for\n    linear/attention layers. The MoE expert weights vary by checkpoint:\n    - ``expert_dtype=\"fp4\"`` (e.g. DeepSeek-V4-Flash): MXFP4 experts\n      with ue8m0 (e8m0fnu) FP8 linear scales.\n    - ``expert_dtype=\"fp8\"`` (e.g. DeepSeek-V4-Flash-Base): FP8 block\n      experts with float32 FP8 linear scales.\n\n    The dispatch and the linear scale dtype are both keyed off\n    ``expert_dtype`` from the model's hf_config; missing values default\n    to ``\"fp4\"`` so existing FP4 checkpoints stay unchanged.\n\n    NOTE: ``expert_dtype`` is resolved lazily because this config is\n    constructed during VllmConfig setup, before ``set_current_vllm_config``\n    is active. Reading hf_config eagerly in ``__init__`` would always see\n    the default ``\"fp4\"`` and silently misroute Flash-Base checkpoints.\n    \"\"\"",
+      "elide": [
+        "NOTE 段（L43-L47）讲惰性解析的原因——机制要点正文要讲，但代码可省。"
+      ]
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/model.py",
+      "lines": "L202-L246",
+      "what": "MXFP4 专家权重的在卡字节形状（MegaMoE 后端）：w13 每字节装 2 个 fp4 值（hidden_size//2 列 uint8），scale 每 32 个值 1 字节 ue8m0（hidden_size//32 列 uint8，quant_method=\"block\"）——每参数 0.5 字节 + 1/32 字节 scale = 0.53125 B/param。这是权重账的本证：256 专家 × 3 矩阵 × (4096×2048) × 43 层的算术全部从这两个 shape 走。",
+      "code": "        self.w13_weight = nn.Parameter(\n            torch.zeros(\n                num_local_experts,\n                2 * intermediate_size,\n                hidden_size // 2,\n                dtype=torch.uint8,\n            ),\n            requires_grad=False,\n        )\n        set_weight_attrs(self.w13_weight, weight_attrs)\n\n        self.w13_weight_scale = nn.Parameter(\n            torch.zeros(\n                num_local_experts,\n                2 * intermediate_size,\n                hidden_size // 32,\n                dtype=torch.uint8,\n            ),\n            requires_grad=False,\n        )\n        set_weight_attrs(self.w13_weight_scale, weight_attrs)\n        self.w13_weight_scale.quant_method = \"block\"\n\n        self.w2_weight = nn.Parameter(\n            torch.zeros(\n                num_local_experts,\n                hidden_size,\n                intermediate_size // 2,\n                dtype=torch.uint8,\n            ),\n            requires_grad=False,\n        )\n        set_weight_attrs(self.w2_weight, weight_attrs)\n\n        self.w2_weight_scale = nn.Parameter(\n            torch.zeros(\n                num_local_experts,\n                hidden_size,\n                intermediate_size // 32,\n                dtype=torch.uint8,\n            ),\n            requires_grad=False,\n        )\n        set_weight_attrs(self.w2_weight_scale, weight_attrs)\n        self.w2_weight_scale.quant_method = \"block\"",
+      "elide": [
+        "set_weight_attrs/权重加载器细节归 ch29 站 9；_transformed_* 缓存字段与本文无关。"
+      ]
+    },
+    {
+      "path": "vllm/models/deepseek_v4/attention.py",
+      "lines": "L206-L213",
+      "what": "层普查的源头：每层注意力按 config.compress_ratios[layer_id] 取压缩比（max(1, r)——0 也按 1 处理）；MTP 层（layer_id ≥ num_hidden_layers）不查表、固定 1。Flash 的 44 项列表 = 2 个 0（纯窗口层）+ 21 个 4（C4A 稀疏层，带 indexer）+ 20 个 128（C128A 层）+ 末位 0（MTP 占位）。这一列数字决定后面五本 KV 账各自的层数。",
+      "code": "        self.window_size = config.sliding_window\n        # NOTE(zyongye) Compress ratio can't be 0\n        # we do this for because MTP layer is not included\n        # in the compress ratio list\n        if layer_id < config.num_hidden_layers:\n            self.compress_ratio = max(1, config.compress_ratios[layer_id])\n        else:\n            self.compress_ratio = 1",
+      "elide": []
+    },
+    {
+      "path": "vllm/models/deepseek_v4/attention.py",
+      "lines": "L90-L120",
+      "what": "--kv-cache-dtype 的档位解析（每种 backend 布局各一份）：fp8_ds_mla 布局（FlashMLA/SM120 FlashInfer）断言 kv 档必须以 fp8 开头，并把 cache_config.cache_dtype 原地写回 \"fp8_ds_mla\"——页大小规格因此取 576B/token 槽位；FlashInfer SM100 路（use_fp8_ds_mla_layout=False）不写回，KV 按普通行存 bf16 或逐张量 fp8 e4m3。操作员只拨一个 \"fp8\"，落进哪种字节格式由 backend 布局决定。",
+      "code": "def _resolve_dsv4_kv_cache_dtype(\n    use_fp8_ds_mla_layout: bool,\n    kv_cache_dtype: str,\n    cache_config: CacheConfig | None,\n) -> tuple[str, torch.dtype]:\n    \"\"\"Map ``(layout, --kv-cache-dtype)`` to ``(cache_dtype_str, torch_dtype)``.\n\n    Both layouts are paged; they differ in the per-token block format. The\n    ``fp8_ds_mla`` format is UE8M0 block-scaled fp8 packed as ``uint8`` (the\n    canonical ``fp8_ds_mla`` string is written back onto ``cache_config`` so the\n    page-size specs pick the 576B per-token slot). Plain-row backends store each\n    token's KV row in its element dtype: bf16 or per-tensor FP8 E4M3.\n    \"\"\"\n    if use_fp8_ds_mla_layout:\n        # fp8_ds_mla block format: UE8M0 block-scaled fp8 packed as uint8.\n        assert kv_cache_dtype.startswith(\"fp8\"), (\n            f\"DeepseekV4 fp8_ds_mla layout only supports fp8 kv-cache, \"\n            f\"got {kv_cache_dtype}\"\n        )\n        if kv_cache_dtype != \"fp8_ds_mla\":\n            if cache_config is not None:\n                cache_config.cache_dtype = \"fp8_ds_mla\"\n            kv_cache_dtype = \"fp8_ds_mla\"\n            logger.info_once(\"Using DeepSeek's fp8_ds_mla KV cache format.\")\n        return kv_cache_dtype, torch.uint8\n\n    # Plain bf16 / per-tensor fp8 KV row (FlashInfer).\n    if kv_cache_dtype.startswith(\"fp8\"):\n        return kv_cache_dtype, torch.float8_e4m3fn\n    # auto / bfloat16 -> plain bf16 KV row.\n    return kv_cache_dtype, torch.bfloat16",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/attention/backends/mla/sparse_swa.py",
+      "lines": "L77-L102",
+      "what": "每层都有的滑动窗口账（DeepseekV4SWACache.get_kv_cache_spec → SlidingWindowMLASpec）：block_size=64 不是可调参数——注释写明它被『SWA 与 C4A KV 块共享物理张量』锁死：C4A 压缩块形状 [256//4, head_dim]=[64, head]，等页大小要求 SWA 也得 64 token/块；窗口 128（config.sliding_window）；对齐 576B（fp8_ds_mla）/512B（普通行）。",
+      "code": "        # Block size is constrained by tensor sharing between SWA and C4A KV blocks.\n        # Since both block types share the same physical tensor, they must use the\n        # same page size. The C4A KV block shape [256//4, head_dim] = [64, head_dim]\n        # determines the SWA block size of 64 tokens per block.\n        # TODO(yifan): make SWA block size automatically determined and configurable.\n        self.block_size = 64\n        # uint8: fp8_ds_mla UE8M0 paged layout. bfloat16 / float8_e4m3fn:\n        # contiguous full-cache layout.\n        assert self.dtype in (torch.uint8, torch.bfloat16, torch.float8_e4m3fn)\n\n    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:\n        # fp8_ds_mla's UE8M0 paged layout needs 576B alignment; contiguous\n        # bf16/fp8 cache uses the natural element-size page.\n        uses_fp8_ds_mla_layout = self.cache_config.cache_dtype == \"fp8_ds_mla\"\n        return SlidingWindowMLASpec(\n            block_size=self.block_size,\n            num_kv_heads=1,\n            head_size=self.head_dim,\n            dtype=self.dtype,\n            sliding_window=self.window_size,\n            cache_dtype_str=self.cache_config.cache_dtype,\n            # 576B for FlashMLA packing; 512B for FlashInfer sparse (#44577).\n            alignment=576 if uses_fp8_ds_mla_layout else 512,\n            model_version=\"deepseek_v4\",\n            kv_quant_mode=get_kv_quant_mode(self.cache_config.cache_dtype),\n        )",
+      "elide": [
+        "TODO(yifan) 一句（L81）是已知技术债，正文可作脚注。"
+      ]
+    },
+    {
+      "path": "vllm/models/deepseek_v4/attention.py",
+      "lines": "L781-L798",
+      "what": "indexer 缓存（Lightning Indexer 的 K 账）的档位字节算术：use_fp4_kv（= attention_config.use_fp4_indexer_cache，官方配方里的 --attention_config.use_fp4_indexer_cache=True）走 MXFP4——head_dim 128 → 64 字节 packed + 4 字节 ue8m0 scale = 68B/压缩槽；默认 FP8 → 128 fp8 + 4×fp32 scale = 132B/压缩槽（与 V3.2 同布局）。两个档差近一倍，只作用于 C4A 层。",
+      "code": "        assert cache_config is not None, \"Deepseek V4 indexer requires cache_config\"\n        if self.use_fp4_kv:\n            # MXFP4 stores two values per byte plus one UE8M0 byte per 32 values.\n            # head_dim bytes = 64 packed values + 4 UE8M0 scales = 68.\n            k_cache_head_dim = self.head_dim // 2 + self.head_dim // MXFP4_BLOCK_SIZE\n        else:\n            # NOTE(yifan): FP8 indexer cache uses the same layout as V3.2:\n            # head_dim bytes = 128 fp8 + 4 fp32 scale = 132.\n            k_cache_head_dim = (\n                self.head_dim + self.head_dim // self.quant_block_size * 4\n            )\n        self.k_cache = DeepseekV4IndexerCache(\n            head_dim=k_cache_head_dim,\n            dtype=torch.uint8,\n            prefix=f\"{prefix}.k_cache\",\n            cache_config=cache_config,\n            compress_ratio=self.compress_ratio,\n        )",
+      "elide": []
+    },
+    {
+      "path": "vllm/models/deepseek_v4/compressor.py",
+      "lines": "L173-L203",
+      "what": "压缩器状态账（CompressorStateCache）：C4 层每 4 token 出一份状态（block_size=4、窗口 8=2 份），C128 层每 8 token 一份（block_size=8、窗口 128）——注释写明块大小被『状态与 KV 块共享物理张量』锁死（C4 块 [4, 2*512*2*4]、C128 块 [8, 512*2*4]）；dtype 恒 fp32。这五本账里唯一不量化的账。",
+      "code": "        assert self.dtype == torch.float32\n        assert compress_ratio in [4, 128]\n        coff = 1 + (compress_ratio == 4)\n        self.sliding_window = coff * compress_ratio\n        # Block size is constrained by tensor sharing between compressor states\n        # and KV blocks. Since compressor states share the same physical tensor\n        # as KV blocks, they must use the same page size.\n        # The KV block shape [256//4, head_dim] = [64, 584] determines:\n        # - C4 compressor block shape [4, 2*512*2*4] -> block_size = 4\n        # - C128 compressor block shape [8, 512*2*4] -> block_size = 8\n        # TODO(yifan): make block size automatically determined and configurable.\n        if compress_ratio == 4:\n            self.block_size = 4\n        elif compress_ratio == 128:\n            self.block_size = 8\n        else:\n            raise ValueError(f\"Invalid compress ratio: {compress_ratio}\")\n\n    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:\n        # fp8_ds_mla is the UE8M0 paged layout and needs 576B alignment. Plain\n        # full-cache rows share state pages with contiguous KV pages, so padding\n        # would break page matching.\n        uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == \"fp8_ds_mla\"\n        return SlidingWindowMLASpec(  # only has one vector instead of K + V\n            block_size=self.block_size,\n            num_kv_heads=1,\n            head_size=self.state_dim,\n            dtype=self.dtype,\n            sliding_window=self.sliding_window,\n            alignment=576 if uses_fp8_ds_mla_layout else 512,\n        )",
+      "elide": []
+    },
+    {
+      "path": "vllm/models/deepseek_v4/attention.py",
+      "lines": "L655-L674",
+      "what": "压缩主账的自报（DeepseekV4Attention.get_kv_cache_spec）：compress_ratio≤1 的纯窗口层返回 None（窗口账走 E6 的 SWACache）；压缩层报 MLAAttentionSpec——num_kv_heads=1（MLA 潜向量天然 MQA）、head_size=512、dtype uint8（fp8_ds_mla）或自然 dtype、compress_ratio=4/128、alignment 576（fp8_ds_mla）/512（普通行）。block_size 取 cache_config.block_size（官方配方 256）。",
+      "code": "    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:\n        if (\n            self.compress_ratio <= 1\n        ):  # SWA part. Allocated separately as DeepseekV4SWACache.\n            return None\n        # fp8_ds_mla is a UE8M0 block-scaled uint8 layout and needs 576B\n        # alignment; plain bf16 / per-tensor fp8 rows use natural element-size\n        # pages.\n        uses_fp8_ds_mla_layout = self.kv_cache_dtype == \"fp8_ds_mla\"\n        return MLAAttentionSpec(\n            block_size=vllm_config.cache_config.block_size,\n            num_kv_heads=1,\n            head_size=self.head_dim,\n            dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,\n            compress_ratio=self.compress_ratio,\n            cache_dtype_str=self.kv_cache_dtype,\n            alignment=576 if uses_fp8_ds_mla_layout else 512,\n            model_version=\"deepseek_v4\",\n            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),\n        )",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/kv_cache_interface.py",
+      "lines": "L389-L426",
+      "what": "584B/token 的出处（MLAAttentionSpec）：storage_block_size = block_size // compress_ratio——C4A 层一个 256-token 块只存 64 个压缩槽；real_page_size_bytes 对 fp8_ds_mla+deepseek_v4 直接按 584B/存储 token 计（448B NoPE + 128B RoPE + 8B fp8 scale），head_size 保持语义值 512 不参与算式；V3.2 是另一套 656B 布局。__post_init__ 的 _apply_alignment_padding 把页补齐到 576B 的倍数。",
+      "code": "class MLAAttentionSpec(FullAttentionSpec):\n    # TODO(Lucas/Chen): less hacky way to do this\n    cache_dtype_str: str | None = None\n    # DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.\n    alignment: int | None = None  # Default to None for no padding.\n    compress_ratio: int = 1  # Default to 1 for no compression.\n    model_version: str | None = None\n    # Marks draft groups that flatten a non-causal query block into decode rows.\n    non_causal_multi_token_decode: bool = False\n\n    def __post_init__(self):\n        super().__post_init__()\n        _apply_alignment_padding(self)\n\n    @property\n    def storage_block_size(self) -> int:\n        return self.block_size // self.compress_ratio\n\n    @property\n    def real_page_size_bytes(self) -> int:\n        if self.cache_dtype_str == \"fp8_ds_mla\":\n            if self.model_version == \"deepseek_v4\":\n                # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.\n                # head_size stays semantic (512); bytes are determined here.\n                return self.storage_block_size * 584\n            # V3.2 main MLA: 656-byte custom layout (kv_lora_rank=512 +\n            # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.\n            return self.block_size * 656\n        if self.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:\n            head_dim = self.head_size // 2\n        else:\n            head_dim = self.head_size\n        return (\n            self.storage_block_size\n            * self.num_kv_heads\n            * head_dim\n            * get_dtype_size(self.dtype)\n        )",
+      "elide": [
+        "merge 类方法（L428 起）是分组合并断言，归分组机制讲。"
+      ]
+    },
+    {
+      "path": "vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py",
+      "lines": "L118-L150",
+      "what": "硬件替操作员选档的现场（DeepseekV4FlashInferMLASparseBackend.supports_combination）：SM10x 走普通逐张量 FP8 KV 行（明确拒绝 fp8_ds_mla）；SM12x（96GB 档位的 RTX PRO 6000 Blackwell）只放行 fp8/fp8_e4m3/fp8_ds_mla——bf16/auto 直接判 \"kv_cache_dtype not supported\"。决策树上『KV 量化档』在 SM120 卡不是选择题。",
+      "code": "    def supports_combination(\n        cls,\n        head_size: int,\n        dtype: torch.dtype,\n        kv_cache_dtype: CacheDType | None,\n        block_size: int | None,\n        use_mla: bool,\n        has_sink: bool,\n        use_sparse: bool,\n        use_mm_prefix: bool,\n        device_capability: DeviceCapability,\n    ) -> str | None:\n        if device_capability.major == 10:\n            if kv_cache_dtype == \"fp8_ds_mla\":\n                return (\n                    \"FLASHINFER_MLA_SPARSE_DSV4 SM10x uses the plain \"\n                    \"per-tensor FP8 KV layout, not fp8_ds_mla\"\n                )\n            if kv_cache_dtype not in (None, \"auto\", \"bfloat16\", \"fp8\", \"fp8_e4m3\"):\n                return \"kv_cache_dtype not supported\"\n            return None\n        if device_capability.major == 12:\n            if kv_cache_dtype not in (\"fp8\", \"fp8_e4m3\", \"fp8_ds_mla\"):\n                return \"kv_cache_dtype not supported\"\n            from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120\n\n            if not has_flashinfer_sparse_mla_sm120():\n                return (\n                    \"FLASHINFER_MLA_SPARSE_DSV4 SM120 requires FlashInfer's \"\n                    \"sparse MLA decode API\"\n                )\n            return None\n        return \"FLASHINFER_MLA_SPARSE_DSV4 requires SM10x or SM12x\"",
+      "elide": [
+        "has_flashinfer_sparse_mla_sm120 的环境探测细节一句带过。"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L1592-L1632",
+      "what": "DSV4 专属分组入口（group_and_unify_kv_cache_specs，docstring 自认『目前只有 DeepseekV4 用』）：SlidingWindowMLASpec 按 (block_size, sliding_window) 分桶——注释点名『SWA 层、C4I+C4A 层、C128A 层分成三组』（(64,128) 窗口账、(4,8) C4 状态账、(8,128) C128 状态账），全部 MLAAttentionSpec（压缩主账 + indexer 账）合并成一个 full_mla 组（UniformTypeKVCacheSpecs 允许组内异页大小）。",
+      "code": "def group_and_unify_kv_cache_specs(\n    kv_cache_spec: dict[str, KVCacheSpec],\n) -> list[UniformTypeKVCacheSpecs] | None:\n    \"\"\"\n    Group the KV cache specs and unify each group into one UniformTypeKVCacheSpecs.\n    Currently, this is only used for DeepseekV4.\n    \"\"\"\n    if not any(\n        isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()\n    ):\n        return None\n\n    # SlidingWindowMLASpec models with uniform page sizes don't need tuple packing.\n    page_sizes = {spec.page_size_bytes for spec in kv_cache_spec.values()}\n    if len(page_sizes) <= 1:\n        return None\n\n    mla_specs: dict[str, KVCacheSpec] = {}\n    grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(\n        dict\n    )\n    # NOTE: Here we group SWA layers by (block_size, sliding_window), which separates\n    # SWA layers, C4I+C4A layers, and C128A layers into three different groups. It can\n    # be fragile with only block_size and sliding_window as keys, but fine for now.\n    for name, spec in kv_cache_spec.items():\n        if isinstance(spec, SlidingWindowMLASpec):\n            grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec\n        elif isinstance(spec, MLAAttentionSpec):\n            mla_specs[name] = spec\n\n    assert len(mla_specs) > 0\n    mla_uniform_spec = UniformTypeKVCacheSpecs.from_specs(mla_specs)\n    assert mla_uniform_spec is not None\n\n    swa_uniform_specs: list[UniformTypeKVCacheSpecs] = []\n    for spec_dict in grouped_swa_mla_specs.values():\n        uniform_spec = UniformTypeKVCacheSpecs.from_specs(spec_dict)\n        assert uniform_spec is not None\n        swa_uniform_specs.append(uniform_spec)\n\n    return [mla_uniform_spec, *swa_uniform_specs]",
+      "elide": []
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L1676-L1715",
+      "what": "层元组（layer tuple）：『11 个 C4 层 + 10 个 C128 层 → 一个元组 [C4I, C4A, C128]，full_mla 组含 11 个元组』的官方举例（Flash 实际是 21+20）；_approximate_gcd 选各组的元组数最小垫整，让 packed 布局里每组的层元组数对齐——垫出来的空位就是混合模型的 padding 税。",
+      "code": "    assert len(grouped_specs) > 0 and all(\n        isinstance(spec, UniformTypeKVCacheSpecs) for spec in grouped_specs\n    )\n    # For now, we restrict the first grouped_spec to be UniformTypeKVCacheSpecs\n    # containing only MLAAttentionSpec.\n    full_mla_spec = grouped_specs[0]\n    assert all(\n        isinstance(spec, MLAAttentionSpec)\n        for spec in full_mla_spec.kv_cache_specs.values()\n    )\n    full_mla_group = KVCacheGroupSpec(\n        layer_names=list(full_mla_spec.kv_cache_specs.keys()),\n        kv_cache_spec=full_mla_spec,\n    )\n\n    # We define a layer tuple as a group of layers with different page sizes, and\n    # one UniformTypeKVCacheSpecs contains a list of layer tuples.\n    # For example, if we have 11 C4 layers and 10 C128 layers, we can define a layer\n    # tuple as [C4I, C4A, C128], and the full_mla_group will contain \"11\" layer tuples.\n    # The other uniform KV cache specs will be similarly partitioned into layer tuples.\n    # Say we have 21 SWA layers, all with the same page size, then we will have \"21\"\n    # layer tuples.\n    num_layer_tuples_per_group: list[int] = [\n        g_spec.get_num_layer_tuples() for g_spec in grouped_specs\n    ]\n    # Choose `num_layer_tuples` to minimize total padding across groups.\n    num_layer_tuples = _approximate_gcd(\n        num_layer_tuples_per_group, lower_bound=num_layer_tuples_per_group[0]\n    )\n    # Round up to the nearest multiple of `num_layer_tuples` (i.e., padding)\n    num_layer_tuples_per_group = [\n        round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group\n    ]\n\n    swa_mla_specs = grouped_specs[1:]\n    assert all(\n        isinstance(spec, SlidingWindowMLASpec)\n        for group in swa_mla_specs\n        for spec in group.kv_cache_specs.values()\n    )",
+      "elide": [
+        "swa_mla_groups 的切分细节（L1717 起）正文可以图代讲。"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L1308-L1358",
+      "what": "DSV4 默认 packed 布局：_use_packed_kv_cache_config 判据=is_dsv4（全组 UniformTypeKVCacheSpecs）或实验开关 enable_cross_layers_blocks；_get_kv_cache_config_packed 把每层页按字节偏移叠进一个 block slab——block_stride=Σ(逐层页大小)，num_blocks = available_memory // block_stride，所有 KVCacheTensor 别名同一物理分配。五本账、一个池、一次除法定块数。",
+      "code": "def _use_packed_kv_cache_config(\n    vllm_config: VllmConfig,\n    kv_cache_groups: list[KVCacheGroupSpec],\n) -> bool:\n    is_dsv4 = all(\n        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)\n        for group in kv_cache_groups\n    )\n    kv_transfer_config = vllm_config.kv_transfer_config\n    extra_config = (\n        kv_transfer_config.kv_connector_extra_config\n        if kv_transfer_config is not None\n        else {}\n    )\n    # NOTE: enable_cross_layers_blocks is an experimental API and subject to change with\n    # https://github.com/vllm-project/vllm/issues/42082\n    enable_cross_layers = (\n        str(extra_config.get(\"enable_cross_layers_blocks\", \"False\")).lower() == \"true\"\n    )\n    return is_dsv4 or (enable_cross_layers and len(kv_cache_groups) > 1)\n\n\ndef _get_kv_cache_config_packed(\n    vllm_config: VllmConfig,\n    kv_cache_groups: list[KVCacheGroupSpec],\n    available_memory: int,\n) -> tuple[int, list[KVCacheTensor]]:\n    \"\"\"Plan a packed per-block KV cache tensor layout.\n\n    Cache groups use dense, overlapping layouts within one block slab. Each\n    emitted tensor aliases the same physical backing allocation.\n    \"\"\"\n    block_stride, layers_by_offset = _get_packed_kv_cache_layout(kv_cache_groups)\n\n    num_blocks = available_memory // block_stride\n    num_blocks = may_override_num_blocks(vllm_config, num_blocks)\n\n    total_size = block_stride * num_blocks\n\n    kv_cache_tensors: list[KVCacheTensor] = []\n    for byte_offset in sorted(layers_by_offset):\n        kv_cache_tensors.append(\n            KVCacheTensor(\n                size=total_size,\n                shared_by=layers_by_offset[byte_offset],\n                offset=byte_offset,\n                block_stride=block_stride,\n            )\n        )\n\n    return num_blocks, kv_cache_tensors",
+      "elide": [
+        "enable_cross_layers 实验注释（L1322-L1326）一句带过。"
+      ]
+    },
+    {
+      "path": "vllm/v1/worker/gpu_worker.py",
+      "lines": "L498-L548",
+      "what": "账本的测量半边（determine_available_memory 主体）：memory_profiling 上下文里跑一次 profile_run（DSV4 的 eager scratch 池、indexer/compressor workspace 在 dummy 前向里全占上）；cudagraph 若启用先 profile_cudagraph_memory 估图池（VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS 默认开）；available_kv_cache_memory_bytes = requested（=总显存×gpu_memory_utilization）− non_kv_cache_memory − cudagraph 估计。profile 是快照不是保证——这是留给 gpu_memory_utilization<1 的头寸。",
+      "code": "        # Execute a forward pass with dummy inputs to profile the memory usage\n        # of the model.\n        with memory_profiling(\n            self.init_snapshot,\n            weights_memory=int(self.model_runner.model_memory_usage),\n        ) as profile_result:\n            self.model_runner.profile_run()\n\n        # Profile CUDA graph memory if graphs will be captured.\n        # ROCm is included: #44825 moved the profiler to\n        # torch.accelerator.get_memory_info (reliable on ROCm, as used by\n        # the AMD-CI mem tests), and graph_pool_handle resolves to the same\n        # torch.cuda handle the live capture path already uses on ROCm.\n        # XPU stays excluded (see #39977).\n        cudagraph_memory_estimate = 0\n        if (\n            current_platform.is_cuda_alike()\n            and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE\n        ):\n            cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()\n\n        # Respect the opt-in flag as originally designed.\n        cudagraph_memory_estimate_applied = (\n            cudagraph_memory_estimate\n            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS\n            else 0\n        )\n\n        self.total_consumed = profile_result.total_consumed\n        self.peak_activation_memory = (\n            profile_result.transient_peak_headroom + cudagraph_memory_estimate_applied\n        )\n        self.cudagraph_memory_estimate = cudagraph_memory_estimate\n\n        free_gpu_memory = profile_result.after_profile.free_memory\n        # NOTE(woosuk): Here we assume that the other processes using the same\n        # GPU did not change their memory usage during the profiling.\n        assert self.init_snapshot.free_memory >= free_gpu_memory, (\n            \"Error in memory profiling. \"\n            f\"Initial free memory {format_gib(self.init_snapshot.free_memory)} GiB, \"\n            f\"current free memory {format_gib(free_gpu_memory)} GiB. \"\n            \"This happens when other processes sharing the same container \"\n            \"release GPU memory while vLLM is profiling during initialization. \"\n            \"To fix this, ensure consistent GPU memory allocation or \"\n            \"isolate vLLM in its own container.\"\n        )\n        self.available_kv_cache_memory_bytes = (\n            self.requested_memory\n            - profile_result.non_kv_cache_memory\n            - cudagraph_memory_estimate_applied\n        )",
+      "elide": [
+        "kv_cache_memory_bytes 手动档分支（L474-L496）在上文，正文以旋钮面带过；woosuk 的『其他进程不得动显存』断言（L533-L543）可作脚注。"
+      ]
+    },
+    {
+      "path": "vllm/v1/core/kv_cache_utils.py",
+      "lines": "L2225-L2240",
+      "what": "启动日志的最后一行账（get_kv_cache_configs 尾部）：各 rank num_blocks 取最小并按比例缩张量（PP 防漂移）；然后 get_kv_cache_capacity 报两行——\"GPU KV cache size: N tokens\"（池能装的总 token）与 \"Maximum concurrency for X tokens per request: N.NNx\"（并发倍数）。部署者读这两行判断『这台卡上这台模型能接多少活』。",
+      "code": "        if len(kv_cache_config.kv_cache_groups) > 0:\n            max_model_len = vllm_config.model_config.max_model_len\n            # GPU KV cache size in tokens = max_concurrency * max_model_len:\n            # the total tokens of context the pool can hold at peak\n            # utilization. Sourcing this from the concurrency calculation\n            # handles hybrid layouts correctly.\n            num_tokens, max_concurrency = get_kv_cache_capacity(\n                vllm_config, kv_cache_config\n            )\n\n            logger.info_once(\"GPU KV cache size: %s tokens\", f\"{num_tokens:,}\")\n            logger.info_once(\n                \"Maximum concurrency for %s tokens per request: %.2fx\",\n                f\"{max_model_len:,}\",\n                max_concurrency,\n            )",
+      "elide": []
+    },
+    {
+      "path": "vllm/config/speculative.py",
+      "lines": "L345-L350",
+      "what": "官方配方里 speculative_config.method=mtp 的落点：deepseek_v4 的 hf_config 被改写成 deepseek_mtp、architectures 换成 DeepSeekV4MTPModel（registry 映射到 vllm.models.deepseek_v4.DeepSeekV4MTP）——草稿模型不需要另下权重，mtp. 前缀的层就躺在同一份 checkpoint 里（目标模型 load_weights 用 skip_substrs=[\"mtp.\"] 跳过它们）。",
+      "code": "        if hf_config.model_type == \"deepseek_v4\":\n            hf_config.model_type = \"deepseek_mtp\"\n            n_predict = getattr(hf_config, \"num_nextn_predict_layers\", None)\n            hf_config.update(\n                {\"n_predict\": n_predict, \"architectures\": [\"DeepSeekV4MTPModel\"]}\n            )",
+      "elide": []
+    },
+    {
+      "path": "tests/evals/gsm8k/configs/moe-refactor/DeepSeek-V4-Flash-deepgemm-mega-moe.yaml",
+      "lines": "L1-L5",
+      "what": "官方配方全文（vLLM 仓内 CI 的 DSV4-Flash 服务参数，B200 机台）：每一个 flag 都是本章一个机制——kv-cache-dtype fp8（E5/E11）、block-size 256（压缩块/kernel 硬约束）、enable-expert-parallel + TP2（权重账的切法，ch35）、use_fp4_indexer_cache（E7）、moe-backend deep_gemm_mega_moe（SM100 专属，model.py L314-L317 的 NotImplementedError 门）、tokenizer-mode/tool-call-parser/reasoning-parser deepseek_v4（serving 面，ch39）、speculative mtp×2（E17）。",
+      "code": "model_name: \"deepseek-ai/DeepSeek-V4-Flash\"\naccuracy_threshold: 0.95\nnum_questions: 1319\nnum_fewshot: 5\nserver_args: \"--trust-remote-code --kv-cache-dtype fp8 --block-size 256 --enable-expert-parallel --tensor-parallel-size 2 --attention_config.use_fp4_indexer_cache=True --moe-backend deep_gemm_mega_moe --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4 --enable-auto-tool-choice --reasoning-parser deepseek_v4 --speculative_config.method=mtp --speculative_config.num_speculative_tokens=2\"",
+      "elide": []
+    }
+  ],
+  "theory": [
+    {
+      "topic": "权重字节算术（MXFP4 + FP8 + 词表）",
+      "content": "专家/层：3 矩阵 × hidden(4096) × mid(2048) = 25.17M 参数/专家；×256 专家 ×43 层 ≈ 277B 专家参数。MXFP4 = 0.5 B/param + 1/32 B ue8m0 scale ≈ 0.53125 B/param → 全部专家 ≈ 147GiB（每层 ≈ 3.42GiB）。线性/注意力层 FP8 块量化（scale 128×128 块 ue8m0，开销 ~1/8192）：每层 ≈ 120M 参数（fused_wqa_wkv 6.3M + wq_b 33.6M + wo_a 33.6M + wo_b 33.6M + indexer wq_b 8.4M + weights_proj + compressor 投影）≈ 0.12GiB ×43。embed+lm_head 各 129280×4096 bf16 ≈ 1.06GiB（tie_word_embeddings=false）。MTP 层再付一份注意力+MoE（≈3.5GiB）。总 ≈ 155-160GiB 量级——单张 96GB 必然装不下，配方 TP2（每卡 ≈ 78-80GiB 权重）是第一道解；TP4 则权重只占一半卡。全部数字为源码 shape/公式的算术推导（E3 的 packed 形状 + config.json 维度），Explainer 站须以容器实测（load 后 torch.cuda.memory 或启动日志 weights_memory）核对后入正文。"
+    },
+    {
+      "topic": "五本账的每页/每 token 字节算术",
+      "content": "(1) 压缩主账 MLAAttentionSpec：storage_block_size = block_size//compress_ratio（kv_cache_interface.py:L403-L405）；页 = storage×584B 补齐到 576 的倍数（L408-L413 + L353-L359）。C4A：256/4=64 槽 → 64×584=37,376 → 补到 65×576=37,440B/块（每 token 摊 146.25B）。C128：256/128=2 槽 → 1,168 → 1,728B/块（每 token 摊 6.75B）。(2) indexer 账（仅 21 层）：64 槽 × 68B（fp4）=4,352B 或 ×132B（fp8）=8,448B/块（attention.py:L781-L791）。(3) 窗口账（每层 44 本）：block 64×584=37,376 → 37,440B/块，但块数受窗口 128 约束（每请求每层最多 2-3 块）。(4) 状态账：state_dim=2×coff×head_dim（compressor.py:L295-L296，kv_state+score_state 两半）——C4 页 = 4×2048×4B=32,768B、C128 页 = 8×1024×4B=32,768B（L181-L182 的形状注释）：两档状态页恰好等大，这正是它们能与彼此共享物理张量的前提。packed 后 block_stride = Σ(全部层页)——一个『块』是全模型一整栈。逐 token 的『有效 KV』≈ C4A 146B×21 + C128 6.75B×20 + indexer 17B(fp4)×21 + 窗口项（有界） ≈ 3.3KB/token 量级——对比 Llama-70B GQA 的 40KB/token（4096 元素×2×2B×80 层/8 kv 头≈ 320KB/token 全层）——这就是 1M 上下文能活的物质基础。数字全部可从源码公式+config 复算，Explainer 站以启动日志（GPU KV cache size: N tokens）反核对。"
+    },
+    {
+      "topic": "账本方程与并发读数",
+      "content": "available = total×gpu_memory_utilization(默认 0.92) − weights − activation_peak(profile) − cudagraph_estimate（gpu_worker.py:L544-L548）；num_blocks = available // block_stride（packed 版，L1342-L1345；通用版 get_num_blocks L993-L1010）；容量 tokens = num_blocks × scheduler_block_size（各组折算）；日志并发 = 容量/max_model_len（get_kv_cache_capacity L1877-L1887 + get_max_concurrency_for_kv_cache_config L937 起——混合组感知：按组的 max_memory_usage_pages 折算，_max_memory_usage_bytes_from_groups L1890-L1937 的 DSV4 特化分支）。实战读法：96GB×0.92≈88.3GiB 预算 − 权重 − 激活峰 − 图池 = KV 池 → ÷block_stride = 块数 → ×256 token/块 ÷ max_model_len = 并发倍数；max_model_len 拉到 1M 时并发掉到 ~N 路、砍到 128K 时并发 ×8——『上下文档位 vs 并发』是同一笔账的两面。"
+    },
+    {
+      "topic": "量化档位决策树（三层决策的合成）",
+      "content": "谁定哪档：(1) checkpoint 层（操作员选模型即选档）——线性恒 FP8 块量化；专家 expert_dtype fp4（Flash）/fp8（Flash-Base）——『再量化』不在档位树里（DSV4 无 GPTQ/AWQ 档，ch27 的方法谱系在此不适用，量化是出厂内置而非部署选项）；(2) 硬件层（SM 架构强制）——SM90/100 → FlashMLA（fp8_ds_mla，assert startswith fp8，attention.py:L104-L107）；SM10x FlashInfer → 普通逐张量 fp8 行（拒 fp8_ds_mla）；SM120 → FlashInfer SM120（只放行 fp8 系，bf16 拒）——96GB 档位卡上 KV fp8 是命令不是建议；MegaMoE 后端仅 SM100（model.py:L314-L317）；(3) 操作员层（剩下的自由度）——--kv-cache-dtype 选 fp8（vs bf16，仅 SM90/100 FlashMLA 有此自由）；--attention_config.use_fp4_indexer_cache 选 68B/132B；TP/EP 数量定每卡权重；gpu_memory_utilization/num_gpu_blocks_override/kv_cache_memory_bytes/max_model_len 定池与门。三层的交集 = 这台卡上这台模型的最终形状。"
+    },
+    {
+      "topic": "为什么 packed（一个池）而不是五池",
+      "content": "通用混合布局（get_kv_cache_config_from_groups 通用分支 L1411-L1437）是 group_size 个池、每池由各组各出一层共享——组多时池碎片化、页大小必须统一（unify 或退化）。DSV4 五组若走通用路：(64,128)/(4,8)/(8,128) 三种 SWA 型 + full_mla 异页组，页统一要么大幅 pad（浪费）要么拒绝。packed（L1330-L1358）：把每层页按字节偏移叠进一个 block slab，block_stride=Σ页——五组全别名同一物理分配：零碎片（没有『某组的池用完了而别组的闲着』）、一次除法定块数、CUDA 一次分配。代价：任何一组的页结构变化都改 block_stride（全模型耦合）；垫整空位（_approximate_gcd）付 padding 税；跨层张量要求全部组都是 UniformTypeKVCacheSpecs（_use_packed 的判据）。"
+    },
+    {
+      "topic": "96GB 档位卡的三种命运（硬件轴实战）",
+      "content": "同为『96GB 级』：(a) H20-96G（SM90）：FlashMLA 路、fp8_ds_mla KV、无 MegaMoE（SM100 门外）→ 专家走通用 FusedMoE/Mxfp4MoEMethod 路线；(b) RTX PRO 6000 Blackwell 96GB（SM120）：FlashInfer SM120 路、KV 强制 fp8 系、flashinfer sparse MLA decode API 前置检查（flashinfer_sparse.py:L574-L582）；(c) 2×96GB TP2/EP2（配方形态）：每卡权重减半、block_stride 同步减半视角（每卡只放本地层页）。三种命运的共同点：账本方程不变，变的是档位树的硬件层输入。正文用决策树图一次讲清（m1/m5 的图）。"
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "m1",
+      "name": "量化档位决策树：checkpoint（expert_dtype/恒 FP8 线性）×硬件（SM 架构强制 KV 档与后端）×操作员（kv-cache-dtype/use_fp4_indexer_cache/TP/EP/utilization）三层合成一台卡上的最终形状",
+      "kind": "config",
+      "source_anchors": [
+        "vllm/models/deepseek_v4/quant_config.py:L29-L47",
+        "vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py:L113-L150",
+        "vllm/models/deepseek_v4/nvidia/model.py:L771-L802",
+        "vllm/config/cache.py:L19-L36"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m2",
+      "name": "checkpoint 混合精度形状：FP8 块量化线性层（128×128 块+ue8m0）恒定；MoE 专家按 expert_dtype 分档（Flash=MXFP4 / Flash-Base=FP8 块）——量化是出厂内置不是部署选项",
+      "kind": "config",
+      "source_anchors": [
+        "vllm/model_executor/models/config.py:L317-L339",
+        "vllm/models/deepseek_v4/quant_config.py:L58-L84",
+        "vllm/models/deepseek_v4/quant_config.py:L181-L199"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m3",
+      "name": "MXFP4 专家字节布局与权重算术：uint8 每字节 2 值 + 每 32 值 1 字节 ue8m0 scale = 0.53125 B/param；256 专家×3×4096×2048×43 层的算术链",
+      "kind": "layout",
+      "source_anchors": [
+        "vllm/models/deepseek_v4/nvidia/model.py:L202-L246"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m4",
+      "name": "层普查：compress_ratios 逐层 max(1,r)（43 层 = 2 纯窗口 + 21 C4A + 20 C128）+ MTP 固定 ratio 1——一列 config 数字决定五本账的层数",
+      "kind": "config",
+      "source_anchors": [
+        "vllm/models/deepseek_v4/attention.py:L206-L213",
+        "vllm/models/deepseek_v4/attention.py:L277-L297"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m5",
+      "name": "硬件×backend×KV 档三元耦合：SM90/100→FlashMLA（fp8_ds_mla，assert fp8）；SM10x FlashInfer→普通逐张量 fp8 行；SM120→FlashInfer SM120 且 KV 只放行 fp8 系（bf16 拒）",
+      "kind": "config",
+      "source_anchors": [
+        "vllm/models/deepseek_v4/nvidia/model.py:L771-L802",
+        "vllm/models/deepseek_v4/sparse_mla.py:L92-L93",
+        "vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py:L130-L150",
+        "vllm/models/deepseek_v4/nvidia/model.py:L314-L317"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m6",
+      "name": "fp8_ds_mla 槽位格式与 576B 对齐：UE8M0 块缩放 fp8 打包 uint8，448B NoPE+128B RoPE+8B scale=584B/存储 token；--kv-cache-dtype fp8 被写回 fp8_ds_mla、页规格取 576B 槽",
+      "kind": "layout",
+      "source_anchors": [
+        "vllm/models/deepseek_v4/attention.py:L90-L120",
+        "vllm/v1/kv_cache_interface.py:L403-L426",
+        "vllm/v1/kv_cache_interface.py:L353-L359"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m7",
+      "name": "五类 KVCacheSpec 自报：窗口账（block64/window128，每层）、压缩主账（MLAAttentionSpec 584B×storage）、indexer 账（68B|132B 档，仅 C4A）、状态账（C4 block4/win8、C128 block8/win128，fp32）、MTP 组（eagle 标注）",
+      "kind": "dataflow",
+      "source_anchors": [
+        "vllm/v1/attention/backends/mla/sparse_swa.py:L87-L102",
+        "vllm/models/deepseek_v4/attention.py:L655-L674",
+        "vllm/models/deepseek_v4/attention.py:L698-L710",
+        "vllm/models/deepseek_v4/attention.py:L781-L798",
+        "vllm/models/deepseek_v4/compressor.py:L191-L203"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m8",
+      "name": "indexer 缓存档位：--attention_config.use_fp4_indexer_cache → MXFP4 68B vs FP8 132B/压缩槽（只作用 21 个 C4A 层，档差近一倍）",
+      "kind": "config",
+      "source_anchors": [
+        "vllm/models/deepseek_v4/attention.py:L745-L749",
+        "vllm/models/deepseek_v4/attention.py:L781-L798",
+        "vllm/config/attention.py:L68-L69"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m9",
+      "name": "块大小被物理张量共享锁死：SWA block 64（C4A 压缩块 [256//4,head]=[64,head] 定形）、状态账 block 4/8（C4 [4,2*512*2*4]、C128 [8,512*2*4]）——块大小不是自由旋钮",
+      "kind": "layout",
+      "source_anchors": [
+        "vllm/v1/attention/backends/mla/sparse_swa.py:L77-L82",
+        "vllm/models/deepseek_v4/compressor.py:L177-L189"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m10",
+      "name": "DSV4 专属分组与层元组：group_and_unify（仅 DSV4）按 (block,window) 分三 SWA 型组 + full_mla 一组；layer 元组 [C4I,C4A,C128]×N 与 _approximate_gcd 垫整；含 MTP 的组标 eagle",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L1592-L1632",
+        "vllm/v1/core/kv_cache_utils.py:L1670-L1754",
+        "vllm/v1/core/kv_cache_utils.py:L1757-L1778",
+        "vllm/v1/kv_cache_interface.py:L837-L898"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m11",
+      "name": "packed 布局定账：block_stride=Σ(逐层页)、num_blocks=available//stride 一次除法、五组全别名同一背衬 torch.zeros（零碎片一次分配）",
+      "kind": "layout",
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L1308-L1327",
+        "vllm/v1/core/kv_cache_utils.py:L1330-L1358",
+        "vllm/v1/worker/gpu_model_runner.py:L7312-L7353"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m12",
+      "name": "测量三件套：memory_profiling 包 profile_run（DSV4 eager scratch/indexer/compressor workspace 全占上）+ profile_cudagraph_memory 估图池 + 差价得 available；kv_cache_memory_bytes 手动档可整个跳过 profile",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_worker.py:L459-L548",
+        "vllm/v1/worker/gpu_model_runner.py:L6433-L6532",
+        "vllm/envs.py:L295"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m13",
+      "name": "护栏与容量读数：check_enough（至少一条 max_model_len）+二分估计可行长度+auto-fit；\"GPU KV cache size: N tokens\"/\"Maximum concurrency: N.NNx\" 的组感知算法（DSV4 特化分支）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L751-L788",
+        "vllm/v1/core/kv_cache_utils.py:L800-L851",
+        "vllm/v1/core/kv_cache_utils.py:L1877-L1937",
+        "vllm/v1/core/kv_cache_utils.py:L2186-L2240"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m14",
+      "name": "显存旋钮面：gpu_memory_utilization(0.92)/num_gpu_blocks_override(账本同步折算)/kv_cache_memory_bytes(跳 profile 手动档)/max_model_len(-1 auto-fit)/block_size(稀疏 MLA kernel 硬约束 256)",
+      "kind": "config",
+      "source_anchors": [
+        "vllm/config/cache.py:L47-L88",
+        "vllm/config/cache.py:L182-L189",
+        "vllm/v1/core/kv_cache_utils.py:L2165-L2179",
+        "vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py:L93-L95",
+        "vllm/v1/attention/backends/mla/sparse_swa.py:L115-L121"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m15",
+      "name": "官方配方逐旋钮：CI yaml 每个 flag 对回本章机制（kv fp8/block256/EP+TP/fp4 indexer/mega-moe SM100 门/tokenizer 自动默认/mtp×2）——另两份变体：TP4 offloading 版与 P/D 分离版",
+      "kind": "config",
+      "source_anchors": [
+        "tests/evals/gsm8k/configs/moe-refactor/DeepSeek-V4-Flash-deepgemm-mega-moe.yaml:L1-L5",
+        "tests/evals/gsm8k/test_gsm8k_offloading.py:L157-L173",
+        ".buildkite/test_areas/disaggregated.yaml:L222-L243"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "core"
+    },
+    {
+      "id": "m16",
+      "name": "MTP 草稿的出生：speculative_config.method=mtp → hf_config 改写 deepseek_mtp/DeepSeekV4MTPModel；草稿权重=同 checkpoint 的 mtp. 前缀（目标 skip_substrs 跳过）；吃 target pre-hc_head 残差流",
+      "kind": "config",
+      "source_anchors": [
+        "vllm/config/speculative.py:L344-L349",
+        "vllm/models/deepseek_v4/nvidia/model.py:L1534-L1545",
+        "vllm/model_executor/models/registry.py:L643"
+      ],
+      "needs_figure": false,
+      "needs_worked_example": false,
+      "difficulty": "supporting"
+    },
+    {
+      "id": "m17",
+      "name": "每 token KV 摊销账：C4A 146.25B/token、C128 6.75B/token、indexer 17B|33B/4token、窗口有界、状态有界——压缩把 1M 上下文从不可能变成可预算（对比 GQA 全层 ~320KB/token）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/v1/kv_cache_interface.py:L403-L426",
+        "vllm/models/deepseek_v4/attention.py:L781-L798"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    },
+    {
+      "id": "m18",
+      "name": "96GB 预算分账（worked example 主线）：88.3GiB(util 0.92) − 权重(TP 档定) − 激活峰 − 图池 → KV 池 → ÷block_stride → 块数 → 容量/并发；砍谁先后的逃生门次序（max_model_len → indexer 档 → TP 档 → override）",
+      "kind": "algorithm",
+      "source_anchors": [
+        "vllm/v1/worker/gpu_worker.py:L544-L548",
+        "vllm/v1/core/kv_cache_utils.py:L1330-L1358",
+        "vllm/v1/core/kv_cache_utils.py:L2225-L2240"
+      ],
+      "needs_figure": true,
+      "needs_worked_example": true,
+      "difficulty": "core"
+    }
+  ],
+  "subtraction_plan": {
+    "delete": [],
+    "must_keep": []
+  },
+  "foreshadow_due": {
+    "source": "v3 伏笔真相源 = book/cartography/pedagogy-plan.json foreshadows（本章条目无埋/收项；bible.py due 是 v2 旧章号账本，不跑）",
+    "should_plant": [],
+    "should_payoff": []
+  },
+  "l2_spec": "book/cartography/l2-specs/ch36.json（同批产出；stations 与本档 stations 同一份账本）"
+}
