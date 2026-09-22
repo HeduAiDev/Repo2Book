@@ -1,0 +1,320 @@
+{
+  "topic": "ch14 四补：社区 planning 图（mengqingcao 博客 gpu_kv_planning.png，组×宽度桶矩阵/valid-wasted 逐格/258 请求分配数）怎么看——桥接小节的 pin 侧承重事实。基线 vLLM v0.27.1（源码根 instances/vllm/source，规范前缀 vllm/...，行号全部当轮逐行现核；Pro/Flash 两组数字为本轮 host 桩真跑 pin 算法零改动复算，Pro 侧与 explainer/traces/v4_cache_groups_61layer.json、Flash 侧与 ch36 登记的 fp8 档 block_stride=1,002,240 逐项互证）",
+  "corrections": [],
+  "mechanisms": [
+    {
+      "id": "sup-plan-1-packed-row-waste",
+      "name": "「跨桶浪费」的 pin 语义：块号归组时的行内闲置账——组自占区连续 [0, dense)、闲置尾 [dense, block_stride)，与博客 Wasted 格是同一笔账的两种几何（行形 vs 桶形）",
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L1283-L1305",
+        "vllm/v1/core/kv_cache_utils.py:L1330-L1358",
+        "vllm/v1/worker/gpu/attn_utils.py:L225-L233",
+        "vllm/v1/core/block_pool.py:L647-L677",
+        "vllm/v1/core/kv_cache_coordinator.py:L238-L268",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L330-L375",
+        "tests/v1/core/test_contiguous_kv_packing.py:L286-L308",
+        "tests/v1/core/test_contiguous_kv_packing.py:L251-L259",
+        "tests/v1/core/test_contiguous_kv_packing.py:L262-L275"
+      ],
+      "facts": [
+        "docstring 逐字（vllm/v1/core/kv_cache_utils.py:L1286-L1290）：\n    \"\"\"Lay out each cache group densely in one shared block slab.\n\n    A block ID is owned by one cache group at a time, so layouts from different\n    groups may overlap. Layers within a group remain disjoint.\n    \"\"\"\n——「一个块号同一时刻只归一组」是布局允许跨组重叠（overlap）的安全前提；它的另一面就是：块归窄组时，行内本组条带之外的区域此刻没有主人、无人写 = 闲置。",
+        "block_stride 与块数的语义（L1293-L1305 + L1342）：每组从 byte_offset=0 逐层累加自己的页宽（L1295-L1302），block_stride = max(各组密排终点)（L1303）——块的大小按最宽租客修；num_blocks = available_memory // block_stride（L1342）。_get_kv_cache_config_packed 的 docstring 逐字（L1335-L1339）：\"Plan a packed per-block KV cache tensor layout. / Cache groups use dense, overlapping layouts within one block slab. Each emitted tensor aliases the same physical backing allocation.\"",
+        "组自占区连续、闲置是尾部一段（不是散斑）：每组 byte_offset 从 0 起、逐层无缝累加（L1295-L1302），所以组 g 持块时它的写入范围恰是行首连续区间 [0, dense_g)，闲置 = 尾部 [dense_g, block_stride) 一个区间。组内条带两两不交有专门测试（test_layouts_are_disjoint_within_each_group，tests/v1/core/test_contiguous_kv_packing.py:L262-L275），条带不越行也有（test_offsets_within_one_block，L251-L259，断言 offset+page_size <= block_stride）。",
+        "「真的没人写」的执行链（三环，全有锚）：①每组一个管家独立领块——协调器 allocate_new_blocks 逐管家发号（vllm/v1/core/kv_cache_coordinator.py:L238-L268），管家按 cdiv 算需求（vllm/v1/core/single_type_kv_cache_manager.py:L360）向共享 BlockPool.get_new_blocks 领（vllm/v1/core/block_pool.py:L647-L677：从 free 队列 pop、逐块 assert ref_cnt == 0 后 ref_cnt += 1——块 id 在被持有期间唯一 owner，任何第二个组此刻拿不到同一个 id）；②层只拿到自己条带的行切片视图——attn_utils.py:L225-L233 四步链逐字 kv_raw_tensor.view(-1, block_stride)[:, offset : offset + page_bytes].view(dtype).view(permuted_kv_cache_shape)，层对行内其余字节根本不寻址；③窄组持块 ⇒ 本组条带之外无任何层写 ⇒ 闲置成立。",
+        "测试级佐证（tests/v1/core/test_contiguous_kv_packing.py::TestInterleavedPacking）：test_group_owned_blocks_do_not_alias（L286-L308）把块 0..n 各分给一个组、逐层 fill 各自视图后断言互不串写；随后 L304 注释逐字 \"# Once the first group releases its block, another group may reuse it.\"——第一个组释放后第二个组复用同一块并覆写成功，这就是「单主 + 时间复用」的测试级证明，也正是博客图里 valid/wasted 格随时间翻转的机制底座。",
+        "Pro 61 逐组行闲置（本轮真跑，block_stride=1,435,968）：G0 主账组（91 层，dense=1,435,968）0 B / 0%——它就是最宽租客、定义 stride；G1 swa 半组（31 层，1,160,640）闲置 275,328 B / 19.174%；G2 swa 半组（30 层，1,123,200）312,768 B / 21.781%；G3 c4 状态组（60 层，1,244,160）191,808 B / 13.357%；G4 c128 状态组（31 层，1,017,792）418,176 B / 29.122%。Lead 问的「G4 持块时 1−1,017,792/1,435,968≈29%？」精确值 29.122%。",
+        "与博客 Wasted 格的同构判定（桥接小节承重结论）：同一笔账、两种几何。同一笔账 = 「块粒度由最宽租客定；窄组持块用不满；差额靠『一个块号同一时刻一个组主』的时间复用收回」。不同几何 = 博客版每块在 3 个宽度桶 tensor 里各占一页，Wasted 格 = 本组不用的那桶整页，格间可加总；pin 版每块是一整行 block_stride 字节，浪费 = 行尾 (block_stride − dense_g) 一个数，桶级归因只是「行尾里该宽度桶条带的并集字节」——跨组条带在行尾互相别名，格间不可加总（实证：Pro G4 三个浪费格并集和 456,768 B > 行闲置 418,176 B，见 worked_example）。此外 pin 的 offset 折叠把「同宽不同组」的重复条带完全重合掉（G2 整段复用 G1 的条带、新开 0 个 offset，见 sup-plan-2），桶形几何里这类同宽层只能各占一页或垫到桶宽——这是 pin 相对三桶制的结构性节省。",
+        "与 ch14 已有账目的分工：组内切片成本（对齐垫、物理碎片化）归「落地为物理张量」节已讲；本补充补的是组间轴——行闲置随块主分布波动，静态最坏（全池都由最窄组持有）= 该组闲置比（Pro 29.122%、Flash 34.483%），最好 0%（全由主账组持有）。两个方向都是同一行账的读法，不是新机制。"
+      ],
+      "worked_example_material": {
+        "pro_idle_table": [
+          {"group": "G0 主账（main×61 + indexer×30）", "layers": 91, "block_size": 256, "dense_bytes": 1435968, "idle_bytes": 0, "idle_pct": 0.0},
+          {"group": "G1 swa 前半（layers[0::2]）", "layers": 31, "block_size": 64, "dense_bytes": 1160640, "idle_bytes": 275328, "idle_pct": 19.174},
+          {"group": "G2 swa 后半（layers[1::2]）", "layers": 30, "block_size": 64, "dense_bytes": 1123200, "idle_bytes": 312768, "idle_pct": 21.781},
+          {"group": "G3 c4 状态（indexer_state+attn_state_c4）", "layers": 60, "block_size": 4, "dense_bytes": 1244160, "idle_bytes": 191808, "idle_pct": 13.357},
+          {"group": "G4 c128 状态（attn_state_c128）", "layers": 31, "block_size": 8, "dense_bytes": 1017792, "idle_bytes": 418176, "idle_pct": 29.122}
+        ],
+        "flash43_idle_table": [
+          {"group": "G0 主账（main×41 + indexer×21）", "layers": 62, "block_size": 256, "dense_bytes": 1002240, "idle_bytes": 0, "idle_pct": 0.0},
+          {"group": "G1 swa 前半", "layers": 22, "block_size": 64, "dense_bytes": 823680, "idle_bytes": 178560, "idle_pct": 17.816},
+          {"group": "G2 swa 后半", "layers": 21, "block_size": 64, "dense_bytes": 786240, "idle_bytes": 216000, "idle_pct": 21.552},
+          {"group": "G3 c4 状态", "layers": 42, "block_size": 4, "dense_bytes": 870912, "idle_bytes": 131328, "idle_pct": 13.103},
+          {"group": "G4 c128 状态", "layers": 20, "block_size": 8, "dense_bytes": 656640, "idle_bytes": 345600, "idle_pct": 34.483}
+        ],
+        "aliasing_proof": {
+          "claim": "浪费格（桶归因）不可加总——跨桶条带在行尾互相别名",
+          "g4_pro": {"cells": {"1728": 53568, "8640": 112320, "37440_union": 290880, "37440_带重叠加权": 449280}, "cells_sum": 456768, "row_idle": 418176, "verdict": "格和 456,768 > 行闲置 418,176：37440 桶内 G0 主账条带与 G1/G2 swa 条带重叠（并集 290,880 < 加权 449,280），跨桶再叠一层别名。行闲置 (stride−dense) 才是唯一可加总量。"},
+          "g4_flash": {"cells": {"1728": 12096, "8640_union": 100800, "37440_union": 293184}, "cells_sum": 406080, "row_idle": 345600, "verdict": "同上，Flash 口径。"}
+        },
+        "ownership_chain": [
+          {"step": 1, "what": "协调器逐管家发号", "anchor": "vllm/v1/core/kv_cache_coordinator.py:L238-L268"},
+          {"step": 2, "what": "管家 cdiv 算需求、向共享池领块（assert ref_cnt==0 ⇒ 块 id 唯一 owner）", "anchor": "vllm/v1/core/single_type_kv_cache_manager.py:L360 + vllm/v1/core/block_pool.py:L647-L677"},
+          {"step": 3, "what": "层只持行切片视图（本组条带之外不寻址）", "anchor": "vllm/v1/worker/gpu/attn_utils.py:L225-L233"},
+          {"step": 4, "what": "释放归池后他组可复用（测试级证明）", "anchor": "tests/v1/core/test_contiguous_kv_packing.py:L286-L308（L304 注释）"}
+        ]
+      }
+    },
+    {
+      "id": "sup-plan-2-blog-figure-version-map",
+      "name": "博客 gpu_kv_planning.png 的版本对位：pin v0.27.1 对同一 43 层 Flash 配置精确复现「5 组/组大小 22」；「每 tensor 被所有组共享」= offset 折叠；「组内 3 个大小不一」= 层元组 [C4I, C4A, C128]；差异只在声明几何（22×3 池式 vs 140/202 offset 单 slab）",
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L1781-L1852",
+        "vllm/v1/core/kv_cache_utils.py:L1812-L1819",
+        "vllm/v1/core/kv_cache_utils.py:L1592-L1632",
+        "vllm/v1/core/kv_cache_utils.py:L1613-L1615",
+        "vllm/v1/core/kv_cache_utils.py:L1670-L1754",
+        "vllm/v1/core/kv_cache_utils.py:L1693-L1697",
+        "vllm/v1/core/kv_cache_utils.py:L1702-L1704",
+        "vllm/v1/kv_cache_interface.py:L889-L892",
+        "vllm/v1/core/kv_cache_utils.py:L1308-L1327",
+        "vllm/v1/core/kv_cache_utils.py:L1405-L1410",
+        "vllm/v1/attention/backends/mla/sparse_swa.py:L77-L82"
+      ],
+      "facts": [
+        "博客口径（research 双转录：hybrid-v4-background.json entry dsv4-kvcache-management-blog + community-narrative-figures.json A2-mqc-dsv4，均抓取自 mengqingcao.github.io/posts/deepseek-v4-kvcache-management/，2026-06-09 原文）：43 层（0/1 层 swa、偶数层 c4、奇数层 c128）分 5 组、组大小 22；「22*3 个 KVCacheTensor，每个 tensor 被所有 5 个组共享」；len=258 请求各组 cdiv 分配 2/2/2/33/65，其中组 4/5 走 SlidingWindowManager、前面的 32/64 块立刻释放、实占 1；图 gpu_kv_planning.png 注明来源于 @ivanium，标注 group 1 block_size=256 但「实际在每个 spec 上的 block_size 都不相等」。版本敏感声明照书里纪律：博客读的是 2026-06 时点的实现，Byte 级数字与 pin 对不上处一律以 pin 为准。",
+        "层构对上了（博客的 43 层表 = 官方 config.json）：Flash 的 compress_ratios 官方 44 项列表 [0, 0, (4,128)×20, 4, 0]（ch36 narrative 已取回登记：2 个 0（纯窗口层）+ 21 个 4（C4A 带 Lightning Indexer）+ 20 个 128（C128A）+ 1 个 0（MTP 占位、layer_id>=43 恒 1 不读表））——「0/1 为 swa、偶 c4、奇 c128」逐位成立（pin 逐层查表 + max(1,·) 折 0 为 1，vllm/models/deepseek_v4/attention.py:L210-L213）。",
+        "【pin 真跑，本轮】43 层 Flash（ratios=[0,0]+[4,128]×20+[4]、sliding_window=128、fp8_ds_mla/576 对齐、spec 构造与 ch14 口径逐字同款）在 pin v0.27.1 走的路：get_kv_cache_groups 第三路 elif（kv_cache_utils.py:L1812-L1819，注释原话 \"DeepseekV4 case\"）→ group_and_unify_kv_cache_specs（L1592-L1632；守门两条件都过：有 SlidingWindowMLASpec、页宽>1，L1599-L1607）→ MLA 全装第一包 + SWA 族按 (block_size, sliding_window) 三分桶 → _get_kv_cache_groups_uniform_groups（L1670-L1754）近似 GCD 对齐 → 5 个 KVCacheGroupSpec → _use_packed_kv_cache_config 判 is_dsv4（全部组是 UniformTypeKVCacheSpecs 即真，L1308-L1327，不看模型名）→ packed 单 slab（L1405-L1410）。与 Pro 61 完全同构，只是层数与元组数不同。",
+        "【头条复现】pin 对这个 Flash 配置算出：4 个 UniformType 桶的元组数 [21, 43, 21, 20]（主包 21 元组：21×37440 主账+21×8640 indexer+20×1728 主账；swa 43；c4 状态 21；c128 状态 20），_approximate_gcd（L1702-L1704 调 L1635-L1667）选 d=22（总垫 5）→ swa 桶 cdiv(43,22)=2 拆成 22+21 两个半组 → 终 5 组。**博客的「分 5 组」「组大小 22」两个头条数字不是版本差异，是同一条近似 GCD 算法对同一层构的输出，pin v0.27.1 精确复现**。带 MTP（44 本窗口账）时 tuples=[21,44,21,20]、d 仍=22（垫 4）、两半组各 22 层——ch36 部署主线「两个 22 层子组」同口径。",
+        "「每 tensor 被所有组共享」在 pin 的对应 = 跨组 offset 折叠（真跑实证）：_get_packed_kv_cache_layout 的 L1301 layers_by_offset[byte_offset].append(layer_name) 把跨组撞到同一 offset 的层折进同一桶，_get_kv_cache_config_packed（L1348-L1356）每个出现的 offset 出一条 KVCacheTensor(shared_by=该桶全部层名)——shared_by 天然跨组。实证（Flash）：G2（第二个 swa 半组，21 层）新开 0 个 offset，21 条条带与 G1 的阶梯（0, 37440, 2×37440, …）完全重合；offset 0 恰压 5 层 = 每组第一层（L2 main / L0 swa / L1 swa / L2 indexer_state / L3 attn_state——Pro 版是 L0 main / L0 swa / L1 swa / L0 indexer_state / L30 attn_state）；shared_by 直方图 Flash 118×1+19×2+2×3+1×5、Pro 167×1+31×2+3×3+1×5（末项就是 offset 0 那桶压 5 层）。",
+        "「组内划分 3 个大小不一的 tensor」在 pin 的对应是两个可锚的「3」，但都不是 3 条独立声明：① 层元组的官方定义注释逐字（kv_cache_utils.py:L1693-L1697）：\"For example, if we have 11 C4 layers and 10 C128 layers, we can define a layer tuple as [C4I, C4A, C128], and the full_mla_group will contain \\\"11\\\" layer tuples. … Say we have 21 SWA layers, all with the same page size, then we will have \\\"21\\\" layer tuples.\"——主包每个元组就是三本不同页宽的账（C4A 主账 37440 + C4I indexer 8640 + C128 主账 1728）；Flash 偶奇交错排布下 G0 的 offset 阶梯正是 (37440, 8640, 1728) 三元组循环 20 轮再加收尾 (37440, 8640)：20×47,808+46,080 = 1,002,240 ✓。② SWA 族三分桶注释逐字（L1613-L1615）：\"# NOTE: Here we group SWA layers by (block_size, sliding_window), which separates / # SWA layers, C4I+C4A layers, and C128A layers into three different groups. It can / # be fragile with only block_size and sliding_window as keys, but fine for now.\"——真滑窗 / c4 状态 / c128 状态三族。pin 里这些「3」最终都折进 offset 桶（Flash 140 条声明、Pro 202 条），不按宽度类各出一条。",
+        "两版本的差异清单（正文如实分列）：①声明几何——博客版 22 池×3 宽度桶 = 66 条声明、每块在 3 桶各占一页、Wasted 格 = 不用桶的整页、格间可加总；pin 1 块 slab、每块 1 行 block_stride 字节、140/202 条 offset 声明全部别名同一物理、浪费 = 行尾（见 sup-plan-1）。②块宽口径——博客版 47,808B/块量级（三桶页宽之和，恰等于一个层元组宽）；pin Flash 1,002,240B/块（G0 整栈 62 层，max 不是 sum，ch36 L725 已立此论）；10 GiB 下 pin 得 10,713 块（floor 余 421,120B）。③swa 块长——博客版 swa 走 256 管理面；pin 是 64、被 C4A 主 KV 块形 [64, 584] 反定（vllm/v1/attention/backends/mla/sparse_swa.py:L77-L82 注释原话 \"Block size is constrained by tensor sharing\"）。④pin 给 attn_state 的 32832 独立第四宽度桶；博客三桶制里没有这个桶（状态组「进 T3/T2」）——pin 不需要把任何层页垫到别族页宽，同宽配对（三对同页：swa≡main_c4@37440、indexer≡indexer_state@8640、attn_state 两族@32832）+ offset 折叠替代了「垫到桶宽」。",
+        "两版本的共同骨架三条（同构映射的落点）：①一个物理共池 + 一个块号同一时刻一个组主（博客 shared_by 全组 ↔ pin offset 桶跨组 shared_by + BlockPool 唯一 owner）；②时间复用收回差额（博客 sliding window 释放后他组接手 ↔ pin test_group_owned_blocks_do_not_alias 的 release-and-reuse）；③同宽配对省垫（页宽相等 ⇒ 同桶零垫：三对同页把七种形态压进四种页宽）。研究包未转录博客版的桶页宽数字与状态账进桶的算术——正文引用博客 Byte 级数字时只能用「博客转录」标注的结构性结论（几组几桶谁 valid 谁 wasted），Byte 级一律用 pin 侧数字。",
+        "与 ch36 的互证：Flash fp8 档（indexer 页 8,640）block_stride = 1,002,240，与本次真跑一致（ch36 narrative 登记的「917,568 vs 1,002,240」两档对照里的 8,640 档；4,608 档为量化 indexer 的另一档，本矩阵不取，取 8,640 档以与 ch14 的页宽体系一致）。五组 dense [1,002,240 / 823,680 / 786,240 / 870,912 / 656,640] 为本轮真跑值。"
+      ],
+      "worked_example_material": {
+        "flash43_pin_account": {
+          "ratios": "[0,0]+[4,128]x20+[4]（43 层，官方 config.json 前 43 项）",
+          "window": 128,
+          "tuples_per_bucket": [21, 43, 21, 20],
+          "gcd_chosen": 22,
+          "pad_total": 5,
+          "groups": [
+            {"gid": 0, "what": "主账 main×41 + indexer×21", "layers": 62, "block_size": 256, "dense": 1002240},
+            {"gid": 1, "what": "swa 前半 layers[0::2]", "layers": 22, "block_size": 64, "dense": 823680},
+            {"gid": 2, "what": "swa 后半 layers[1::2]", "layers": 21, "block_size": 64, "dense": 786240},
+            {"gid": 3, "what": "c4 状态 indexer_state×21 + attn_state×21", "layers": 42, "block_size": 4, "dense": 870912},
+            {"gid": 4, "what": "c128 状态 attn_state×20", "layers": 20, "block_size": 8, "dense": 656640}
+          ],
+          "block_stride": 1002240,
+          "n_offset_declarations": 140,
+          "new_offsets_per_group": [62, 19, 0, 40, 19],
+          "shared_hist": "118x1 + 19x2 + 2x3 + 1x5",
+          "num_blocks_10gib": 10713,
+          "mtp_variant": "加 MTP（第 44 本窗口账）：tuples=[21,44,21,20]，d 仍 22（垫 4），两半组各 22 层、dense 同 823,680，声明仍 140——ch36「两个 22 层子组」口径"
+        },
+        "blog_to_pin_term_map": [
+          {"blog_term": "5 组", "pin_counterpart": "同数复现：4 桶 → 近似 GCD → 5 组", "anchor": "kv_cache_utils.py:L1670-L1754"},
+          {"blog_term": "组大小 22", "pin_counterpart": "同数复现：_approximate_gcd([21,43,21,20])=22", "anchor": "kv_cache_utils.py:L1702-L1704"},
+          {"blog_term": "22×3 个 tensor", "pin_counterpart": "无此计数；对应 140（Flash）/202（Pro）条 offset 声明 → 1 块 slab", "anchor": "kv_cache_utils.py:L1348-L1356"},
+          {"blog_term": "每 tensor 被所有组共享", "pin_counterpart": "offset 折叠：G2 新开 0 offset 全复用 G1 条带；offset 0 压 5 层（每组第一层）；shared_by 跨组", "anchor": "kv_cache_utils.py:L1301"},
+          {"blog_term": "组内 3 个大小不一的 tensor", "pin_counterpart": "层元组 [C4I, C4A, C128]（docstring 自举例）+ SWA 族 (block_size, window) 三分桶 NOTE——都折进 offset 桶、不各出声明", "anchor": "kv_cache_utils.py:L1693-L1697 / L1613-L1615"},
+          {"blog_term": "Wasted 格（桶形）", "pin_counterpart": "行尾闲置 (block_stride − dense_g)（行形）；桶级归因不可加总", "anchor": "kv_cache_utils.py:L1303 + 本补充 sup-plan-1"},
+          {"blog_term": "group 1 block_size=256 但每个 spec 上实际不等", "pin_counterpart": "管理面 block_size 与 storage_block_size=block_size//compress_ratio 两套账（ch14「压缩记账」已立）", "anchor": "vllm/v1/kv_cache_interface.py:L403-L405"}
+        ]
+      }
+    },
+    {
+      "id": "sup-plan-3-group-by-width-matrix",
+      "name": "组×宽度桶矩阵账（worked example 主件）：61 层 Pro 版与 43 层 Flash 版双矩阵（行=4 种页宽、列=5 组、格=valid 内容/浪费归因），外加博客三桶同构版（结构性转录）——两矩阵并排做「同构映射」",
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_utils.py:L1283-L1305",
+        "vllm/v1/core/kv_cache_utils.py:L1670-L1754",
+        "vllm/v1/kv_cache_interface.py:L847-L849",
+        "vllm/v1/kv_cache_interface.py:L889-L892"
+      ],
+      "facts": [
+        "矩阵的读法（与博客图同构的行列语义）：行 = 页宽桶（Pro/Flash 都是 4 行：37440/32832/8640/1728），列 = 分配组（5 列），格 = 「该组有没有这个宽度桶的层账」：有 = valid 格（放什么 spec、几层、共几 Byte = 层数×页宽）；没有 = 浪费归因格（该桶条带落在本组密排尾 [dense, stride) 内的并集字节——见 sup-plan-1 的不可加总警示）。每列另配一行「行闲置」= stride − dense，这才是该组持一块时的真实浪费。",
+        "三对同页在矩阵上的样子（行结构之所以只有 4 行的原因）：37440 行 = swa ≡ main_c4 同页对（跨 G0/G1/G2 三组 valid——同页对跨组）；8640 行 = indexer ≡ indexer_state 同页对（G0 与 G3 各一半）；32832 行 = attn_state 两族同页对（G3 与 G4）；1728 行 = main_c128 单独。七种缓存形态压进四种页宽（round_up(·,576) 对齐保证，ch14「形状因子链」已立），所以博客图的三桶在 pin 长成四行。",
+        "Pro 61 矩阵数字全部来自本轮真跑（与 explainer/traces/v4_cache_groups_61layer.json 的 dense/tuples/stride/202 offsets/直方图逐项一致）；Flash 43 矩阵来自本轮真跑（stride 1,002,240 与 ch36 登记的 fp8 档一致）。博客三桶版只有结构性结论（valid/wasted 格分布）有转录出处，Byte 级数字无转录——正文并排时博客矩阵只画结构、数字标「推导口径（按 pin 页宽代入）」。",
+        "T1/T2/T3 的对应口径（本补充给出的映射，版本敏感，正文引用需带此标注）：博客 T3（大桶）↔ 37440 族（swa+main_c4），T2（中桶）↔ 8640 族（indexer+indexer_state），T1（小桶）↔ 1728（main_c128）；pin 的第四宽度 32832（attn_state 对）在博客三桶里没有自己的桶——博客版状态组「进 T3/T2」意味着状态页要并进已有桶（垫页算术未转录），pin 给它独立桶且不垫。据此博客口径的逐格浪费 Byte（推导口径）：wasted(T1)=1,728、wasted(T2)=8,640、每块足迹 = 1,728+8,640+37,440 = 47,808B（恰等于 pin 主包一个层元组的宽度，也是 G0 阶梯的循环步长）。",
+        "并排要点（writer 的同构映射句式素材）：行列同构（组×宽度桶、valid/wasted 二色）↔ 三个不同：块足迹（47,808B 三页 vs stride 整行）、浪费几何（桶页可加总 vs 行尾单一数）、声明数（66 vs 140/202）。四组数字 anchor：Pro 表格见 worked_example；两版共同骨架见 sup-plan-2 facts[8]。"
+      ],
+      "worked_example_material": {
+        "pro61_matrix": {
+          "block_stride": 1435968,
+          "rows": [
+            {
+              "bucket": 37440,
+              "cells": [
+                {"col": "G0 主账", "type": "valid", "content": "main_c4 ×30 层", "bytes": 1123200},
+                {"col": "G1 swa 前半", "type": "valid", "content": "swa ×31 层", "bytes": 1160640},
+                {"col": "G2 swa 后半", "type": "valid", "content": "swa ×30 层", "bytes": 1123200},
+                {"col": "G3 c4 状态", "type": "wasted", "bytes_union_in_tail": 112320},
+                {"col": "G4 c128 状态", "type": "wasted", "bytes_union_in_tail": 290880, "note": "带重叠加权 449,280（G0 主账条带与 swa 条带互相重叠）"}
+              ]
+            },
+            {
+              "bucket": 32832,
+              "cells": [
+                {"col": "G0 主账", "type": "wasted", "bytes_union_in_tail": 0, "note": "G0 是最宽租客、无行尾，浪费恒 0"},
+                {"col": "G1 swa 前半", "type": "wasted", "bytes_union_in_tail": 65664},
+                {"col": "G2 swa 后半", "type": "wasted", "bytes_union_in_tail": 98496},
+                {"col": "G3 c4 状态", "type": "valid", "content": "attn_state_c4 ×30 层", "bytes": 984960},
+                {"col": "G4 c128 状态", "type": "valid", "content": "attn_state_c128 ×31 层", "bytes": 1017792}
+              ]
+            },
+            {
+              "bucket": 8640,
+              "cells": [
+                {"col": "G0 主账", "type": "valid", "content": "indexer ×30 层", "bytes": 259200},
+                {"col": "G1 swa 前半", "type": "wasted", "bytes_union_in_tail": 60480},
+                {"col": "G2 swa 后半", "type": "wasted", "bytes_union_in_tail": 69120},
+                {"col": "G3 c4 状态", "type": "valid", "content": "indexer_state ×30 层", "bytes": 259200},
+                {"col": "G4 c128 状态", "type": "wasted", "bytes_union_in_tail": 112320}
+              ]
+            },
+            {
+              "bucket": 1728,
+              "cells": [
+                {"col": "G0 主账", "type": "valid", "content": "main_c128 ×31 层", "bytes": 53568},
+                {"col": "G1 swa 前半", "type": "wasted", "bytes_union_in_tail": 53568},
+                {"col": "G2 swa 后半", "type": "wasted", "bytes_union_in_tail": 53568},
+                {"col": "G3 c4 状态", "type": "wasted", "bytes_union_in_tail": 53568},
+                {"col": "G4 c128 状态", "type": "wasted", "bytes_union_in_tail": 53568}
+              ]
+            }
+          ],
+          "row_idle_line": [
+            {"col": "G0", "idle_bytes": 0, "pct": 0.0},
+            {"col": "G1", "idle_bytes": 275328, "pct": 19.174},
+            {"col": "G2", "idle_bytes": 312768, "pct": 21.781},
+            {"col": "G3", "idle_bytes": 191808, "pct": 13.357},
+            {"col": "G4", "idle_bytes": 418176, "pct": 29.122}
+          ],
+          "caveats": [
+            "浪费格 = 该桶条带在本组密排尾 [dense, stride) 的并集字节；跨桶条带互相别名，格间不可加总（G4 格和 456,768 > 行闲置 418,176）",
+            "valid 格也可能有同桶他组条带闲置在尾部（如 G4|32832 valid，但 G3 的 32832 条带超出 G4 密排的部分在 G4 持块时同样闲置）",
+            "行闲置 (stride − dense) 是每列唯一可加总的浪费量"
+          ]
+        },
+        "flash43_matrix": {
+          "block_stride": 1002240,
+          "rows": [
+            {
+              "bucket": 37440,
+              "cells": [
+                {"col": "G0 主账", "type": "valid", "content": "main_c4 ×21 层", "bytes": 786240},
+                {"col": "G1 swa 前半", "type": "valid", "content": "swa ×22 层", "bytes": 823680},
+                {"col": "G2 swa 后半", "type": "valid", "content": "swa ×21 层", "bytes": 786240},
+                {"col": "G3 c4 状态", "type": "wasted", "bytes_union_in_tail": 74880},
+                {"col": "G4 c128 状态", "type": "wasted", "bytes_union_in_tail": 293184}
+              ]
+            },
+            {
+              "bucket": 32832,
+              "cells": [
+                {"col": "G0 主账", "type": "wasted", "bytes_union_in_tail": 0},
+                {"col": "G1 swa 前半", "type": "wasted", "bytes_union_in_tail": 32832},
+                {"col": "G2 swa 后半", "type": "wasted", "bytes_union_in_tail": 65664},
+                {"col": "G3 c4 状态", "type": "valid", "content": "attn_state_c4 ×21 层", "bytes": 689472},
+                {"col": "G4 c128 状态", "type": "valid", "content": "attn_state_c128 ×20 层", "bytes": 656640}
+              ]
+            },
+            {
+              "bucket": 8640,
+              "cells": [
+                {"col": "G0 主账", "type": "valid", "content": "indexer ×21 层", "bytes": 181440},
+                {"col": "G1 swa 前半", "type": "wasted", "bytes_union_in_tail": 43200},
+                {"col": "G2 swa 后半", "type": "wasted", "bytes_union_in_tail": 60480},
+                {"col": "G3 c4 状态", "type": "valid", "content": "indexer_state ×21 层", "bytes": 181440},
+                {"col": "G4 c128 状态", "type": "wasted", "bytes_union_in_tail": 100800}
+              ]
+            },
+            {
+              "bucket": 1728,
+              "cells": [
+                {"col": "G0 主账", "type": "valid", "content": "main_c128 ×20 层", "bytes": 34560},
+                {"col": "G1 swa 前半", "type": "wasted", "bytes_union_in_tail": 5184},
+                {"col": "G2 swa 后半", "type": "wasted", "bytes_union_in_tail": 6912},
+                {"col": "G3 c4 状态", "type": "wasted", "bytes_union_in_tail": 3456},
+                {"col": "G4 c128 状态", "type": "wasted", "bytes_union_in_tail": 12096}
+              ]
+            }
+          ],
+          "row_idle_line": [
+            {"col": "G0", "idle_bytes": 0, "pct": 0.0},
+            {"col": "G1", "idle_bytes": 178560, "pct": 17.816},
+            {"col": "G2", "idle_bytes": 216000, "pct": 21.552},
+            {"col": "G3", "idle_bytes": 131328, "pct": 13.103},
+            {"col": "G4", "idle_bytes": 345600, "pct": 34.483}
+          ],
+          "caveats": "同 Pro 矩阵三条 caveat；G4 格和 406,080 > 行闲置 345,600"
+        },
+        "blog3bucket_matrix": {
+          "provenance": "结构性结论 = research 转录（community-narrative-figures.json A2 / hybrid-v4-background.json entry 5，Lead 指定口径）；Byte 数字 = 推导口径（按 pin 页宽代入 T1=1728/T2=8640/T3=37440），博客原文的桶页宽未转录",
+          "shape": "行 = T1/T2/T3 三个宽度桶 tensor；列 = 5 组（G1 主账、G2/G3 swa、G4/G5 状态）；每块在 3 桶各占一页",
+          "rows": [
+            {"bucket": "T1（↔1728 族）", "cells": [
+              {"col": "G1 主账", "type": "valid"},
+              {"col": "G2 swa", "type": "wasted", "bytes_derived": 1728},
+              {"col": "G3 swa", "type": "wasted", "bytes_derived": 1728},
+              {"col": "G4 状态", "type": "wasted", "bytes_derived": 1728},
+              {"col": "G5 状态", "type": "wasted", "bytes_derived": 1728}
+            ]},
+            {"bucket": "T2（↔8640 族）", "cells": [
+              {"col": "G1 主账", "type": "valid"},
+              {"col": "G2 swa", "type": "wasted", "bytes_derived": 8640},
+              {"col": "G3 swa", "type": "wasted", "bytes_derived": 8640},
+              {"col": "G4 状态", "type": "valid"},
+              {"col": "G5 状态", "type": "valid"}
+            ]},
+            {"bucket": "T3（↔37440 族）", "cells": [
+              {"col": "G1 主账", "type": "valid"},
+              {"col": "G2 swa", "type": "valid"},
+              {"col": "G3 swa", "type": "valid"},
+              {"col": "G4 状态", "type": "valid"},
+              {"col": "G5 状态", "type": "valid"}
+            ]}
+          ],
+          "per_block_footprint_derived": 47808,
+          "footprint_note": "47,808 = 1,728+8,640+37,440 = pin 主包一个层元组 [C4I, C4A, C128] 的宽度 = Flash G0 阶梯循环步长——博客版「一块」的量级恰是 pin「一个元组」的宽度；pin 的块 = G0 整栈 1,002,240B（max 不是 sum）"
+        },
+        "reproduction_recipe": {
+          "pin": "vLLM v0.27.1 @ 6e448d0ea9（instances/vllm/source）",
+          "method": "host 桩跑（与 explainer/traces/run_v4_cache_groups.py 同一桩面：vllm.config / vllm.config.kv_events / vllm.v1.metrics / vllm.v1.metrics.stats / vllm.v1.request / vllm.v1.utils 六处替身，分组/近似 GCD/packed 布局全部 pin 算法零改动）",
+          "pro_ratios": "[4]*30 + [128]*31，sliding_window=8192（示教窗，dense/tuples/stride 不随窗值变）",
+          "flash_ratios": "[0,0] + [4,128]*20 + [4]，sliding_window=128（Flash config.json 官方窗）",
+          "spec_builders": "swa=SlidingWindowMLASpec(64,512,uint8,fp8_ds_mla,窗,576)；main=MLAAttentionSpec(256,512,uint8,r,fp8_ds_mla,576)；indexer=MLAAttentionSpec(256,132,uint8,r=4,576)；attn_state=SlidingWindowMLASpec(4/8, 2*coff*512, fp32, coff*r, 576)；indexer_state=SlidingWindowMLASpec(4, 512, fp32, 8, 576)——与 ch14「形状因子链」同款",
+          "functions_called": "group_and_unify_kv_cache_specs → _get_kv_cache_groups_uniform_groups → _get_packed_kv_cache_layout（+ 自写 offset 阶梯/并集归因后处理，只读不写 pin）",
+          "cross_validation": "Pro：dense 五值/202 offsets/91-27-0-57-27/直方图/7477 块与 traces/v4_cache_groups_61layer.json 全一致；Flash：stride 1,002,240 与 ch36 narrative fp8 档登记一致；MTP 变体两半组各 22 层与 ch36「两个 22 层子组」一致"
+        }
+      }
+    },
+    {
+      "id": "sup-plan-4-runtime-258-bridge",
+      "name": "运行时行桥接：博客图下的 258 分配数（2/2/2/33/65）与「SWA 立即释放、实占 1」在本书的归属——ch14「门多紧/SWA 的还账方式」+ ch15「每组一张块表」，writer 一句回指即可",
+      "source_anchors": [
+        "vllm/v1/core/kv_cache_coordinator.py:L238-L268",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L360",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L878",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L1057-L1083",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L622-L659",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L1894-L1898",
+        "vllm/v1/core/single_type_kv_cache_manager.py:L1920-L1922",
+        "vllm/v1/core/kv_cache_manager.py:L495-L508"
+      ],
+      "facts": [
+        "每组分配数的算术锚：协调器 allocate_new_blocks 逐管家调（kv_cache_coordinator.py:L238-L268），管家 num_required_blocks = cdiv(num_tokens, self.block_size)（single_type_kv_cache_manager.py:L360）。V4 五组的管理面块长 256/64/64/4/8——len=258、无前缀命中时逐组 cdiv 得 2/5/5/65/33。",
+        "与博客 258 行的对照：博客 2/2/2/33/65。其中 33 = cdiv(258,8)、65 = cdiv(258,4) 在 pin 原样成立（两本状态账的组块长恰是 8/4）；swa 组博客 2、pin 5，差在博客版 swa 走 256 管理面、pin 是 64（被 C4A 主 KV 块形反定，sparse_swa.py:L77-L82）。状态组的 token→压缩槽位换算细节（每块几个 token 的口径）归 ch14「压缩记账」/ch22 槽位映射一侧，本桥接不展开、正文也别展开。",
+        "「立即释放」的归属锚（pin）：allocate_slots 在每次分配预测之前先调 coordinator.remove_skipped_blocks（kv_cache_manager.py:L495-L508，注释原话 \"Should call this function before allocating new blocks to reduce the number of evicted blocks\"）；SlidingWindowManager.get_num_skipped_tokens = max(0, num_computed_tokens − sliding_window + 1)（single_type_kv_cache_manager.py:L1057-L1083，docstring 自带 sliding_window=4/computed=7 的图解）；remove_skipped_blocks 只收整块、原位换 null 占位（L622-L659）。",
+        "pin 的管家分布（与博客「组 4/5 走 SlidingWindowManager」对读）：注册表 SlidingWindowMLASpec → SlidingWindowManager（single_type_kv_cache_manager.py:L1894-L1898）、MLAAttentionSpec → FullAttentionManager（L1920-L1922）——V4 五组里 G1-G4（两个 swa 半组 + 两本状态组，全部申报滑窗族 spec）都是 SlidingWindowManager，只有 G0 主账组全长持有。博客说「组 4/5 走 SlidingWindowManager」是其版本的组编法与口径，pin 侧是 4/5。",
+        "博客「前面的 32/64 块立刻释放、实占 1」在研究包只有结论、没有算式（版本敏感，正文不得替它补推导）；pin 的同语义算术即站 11 机制：窗外 token = computed − window + 1，整除块长收整块。示例（pin 公式代入，可给可不给）：Flash 窗 128 的 swa 组对 258-token 请求回收 (258−128+1)//64 = 2 块、实持 3/5。",
+        "writer 的回指句式素材（不重讲）：分配数与释放语义 = ch14「门多紧」的「SWA 的还账方式：窗外块回收与 null 占位（站 11）」（get_num_skipped_tokens/remove_skipped_blocks/null 换位全在该节走读）+ ch15 的组视角实拍（同一请求两组块表各自演化、hybrid 协调器逐管家发号）；「每请求每组各自一套账」的实拍表在 ch15「组是什么」段落。"
+      ],
+      "worked_example_material": {
+        "cdiv_258_table": [
+          {"group": "G0 主账", "block_size": 256, "pin_blocks": 2, "blog_blocks": 2, "note": "一致"},
+          {"group": "G1 swa 前半", "block_size": 64, "pin_blocks": 5, "blog_blocks": 2, "note": "差在博客版 swa 走 256 管理面"},
+          {"group": "G2 swa 后半", "block_size": 64, "pin_blocks": 5, "blog_blocks": 2, "note": "同上"},
+          {"group": "G3 c4 状态", "block_size": 4, "pin_blocks": 65, "blog_blocks": 65, "note": "cdiv(258,4)，两版本同数"},
+          {"group": "G4 c128 状态", "block_size": 8, "pin_blocks": 33, "blog_blocks": 33, "note": "cdiv(258,8)，两版本同数"}
+        ],
+        "backref_anchors": {
+          "ch14": "「门多紧」→「SWA 的还账方式：窗外块回收与 null 占位（站 11）」（narrative 既有节）",
+          "ch15": "「组是什么、为什么会有组」段（hybrid 协调器、每组一张块表、同一请求两组账各自演化的实拍表）",
+          "one_liner": "图下那行 258 的分配数是「每组一套 cdiv 账」的直读，「实占 1」是站 11 窗外回收跑完后的稳态——机制 ch14 站 11 已走读、两组各演各的实拍 ch15 已给，此处只认数不重讲。"
+        }
+      }
+    }
+  ]
+}
