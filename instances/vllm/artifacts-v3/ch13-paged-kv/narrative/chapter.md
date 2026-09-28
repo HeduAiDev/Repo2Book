@@ -20,7 +20,7 @@
 
 读法建议：想知道「凭什么利用率能顶到满」，从[「三源浪费」](#三源浪费旧系统只用了两三成显存)读起；只想看账本三件套长什么样，跳[「池的出生」](#池的出生一秒发完全部身份证站-1)和[「自由队列」](#自由队列指针长在块身上站-1-续)；关心[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)那个 None 的出生地，直奔[「入场要块」](#入场要块allocate_slots-三段式站-2-4)；想弄懂一个 token 的 KV 到底放进显存哪个格子，看[「槽位恒等式」](#槽位恒等式一个位置号怎么变成一个物理槽位站-9)；想知道多卡部署下一拍的消息怎么往返（EngineCore 与 worker 各发什么、收什么、何时），直奔[「一拍两次 RPC」](#一拍两次-rpcenginecore-与-worker-的消息往返清单)；想跟全程，按序读。
 
-还有一句环境交代，全章的数值表都适用：本章实测来自配套精简版：按 v0.27.1 只做减法抽出的「账本三件套 + worker 页表」，host 上实跑纯控制流，不依赖 GPU 与 vLLM 运行时。它与真实引擎有三处刻意差别，后文碰到会就近再提：其一，精简版关掉前缀缓存跑（`enable_prefix_caching=False`，cache 配置里的正交开关，真实部署默认开，vllm/config/cache.py:L93），所以本章 `allocate_slots` 里「挂命中块」一段恒空、「写回满块」一段早退，这两段的戏在[前缀缓存章（第 15 章）](../../ch15-prefix-caching/narrative/chapter.md)，它开门第一件事就是回答「满块的哈希什么时候算、谁来算」；其二，host 无 CUDA，槽位换算走 kernel 的逐行 CPU 镜像（同一恒等式、同一变量名，CUDA 分支逐字保留），新块清零走 CPU 分支；其三，多卡部署里调度器与 worker 分属两个进程（单卡默认部署两者同住一个进程，同一条消息契约照样成立），块表过线天然各持一份，单进程驱动脚本在打包时刻手工快照防就地改动。凡表内数字都是实跑输出，一个没改。
+还有一句环境交代，全章的数值表都适用：本章实测来自配套精简版：按 v0.27.1 只做减法抽出的「账本三件套 + worker 页表」，host 上实跑纯控制流，不依赖 GPU 与 vLLM 运行时。它与真实引擎有三处刻意差别，后文碰到会就近再提：其一，精简版关掉前缀缓存跑（`enable_prefix_caching=False`，cache 配置里的正交开关，真实部署默认开，vllm/config/cache.py:L93），所以本章 `allocate_slots` 里「挂命中块」一段恒空、「写回满块」一段早退，这两段的戏在[前缀缓存章（第 15 章）](../../ch15-prefix-caching/narrative/chapter.md)，它开门第一件事就是回答「满块的哈希什么时候算、谁来算」；其二，host 无 CUDA，槽位换算走 kernel 的逐行 CPU 镜像（同一恒等式、同一变量名，CUDA 分支逐字保留），新块清零走 CPU 分支；其三，多卡部署里调度器与 worker 分属两个进程（单卡默认部署两者同住一个进程，同一条消息契约照样成立），块表过线天然各持一份，单进程驱动脚本在打包时刻手工快照防就地改动。小例的形状也在此一并立住，后文所有标了「小例」的数字都用它：块大小 16（默认值，vllm/config/cache.py:L47）、8 个 KV 头、每头 128 维、fp16，一页 65536 B；池子固定 10 块、每层缓冲 655360 B（= 65536 × 10，后文总账表那个 10 块池就是它）。凡表内数字都是实跑输出，一个没改。
 
 ## 显存为什么是主角：一个 token 的 KV 有多大
 
@@ -108,7 +108,7 @@ class AttentionSpec(KVCacheSpec):
                     # … 省略：kernel 块细分乘数四行（下一章显存账本）……
 ```
 
-`num_blocks = 字节数 // page_size_bytes`。除不尽的零头连一页都当不上，assert 逼着配置保证整除。之后每层的缓冲 reshape 成什么形状，由注意力后端仲裁（`get_kv_cache_shape`，gpu_model_runner.py:L7433-L7439）：主流后端把 K/V 打进内容维，得到 `[num_blocks, num_kv_heads, block_size, 2 × head_dim]`，每个 token 的 K 和 V 相邻存放（flash_attn.py:L143 的注释原话 "K and V are packed into the content dim"）；把 K、V 分成两半页的五维排布（`[num_blocks, 2, block_size, num_kv_heads, head_dim]`）只是个别后端的选择。无论哪种，页字节数不变，分页的账不依赖页内排布（后端怎么选，执行篇讲）。把本章用到的三个刻度实跑一遍：
+`num_blocks = 字节数 // page_size_bytes`。除不尽的零头连一页都当不上，assert 逼着配置保证整除。之后每层的缓冲 reshape 成什么形状，由注意力后端仲裁（`get_kv_cache_shape`，gpu_model_runner.py:L7433-L7439）：主流后端把 K/V 打进内容维，得到 `[num_blocks, num_kv_heads, block_size, 2 × head_dim]`，每个 token 的 K 和 V 相邻存放（flash_attn.py:L143 的注释原话 "K and V are packed into the content dim"）；把 K、V 分成两半页的五维排布（`[num_blocks, 2, block_size, num_kv_heads, head_dim]`）只是个别后端的选择。无论哪种，页字节数不变，分页的账不依赖页内排布（后端怎么选，执行篇讲）。把本章用到的三个刻度实跑一遍——小例的页（块大小 16、8 个 KV 头、128 维、fp16）、7B 模型的 token 账（32 个 KV 头乘 32 层：表里行 2 的 32 是 KV 头数、行 3 的 32 是层数，两个 32 不同物，本节开头那道 2 × 32 × 32 × 128 × 2 的原式里它们并排出现，是最易混点）、worker 的池换算（每层 655360 B 的 10 块池）：
 
 <!-- trace: m10 -->
 | 算什么 | 公式代入 | 结果 |
@@ -117,7 +117,7 @@ class AttentionSpec(KVCacheSpec):
 | 7B 模型（Llama 2）每 token 每层 | 2×32×128×2 B | 16384 B |
 | 7B 模型（Llama 2）每 token 全模型 | 16384×32 层 | 524288 B ≈ 0.5 MB |
 | 4096-token 序列的 KV | 524288×4096 | 2147483648 B = 2 GiB |
-| worker 换算块数 | 655360 // 65536 | 10 块（说明性视图 [10, 2, 16, 8, 128]） |
+| worker 换算块数 | 655360 // 65536（= 65536 × 10） | 10 块（10 块池每层的字节数；说明性视图 [10, 2, 16, 8, 128]） |
 
 （host 上 CPU 张量代 GPU 面做的验证，同一公式、同一整除断言；页字节数与块数在真 GPU 上不变。表中视图形状是 host 精简版的说明性布局：真实 GPU 上每层缓冲 reshape 成什么形状由注意力后端的 `get_kv_cache_shape` 仲裁，主流后端是 `[num_blocks, num_kv_heads, block_size, 2 × head_dim]`、K/V 逐 token 相邻打包，不存在「上下两半页」；页字节数不变。）
 
@@ -469,7 +469,40 @@ class FreeKVCacheBlockQueue:
         ```
 ```
 
-五段从左到右：**comp**（已算过的）、**new_comp**（本拍新命中的前缀缓存块）、**ext_comp**（外部 connector 缓存的）、**new**（本拍真要算的）、**lookahead**（投机解码的前瞻槽）。本章单请求、无缓存、无 connector、无投机的主路径上，中间三段恒空，活的只有 comp 和 new。「已经算过多少 + 这一拍要算多少」恰好就是[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)立的追赶公式那两个数。这张图是读 vLLM 全部 KV 代码的地图，后两章回头看它会多亮几段。
+五段从左到右：**comp**（已算过的）、**new_comp**（本拍新命中的前缀缓存块）、**ext_comp**（外部 connector 缓存的；connector 指 KV connector，把别处算好的 KV 搬进本引擎的外挂传输模块，Part IV 压轴一站的主角）、**new**（本拍真要算的）、**lookahead**（投机解码的前瞻槽）。本章单请求、无缓存、无 connector、无投机的主路径上，中间三段恒空，活的只有 comp 和 new。「已经算过多少 + 这一拍要算多少」恰好就是[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)立的追赶公式那两个数。这张图是读 vLLM 全部 KV 代码的地图，后两章回头看它会多亮几段。
+
+### 先看送料：五段怎么合成预测器的入参
+
+五段是 token 域的地图，而容量检查要拿的是一个数——五个段怎么缩成传给预测器的 num_tokens、这个数又经谁的手递进去，`allocate_slots` 在调预测器之前就把这两件事办完了。两处求和点，源码原文：
+
+```python
+# vllm/v1/core/kv_cache_manager.py:L453-L461
+        # The number of computed tokens is the number of computed tokens plus
+        # the new prefix caching hits
+        num_local_computed_tokens = (
+            request.num_computed_tokens + num_new_computed_tokens
+        )
+        total_computed_tokens = min(
+            num_local_computed_tokens + num_external_computed_tokens,
+            self.max_model_len,
+        )
+```
+
+第一个求和点收拢「已算过」的三段：comp 加 new_comp 得 num_local_computed_tokens（本地已算 token 数），再加 ext_comp、钳到 max_model_len（模型允许的最长序列长度，来自模型配置），就是 total_computed_tokens。两个求和点之间还隔着两道预算门，即 watermark 水位分支与 `full_sequence_must_fit` 整序列准入门（kv_cache_manager.py:L463-L488）——why 链[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)、[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)拆过，预算的账归下一章显存账本，这里一笔带过。门后是第二个求和点，收拢「要算」的两段：
+
+```python
+# vllm/v1/core/kv_cache_manager.py:L490-L493
+        num_tokens_main_model = total_computed_tokens + num_new_tokens
+        num_tokens_need_slot = min(
+            num_tokens_main_model + num_lookahead_tokens, self.max_model_len
+        )
+```
+
+total_computed_tokens 加 new 得 num_tokens_main_model，再加 lookahead、再钳一次 max_model_len，才是最终传给预测器的 num_tokens_need_slot。五段至此各就各位：comp 与 new_comp 进第一个和，ext_comp 藏在 total 里过门，new 与 lookahead 在门后压轴。
+
+两个求和点各埋一个陷阱，就近记下。其一，L458-L461 这个钳过 max_model_len 的 total_computed_tokens 只是局部变量，真正传给预测器的是 L515-L516 未钳版本的「本地已算 + 外部已算」之和，滑窗跳段的基数用的是后者。其二，num_tokens_main_model 是**不带 lookahead** 的中间量：投机解码时主模型与草稿模型各算各的账，无投机时它就等于 num_tokens_need_slot。
+
+数合成了，谁去调预测器？kv_cache_manager.py:L510 那句 `self.coordinator.get_num_blocks_to_allocate`。后文代码里反复出现的 `self.coordinator`（协调器）在此先交代：KVCacheManager 不直接摸块池，而是把请求按「注意力组」分发给各组的单类型管理器去办——调预测器也是这条路：协调器按组拆分实参、逐组调用、把各组的返回值**求和**（kv_cache_coordinator.py:L130-L190；cross-attention 组对 encoder 输入另走一支特例，本章不碰）。本章单组全注意力，它近似直通（「组」是什么、为什么要分，下一章显存账本讲）。预测器收五个实参（docstring 的 Args 段有权威释义，single_type_kv_cache_manager.py:L157-L172）：num_tokens 就是上面的 num_tokens_need_slot；total_computed_tokens 是未钳版（陷阱一）；num_local_computed_tokens 是第一个求和点的中间量；new_computed_blocks 是入场首拍 `get_cached_block` 查池的命中块（出处前文交代过）；num_tokens_main_model 不带 lookahead（陷阱二）。输入立住了，进预测器内部。
 
 ### 先数块：快慢两条路，同一本账
 
@@ -573,7 +606,7 @@ class FreeKVCacheBlockQueue:
 - `num_skipped_blocks = num_skipped_tokens // self.block_size`：**floor（向下取整），不是 cdiv（向上取整）**。跨窗边界的块还有一角在窗内、必须保留实体（上例 token 0..3 落在窗外、但它所在的块还装着窗内的 token，换不得），只有整块全在窗外才换成 null 占位——null 块永不出租（站 1 贴封条那位），get_usage 的分母也永远少记它。为什么敢跳、跳了为什么正确（回收不变量），下一章显存账本推。
 - `num_new_blocks = max(required − max(skipped, local_computed), 0)`：内层 max 是「挂账之后无需新实体块的表长」。无跳段时 = 已持 + 命中；跳段压过已就位时以跳段为准——null 占位虽然不是实体块，**本身也占表长**（这个分支只在 ext_comp 抬高跳段基数的混合场景出现，下面的 E3 正是它）。
 - `num_skipped_new_computed_blocks`：命中块里落在跳段前缀内的那部分——它们不会被 touch（不离开自由队列），所以要从可驱逐计数里剔掉。
-- `num_evictable_blocks`：将被 touch 的命中块里 ref_cnt==0 且非 null 的（正躺在自由队列当驱逐候选）。touch 会把它们从自由队列**中间**摘走——上一节 remove 原语在这里等到了主人。命中块（别的请求算过、内容相同、可直接复用的块）既是「不用新分配」、又实打实离开空闲池，漏数它容量检查就失真（注释原话 so we must count it in the free-capacity check）。这条注释是第二条 why 链的另一半「预测器与分配器严格同构」的一个样本：预测用的数学必须和分配动作一一对应，漂移没有运行时校验、只有注释和单源公式防着。
+- `num_evictable_blocks`：将被 touch 的命中块里 ref_cnt==0 且非 null 的（正躺在自由队列当驱逐候选）。touch 会把它们从自由队列**中间**摘走——上一节 remove 原语在这里等到了主人。命中块（别的请求算过、内容相同、可直接复用的块）既是「不用新分配」、又实打实离开空闲池，漏数它容量检查就失真（注释原话 so we must count it in the free-capacity check）。这条注释是第二条 why 链的另一半——**预测器必须把分配段的取块动作逐项数全**——的一个样本：预测用的数学必须和分配动作一一对应，touch 不在任何差值公式里、却实打实摘走空闲块，漏数它账就错；漂移没有运行时校验、只有注释和单源公式防着（后文「再拿块挂账」一节正面收这条线）。
 - 六行之外还跟一个尾巴：partial 命中（命中的长度停在某个块的中间）时 `num_new_blocks += 1`，为 CoW 预留一个私有块——CoW 的机制一句话：共享的块谁要接着写，谁先拷一份私有；什么时候真的发生，过线一节的[「CoW 六拍」](#cow-六拍partial-命中的共享尾块什么时候换私房)单独讲。
 
 ![慢路径六行账的块关系：E2 全注意力 vs E3 滑窗+外部，同一块号刻度尺对照](../diagrams/ch13-fig-slowpath-blocks.png)
@@ -611,30 +644,7 @@ E2（全注意力，prompt=100、前缀命中 48 token——恰好 3 整块，�
 
 E3（滑窗 W=16，本地命中 2 块 + connector 外部缓存 32 token，total_computed = 64，本拍再算 36）：窗外 token = max(0, 64−16+1) = 49，跳段 = 49//16 = 3——floor 在这里救命：第 4 块跨 48/49 窗边界，token 49..63 还在窗内，必须留实体。内层 max 落在跳段支（ext_comp 抬高了跳段基数、却不进 local_computed），新块 = 7−max(3,2) = 4；命中的 2 块全落在跳段前缀内、被剔出可驱逐计数 → 预测 4。（E3 分配侧的对账是代码走读推演：外部段补块的 allocate_external_computed_blocks 在精简版已删、账归 KVConnector 章；真实挂账会是 [null, null, null] 占位 3 格、外部段另发 1 块、新块 3 块，实体块 1+3 = 4。）
 
-六行账在手，回头把开头的五段图逐段对到块账参数上——这是最容易卡住的地方：docstring 把 comp、new_comp、ext_comp 都画成「前缀已算过」，但块账里三者的待遇完全不同（先补一词：ext_comp 里的 connector 指 KV connector，把别处算好的 KV 搬进本引擎的外挂传输模块，Part IV 压轴一站的主角）。先立住两个求和点（token 域怎么合成传进预测器的数）：
-
-```python
-# vllm/v1/core/kv_cache_manager.py:L453-L461
-        # The number of computed tokens is the number of computed tokens plus
-        # the new prefix caching hits
-        num_local_computed_tokens = (
-            request.num_computed_tokens + num_new_computed_tokens
-        )
-        total_computed_tokens = min(
-            num_local_computed_tokens + num_external_computed_tokens,
-            self.max_model_len,
-        )
-```
-
-```python
-# vllm/v1/core/kv_cache_manager.py:L490-L493
-        num_tokens_main_model = total_computed_tokens + num_new_tokens
-        num_tokens_need_slot = min(
-            num_tokens_main_model + num_lookahead_tokens, self.max_model_len
-        )
-```
-
-两个陷阱先记下。其一，L458-L461 这个钳过 max_model_len 的 total_computed_tokens 只是局部变量，真正传给预测器的是 L515-L516 未钳版本的「本地已算 + 外部已算」之和，滑窗跳段的基数用的是后者。其二，num_tokens_main_model 是**不带 lookahead** 的中间量：投机解码时主模型与草稿模型各算各的账，无投机时它就等于 num_tokens_need_slot。逐段映射：
+六行账在手，回头把开头的五段图逐段对到块账参数上——这是最容易卡住的地方：docstring 把 comp、new_comp、ext_comp 都画成「前缀已算过」，但块账里三者的待遇完全不同。token 域怎么合成传进预测器的 num_tokens，「先看送料」一节已立（两个求和点、两个陷阱都在那节）；这里接着看块账这头怎么接。逐段映射：
 
 | 五段（token 域） | 进块账哪一项 | 一句话 |
 |---|---|---|
@@ -645,7 +655,7 @@ E3（滑窗 W=16，本地命中 2 块 + connector 外部缓存 32 token，total_
 
 病根就在第三行：ext_comp 的 token 在远端算过、调度器据此少排新算量（new 变小），但这些 token 的块在本地池里**一个都还没有**，必须当新块真金白银地分配——「已算过」是 token 账的事，「不用分配」是块账的事，两本账在 ext_comp 上分道扬镳。**五段图解释不了块账，准确解法就是这句话**；E3 里 max 落在跳段支，正是 ext_comp「抬基数、不进减数」的直接后果。
 
-预测值回到 `allocate_slots` 里对着空闲块数一比。代码里反复出现的 `self.coordinator`（协调器）先交代一句：KVCacheManager 不直接摸块池，而是把请求按「注意力组」分发给各组的单类型管理器去办。本章单组全注意力，它近似直通（「组」是什么、为什么要分，下一章显存账本讲）。检查之前还有两道预算门，即 watermark 水位分支与 `full_sequence_must_fit` 整序列准入门（kv_cache_manager.py:L463-L488），why 链[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)、[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)拆过，预算的账归下一章显存账本；本章只看普通容量检查这三行：
+预测值回到 `allocate_slots` 里对着空闲块数一比——协调器怎么按组拆分实参、逐组求和，以及检查之前那两道预算门，「先看送料」一节都已交代；本章只看普通容量检查这三行：
 
 ```python
 # vllm/v1/core/kv_cache_manager.py:L510-L527 · KVCacheManager.allocate_slots
@@ -690,7 +700,7 @@ E3（滑窗 W=16，本地命中 2 块 + connector 外部缓存 32 token，total_
 
         req_blocks = self.req_to_blocks[request_id]           # 这个请求的块表   # L359
         num_required_blocks = cdiv(num_tokens, self.block_size)
-        num_new_blocks = num_required_blocks - len(req_blocks)  # 与预测同一公式  # L361
+        num_new_blocks = num_required_blocks - len(req_blocks)  # 与 fast-path 同一公式  # L361
         if num_new_blocks <= 0:
             return cow_blocks                                 # 只换不增         # L363
         else:
@@ -701,7 +711,7 @@ E3（滑窗 W=16，本地命中 2 块 + connector 外部缓存 32 token，total_
             return cow_blocks + new_blocks                    # 又换又增         # L369
 ```
 
-注意 L361 与预测器是**同一个公式**（cdiv 差值），这就是「预测器与分配器严格同构」的字面意思：同一个算术，先在检查段算一遍、再在分配段算一遍，中间没有第二套逻辑可以漂移。`req_to_blocks` 是本章的轴，即**逻辑块表**：每个请求名下一个有序块清单（`defaultdict(list)`，vllm/v1/core/single_type_kv_cache_manager.py:L97），`extend` 一次，提货单加长一段。旁边顺手记的 `self.new_block_ids`（新块 id 流水账）是给 worker 清零用的，站 6 正面讲。CoW 前奏里那句「原地替换让下面的长度差值算术照常成立」（Replacing in place keeps the length-based allocation below correct）值得盯一眼：私有块顶进表位、表长不变，主干的三件事一行都不用改——两个 return 的分岔（L363 只返回换来的 / L369 换来加新增）什么条件走哪边，同样留给「CoW 六拍」。
+注意 L361 与预测器 fast-path 是**同一个公式**（cdiv 差值）：running 请求的检查段（L200）与分配段（L361）之间没有任何代码动过块表——第二段「挂命中块」对 running 请求是 no-op——同一个算术算两遍、中间没有第二套逻辑可以漂移，「预测器与分配器同构」在 fast-path 这个范围内是字面的。首排带命中的请求则不然：预测器比 L361 多出的项各有对应的取块动作，且都发生在 L361 之前——第二段 touch 把冷命中块从自由队列中间摘走（num_evictable 项）、CoW 前奏先取一块私有块（慢路径 num_new_blocks += 1 预留的那 1）、外部段补块也先发进表，这些动作把 req_to_blocks 加长，L361 的差值于是恰好落在「还差的新块」上。预测值是这些动作的块数之和——E2 全冷的 touch 3 块加 get_new_blocks(4) = 7 正是这个对账。所以「同构」的准确含义不是同一算术算两遍，而是 **预测器逐项预告分配段的每个取块动作**（touch 摘队、CoW 私有块、差值新块），漏数任何一项容量检查就失真；漂移没有运行时校验，防着它的是源码钉下的三处注释——可驱逐块要数进容量检查（L223 上方注释，前文读过）、CoW 预留那 1 块（L226-L229，同前）、每步分配必须关准入帽否则预测器对不上 allocate_new_blocks（kv_cache_coordinator.py:L158-L161）——加「检查与分配共用同一张块表」这个事实本身。`req_to_blocks` 是本章的轴，即**逻辑块表**：每个请求名下一个有序块清单（`defaultdict(list)`，vllm/v1/core/single_type_kv_cache_manager.py:L97），`extend` 一次，提货单加长一段。旁边顺手记的 `self.new_block_ids`（新块 id 流水账）是给 worker 清零用的，站 6 正面讲。CoW 前奏里那句「原地替换让下面的长度差值算术照常成立」（Replacing in place keeps the length-based allocation below correct）值得盯一眼：私有块顶进表位、表长不变，主干的三件事一行都不用改——两个 return 的分岔（L363 只返回换来的 / L369 换来加新增）什么条件走哪边，同样留给「CoW 六拍」。
 
 取块下沉到池里：
 
@@ -1036,7 +1046,7 @@ docstring 就是账本：**两端都要活到 worker 拷完**。共享尾块 sou
 
 （cow 块对 worker 来说就是新块——`allocate_new_blocks` 前奏里 `self.new_block_ids.append(cow_block.block_id)` 那行把它记进了清零名单。）拷贝本体 `copy_kv_cache_blocks_inplace` 把每层存储视为 `[num_blocks, page_bytes]` 的字节矩阵，对每个 (src, dst) 对执行一句 `blocks[dst] = blocks[src]` 整页搬运（vllm/v1/worker/utils.py:L528-L567）。
 
-走读一个完整例对账（E4，代码走读推演——精简版删了 CoW 整段无法实跑，数字按上列锚点逐步推演；块大小 32、多组部署哈希粒度 16、prompt=36、命中到 token 16）。**预测段**：查得 1 块命中但只盖 16 token，16 % 32 ≠ 0，partial 成立，登记 (block_idx=0, blkX)；required = cdiv(36,32) = 2、local_computed = 1 → 新块 1；blkX 冷（ref_cnt==0）可驱逐 1；partial +1 → 总预测 3。**分配侧**：touch blkX（净减 1）、换尾取 1（净减 1）、差值 cdiv(36,32)−1 = 1 再取 1（净减 1）→ 自由队列净减 3 = 预测 3，预测器与分配器在这条支上同样同构。**worker 侧**：过线 [(blkX → cow)]，先清零（cow 与新块）再整页拷 32 槽字节，随后 prefill 的 token 16..35 写进 cow 的槽 16..31 和新块的槽 0..3——共享方 blkX 后半截的陈旧字节永远不被读到。半块命中既省显存又不出错，闭环就在这六拍里。
+走读一个完整例对账（E4，代码走读推演——精简版删了 CoW 整段无法实跑，数字按上列锚点逐步推演；块大小 32、多组部署哈希粒度 16、prompt=36、命中到 token 16）。**预测段**：查得 1 块命中但只盖 16 token，16 % 32 ≠ 0，partial 成立，登记 (block_idx=0, blkX)；required = cdiv(36,32) = 2、local_computed = 1 → 新块 1；blkX 冷（ref_cnt==0）可驱逐 1；partial +1 → 总预测 3。**分配侧**：touch blkX（净减 1）、换尾取 1（净减 1）、差值 cdiv(36,32)−1 = 1 再取 1（净减 1）→ 自由队列净减 3 = 预测 3——预测器把三个取块动作逐项预告、分配侧逐项兑现，对账分毫不差。**worker 侧**：过线 [(blkX → cow)]，先清零（cow 与新块）再整页拷 32 槽字节，随后 prefill 的 token 16..35 写进 cow 的槽 16..31 和新块的槽 0..3——共享方 blkX 后半截的陈旧字节永远不被读到。半块命中既省显存又不出错，闭环就在这六拍里。
 
 与 v0 经典 CoW 的对比，pin 里的官方文档一段话讲完（v0 引擎代码本体已随旧架构删除，只能引文档原话）：
 
@@ -1428,7 +1438,7 @@ slot = block_table[req][pos // block_size] × block_size + pos % block_size
 本章点亮的是 L0 图「调度 · 显存账本」列的**下半**，即 KVCacheManager 之下的 BlockPool、自由队列、引用计数，连同过线到 worker 侧的页表、清零账、槽位换算。与[第 10 章](../../ch10-continuous-batching-chunked-prefill/narrative/chapter.md)（token 预算）、[第 11 章](../../ch11-preemption-request-lifecycle/narrative/chapter.md)（抢占与一生）合起来，调度账本列从外到里全部打开；调度器三章里反复出现的「借 block_id、还 block_id」，从此每个 id 都有了实物。开篇三问的答案：**浪费被谁吃掉**：预留空槽、内部碎片、外部碎片三源（外加共享前缀的冗余复制），旧系统按最大长度连续预分配的必然代价，论文实测有效利用率 20.4%-38.2%；**凭什么敢按需拿页**：固定大小 + 间接层这对操作系统老配方，等大块池一次预构、每请求一张逻辑块表、按 cdiv 差值领块，浪费被钉死在「每请求不足一块」，代价是注意力 kernel 从此要穿表读（F7，账单在执行篇）；**隔着进程凭什么对上账**：block_id 是两个进程唯一的共同语言，调度器独占元数据、worker 独占张量，全量首帧 + 增量电报 + 恢复者整表替换 + 新块清零旁路，一套差量协议把两个世界钉在同一份 KVCacheConfig 上。带三件事走：
 
 1. **账本三件套是一台纯 CPU 的机器**。块是七个整数的 slots 卡片（两个哈希账位留给缓存），自由队列是指针长在块身上的侵入式链表（O(1) 中摘、零对象分配），共享靠明晃晃的引用计数（+1 登记、−1 退租、归零才回池）。这台机器活在调度器进程里，一拍要给几百个请求算账，所以它的每一条纪律（预构、复用空对象、哨兵消分支）都是在护调度循环的毫秒。
-2. **预测器与分配器是同一个公式跑两遍**。cdiv 差值先在容量检查算（不够 → None，零半截账），再在分配段算（popleft_n + ref_cnt=1 + 块表加长）。预测器内部分岔：num_cached_block 记账位在就 fast-path 一句差值，不在就慢路径六行账——后者是同一本账的全写，数的是「本拍从自由队列摘走多少块」。None 不是异常是算出来的答案：WAITING 侧听到它等下一拍，RUNNING 侧听到它进抢占环。
+2. **预测器逐项预告分配段的每个取块动作**。fast-path（running 请求）上就是同一句 cdiv 差值算两遍——检查段与分配段之间没人动块表；慢路径则把动作清单数全：touch 摘走的冷命中块、CoW 预留的私有块、差值新块，几项之和才是预测值（E2 全冷的 3 + 4 = 7 验过货）。cdiv 差值先在容量检查算（不够 → None，零半截账），再在分配段算（popleft_n + ref_cnt=1 + 块表加长）。预测器内部分岔：num_cached_block 记账位在就 fast-path 一句差值，不在就慢路径六行账——后者是同一本账的全写，数的是「本拍从自由队列摘走多少块」。None 不是异常是算出来的答案：WAITING 侧听到它等下一拍，RUNNING 侧听到它进抢占环。
 3. **一条恒等式两条腿，写直读弯**。slot = 块表[pos//16] × 16 + pos%16，写腿每 token 一个门牌号直塞，读腿让注意力 kernel 自己翻表跳读。换算在 GPU 的 Triton kernel 里做（positions 本身是 GPU 张量，落 CPU 就要付一次 D2H 同步）。分页的总账单记在读腿上，执行篇结算。
 
 最后替读者把一拍里块池的全部事件按发生顺序缝成一张对齐表（正文拆在六处，事件全是上面拆过的锚点，无新内容）：
