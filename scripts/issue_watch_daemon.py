@@ -17,6 +17,12 @@ import subprocess
 import sys
 import datetime
 
+# pythonw 下 sys.stdout/stderr 为 None——被导入模块（watch_issues 的失败分支
+# 会 print）一旦 print 就 AttributeError 崩溃，pythonw 崩溃可能弹系统错误框
+# （2026-09-29 弹窗风暴教训）。开局一律重定向到 devnull，物理杜绝任何输出路径。
+sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="replace")
+sys.stderr = sys.stdout
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import watch_issues as wi
@@ -85,7 +91,8 @@ def main() -> None:
         return
     if not has_events:
         return
-    log("event: spawning headless claude")
+    log("event: detected (log-only mode — 2026-09-29 用户reopen实锤无头修复质量不足，处理收回主会话；恢复自主处理需 Lead 改回)")
+    return
     # 无头拉起：--permission-mode bypassPermissions（用户部署的值守机器人，
     # prompt 已限定工作流与目录树）；输出追加日志供事后审计。
     try:
